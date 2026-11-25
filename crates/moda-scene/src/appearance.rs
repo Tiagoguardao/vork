@@ -19,7 +19,7 @@
 
 use crate::value::Value;
 
-use crate::effect::{is_visible_json, GEOMETRY_EFFECT_TYPES};
+use crate::effect::{is_visible_json};
 use crate::paint::{parse_fills, parse_strokes, shown, Fill, Stroke};
 use crate::types::RawNode;
 
@@ -54,7 +54,7 @@ pub enum Entry {
 
 /// Whether an effect type may sit on a fill or stroke.
 pub fn is_entry_effect_type(t: &str) -> bool {
-    GEOMETRY_EFFECT_TYPES.contains(&t) || ENTRY_DRAWING_EFFECT_TYPES.contains(&t)
+    ENTRY_DRAWING_EFFECT_TYPES.contains(&t)
 }
 
 /// The visible effects of an entry that draw on an entry, in list order.
@@ -72,15 +72,6 @@ pub fn entry_effects(effects: Option<&Vec<Value>>) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Split entry effects into (geometry, drawing), each in list order.
-pub fn split_entry_effects(effects: &[Value]) -> (Vec<Value>, Vec<Value>) {
-    effects.iter().cloned().partition(|e| {
-        e.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| GEOMETRY_EFFECT_TYPES.contains(&t))
-    })
 }
 
 /// A fill's visible entry effects.
@@ -311,26 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn entry_effects_keep_the_kinds_an_entry_draws() {
-        let n = node(json!({"id": "r", "type": "rectangle", "strokes": [{
-        "id": "s0", "paint": {"type": "solid", "color": "#0ff"}, "width": 4,
-        "effects": [
-            {"id": "b", "type": "layer-blur", "radius": 8},
-            {"id": "h", "type": "layer-blur", "radius": 8, "visible": false},
-            {"id": "g", "type": "background-blur", "radius": 8},
-            {"id": "r", "type": "roughen", "size": 5}
-        ]}]}));
-        let (f, s) = layers(&n);
-        let fx = stroke_effects(&s[0]);
-        assert_eq!(fx.len(), 2);
-        let (geometry, drawing) = split_entry_effects(&fx);
-        assert_eq!(geometry[0]["id"], "r");
-        assert_eq!(drawing[0]["id"], "b");
-        assert!(has_custom_stack(&n, &f, &s));
-        assert!(has_entry_drawing_effects(&n));
-    }
-
-    #[test]
     fn group_split_puts_entries_either_side_of_the_contents() {
         let n = node(json!({"id": "g", "type": "group", "children": [],
             "fills": [solid("f0")], "strokes": [stroke("s0"), stroke("s1")],
@@ -342,4 +313,21 @@ mod tests {
         let plain = node(json!({"id": "g", "type": "group", "children": []}));
         assert!(!group_has_appearance(&plain));
     }
+    #[test]
+    fn entry_effects_keep_the_kinds_an_entry_draws() {
+        let n = node(json!({"id": "r", "type": "rectangle", "strokes": [{
+        "id": "s0", "paint": {"type": "solid", "color": "#0ff"}, "width": 4,
+        "effects": [
+            {"id": "b", "type": "layer-blur", "radius": 8},
+            {"id": "h", "type": "layer-blur", "radius": 8, "visible": false},
+            {"id": "g", "type": "background-blur", "radius": 8},
+        ]}]}));
+        let (f, s) = layers(&n);
+        let fx = stroke_effects(&s[0]);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0]["id"], "b");
+        assert!(has_custom_stack(&n, &f, &s));
+        assert!(has_entry_drawing_effects(&n));
+    }
+
 }

@@ -186,7 +186,7 @@ impl Germ {
 /// coefficients, a line `value + k * step` in the common case. Each value is read exactly as
 /// `Germ::seconds` and `Germ::numeric` read it: in machine integers while its numerator and
 /// denominator are exact in an f64, and through the same rational otherwise.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progression {
     /// Coefficients of the powers of `k`, lowest first.
     coefficients: Vec<Rational>,
@@ -246,6 +246,24 @@ impl Progression {
             _ => None,
         };
         Self { coefficients, fixed, line }
+    }
+    /// Whether the progression has a constant step.
+    pub fn is_line(&self) -> bool {
+        self.coefficients.len() <= 2
+    }
+
+    /// The starting tick of a line that advances exactly one tick per step.
+    pub fn unit_step_start(&self, ticks_per_unit: u32) -> Option<i64> {
+        let (value, step, denominator) = self.line?;
+        let ticks = i128::from(ticks_per_unit);
+        if step.checked_mul(ticks)? != denominator {
+            return None;
+        }
+        let start = value.checked_mul(ticks)?;
+        if start % denominator != 0 {
+            return None;
+        }
+        i64::try_from(start / denominator).ok()
     }
     pub fn exact(&self, k: i64) -> Rational {
         let k = Rational::from_integer(k.into());
@@ -325,9 +343,7 @@ impl Progression {
         // normal f32 range a midpoint has only the first of the 29 dropped bits set. A
         // midpoint, like every larger fraction, is decided by the long division below.
         if numer.unsigned_abs() <= Self::EXACT as u128 && denom <= Self::EXACT {
-            let wide = numer as f64 / denom as f64;
-            let value = wide as f32;
-            if value.is_finite() && wide.abs() >= f64::from(f32::MIN_POSITIVE) && wide.to_bits() & 0x1fff_ffff != 0x1000_0000 {
+            if let Some(value) = Self::narrow(numer as f64 / denom as f64) {
                 return Some(value);
             }
         }
@@ -336,6 +352,44 @@ impl Progression {
         let value = f32::from_bits(((power + 127) as u32) << 23 | (mantissa as u32 & ((1 << 23) - 1)));
         Some(if numer < 0 { -value } else { value })
     }
+    fn narrow(wide: f64) -> Option<f32> {
+        let value = wide as f32;
+        (value.is_finite() && (wide == 0. || (wide.abs() >= f64::from(f32::MIN_POSITIVE)
+            && wide.to_bits() & 0x1fff_ffff != 0x1000_0000))).then_some(value)
+    }
+
+    /// Fill consecutive numeric values. For a line that fits in an f64's
+    /// integer precision, establish that bound once and advance its exact
+    /// numerator. At a possible f32 midpoint, use the scalar exact reader.
+    pub fn numeric_run(&self, range: std::ops::Range<i64>, out: &mut Vec<f32>) -> Result<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        if let Some((_, step, denom)) = self.line
+            && let Some((first, _)) = self.fraction(range.start)
+            && let Some((last, _)) = self.fraction(range.end - 1)
+            && first.unsigned_abs().max(last.unsigned_abs()).max(step.unsigned_abs()) <= Self::EXACT as u128
+            && denom <= Self::EXACT
+        {
+            let mut numerator = first as f64;
+            let step = step as f64;
+            let denom = denom as f64;
+            for k in range {
+                let value = match Self::narrow(numerator / denom) {
+                    Some(value) => value,
+                    None => self.numeric(k)?,
+                };
+                out.push(value);
+                numerator += step;
+            }
+        } else {
+            for k in range {
+                out.push(self.numeric(k)?);
+            }
+        }
+        Ok(())
+    }
+
     /// `|numer / denom|` (`numer != 0`, `denom > 0`) rounded to `digits` significant bits, ties
     /// to even, by long division: the quotient's leading bits, a rounding bit and whether
     /// anything remains. Returns the mantissa, in `[2^(digits-1), 2^digits)`, and the power of
@@ -531,6 +585,13 @@ mod tests {
         assert!(ties.fits_through(47_999));
         for k in [0, 1, 2, 777, 47_999] {
             assert_eq!(ties.numeric(k)?.to_bits(), Germ::point(ties.exact(k)).numeric()?.to_bits(), "at {k}");
+        }
+        for line in [ties, Progression::new(q("999999999999/48000"), q("-1/48000"))] {
+            let mut run = Vec::new();
+            line.numeric_run(-10..1100, &mut run)?;
+            for (k, value) in (-10..1100).zip(run) {
+                assert_eq!(value.to_bits(), line.numeric(k)?.to_bits(), "at {k}");
+            }
         }
         assert_eq!(Progression::divide(1, 3, 53), Some((0x15555555555555, -2)));
         assert_eq!(Progression::divide(-(1 << 60) - 1, 1 << 7, 53), Some((1 << 52, 53)));

@@ -176,7 +176,7 @@ fn sdEllipse(p: vec2<f32>, radii: vec2<f32>) -> f32 {
 // Main shader code
 
         // Frame-level uniforms (constant for all shapes in a frame)
-        @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>; // viewProjection
+// #include "rect-clip.wgsl"
         
         // Storage buffer for rectangle shadow instances
         struct RectangleShadowData {
@@ -195,7 +195,7 @@ fn sdEllipse(p: vec2<f32>, radii: vec2<f32>) -> f32 {
           @builtin(position) position: vec4<f32>,
           @location(0) @interpolate(flat) instanceId: u32,
           @location(1) localPos: vec2<f32>, // Local position in pixels, centered at rectangle center
-          @location(2) worldPos: vec2<f32>, // World position for clipping
+          @location(2) @interpolate(flat) clip: vec4<f32>,
         }
         
         @vertex
@@ -247,8 +247,8 @@ fn sdEllipse(p: vec2<f32>, radii: vec2<f32>) -> f32 {
             worldPos.y += shadow.shadowOffset.y;
           }
 
-          output.worldPos = worldPos.xy; // Pass world position to fragment shader
-          output.position = frameUniforms * worldPos;
+          output.clip = projectRectClip(shadow.pageClipBounds);
+          output.position = frameUniforms.viewProjection * worldPos;
           output.position.z = shadow.shapeData.w; // Use the depth value from shapeData
           output.instanceId = instanceIndex;
 
@@ -449,12 +449,7 @@ fn sdfCoverage(dist: f32, edgeWidth: f32) -> f32 {
           // (fwidth) is kept at top level for uniformity.
           let insideCoverage = computeCoverageAlpha(shadowDistance);
 
-          // Check page clip bounds
-          let bounds = shadow.pageClipBounds;
-          if (input.worldPos.x < bounds.x || 
-              input.worldPos.x > bounds.x + bounds.z ||
-              input.worldPos.y < bounds.y || 
-              input.worldPos.y > bounds.y + bounds.w) {
+          if (outsideRectClip(input.position.xy, input.clip)) {
             discard;
           }
 

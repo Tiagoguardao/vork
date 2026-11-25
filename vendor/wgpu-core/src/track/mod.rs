@@ -651,6 +651,11 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
+    pub(crate) fn set_from_usage_scope(&mut self, scope: &UsageScope) {
+        self.buffers.set_from_usage_scope(&scope.buffers);
+        self.textures.set_from_usage_scope(&scope.textures);
+    }
+
     pub fn new(
         ordered_buffer_usages: wgt::BufferUses,
         ordered_texture_usages: wgt::TextureUses,

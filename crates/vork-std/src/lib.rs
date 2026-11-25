@@ -118,7 +118,8 @@ mod tests {
         }
         assert_eq!(writes.get(), calls.len());
         assert!(cached("sphere", r#"{"radius":-1}"#).is_err());
-        assert!(cached("not_a_builder", "{}").is_err());
+        let error = cached("shpere", "{}").unwrap_err().to_string();
+        assert!(error.contains("unknown standard-library function shpere"), "{error}");
         assert_eq!(writes.get(), calls.len(), "failed calls are never published");
     }
 
@@ -130,19 +131,6 @@ mod tests {
             || panic!("a font read cannot be replaced by a closed-input cache hit"),
             |_| panic!("a file-dependent result cannot be published here")).unwrap_err();
         assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
-    }
-
-    #[test]
-    fn retired_builders_are_normal_lookup_errors() {
-        for name in [
-            "scatter",
-        ] {
-            let error = evaluate(name, "{}").unwrap_err().to_string();
-            assert!(
-                error.contains(&format!("unknown standard-library function {name}")),
-                "{error}"
-            );
-        }
     }
 
     #[test]

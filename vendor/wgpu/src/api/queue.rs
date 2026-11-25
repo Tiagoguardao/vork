@@ -295,9 +295,9 @@ impl Queue {
         if !reservations.is_empty() { self.on_submitted_work_done(move || drop(reservations)); }
 
         // Execute all deferred actions after submit.
-        actions.execute(&self.inner);
-
-        SubmissionIndex { index }
+        let index = SubmissionIndex { index };
+        actions.execute(&self.inner, index.clone());
+        index
     }
 
     #[cfg(std)]

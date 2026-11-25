@@ -2,6 +2,16 @@ UPGRADE
 Breaking changes, newest first. Rewrite scenes and scripts for the current API.
 Use matching SDK and executable versions; regenerate SDK-written scenes after upgrading.
 
+0.6.2 (from 0.6.1)
+- Movies in supported node bindings now play sound. Remove a redundant audio.file to avoid doubling.
+  Use a decodable mono or stereo first audio stream, or strip the audio.
+  For a silent MP4 or MOV, use one-shot vork render --no-audio.
+- Rename authored Slang names starting with VORK_, except VORK_ABI and VORK_FLUID_STATUS_BOUND.
+- Recheck canvas frames with clips, filters, dashed strokes, masks, colour emoji or cropped movies.
+  Still output numbers and CompositeContext.frame are based on the nearest frame to --at.
+- glTF export refuses movie textures on meshes. Use still PNGs.
+- Replace vork_render::session with CLI or SDK sessions. Re-render 0.6.1 MP4 parts for the bundled chunk joiner.
+
 0.6.0 (from 0.5.1)
 A 0.5.1 scene either loads unchanged or is refused in one line naming the edit below. No aliases.
 

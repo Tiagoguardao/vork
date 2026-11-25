@@ -289,20 +289,8 @@ fn union_regions(
     loop {
         let mut batch: Vec<Vec<PathPoint>> = shape.take().map(|s| s.points).into_iter().collect();
         batch.extend(rest.by_ref().take(MAX_OPERANDS - batch.len()));
-        if batch.len() < 2 {
-            // Nothing new was added: the accumulated union is the answer.
-            return Ok(batch.pop().map(|points| {
-                let bounds = points_bounds(&points);
-                let subpath_count = points
-                    .iter()
-                    .filter(|p| matches!(p, PathPoint::Move { .. }))
-                    .count();
-                Shape {
-                    points,
-                    subpath_count,
-                    bounds,
-                }
-            }));
+        if batch.is_empty() {
+            return Ok(None);
         }
         let more = rest.len() > 0;
         match boolean_paths(&BooleanRequest {
@@ -560,31 +548,4 @@ fn run_json(request_json: &str) -> Result<Value, BooleanError> {
             }
         }).collect::<Vec<_>>(),
     }))
-}
-
-/// Bounds of a path's anchors and control points (a safe over-estimate).
-fn points_bounds(points: &[PathPoint]) -> Bounds {
-    let mut b = Bounds {
-        min_x: f64::INFINITY,
-        min_y: f64::INFINITY,
-        max_x: f64::NEG_INFINITY,
-        max_y: f64::NEG_INFINITY,
-    };
-    for p in points {
-        match p {
-            PathPoint::Move { x, y } | PathPoint::Line { x, y } | PathPoint::Arc { x, y, .. } => {
-                b.include(*x, *y)
-            }
-            PathPoint::Curve { x, y, cp1, cp2 } => {
-                b.include(*x, *y);
-                b.include(cp1.0, cp1.1);
-                b.include(cp2.0, cp2.1);
-            }
-            PathPoint::Quadratic { x, y, cp } => {
-                b.include(*x, *y);
-                b.include(cp.0, cp.1);
-            }
-        }
-    }
-    b
 }

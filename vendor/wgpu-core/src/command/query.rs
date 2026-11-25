@@ -45,7 +45,14 @@ impl QueryResetMap {
         mem::replace(&mut vec_pair.0[query as usize], true)
     }
 
-    pub fn reset_queries(&mut self, raw_encoder: &mut dyn hal::DynCommandEncoder) {
+    pub fn reset_queries(
+        &mut self,
+        encoder: &mut super::InnerCommandEncoder,
+    ) -> Result<(), DeviceError> {
+        if self.map.is_empty() {
+            return Ok(());
+        }
+        let raw_encoder = encoder.open_pre_pass()?;
         for (_, (state, query_set)) in self.map.drain() {
             debug_assert_eq!(state.len(), query_set.desc.count as usize);
 
@@ -71,6 +78,7 @@ impl QueryResetMap {
                 }
             }
         }
+        Ok(())
     }
 }
 

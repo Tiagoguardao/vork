@@ -767,8 +767,7 @@ mod tests {
             pointer_length: None,
             pointer_width: None,
             corner_radius: None,
-            body_outlined: false,
-            outlined_cap_reach: [0.0, 0.0],
+
         }
     }
 
@@ -856,8 +855,7 @@ mod tests {
             pointer_length: Some(16.0),
             pointer_width: Some(16.0),
             corner_radius: None,
-            body_outlined: false,
-            outlined_cap_reach: [0.0, 0.0],
+
         };
         // polyline lengths: 300 + 280 + 280 = 860; to mid of segment 1:
         // 300 + 140 = 440 → t = 440/860.

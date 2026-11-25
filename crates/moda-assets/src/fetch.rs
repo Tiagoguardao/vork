@@ -45,11 +45,10 @@ struct Span {
 /// CLI's resource report (WF5 r3 "scream on missing resources").
 #[derive(Debug, Clone)]
 pub struct AssetFailure {
-    /// The original source URL (pattern src, or the shader-image src behind
-    /// a resource key), log-truncated NOWHERE — the report needs the full
+    /// The original source URL, log-truncated NOWHERE — the report needs the full
     /// URL to be actionable.
     pub url: String,
-    pub shader_image: bool,
+
     /// Full error chain.
     pub reason: String,
     /// `Some(kind)` when the decode failure carries a positive browser-
@@ -166,8 +165,7 @@ enum Outcome {
     /// Decoded pattern image + byte-probe warnings (SVG only; see
     /// [`SvgProbeWarning`] — empty for raster and for clean SVGs).
     Loaded(PreparedImage, Vec<String>),
-    /// M4e: a settled shader-image request (stored under its resource key).
-    LoadedShaderImage(moda_shaders::runtime::image_processing::PreparedShaderImage),
+
     /// Committed failure: the flattened error chain plus the typed browser-
     /// undecodable sniff kind extracted from the LIVE error (see
     /// [`AssetFailure::browser_undecodable`]).
@@ -184,13 +182,6 @@ enum Job {
     Pattern {
         src: String,
         min: Option<(u32, u32)>,
-    },
-    /// M4e shader image: store key = `image_resource_key(src, processing)`
-    /// (dedup identical to `ShaderImageResourceManager`'s entry map).
-    Shader {
-        src: String,
-        key: String,
-        processing: moda_shaders::runtime::image_processing::Processing,
     },
 }
 
@@ -215,8 +206,7 @@ pub fn fetch_media_bytes_blocking(src: &str, config: &PrefetchConfig) -> Result<
     Ok(bytes)
 }
 
-/// Resolve + decode every request (deduped; pattern requests by src,
-/// shader-image requests by resource key). Returns the settled store plus a
+/// Resolve + decode every request, deduplicated by source. Returns the settled store plus a
 /// [`PrefetchReport`] with full failure details — the store keeps placeholder
 /// semantics for the pixels; the report is the scream channel.
 pub fn prefetch_blocking(
@@ -225,8 +215,6 @@ pub fn prefetch_blocking(
 ) -> (AssetStore, PrefetchReport) {
     let mut merged: HashMap<String, Option<(u32, u32)>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut shader_jobs: Vec<Job> = Vec::new();
-    let mut shader_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // store key → (original src, referencing node ids) for the report.
     let mut nodes_by_key: HashMap<String, Vec<String>> = HashMap::new();
     let mut src_by_key: HashMap<String, String> = HashMap::new();
@@ -242,18 +230,7 @@ pub fn prefetch_blocking(
         }
     };
     for r in requests {
-        if let Some(processing) = r.shader_processing {
-            let key = moda_shaders::runtime::image_resource_key(&r.src, &processing);
-            note_node(&key, &r.src, &r.node_id);
-            if shader_seen.insert(key.clone()) {
-                shader_jobs.push(Job::Shader {
-                    src: r.src,
-                    key,
-                    processing,
-                });
-            }
-            continue;
-        }
+
         note_node(&r.src, &r.src, &r.node_id);
         let entry = merged.entry(r.src.clone()).or_insert_with(|| {
             order.push(r.src.clone());
@@ -264,7 +241,7 @@ pub fn prefetch_blocking(
             (a, b) => a.or(b),
         };
     }
-    if order.is_empty() && shader_jobs.is_empty() {
+    if order.is_empty() {
         return (AssetStore::default(), PrefetchReport::default());
     }
 
@@ -274,16 +251,15 @@ pub fn prefetch_blocking(
             let min = merged[&src];
             Job::Pattern { src, min }
         })
-        .chain(shader_jobs)
         .collect();
     let results = run_jobs(&jobs, config);
 
     let mut store = AssetStore::default();
     let mut report = PrefetchReport {
-        referenced: merged.len() + shader_seen.len(),
+        referenced: merged.len(),
         ..PrefetchReport::default()
     };
-    for (key, is_shader, outcome, span) in results {
+    for (key, outcome, span) in results {
         // Aggregate the read/decode split + slow-asset telemetry.
         let total_ms = span.fetch_ms + span.decode_ms;
         report.fetch_ms += span.fetch_ms;
@@ -317,13 +293,7 @@ pub fn prefetch_blocking(
                 }
                 store.insert(key, AssetEntry::Loaded(Arc::new(img)))
             }
-            Outcome::LoadedShaderImage(img) => {
-                report.loaded += 1;
-                store.insert_shader_image(
-                    key,
-                    crate::shader_image::ShaderImageEntry::Loaded(Arc::new(img)),
-                )
-            }
+
             Outcome::Failed {
                 reason,
                 browser_undecodable,
@@ -331,24 +301,16 @@ pub fn prefetch_blocking(
                 eprintln!(
                     "moda-assets: failed loading '{}' — baking {} placeholder: {reason}",
                     truncate(&key),
-                    if is_shader {
-                        "shader-image fallback"
-                    } else {
-                        "failed"
-                    }
+                    "failed"
                 );
                 report.failures.push(AssetFailure {
                     url,
-                    shader_image: is_shader,
+
                     reason,
                     browser_undecodable,
                     nodes,
                 });
-                if is_shader {
-                    store.insert_shader_image(key, crate::shader_image::ShaderImageEntry::Fallback)
-                } else {
-                    store.insert(key, AssetEntry::Failed)
-                }
+                store.insert(key, AssetEntry::Failed)
             }
         }
     }
@@ -356,12 +318,12 @@ pub fn prefetch_blocking(
 }
 
 /// Resolve every job on up to `config.concurrency` scoped worker threads,
-/// returning `(store_key, is_shader, outcome, span)` per job, ordered by store
+/// returning `(store_key, outcome, span)` per job, ordered by store
 /// key so the report is deterministic.
-fn run_jobs(jobs: &[Job], config: &PrefetchConfig) -> Vec<(String, bool, Outcome, Span)> {
+fn run_jobs(jobs: &[Job], config: &PrefetchConfig) -> Vec<(String, Outcome, Span)> {
     let next = AtomicUsize::new(0);
     let workers = config.concurrency.max(1).min(jobs.len());
-    let mut results: Vec<(String, bool, Outcome, Span)> = std::thread::scope(|scope| {
+    let mut results: Vec<(String, Outcome, Span)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
@@ -382,10 +344,9 @@ fn run_jobs(jobs: &[Job], config: &PrefetchConfig) -> Vec<(String, bool, Outcome
     results
 }
 
-fn run_job(job: &Job, config: &PrefetchConfig) -> (String, bool, Outcome, Span) {
-    let (store_key, is_shader) = match job {
-        Job::Pattern { src, .. } => (src.clone(), false),
-        Job::Shader { key, .. } => (key.clone(), true),
+fn run_job(job: &Job, config: &PrefetchConfig) -> (String, Outcome, Span) {
+    let store_key = match job {
+        Job::Pattern { src, .. } => src.clone(),
     };
     let started = Instant::now();
     // A decoder panic on hostile bytes is a per-asset failure, not a crashed
@@ -415,7 +376,7 @@ fn run_job(job: &Job, config: &PrefetchConfig) -> (String, bool, Outcome, Span) 
             span.decode_ms,
         );
     }
-    (store_key, is_shader, outcome, span)
+    (store_key, outcome, span)
 }
 
 fn truncate(s: &str) -> String {
@@ -428,36 +389,6 @@ fn load_job(config: &PrefetchConfig, job: &Job) -> Result<(Outcome, Span)> {
         Job::Pattern { src, min } => {
             let (img, span, probe_warnings) = load_one(config, src, *min)?;
             Ok((Outcome::Loaded(img, probe_warnings), span))
-        }
-        Job::Shader {
-            src, processing, ..
-        } => {
-            // The production `!source.src` arm never fetches.
-            let fetch_started = Instant::now();
-            let (bytes, svg_hint) = if src.is_empty() {
-                (Vec::new(), false)
-            } else {
-                let (bytes, svg_hint) = fetch_bytes(config, src)?;
-                if bytes.is_empty() {
-                    bail!("empty asset body for {}", truncate(src));
-                }
-                (bytes, svg_hint)
-            };
-            let fetch_ms = fetch_started.elapsed().as_millis() as u64;
-            let decode_started = Instant::now();
-            let img = crate::shader_image::load_shader_image(
-                src,
-                &bytes,
-                svg_hint,
-                processing,
-            )?;
-            Ok((
-                Outcome::LoadedShaderImage(img),
-                Span {
-                    fetch_ms,
-                    decode_ms: decode_started.elapsed().as_millis() as u64,
-                },
-            ))
         }
     }
 }
@@ -593,7 +524,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: PNG_1PX.into(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: None,
             }],
             &PrefetchConfig::default(),
@@ -619,7 +550,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: src.clone(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: Some("n1".into()),
             }],
             &PrefetchConfig::default(),
@@ -664,7 +595,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: clean_src.clone(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: None,
             }],
             &PrefetchConfig::default(),
@@ -677,7 +608,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: PNG_1PX.into(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: None,
             }],
             &PrefetchConfig::default(),
@@ -698,7 +629,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: src.clone(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: Some("n7".into()),
             }],
             &PrefetchConfig::default(),
@@ -723,7 +654,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: PNG_1PX.into(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: None,
             }],
             &PrefetchConfig::default(),
@@ -739,7 +670,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: src.into(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: Some("node-a".into()),
             }],
             &PrefetchConfig::default(),
@@ -774,7 +705,7 @@ mod tests {
             vec![PrefetchRequest {
                 src: src.clone(),
                 min_raster_size: None,
-                shader_processing: None,
+
                 node_id: Some("node-a".into()),
             }],
             &PrefetchConfig::default(),
@@ -808,7 +739,7 @@ mod tests {
                 vec![PrefetchRequest {
                     src: src.clone(),
                     min_raster_size: None,
-                    shader_processing: None,
+
                     node_id: Some("n1".into()),
                 }],
                 &PrefetchConfig::default(),
@@ -856,7 +787,7 @@ mod tests {
                 .map(|src| PrefetchRequest {
                     src,
                     min_raster_size: None,
-                    shader_processing: None,
+
                     node_id: None,
                 })
                 .collect(),
@@ -880,13 +811,13 @@ mod tests {
                 PrefetchRequest {
                     src: svg.into(),
                     min_raster_size: Some((1100, 200)),
-                    shader_processing: None,
+
                     node_id: None,
                 },
                 PrefetchRequest {
                     src: svg.into(),
                     min_raster_size: Some((200, 1200)),
-                    shader_processing: None,
+
                     node_id: None,
                 },
             ],
@@ -915,7 +846,7 @@ mod tests {
         let request = PrefetchRequest {
             src: src.into(),
             min_raster_size: None,
-            shader_processing: None,
+
             node_id: None,
         };
         prefetch_blocking(vec![request], &config).0

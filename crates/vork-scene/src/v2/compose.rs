@@ -19,17 +19,21 @@ impl Scene {
     /// The nodes that start a part of another space, outermost first (not those inside another part). In a canvas
     /// these are worlds; in a world, canvases.
     pub fn composition_parts(&self) -> Vec<&Node> {
-        fn visit<'a>(nodes: &'a [Node], space: Space, out: &mut Vec<&'a Node>) {
+        let mut parts = Vec::new();
+        self.visit_space_nodes(|node, part| { if part { parts.push(node); } });
+        parts
+    }
+    /// Visit the document's own nodes. A node starting another space is reported
+    /// as a part, whose children belong to that part's document.
+    pub fn visit_space_nodes<'a>(&'a self, mut visit: impl FnMut(&'a Node, bool)) {
+        fn walk<'a>(nodes: &'a [Node], space: Space, visit: &mut impl FnMut(&'a Node, bool)) {
             for node in nodes {
-                match &node.composition {
-                    Some(c) if c.space != space => out.push(node),
-                    _ => visit(&node.children, space, out),
-                }
+                let part = node.composition.as_ref().is_some_and(|c| c.space != space);
+                visit(node, part);
+                if !part { walk(&node.children, space, visit); }
             }
         }
-        let mut out = Vec::new();
-        visit(&self.nodes, self.own_space(), &mut out);
-        out
+        walk(&self.nodes, self.own_space(), &mut visit);
     }
     /// Whether some part still holds its nodes (a part emptied by `without_compositions` holds none).
     pub fn has_composition_parts(&self) -> bool {

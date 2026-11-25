@@ -15,7 +15,8 @@ mod test_support;
 mod image_native;
 mod identity;
 mod filesystem;
-pub use identity::{ClosedInputIdentity, InputIdentity, PreparedModules, PreparedProgram};
+pub use filesystem::{RevisionFiles, RevisionScope};
+pub use identity::{ClosedInputIdentity, InputIdentity, InstalledInputs, PreparedModules, PreparedProgram};
 pub mod metal_source;
 pub mod spirv;
 
@@ -160,6 +161,10 @@ fn reject_reserved(source: &str, file: &str) -> Result<()> {
             // Modules every workspace supplies (write_modules: vork_sampling and the
             // OpenPBR constants) are importable by name; a module name is not plumbing.
             let module = name == "vork_openpbr_constants" || KERNEL_MODULES.iter().any(|(kernel, _)| *kernel == name);
+            // Native consumers and the effect proof use different renderer defines.
+            // An authored branch on one would give them different program bodies.
+            ensure!(!name.starts_with("VORK_") || matches!(name, "VORK_ABI" | "VORK_FLUID_STATUS_BOUND"),
+                "{file}:{}: {name} is reserved for the renderer", line(i));
             ensure!((!name.starts_with("vork_") || module) && !name.starts_with("__"),
                 "{file}:{}: {name}: names beginning vork_ or __ are reserved for the compiler", line(i));
             i += end;
@@ -375,14 +380,6 @@ impl Abi {
                 + &renderer_registry::generate(true)
         ))
     }
-    /// The Slang `Closure`: every OpenPBR field on every build. Fields absent from `closure` (hair and test ABIs) never
-    /// cross into the kernel.
-    fn declared_closure(&self) -> Vec<Field> {
-        openpbr_fields()
-            .into_iter()
-            .map(|p| self.closure.iter().find(|f| f.name == p.name).cloned().unwrap_or(p))
-            .collect()
-    }
     /// The `vork` Slang module every program and library imports.
     pub fn module(&self) -> String {
         self.module_with(
@@ -423,7 +420,7 @@ impl Abi {
         let aov_slots = self.aov_count.max(1);
         let aov_count = self.aov_count;
         let mut s = format!("module vork;\n{imports}public static const uint VORK_ABI = {PROGRAM_ABI}u;\n");
-        let closure = self.declared_closure();
+        let closure = openpbr::declared_closure(&self.closure);
         for (name, fields) in [
             ("ShadingContext", &self.context[..]),
             ("Closure", &closure[..]),
@@ -1705,6 +1702,9 @@ mod reserved_tests {
         // Kernel modules supplied to every program are importable.
         reject_reserved("// Header.\nimport vork_sampling;\nfloat2 p=sample_2d(uint2(0u),0u,4u,0u);", "program").unwrap();
         assert!(reject_reserved("import vork_sampling;\nuint w=vork_input_word(0u);", "program").is_err());
+        for name in ["VORK_AOV_SLOTS", "VORK_OUTPUT_SLOTS", "VORK_AOV_COUNT", "VORK_AOV_CHANNELS", "VORK_UNIT_IMAGE_HANDLES", "VORK_ATTRIBUTES", "VORK_DENSE_GRIDS_ONLY"] {
+            assert!(reject_reserved(&format!("#ifdef {name}"), "program").is_err());
+        }
         reject_reserved("import vork_openpbr_constants;", "program").unwrap();
         assert!(reject_reserved("import vork_private;", "program").is_err());
         // Source provenance never grants compiler access, even for shipped code.

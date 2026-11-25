@@ -130,6 +130,9 @@ fn collected<T>(checked: Result<()>, result: Result<T>) -> Result<T> {
     match (checked, result) {
         (Err(_), Err(error)) if device(&error) => Err(error),
         (Err(error), _) if crate::failure::kind(&error).is_some() => Err(error),
+        (Err(checked), Err(own)) if checked.is::<FrameRedo>() && own.is::<FrameRedo>() => {
+            Err(FrameRedo(checked.downcast::<FrameRedo>().unwrap().0.max(own.downcast::<FrameRedo>().unwrap().0)).into())
+        }
         (checked, result) => result.and_then(|output| checked.map(|()| output)),
     }
 }
@@ -153,8 +156,43 @@ fn reservation_retry_allowed(errors: Option<[u32; 2]>) -> bool {
         0 | vork_slang::registry::RADIANCE_NONFINITE | vork_slang::registry::DISPLAY_NONFINITE))
 }
 
+/// Static ray geometry has a history independent of camera working storage.
+/// Keep its TLAS topology, placement buffers and object deltas together.
+/// Evaluated geometry and compute publications still belong to their full slot.
+pub(crate) struct RayHistory {
+    objects: wgpu::Buffer,
+    object_values: Vec<Object>,
+    rays: crate::rt::FrameRays,
+    changes: values::ChangeTracker,
+}
+
+impl RayHistory {
+    pub(crate) fn supports(s: &InstalledScene) -> bool {
+        s.compute.is_none()
+            && s.draws.iter().all(|draw| !draw.evaluated() && draw.implicit.is_none())
+            && s.rays.as_ref().is_some_and(|rays| !rays.has_point_shapes())
+    }
+
+    /// Allocate persistent geometry before measuring reclaimable camera storage.
+    /// Static draws have no frame-local evaluated buffers to bind here.
+    pub(crate) fn new(s: &InstalledScene, r: &Renderer) -> Result<Self> {
+        assert!(Self::supports(s));
+        let _foreground = r.compiler.foreground_preparation();
+        r.errors.check()?;
+        let packed = gpu_objects(&s.objects);
+        let objects = init(&r.device, "frame objects", bytemuck::cast_slice(&packed),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let deforms = (0..s.draws.len()).map(|_| None).collect::<Vec<_>>();
+        let rays = crate::rt::FrameRays::new(s, r, &objects, &deforms)?
+            .expect("supported static ray scene");
+        r.errors.check()?;
+        Ok(Self { objects, object_values: s.objects.clone(), rays,
+            changes: values::ChangeTracker::default() })
+    }
+}
+
 pub struct FrameSlot {
-    pub(crate) dielectric_spill_reservation: u64,
+    pub(crate) reservations: Reservations,
     boundary_names: Vec<String>,
     pub(crate) nominal_frame: u32,
     pub(crate) nominal_request: vork_time::Request,
@@ -164,6 +202,8 @@ pub struct FrameSlot {
     propagation_motion: bool,
     warned_propagation_motion: bool,
     _retained_transients: std::sync::Arc<std::sync::Mutex<crate::graph::State>>,
+    probe_collection: Option<std::sync::Arc<std::sync::Mutex<crate::graph::ProbeCollection>>>,
+    probe_submission: Option<u64>,
     publication_error: std::sync::Arc<std::sync::OnceLock<String>>,
     publication_checks: Option<crate::graph::PublicationChecks>,
     solver_receipts: Vec<(crate::graph::PublicationDiagnostic, wgpu::Buffer)>,
@@ -216,7 +256,6 @@ pub struct FrameSlot {
     pub(crate) exposure_upload: Vec<(wgpu::Buffer, Vec<u8>)>,
     batch_uploads: bool,
     pub(crate) shadow_bind: wgpu::BindGroup,
-    pub(crate) probe_generation: u32,
     probe_feedback: Option<(crate::probes::Feedback, wgpu::Buffer)>,
     probe_demand: Option<std::sync::Arc<std::sync::Mutex<crate::probes::Demand>>>,
 
@@ -618,18 +657,41 @@ impl FrameSlot {
         r: &Renderer,
         precision: ReadbackPrecision,
     ) -> Result<Self> {
+        Self::new_recording(s, r, precision, None)
+    }
+
+    pub(crate) fn resume_ray_history(s: &InstalledScene, r: &Renderer,
+        precision: ReadbackPrecision, history: Option<RayHistory>) -> Result<Self> {
+        let _foreground = r.compiler.foreground_preparation();
+        r.errors.check()?;
+        let slot = Self::new_recording(s, r, precision, history);
+        r.errors.check()?;
+        slot
+    }
+
+    pub(crate) fn into_ray_history(mut self) -> Option<RayHistory> {
+        if self.pending { return None; }
+        let rays = self.rays.take()?;
+        self.changes.retain_ray_history(&self.objects);
+        Some(RayHistory { objects: self.objects, object_values: self.object_values,
+            rays, changes: self.changes })
+    }
+
+    fn new_recording(s: &InstalledScene, r: &Renderer, precision: ReadbackPrecision,
+        history: Option<RayHistory>) -> Result<Self> {
         let retained_transients = s.transients.retain();
         let retained_shadows = s.retain_shadows(r)?;
         let d = &r.device;
         // Storage bindings need one complete record even when there are no draws.
-        let object_values = gpu_objects(&s.objects);
-        let object_bytes = bytemuck::cast_slice(&object_values);
-        let objects = init(
-            d,
-            "frame objects",
-            object_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        );
+        let (objects, object_values, retained_rays, changes) = match history {
+            Some(history) => (history.objects, history.object_values, Some(history.rays), history.changes),
+            None => {
+                let values = gpu_objects(&s.objects);
+                let objects = init(d, "frame objects", bytemuck::cast_slice(&values),
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+                (objects, s.objects.clone(), None, values::ChangeTracker::default())
+            }
+        };
         let geometry_chain = crate::geometry_chain::Frame::new(r, s)?;
         let deforms = geometry_chain.outputs();
         let point_publication=point_publication::Frame::new(r,s,&deforms)?;
@@ -655,7 +717,10 @@ impl FrameSlot {
             wgpu::BufferUsages::STORAGE,
         );
 
-        let mut rays = crate::rt::FrameRays::new(s, r, &objects, &deforms)?;
+        let mut rays = match retained_rays {
+            Some(rays) => Some(rays),
+            None => crate::rt::FrameRays::new(s, r, &objects, &deforms)?,
+        };
         if let Some(rays) = rays.as_mut() { rays.resolve_hit_buffers(s, &deforms); }
         let shadow_bind = s.shadows().bind(s, d, rays.as_ref());
         r.errors.check()?;
@@ -782,7 +847,7 @@ impl FrameSlot {
             boundary_names[solid as usize]=root.instance_index.map_or_else(||name.clone(),|instance|format!("{name}[{instance}]"));
         }
         let mut slot = Self {
-            dielectric_spill_reservation: s.reservations.dielectric_spill,
+            reservations: s.reservations,
             boundary_names,
             computed_bounds,
             point_publication,
@@ -790,6 +855,8 @@ impl FrameSlot {
             warned_propagation_motion: false,
             _retained_shadows: retained_shadows,
             _retained_transients: retained_transients,
+            probe_collection: s.probes.as_ref().map(|_| s.transients.probe_collection.clone()),
+            probe_submission: None,
             publication_error: s.transients.recording_error.clone(),
             solver_receipts: Vec::new(),
             publication_checks: (s.has_media || s.compute.is_some() || s.displacement.is_some() || s.implicit_fields.iter().any(|f|!f.statuses.is_empty()) || !image_targets.is_empty()).then(||s.transients.publication_checks.clone()),
@@ -809,7 +876,7 @@ impl FrameSlot {
             materials: frame_materials,
             compute,
             compute_commands,
-            changes: Default::default(),
+            changes,
             reuse_values: false,
             nominal_frame: 0,
             nominal_request: vork_time::Request::Numeric(0.),
@@ -837,9 +904,8 @@ impl FrameSlot {
             offset_values: values::offset_storage(s),
             sampled_nodes: values::sample_storage(&s.nodes),
             previous_nodes: values::sample_storage(&s.nodes),
-            object_values: s.objects.clone(),
+            object_values,
             shadow_bind,
-            probe_generation: s.reservations.probe_pages,
             probe_feedback: s.probes.as_ref().and_then(|p|p.feedback()).map(|source|
                 (source,buffer("probe request status",4,wgpu::BufferUsages::MAP_READ|wgpu::BufferUsages::COPY_DST))),
             probe_demand: s.probes.as_ref().map(|p|p.demand.clone()),
@@ -962,9 +1028,7 @@ impl FrameSlot {
         outputs: ReadbackOutputs,
     ) -> Result<()> {
         let request=time.into();
-        let identity=request.exact()?.scale(&vork_time::exact::decimal(&s.render.fps.to_string())?)
-            .add(&vork_time::exact::Germ::point(vork_time::exact::decimal("1/2")?)).floor();
-        let index=u32::try_from(identity).context("frame index exceeds u32 identity capacity")?;
+        let index = request.nearest_frame(s.render.fps)?;
         self.submit_indexed_outputs(s,r,index,request,outputs)
     }
     pub(crate) fn submit_indexed_outputs(&mut self, s: &InstalledScene, r: &Renderer, index: u32, request: vork_time::Request, outputs: ReadbackOutputs) -> Result<()> {
@@ -992,6 +1056,7 @@ impl FrameSlot {
             }
         }
         self.completed = None;
+        ensure!(self.reservations == s.reservations, "frame slot has stale storage reservations; include every slot in redo_frame");
         self.submit_exposure(s, r, time, outputs)
     }
     fn controls_view(&self, s: &InstalledScene, r: &Renderer) -> Result<ViewState> {
@@ -1083,8 +1148,6 @@ impl FrameSlot {
             }
         }
         self.simulation_checkpoint = None;
-        ensure!(self.probe_generation==s.reservations.probe_pages,"frame slot has stale probe support; include every slot in redo_frame");
-        ensure!(self.dielectric_spill_reservation==s.reservations.dielectric_spill,"frame slot has stale dielectric storage; include every slot in redo_frame");
         self.submitted_time = time;
         for view in self.views_mut() {
             view.refresh_variants(s, r)?;
@@ -1333,8 +1396,7 @@ impl FrameSlot {
             let start = Instant::now();
             debug_assert!(recording.is_none());
             {
-                #[cfg(feature = "frame-profile")]
-                let _profile = crate::frame_profile::span("queue_upload");
+                profile_span!(_profile, "queue_upload");
                 for (buffer, bytes) in &self.exposure_upload {
                     r.queue.write_buffer(buffer, 0, bytes);
                 }
@@ -1352,6 +1414,11 @@ impl FrameSlot {
             if let Some(env)=&self.environment_diagnostics {buffers.push((crate::graph::PublicationDiagnostic::Code("environment"),env.readback.clone()));}
             if let Some(compute)=&self.compute {buffers.push((crate::graph::PublicationDiagnostic::Code("placement"),compute.error_readback.clone()));}
             checks.lock().unwrap().push((self.submission.clone().context("publication has no fence")?,buffers));
+        }
+        if let Some(order) = &self.probe_collection {
+            let mut order = order.lock().unwrap();
+            self.probe_submission = Some(order.submitted);
+            order.submitted += 1;
         }
         self.flight_ownership.submit();
         self.pending = true;
@@ -1389,8 +1456,7 @@ impl FrameSlot {
             "time must be nonnegative and finite"
         );
         self.read_pixels = read_pixels;
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("encode_sample_inclusive");
+        profile_span!(_profile, "encode_sample_inclusive");
         let start = Instant::now();
         self.view.queries = self.queries.clone();
         // Rule 7: the environment's movies show its node's local time while its scene-owned tracks
@@ -1424,12 +1490,8 @@ impl FrameSlot {
             let clock=if image.canvas.is_some() {
                 image.canvas_instant(s,&self.animation_values,&request)?
             } else {
-                let base=match s.animation.footage_clock(&self.animation_values,&image.name) {
-                    crate::animation::FootageClock::Absent=>continue,
-                    crate::animation::FootageClock::Node(clock)=>clock,
-                    crate::animation::FootageClock::Scene=>image.time.as_ref().map(|t|vork_time::exact::Germ::point(t.exact())).unwrap_or_else(||request.clone()),
-                };
-                Some(s.animation.image_time_exact(&self.animation_values,&request,&image.name,base)?)
+                let Some(time) = s.animation.footage_time(&self.animation_values, &request, &image.name, image.time.as_ref())? else { continue };
+                Some(time)
             };
             let key=image.sample_key(clock.as_ref(),s.render.fps)?;
             if image_changes.changed(values::ChangeKey::ImageClock(image.name.clone()),&key) {
@@ -1509,8 +1571,7 @@ impl FrameSlot {
             );
         }
         self.prep_ms = start.elapsed().as_secs_f64() * 1000.;
-        #[cfg(feature = "frame-profile")]
-        let _profile_recording = crate::frame_profile::span("record_commands_inclusive");
+        profile_span!(_profile_recording, "record_commands_inclusive");
         let mut encoder = recording.unwrap_or_else(|| self.sample_segments.encoder(r, Some("installed sample group")));
         let mut compute_cursor = s
             .compute
@@ -1664,8 +1725,7 @@ impl FrameSlot {
                 }
                 Pass::Deform => self.geometry_chain.encode(&mut encoder, s, &self.queries),
                 Pass::Rays => {
-                    #[cfg(feature = "frame-profile")]
-                    let _profile = crate::frame_profile::span("as_recording");
+                    profile_span!(_profile, "as_recording");
                     timing::boundary(r, &mut encoder, &self.queries, timing::query("acceleration structures"));
                     crate::rt::encode(&mut encoder, s, self);
                     timing::boundary(r, &mut encoder, &self.queries, timing::query("acceleration structures") + 1);
@@ -1838,7 +1898,7 @@ impl FrameSlot {
     /// Drain a queued successor without throwing away accepted independent output.
     pub(crate) fn collect_for_redo(&mut self, r: &Renderer, independent: bool) -> Result<()> {
         let submission = self.submission.clone().context("submitted successor has no fence")?;
-        let readback = self.collect_readback(r)?;
+        let readback = self.collect_checked(r)?;
         if independent {
             self.completed = Some(CompletedFrame {
                 nominal_frame: self.nominal_frame,
@@ -1854,7 +1914,7 @@ impl FrameSlot {
         Ok(())
     }
 
-    /// Waits for this slot’s submission, leaving later slots in flight.
+    /// Waits for this slot’s submission. Probe scenes require submission-order collection.
     pub fn collect(&mut self, r: &Renderer) -> Result<FrameOutput> {
         self.collect_readback(r)?.unpack()
     }
@@ -1885,7 +1945,20 @@ impl FrameSlot {
     fn failed_frame(&self) -> String {
         format!("GPU failed at or before the frame at {}s; frames run {}; frame discarded", self.submitted_time, self.work)
     }
+    /// Probe scenes share captures across slots. Collect their frames in submission
+    /// order. An out-of-order collection leaves the slot pending for a later call.
     pub fn collect_readback(&mut self, r: &Renderer) -> Result<FrameReadback> {
+        if let (Some(order), Some(sequence)) = (&self.probe_collection, self.probe_submission) {
+            ensure!(order.lock().unwrap().accepted == sequence,
+                "collect earlier probe frames in submission order and replay any rejected producer before collecting this frame");
+        }
+        let output = self.collect_checked(r)?;
+        if let (Some(order), Some(_)) = (&self.probe_collection, self.probe_submission.take()) {
+            order.lock().unwrap().accepted += 1;
+        }
+        Ok(output)
+    }
+    fn collect_checked(&mut self, r: &Renderer) -> Result<FrameReadback> {
         // Validate every queued producer before returning any dependent image,
         // even when the caller collects successors out of submission order.
         // Receipts use the existing slot readbacks; no extra GPU pass is needed.
@@ -2046,7 +2119,7 @@ impl FrameSlot {
                 let mapped=buffer.get_mapped_range(..);
                 crate::probes::Volume::collect_demand(self.probe_demand.as_ref().unwrap(),&mapped);
                 drop(mapped);buffer.unmap();
-                self.probe_generation.checked_add(1).context("probe generation exhausted")?
+                self.reservations.probe_pages.checked_add(1).context("probe generation exhausted")?
             } else {0}
         } else {0};
         let slots = self.slot_overflow.as_ref().map(read);
@@ -2121,7 +2194,7 @@ impl FrameSlot {
         if errors.is_some_and(|[code,_]|code==constants::PATH_BOUNDARY_OVERFLOW)
             && let Some(dielectric_spill)=self.spill_growth(r) {
             fail(self);
-            return Err(FrameRedo(Reservations {dielectric_spill,..Default::default()}).into());
+            return Err(FrameRedo(Reservations {dielectric_spill, probe_pages, ..Default::default()}).into());
         }
         let dropped_path_samples = shader_diagnostics.as_ref().map_or(0, |words| {
             let pair=words[(vork_slang::registry::DROPPED_PATH_SAMPLES_WORD/2) as usize];
@@ -2214,7 +2287,11 @@ impl FrameSlot {
             if count == vork_slang::registry::CAMERA_RAY_INVALID {return Err(self.authored(r, completion, anyhow::anyhow!("camera program returned a non-finite ray, zero direction or invalid t_min/t_max interval")));}
             if count == vork_slang::registry::PATH_PROPAGATION_ERROR {anyhow::bail!("authored propagation failed: invalid or non-progressing segment, or free-flight work reservation exhausted (code {capacity})");}
             if count == vork_slang::registry::PATH_MEDIUM_DIVERGENT {return Err(self.authored(r, completion, anyhow::anyhow!("unbounded medium emission has no proven finite integral: a constant zero-extinction channel diverges; varying emission without asymptotic closure is unsupported; use a finite mesh boundary")));}
-            anyhow::bail!("unrecognized shader diagnostic code {count} (detail {capacity})");
+            // An unknown code can be a buffer read back from a reset GPU (Windows TDR maps it without error).
+            // Submit and wait once more so a lost device reports itself (and VK_EXT_device_fault with VORK_DEVICE_FAULT=1).
+            r.queue.submit([]);
+            let poll = r.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) });
+            anyhow::bail!("unrecognized shader diagnostic code {count} (detail {capacity}); device after a further submit: {poll:?}");
         }
         if shader_diagnostics.as_ref().is_some_and(|words|
             words[(vork_slang::registry::TERMINATED_MEDIUM_PATHS_WORD/2) as usize] != [0,0]) {
@@ -2415,6 +2492,58 @@ mod profiling_tests {
         assert_eq!(spill_growth(limit + 4, limit), None);
     }
 
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn reclaimed_camera_recording_keeps_static_ray_history_and_pixels() -> Result<()> {
+        let renderer = crate::test_renderer()?;
+        let mut value = serde_json::json!({
+            "version":2,
+            "render":{"resolution":[32,32],"settings":{"integrator":"raster",
+                "samples":1,"seed":11,"denoiser":null,"fast_gi":null,"shadow_method":"ray"}},
+            "buffers":{"p":{"type":"vec3","data":[[-1,-1,-3],[1,-1,-3],[0,1,-3]]}},
+            "geometry":{"triangle":{"attributes":{"POSITION":"p"}}},
+            "nodes":[{"type":"camera"},{"type":"mesh","name":"moving","geometry":"triangle"},
+                {"type":"light","shape":"sun","energy":3.141593}],
+            "animation":[{"tracks":[{"path":["nodes","moving","translation"],
+                "keys":[[0,[0,0,0]],[1,[0.1,0,0]],[2,[0,0,0]]]}]}]
+        });
+        // One moving object among many static objects leaves motion below the
+        // rebuild threshold, exercising real native refits as well as rebuilds.
+        for index in 0..12 {
+            value["nodes"].as_array_mut().unwrap().push(serde_json::json!({
+                "type":"mesh","name":format!("static-{index}"),"geometry":"triangle",
+                "translation":[(index % 4) as f32 * 0.4 - 0.6,(index / 4) as f32 * 0.3 - 0.3,-0.5]
+            }));
+        }
+        let scene = vork_scene::v2::from_test_value(value)?;
+        let installed = renderer.install(scene, Path::new("."))?;
+        assert!(installed.compute.is_none());
+        assert!(installed.draws.iter().all(|draw| !draw.evaluated() && draw.implicit.is_none()));
+        assert!(!installed.rays.as_ref().expect("ray scene").has_point_shapes());
+        let mut resident = installed.create_frame_slot(&renderer, crate::ReadbackPrecision::Float)?;
+        let mut reclaimed = FrameSlot::resume_ray_history(&installed, &renderer,
+            crate::ReadbackPrecision::Float, Some(RayHistory::new(&installed, &renderer)?))?;
+        for time in [0., 0.25, 0.25, 0.75, 1., 1.5, 2., 0.] {
+            resident.submit(&installed, &renderer, time)?;
+            let expected = resident.collect(&renderer)?.linear_rgba.expect("linear reference");
+            reclaimed.submit(&installed, &renderer, time)?;
+            let actual = reclaimed.collect(&renderer)?.linear_rgba.expect("linear candidate");
+            assert_eq!(actual.iter().flatten().map(|v|v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().flatten().map(|v|v.to_bits()).collect::<Vec<_>>(), "time {time}");
+            let counts = |rays: &crate::rt::FrameRays| (rays.builds, rays.rebuilds, rays.refits);
+            let updates = counts(reclaimed.rays.as_ref().unwrap());
+            assert_eq!(updates, counts(resident.rays.as_ref().unwrap()), "same rebuild/refit trajectory");
+            let history = reclaimed.into_ray_history().expect("completed static ray history");
+            reclaimed = FrameSlot::resume_ray_history(&installed, &renderer,
+                crate::ReadbackPrecision::Float, Some(history))?;
+            assert_eq!(counts(reclaimed.rays.as_ref().unwrap()), updates, "camera replacement reset ray state");
+        }
+        let rays = resident.rays.as_ref().unwrap();
+        assert!(rays.rebuilds > 0 && rays.refits > 0, "must exercise native rebuilds and refits");
+        renderer.errors.check()?;
+        Ok(())
+    }
+
     /// A frame's shader diagnostics are also a publication receipt in scenes
     /// with media, compute, displacement or captures. A spill arena overflow
     /// there must ask for the redo that grows the arena; it used to invalidate
@@ -2445,6 +2574,30 @@ mod profiling_tests {
             frame.publication_checks = Some(checks);
             frame.collect(&renderer).err().context("a nonzero shader receipt was accepted")
         };
+        // Deliver probe page demand with the slot's own spill receipt.
+        let mut mixed = installed.create_frame_slot(&renderer, crate::ReadbackPrecision::Float)?;
+        mixed.submit(&installed, &renderer, 0.)?;
+        let readback = |size| renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let diagnostic = readback(crate::materials::SHADER_DIAGNOSTICS_BYTES);
+        renderer.queue.write_buffer(&diagnostic, 0, &constants::PATH_BOUNDARY_OVERFLOW.to_le_bytes());
+        mixed.shader_error_readback = Some(diagnostic);
+        let status = readback(4);
+        renderer.queue.write_buffer(&status, 0, &1u32.to_le_bytes());
+        let size = std::mem::size_of::<crate::probes::Grid>() as u64;
+        let source = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size, usage: wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        });
+        mixed.probe_feedback = Some((crate::probes::Feedback {source, offset:0, size, status_offset:0}, status));
+        mixed.probe_demand = Some(Default::default());
+        mixed.submission = Some(crate::command_finish::Segments::flush(&renderer.queue));
+        let error = mixed.collect(&renderer).err().context("combined receipt was accepted")?;
+        let redo = error.downcast::<FrameRedo>()?.0;
+        assert!(redo.dielectric_spill > 0);
+        assert_eq!(redo.probe_pages, mixed.reservations.probe_pages + 1);
+        drop(mixed);
         let error = collect_with(&mut frame, constants::PATH_BOUNDARY_OVERFLOW)?;
         let redo = error.downcast_ref::<FrameRedo>().with_context(|| format!("overflow receipt must redo: {error:#}"))?;
         assert!(redo.0.dielectric_spill > 0);

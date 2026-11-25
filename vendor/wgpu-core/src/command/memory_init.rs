@@ -130,13 +130,17 @@ impl CommandBufferTextureMemoryActions {
 // register_init_action and initializes them on the spot.
 //
 // Takes care of barriers as well!
-pub(crate) fn fixup_discarded_surfaces<InitIter: Iterator<Item = TextureSurfaceDiscard>>(
-    inits: InitIter,
-    encoder: &mut dyn hal::DynCommandEncoder,
+pub(crate) fn fixup_discarded_surfaces(
+    inits: SurfacesInDiscardState,
+    encoder: &mut super::InnerCommandEncoder,
     texture_tracker: &mut TextureTracker,
     device: &Device,
     snatch_guard: &SnatchGuard<'_>,
-) {
+) -> Result<(), crate::device::DeviceError> {
+    if inits.is_empty() {
+        return Ok(());
+    }
+    let encoder = encoder.open_pre_pass()?;
     for init in inits {
         clear_texture(
             &init.texture,
@@ -153,6 +157,7 @@ pub(crate) fn fixup_discarded_surfaces<InitIter: Iterator<Item = TextureSurfaceD
         )
         .unwrap();
     }
+    Ok(())
 }
 
 impl BakedCommands {

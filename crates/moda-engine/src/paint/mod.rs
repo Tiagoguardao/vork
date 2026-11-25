@@ -69,13 +69,23 @@ use moda_scene::types::RawNode;
 /// A pattern body's full draw payload: packed instance + resolved texture +
 /// sampler selection. Carried by `seams::BodyPaint::Pattern` (GPU-free, so
 /// the `CoveragePlan` IR stays consumable by a CPU backend).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PatternBody {
     pub instance: PatternInstance,
     pub texture: PatternTexture,
+    /// Private GPU storage for a retained pattern whose texels changed in place.
+    pub(crate) texture_slot: Option<u64>,
     /// `fillPatternRepeat === 'no-repeat'` → clamp sampler, else repeat
     /// (`WebGPUPathRenderer.createTextureBindGroup`, `:2276-2293`).
     pub clamp_sampler: bool,
+}
+
+// The private GPU slot does not enter plan debug fingerprints.
+impl std::fmt::Debug for PatternBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatternBody").field("instance", &self.instance)
+            .field("texture", &self.texture).field("clamp_sampler", &self.clamp_sampler).finish()
+    }
 }
 
 impl PartialEq for PatternTexture {
@@ -99,20 +109,13 @@ impl PartialEq for PatternInstance {
 /// How a body's FILL routes (step 1 is reported separately since M3f owns it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRoute {
-    /// Custom shader fill — M3f pipeline.
-    Shader,
+
     /// Gradient pipeline owns the whole body (fill gradient, or solid fill +
     /// gradient stroke).
     Gradient,
     /// Pattern pipeline owns the fill (gradient-stroke overlay drawn extra).
     Pattern,
     Solid,
-}
-
-/// Whether a renderable source-mask shader EFFECT paints the node's fill (it beats every fill layer, see
-/// [`classify_fill`]).
-pub fn classify_fill_is_effect(node: &RawNode) -> bool {
-    moda_scene::shader_effects::renderable_source_mask_effect(node).is_some()
 }
 
 /// Production routing order — see module docs.
@@ -127,9 +130,7 @@ pub fn classify_fill(node: &RawNode) -> FillRoute {
 
     // (including pattern); a stale self-asset effect falls through to the
     // underlying fill.
-    if moda_scene::shader_effects::renderable_source_mask_effect(node).is_some() {
-        return FillRoute::Shader;
-    }
+
     for fill in moda_scene::paint::node_fills_shared(node).iter().rev() {
         // The layers the layer plan draws (`shown`: switched on and not at 0% opacity), so the route is the top
         // DRAWN layer's: a 0% image over a solid used to route Pattern and draw the white placeholder.
@@ -137,7 +138,7 @@ pub fn classify_fill(node: &RawNode) -> FillRoute {
             continue;
         }
         match fill.paint {
-            Paint::Shader(_) => return FillRoute::Shader,
+
             Paint::Linear(_)
             | Paint::Radial(_)
             | Paint::Conic(_)
@@ -148,11 +149,7 @@ pub fn classify_fill(node: &RawNode) -> FillRoute {
             // image; a missing poster/src resolves to the same white
             // placeholder.
             Paint::Image(_) | Paint::Video(_) => return FillRoute::Pattern,
-            // A gradient mesh is baked to an image and drawn by the image lane (`crate::mesh_paint`).
-            Paint::Mesh(_) => return FillRoute::Pattern,
-            // A vector pattern (E8.5) draws in its own lane (`pattern_paint`), never through a body pipeline:
-            // the layer under it routes.
-            Paint::Pattern(_) => continue,
+
             Paint::Solid(_) => break,
         }
     }
@@ -179,46 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn routing_order_copies_the_bugs() {
-        // The top visible fill's paint type routes ([Q1]: gradient fields no
-        // longer beat the chosen image). An image over a gradient → Pattern.
-        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
-            {"id": "fill-0", "paint": linear()},
-            {"id": "fill-1", "paint": {"type": "image", "src": "data:x"}}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Pattern);
-        // …and with the image hidden, the gradient under it routes.
-        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
-            {"id": "fill-0", "paint": linear()},
-            {"id": "fill-1", "visible": false, "paint": {"type": "image", "src": "data:x"}}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Gradient);
-        // …and so does a 0% image (it doesn't draw): the solid under it routes, as the layer plan draws it.
-        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
-            {"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}},
-            {"id": "fill-1", "opacity": 0.0, "paint": {"type": "image", "src": "data:x"}}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Solid);
-
-        let node = raw(json!({"id": "n", "type": "rectangle",
-            "fills": [{"id": "fill-0", "paint": {"type": "shader", "shaderId": "clouds"}}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Shader);
-
-        // Solid fill + visible gradient stroke → gradient pipeline.
-        let node = raw(json!({"id": "n", "type": "rectangle",
-            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}}],
-            "strokes": [{"id": "stroke-0", "paint": linear(), "width": 4}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Gradient);
-
-        // Zero-width gradient stroke falls through to solid.
-        let node = raw(json!({"id": "n", "type": "rectangle",
-            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}}],
-            "strokes": [{"id": "stroke-0", "paint": linear(), "width": 0}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Solid);
-
-        let node = raw(json!({"id": "n", "type": "rectangle",
-            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:x", "placement": {}}}]}));
-        assert_eq!(classify_fill(&node), FillRoute::Pattern);
-    }
-
-    #[test]
     fn video_fill_routes_to_pattern() {
         // A `'video'` fill renders its poster through the pattern
         // texture path — it routes to Pattern just like an image pattern.
@@ -237,5 +194,52 @@ mod tests {
             {"id": "fill-0", "paint": {"type": "video", "posterSrc": "data:x"}},
             {"id": "fill-1", "paint": linear()}]}));
         assert_eq!(classify_fill(&node), FillRoute::Gradient);
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+    use moda_scene::value::json;
+    fn raw(v: moda_scene::value::Value) -> RawNode { RawNode::from_value(v).unwrap() }
+    fn linear() -> moda_scene::value::Value {
+        json!({"type": "linear", "start": {"x": 0, "y": 0}, "end": {"x": 100, "y": 0},
+            "stops": [{"offset": 0, "color": "#fff"}, {"offset": 1, "color": "#000"}]})
+    }
+
+    #[test]
+    fn routing_order_copies_the_bugs() {
+        // The top visible fill's paint type routes ([Q1]: gradient fields no
+        // longer beat the chosen image). An image over a gradient → Pattern.
+        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
+            {"id": "fill-0", "paint": linear()},
+            {"id": "fill-1", "paint": {"type": "image", "src": "data:x"}}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Pattern);
+        // …and with the image hidden, the gradient under it routes.
+        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
+            {"id": "fill-0", "paint": linear()},
+            {"id": "fill-1", "visible": false, "paint": {"type": "image", "src": "data:x"}}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Gradient);
+        // …and so does a 0% image (it doesn't draw): the solid under it routes, as the layer plan draws it.
+        let node = raw(json!({"id": "n", "type": "rectangle", "fills": [
+            {"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}},
+            {"id": "fill-1", "opacity": 0.0, "paint": {"type": "image", "src": "data:x"}}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Solid);
+
+        // Solid fill + visible gradient stroke → gradient pipeline.
+        let node = raw(json!({"id": "n", "type": "rectangle",
+            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}}],
+            "strokes": [{"id": "stroke-0", "paint": linear(), "width": 4}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Gradient);
+
+        // Zero-width gradient stroke falls through to solid.
+        let node = raw(json!({"id": "n", "type": "rectangle",
+            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}}],
+            "strokes": [{"id": "stroke-0", "paint": linear(), "width": 0}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Solid);
+
+        let node = raw(json!({"id": "n", "type": "rectangle",
+            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:x", "placement": {}}}]}));
+        assert_eq!(classify_fill(&node), FillRoute::Pattern);
     }
 }

@@ -3,13 +3,12 @@
 //! Mirrors the production texture manager's behavior for pattern fills
 //! (`renderers/webgpu/utils/WebGPUTextureManager.ts:107-148` samplers;
 //! `WebGPUPathRenderer.createTextureBindGroup` `:2269-2312`):
-//! - textures are `rgba8unorm` (never `-srgb`), premultiplied bytes, no mips —
-//!   except paint-layer surfaces (`crate::surface`), which have a full mip chain,
+//! - decoded sRGB textures use premultiplied RGBA8 texels and mipmaps,
 //! - in an engine that blends in another encoding than sRGB (`moda_shaders::working_color`) a decoded image's
 //!   texture is `rgba16float` in that encoding: each texel is unassociated, converted and associated again when
 //!   it is uploaded, so the sampler and the mip chain filter in the encoding the engine blends in,
 //! - sampler: linear mag/min; `clamp-to-edge` for `no-repeat` fills,
-//!   `repeat` otherwise; surfaces also filter linearly between mips (trilinear
+//!   `repeat` otherwise; mipmapped textures filter linearly between mips (trilinear
 //!   when minified, bilinear from level 0 when magnified),
 //! - bind group = { 0: sampler, 1: texture view } at group index 2 of the
 //!   pattern pipeline (mask rides group 3),
@@ -25,7 +24,6 @@ use crate::paint::image_source::DecodedImage;
 #[derive(Default)]
 pub struct SharedImages(
     std::sync::Mutex<HashMap<String, SharedImage>>,
-    std::sync::Mutex<HashMap<String, SharedImage>>,
 );
 struct SharedImage {
     pixels: std::sync::Weak<Vec<u8>>,
@@ -33,28 +31,11 @@ struct SharedImage {
     size: [u32; 2],
 }
 
-impl SharedImages {
-    /// Shader images are straight RGBA8 without mips; keep their namespace apart
-    /// from paint images, whose upload includes colour conversion and mipmaps.
-    pub(crate) fn shader_texture(&self, key: &str, pixels: &std::sync::Arc<Vec<u8>>, size: [u32; 2],
-        create: impl FnOnce() -> wgpu::Texture) -> std::sync::Arc<wgpu::Texture> {
-        let mut store = self.1.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some(texture) = store.get(key).filter(|entry| entry.size == size
-            && entry.pixels.ptr_eq(&std::sync::Arc::downgrade(pixels))).and_then(|entry| entry.texture.upgrade()) {
-            return texture;
-        }
-        let texture = std::sync::Arc::new(create());
-        crate::scratch::flush();
-        store.retain(|_, entry| entry.texture.strong_count() > 0);
-        store.insert(key.to_string(), SharedImage { pixels: std::sync::Arc::downgrade(pixels),
-            texture: std::sync::Arc::downgrade(&texture), size });
-        texture
-    }
-}
-
 /// Per-frame (or per-engine) cache of uploaded pattern textures and their
 /// texture bind groups.
 pub struct PatternTextureCache {
+    /// Identifies writes and evictions of private packet textures, including a draw of an older plan.
+    pub(crate) slot_epoch: u64,
     /// Trilinear (linear between mip levels): an image drawn smaller than its pixels samples the level whose texels
     /// match the screen's, as a filtered downscale would, in the canvas and the export alike. With one level (a
     /// borrowed capture texture) it is plain bilinear.
@@ -69,17 +50,13 @@ pub struct PatternTextureCache {
     /// its format that has mips).
     mip_gens: HashMap<wgpu::TextureFormat, crate::surface::MipGen>,
     /// Per texture with mips (cache key): its level views and bind groups. Images regenerate the whole chain when
-    /// level 0 is written; paint surfaces regenerate under the tiles uploaded since the last render.
+    /// level 0 is written.
     surface_mips: HashMap<String, crate::surface::SurfaceMips>,
-    /// `crate::surface::dirty_generation()` when this cache last took its dirty rects.
-    surface_dirty_seen: u64,
-    /// Bytes of resident surface textures (mips included), budgeted apart from `total_bytes`
-    /// (`crate::surface::budget_bytes`).
-    surface_bytes: usize,
     /// (texture key, clamp?) → bind group.
     bind_groups: HashMap<(String, bool), wgpu::BindGroup>,
     /// texture key → uploaded texture (kept alive for the bind groups).
     textures: HashMap<String, wgpu::Texture>,
+    device_revisions: HashMap<String, u64>,
     heap_pixel_allocations: HashMap<String, std::sync::Weak<Vec<u8>>>,
     /// Keys whose texture is a graph-pixel unit's pool texture (`external_texture::CaptureTexture`): the pool owns it,
     /// so dropping the cache's handle must not destroy it.
@@ -97,8 +74,6 @@ pub struct PatternTextureCache {
     /// that skips a (panic-prone) live-external copy would durably poison this
     /// (retained, present-shared) cache and blank the image on the live present.
     pending_retry: HashSet<String>,
-    /// Paint-surface textures (raster spike): cache key → the surface registry token to detach on drop.
-    surface_tokens: HashMap<String, u64>,
 }
 
 impl PatternTextureCache {
@@ -117,6 +92,7 @@ impl PatternTextureCache {
         };
         let linear = wgpu::MipmapFilterMode::Linear;
         PatternTextureCache {
+            slot_epoch: 0,
             shared: None,
             shared_textures: HashMap::new(),
             repeat_sampler: mk("pattern repeat sampler", wgpu::AddressMode::Repeat, linear),
@@ -124,23 +100,43 @@ impl PatternTextureCache {
             working,
             mip_gens: HashMap::new(),
             surface_mips: HashMap::new(),
-            surface_dirty_seen: 0,
-            surface_bytes: 0,
             bind_groups: HashMap::new(),
             textures: HashMap::new(),
+            device_revisions: HashMap::new(),
             heap_pixel_allocations: HashMap::new(),
             borrowed_textures: HashMap::new(),
             usage: HashMap::new(),
             total_bytes: 0,
             tick: 0,
             pending_retry: HashSet::new(),
-            surface_tokens: HashMap::new(),
         }
     }
 
-    /// Call before the first draw. Mutable surfaces and external/video frames stay local.
+    /// Call before the first draw. External/video frames stay local.
     pub fn share_images(&mut self, shared: std::sync::Arc<SharedImages>) {
         self.shared = Some(shared);
+    }
+
+    /// Share the immutable uploads already made by the serial frame. Future
+    /// writes replace a shared texture while another lane can sample its old pixels.
+    pub(crate) fn publish_images(&mut self, shared: &std::sync::Arc<SharedImages>) {
+        crate::scratch::flush();
+        let mut store = shared.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (key, pixels) in &self.heap_pixel_allocations {
+            if key.starts_with("video:") || key.starts_with("\0pattern-slot:") { continue; }
+            let Some(texture) = self.textures.get(key) else { continue; };
+            let owner = self.shared_textures.entry(key.clone())
+                .or_insert_with(|| std::sync::Arc::new(texture.clone()));
+            store.insert(key.clone(), SharedImage {
+                pixels: pixels.clone(), texture: std::sync::Arc::downgrade(owner),
+                size: [texture.width(), texture.height()],
+            });
+        }
+        self.shared = Some(shared.clone());
+    }
+
+    pub(crate) fn stop_sharing(&mut self) {
+        self.shared = None;
     }
 
     /// Task #95 R2d: advance the LRU clock (once per render).
@@ -149,7 +145,7 @@ impl PatternTextureCache {
             crate::external_texture::capture_texture(capture).is_none().then(|| key.clone())
         }).collect();
         for key in expired {
-            self.evict(&key, false);
+            self.evict(&key);
         }
         // Re-attempt any external upload that was SKIPPED last render (offscreen
         // snapshot guard): drop the transparent placeholder so this render
@@ -160,23 +156,24 @@ impl PatternTextureCache {
         // avoid per-frame texture churn.
         if !self.pending_retry.is_empty() {
             for key in std::mem::take(&mut self.pending_retry) {
-                self.evict(&key, false);
+                self.evict(&key);
             }
         }
         self.tick += 1;
     }
 
-    /// Drop a single key's cached texture + bind groups + LRU bookkeeping. `budget`: dropped to fit a budget
-    /// (a surface's registry counts it as an eviction).
-    fn evict(&mut self, key: &str, budget: bool) {
+    fn advance_slot_epoch(&mut self) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.slot_epoch = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop a single key's cached texture + bind groups + LRU bookkeeping.
+    fn evict(&mut self, key: &str) {
+        if key.starts_with("\0pattern-slot:") { self.advance_slot_epoch(); }
+        self.device_revisions.remove(key);
         self.heap_pixel_allocations.remove(key);
-        let surface = self.surface_tokens.contains_key(key);
         if let Some((bytes, _)) = self.usage.remove(key) {
-            if surface {
-                self.surface_bytes = self.surface_bytes.saturating_sub(bytes);
-            } else {
-                self.total_bytes = self.total_bytes.saturating_sub(bytes);
-            }
+            self.total_bytes = self.total_bytes.saturating_sub(bytes);
         }
         // At most two bind groups per key (clamp on/off), so two O(1) removes beat
         // an O(N) `retain` scan — which would be O(N²) across a trim sweep.
@@ -184,9 +181,6 @@ impl PatternTextureCache {
         self.bind_groups.remove(&(key_string.clone(), true));
         self.bind_groups.remove(&(key_string, false));
         if let Some(texture) = self.textures.remove(key) {
-            if let Some(token) = self.surface_tokens.remove(key) {
-                crate::surface::detach_texture(token, budget);
-            }
             self.surface_mips.remove(key);
             if self.borrowed_textures.remove(key).is_none() && self.shared_textures.remove(key).is_none() {
                 crate::scratch::destroy(&texture);
@@ -194,12 +188,20 @@ impl PatternTextureCache {
         }
     }
 
+    /// Copy and filter a decoder publication in queue order in one command buffer.
+    fn copy_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: &str,
+        source: &wgpu::Texture, texture: &wgpu::Texture) {
+        let gen = self.mip_gens.entry(texture.format()).or_insert_with(|| crate::surface::MipGen::new(device, texture.format()));
+        let mips = self.surface_mips.entry(key.to_string()).or_insert_with(|| crate::surface::SurfaceMips::new(device, gen, texture));
+        mips.copy_frame(device, queue, gen, source, texture);
+    }
+
     /// An image texture's level 0 was just written in full: build its whole mip chain (views and bind groups are
     /// made once per texture and kept with it).
     fn build_mips(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: &str, texture: &wgpu::Texture) {
         let gen = self.mip_gens.entry(texture.format()).or_insert_with(|| crate::surface::MipGen::new(device, texture.format()));
         let mips = crate::surface::SurfaceMips::new(device, gen, texture);
-        mips.regen(device, queue, gen, texture, vec![[0, texture.width(), 0, texture.height()]]);
+        mips.regen(device, queue, gen, texture);
         self.surface_mips.insert(key.to_string(), mips);
     }
 
@@ -210,83 +212,43 @@ impl PatternTextureCache {
             return;
         };
         let Some(gen) = self.mip_gens.get(&texture.format()) else { return };
-        mips.regen(device, queue, gen, texture, vec![[0, texture.width(), 0, texture.height()]]);
+        mips.regen(device, queue, gen, texture);
     }
 
-    /// Paint surfaces: regenerate the mips under every tile uploaded into this cache's surface textures since the
-    /// last call (one command buffer per texture, submitted now: after the uploads' level-0 writes, before the frame
-    /// that samples them). The engine calls it at the start of every render, so the uploads between two frames are
-    /// regenerated once, together; it costs a lock and a compare when nothing was uploaded.
-    pub fn flush_surface_mips(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.surface_mips.is_empty() {
-            return;
-        }
-        let gen_now = crate::surface::dirty_generation();
-        if gen_now == self.surface_dirty_seen {
-            return;
-        }
-        self.surface_dirty_seen = gen_now;
-        // A paint surface's texture is 8-bit.
-        let Some(gen) = self.mip_gens.get(&wgpu::TextureFormat::Rgba8Unorm) else { return };
-        for (key, mips) in &self.surface_mips {
-            let (Some(&token), Some(texture)) = (self.surface_tokens.get(key), self.textures.get(key)) else {
-                continue;
-            };
-            let rects = crate::surface::take_dirty(token);
-            if !rects.is_empty() {
-                mips.regen(device, queue, gen, texture, rects);
-            }
-        }
-    }
-
-    /// Resident texture count and bytes, paint surfaces included (retained mode; `gpu_profile` memory report).
+    /// Resident texture count and bytes (retained mode; `gpu_profile` memory report).
     pub fn resident(&self) -> (usize, usize) {
-        (self.textures.len(), self.total_bytes + self.surface_bytes)
+        (self.textures.len(), self.total_bytes)
     }
 
     /// Task #95 R2d: evict least-recently-touched textures until under
     /// `budget` bytes. A miss only re-uploads — never correctness-bearing.
-    /// Paint surfaces have their own budget (`crate::surface::budget_bytes`,
-    /// mips counted): least-recently-drawn first, so layers outside the view go
-    /// before the ones that drew last frame, and never one drawn this render. A
-    /// surface's texture comes back filled from the retained tiles (native) or
-    /// blank and marked for a refill from the host (wasm).
     pub fn trim(&mut self, budget: usize) {
-        self.trim_lane(false, budget);
-        let surface_budget = usize::try_from(crate::surface::budget_bytes()).unwrap_or(usize::MAX);
-        self.trim_lane(true, surface_budget);
-    }
-
-    fn trim_lane(&mut self, surfaces: bool, budget: usize) {
-        let used = |c: &Self| if surfaces { c.surface_bytes } else { c.total_bytes };
-        if used(self) <= budget {
+        if self.total_bytes <= budget {
             return;
         }
         let mut keys: Vec<(String, u64)> = self
             .usage
             .iter()
-            .filter(|(k, _)| self.surface_tokens.contains_key(*k) == surfaces)
             .map(|(k, (_, t))| (k.clone(), *t))
             .collect();
         keys.sort_by_key(|(_, t)| *t);
         for (key, tick) in keys {
-            if used(self) <= budget {
+            if self.total_bytes <= budget {
                 break;
             }
             if tick == self.tick {
                 break; // never evict textures touched this frame
             }
-            self.evict(&key, true);
+            self.evict(&key);
         }
     }
 
     pub fn clear_gpu_resources(&mut self) {
+        self.slot_epoch = 0;
         self.bind_groups.clear();
+        self.device_revisions.clear();
         self.heap_pixel_allocations.clear();
         for (key, texture) in self.textures.drain() {
-            if let Some(token) = self.surface_tokens.remove(&key) {
-                crate::surface::detach_texture(token, false);
-            }
             self.surface_mips.remove(&key);
             if self.borrowed_textures.remove(&key).is_none() && self.shared_textures.remove(&key).is_none() {
                 crate::scratch::destroy(&texture);
@@ -294,18 +256,12 @@ impl PatternTextureCache {
         }
         self.usage.clear();
         self.total_bytes = 0;
-        self.surface_bytes = 0;
         self.pending_retry.clear();
     }
 
     /// Look up an already-prepared bind group (no upload). The executor
     /// pre-populates the cache with `bind_group(...)` before the render pass
     /// so pass-lifetime borrows stay immutable.
-    /// A view of the texture uploaded under `key` (all its levels), if any.
-    pub fn texture_view(&self, key: &str) -> Option<wgpu::TextureView> {
-        self.textures.get(key).map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
-    }
-
     pub fn get(&self, key: &str, clamp: bool) -> Option<&wgpu::BindGroup> {
         self.bind_groups.get(&(key.to_string(), clamp))
     }
@@ -320,18 +276,49 @@ impl PatternTextureCache {
         image: &DecodedImage,
         clamp: bool,
     ) -> &wgpu::BindGroup {
-        let surface = image
-            .external
-            .as_ref()
-            .is_some_and(|ext| crate::surface::is_surface_key(&ext.key));
-        // A graph-pixel unit's pool texture is used as it is (one level); every other texture gets its mip chain.
+        self.bind_group_priced(device, queue, layout, key, image, clamp, Default::default())
+    }
+
+    pub(crate) fn bind_group_priced(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        key: &str,
+        image: &DecodedImage,
+        clamp: bool,
+        admission: moda_text_draw::device::PageAdmission,
+    ) -> &wgpu::BindGroup {
+        // A recorded render bundle owns its bind group. Keep its sampled texture in place
+        // while immutable decoder frames supply new level-zero texels on the same queue.
+        let private = key.starts_with("\0pattern-slot:");
+        let device_frame = image.external.as_ref().and_then(|ext| Some((ext.upload_id, ext.texture.as_ref()?)));
+        if image.external.is_some() && self.heap_pixel_allocations.contains_key(key) {
+            self.evict(key);
+        }
+        if let Some((revision, source)) = device_frame.filter(|_| private) {
+            if self.device_revisions.get(key) != Some(&revision) {
+                self.advance_slot_epoch();
+                if let Some(destination) = self.textures.get(key).cloned() {
+                    if source.size() == destination.size() && source.format() == destination.format() {
+                        self.copy_frame(device, queue, key, source, &destination);
+                    } else {
+                        self.evict(key);
+                    }
+                }
+                self.device_revisions.insert(key.to_owned(), revision);
+            }
+        }
+        if private && image.external.is_none() && !self.heap_pixel_allocations.get(key)
+            .is_some_and(|old| old.ptr_eq(&std::sync::Arc::downgrade(&image.rgba_premultiplied))) {
+            self.advance_slot_epoch();
+        }
+        // A pooled capture is sampled directly (one level); every other texture gets its mip chain.
         let borrowed = image
             .external
             .as_ref()
             .is_some_and(|ext| crate::external_texture::capture_texture(&ext.key).is_some());
-        let levels = if surface {
-            crate::surface::mip_levels(image.width, image.height)
-        } else if borrowed {
+        let levels = if borrowed {
             1
         } else {
             crate::surface::full_mip_levels(image.width, image.height)
@@ -344,25 +331,24 @@ impl PatternTextureCache {
             .and_modify(|(_, t)| *t = self.tick)
             .or_insert_with(|| (0, self.tick))
             .1 = self.tick;
-        if image.external.is_some() && self.heap_pixel_allocations.contains_key(key) {
-            self.evict(key, false);
-        }
-        let share = self.shared.is_some() && image.external.is_none() && !key.starts_with("video:");
+        let share = self.shared.is_some() && image.external.is_none() && !key.starts_with("video:")
+            && !key.starts_with("\0pattern-slot:");
         if share && self.heap_pixel_allocations.get(key).is_some_and(|pixels|
             !pixels.ptr_eq(&std::sync::Arc::downgrade(&image.rgba_premultiplied))) {
-            self.evict(key, false);
+            self.evict(key);
         }
         if image.external.is_none() {
             if let Some(texture) = self.textures.get(key) {
                 let oversized = image.width.max(image.height) > device.limits().max_texture_dimension_2d;
                 let expected = if oversized { (1, 1) } else { (image.width, image.height) };
                 if (texture.width(), texture.height()) != expected || !self.heap_pixel_allocations.contains_key(key) {
-                    self.evict(key, false);
+                    self.evict(key);
                 } else if !self.heap_pixel_allocations[key].ptr_eq(&std::sync::Arc::downgrade(&image.rgba_premultiplied)) {
                     if !oversized {
                         let _upload = key.starts_with("video:").then(|| crate::prof::span("video.upload"));
                         let (texels, texel_bytes) = level0(self.working.as_ref(), image);
                         crate::gpu_profile::count_texture_write(texels.len());
+                        admission.charge(0, texels.len() as u64);
                         queue.write_texture(
                             wgpu::TexelCopyTextureInfo {
                                 texture,
@@ -414,11 +400,7 @@ impl PatternTextureCache {
                 );
             }
             self.usage.insert(key.to_string(), (bytes, self.tick));
-            if surface {
-                self.surface_bytes += bytes;
-            } else {
-                self.total_bytes += bytes;
-            }
+            self.total_bytes += bytes;
             let extent = wgpu::Extent3d {
                 width: image.width,
                 height: image.height,
@@ -441,7 +423,7 @@ impl PatternTextureCache {
                 );
             }
             let texture = if oversized {
-                device.create_texture(&wgpu::TextureDescriptor {
+                admission.texture(device, &wgpu::TextureDescriptor {
                     label: Some(key),
                     size: wgpu::Extent3d {
                         width: 1,
@@ -455,10 +437,19 @@ impl PatternTextureCache {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 })
+            } else if let Some((_, source)) = device_frame {
+                let texture = admission.texture(device, &wgpu::TextureDescriptor {
+                    label: Some(key), size: extent, mip_level_count: levels, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2, format: source.format(),
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+                });
+                self.copy_frame(device, queue, key, source, &texture);
+                texture
             } else if let Some((capture_key, texture)) = image.external.as_ref().and_then(|ext| {
                 crate::external_texture::capture_texture(&ext.key).map(|texture| (ext.key.clone(), texture))
             }) {
-                // A graph-pixel unit's pool texture, already quantized to the bytes an upload would hold.
+                // Borrow the pooled capture directly.
                 self.borrowed_textures.insert(key.to_string(), capture_key);
                 texture
             } else if let Some(ext) = &image.external {
@@ -468,7 +459,7 @@ impl PatternTextureCache {
                 // this texture. copyExternalImageToTexture's destination is a
                 // render pass, so the texture also needs RENDER_ATTACHMENT.
                 // Its mip chain is regenerated by render passes into each level (RENDER_ATTACHMENT again).
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                let texture = admission.texture(device, &wgpu::TextureDescriptor {
                     label: Some(key),
                     size: extent,
                     mip_level_count: levels,
@@ -486,29 +477,12 @@ impl PatternTextureCache {
                 // zero-initializes textures, so it samples as transparent
                 // instead of garbage — without allocating a decoded-size zero
                 // buffer on the very heap this feature keeps pixels off of.
-                let outcome = if surface {
-                    // A paint layer's surface: filled (now or by later uploads) from the surface registry, which
-                    // also keeps its mips current.
-                    let token = crate::surface::attach_texture(&ext.key, queue, &texture);
-                    self.surface_tokens.insert(key.to_string(), token);
-                    if levels > 1 {
-                        // Created mid-frame, after this render's flush: build the chain of what the registry just
-                        // filled (native) now, before the frame that samples it is submitted.
-                        let gen = self.mip_gens.entry(texture.format()).or_insert_with(|| crate::surface::MipGen::new(device, texture.format()));
-                        let mips = crate::surface::SurfaceMips::new(device, gen, &texture);
-                        mips.regen(device, queue, gen, &texture, crate::surface::take_dirty(token));
-                        self.surface_mips.insert(key.to_string(), mips);
-                    }
-                    ExternalUploadOutcome::Uploaded
-                } else {
-                    let outcome = crate::external_texture::external_uploader()
-                        .map(|u| u.upload(&ext.key, device, queue, &texture, image.width, image.height))
-                        .unwrap_or(ExternalUploadOutcome::Unavailable);
-                    if outcome == ExternalUploadOutcome::Uploaded && levels > 1 {
-                        self.build_mips(device, queue, key, &texture);
-                    }
-                    outcome
-                };
+                let outcome = crate::external_texture::external_uploader()
+                    .map(|u| u.upload(&ext.key, device, queue, &texture, image.width, image.height))
+                    .unwrap_or(ExternalUploadOutcome::Unavailable);
+                if outcome == ExternalUploadOutcome::Uploaded && levels > 1 {
+                    self.build_mips(device, queue, key, &texture);
+                }
                 if outcome == ExternalUploadOutcome::Skipped {
                     // Deliberately skipped this render (wasm offscreen snapshot
                     // guard): cache the transparent texture so this render pass
@@ -528,7 +502,7 @@ impl PatternTextureCache {
                     usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
                 }
                 let (texels, texel_bytes) = level0(self.working.as_ref(), image);
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                let texture = admission.texture(device, &wgpu::TextureDescriptor {
                     label: Some(key),
                     size: extent,
                     mip_level_count: levels,
@@ -540,6 +514,7 @@ impl PatternTextureCache {
                     view_formats: &[],
                 });
                 crate::gpu_profile::count_texture_write(texels.len());
+                admission.charge(0, texels.len() as u64);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
@@ -767,6 +742,7 @@ mod tests {
             rgba_premultiplied: Arc::new(Vec::new()),
             straight: false,
             external: Some(ExternalTextureRef {
+                texture: None,
                 key: asset_key.to_string(),
                 upload_id: 1,
             }),
@@ -787,9 +763,10 @@ mod tests {
         let layout = pattern_texture_bgl(&gpu.device);
         let mut a = PatternTextureCache::new(&gpu.device, None);
         let mut b = PatternTextureCache::new(&gpu.device, None);
-        a.share_images(shared.clone()); b.share_images(shared);
         let mut image = DecodedImage { width: 4, height: 4, rgba_premultiplied: Arc::new(vec![255; 64]), straight: false, external: None };
         a.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image, true);
+        a.publish_images(&shared);
+        b.share_images(shared);
         b.bind_group(&gpu.device, &gpu.queue, &layout, "image", &image, true);
         assert_eq!(a.textures["image"], b.textures["image"]);
         let old = b.textures["image"].clone();
@@ -812,7 +789,7 @@ mod tests {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let read = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let view = b.texture_view("image").unwrap();
+        let view = b.textures["image"].create_view(&Default::default());
         let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shared image lifetime"), layout: &pipeline.get_bind_group_layout(0),
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&b.clamp_sampler) },
@@ -889,7 +866,7 @@ mod tests {
         cache.bind_group(&gpu.device, &gpu.queue, &layout, "heap", &image, true);
         assert_eq!(Arc::weak_count(&image.rgba_premultiplied), 1);
         assert_eq!(Arc::strong_count(&image.rgba_premultiplied), 1);
-        cache.evict("heap", false);
+        cache.evict("heap");
         assert_eq!(Arc::weak_count(&image.rgba_premultiplied), 0);
         cache.bind_group(&gpu.device, &gpu.queue, &layout, "heap", &image, true);
         assert_eq!(Arc::weak_count(&image.rgba_premultiplied), 1);
@@ -903,22 +880,22 @@ mod tests {
 
     #[test]
     #[ignore = "requires a working GPU adapter"]
-    /// A graph-pixel unit's pool texture bound through the cache survives eviction and a cache clear (the pool owns
+    /// A pooled capture bound through the cache survives eviction and a cache clear (the pool owns
     /// it), and leaves the registry when its `CaptureTexture` drops.
     fn native_capture_cache_does_not_destroy_pool_texture() {
         let gpu = crate::device::GpuContext::new(crate::device::BackendChoice::Auto).expect("GPU test requires a working adapter");
-        let exec = crate::pixel::Executor::new(&gpu.device, &gpu.queue, 1 << 20);
-        let texture = exec.passes.upload(&exec.pool, 4, 4, crate::pixel::Storage::U8, &[0.5; 64]).unwrap();
+        let pool = crate::pixel::TexturePool::new(&gpu.device, 1 << 20);
+        let texture = pool.acquire(4, 4, crate::pixel::Storage::F16).unwrap();
         let capture = crate::external_texture::CaptureTexture::new(texture.clone());
         let image = external_image(capture.key());
         let layout = pattern_texture_bgl(&gpu.device);
         let mut cache = PatternTextureCache::new(&gpu.device, None);
         cache.bind_group(&gpu.device, &gpu.queue, &layout, "capture", &image, true);
-        cache.evict("capture", false);
-        exec.passes.download(&texture).expect("eviction must leave pooled capture alive");
+        cache.evict("capture");
+        crate::readback::read_texture_rgba(&gpu.device, &gpu.queue, texture.texture(), 4, 4).expect("eviction must leave pooled capture alive");
         cache.bind_group(&gpu.device, &gpu.queue, &layout, "capture", &image, true);
         cache.clear_gpu_resources();
-        exec.passes.download(&texture).expect("cache clear must leave pooled capture alive");
+        crate::readback::read_texture_rgba(&gpu.device, &gpu.queue, texture.texture(), 4, 4).expect("cache clear must leave pooled capture alive");
         let key = capture.key().to_string();
         drop(capture);
         assert!(crate::external_texture::capture_texture(&key).is_none());
@@ -928,8 +905,8 @@ mod tests {
     #[ignore = "requires a working GPU adapter"]
     fn native_capture_cache_expires_only_unregistered_borrowed_entries() {
         let gpu = crate::device::GpuContext::new(crate::device::BackendChoice::Auto).expect("GPU test requires a working adapter");
-        let exec = crate::pixel::Executor::new(&gpu.device, &gpu.queue, 1 << 20);
-        let texture = exec.passes.upload(&exec.pool, 4, 4, crate::pixel::Storage::U8, &[0.5; 64]).unwrap();
+        let pool = crate::pixel::TexturePool::new(&gpu.device, 1 << 20);
+        let texture = pool.acquire(4, 4, crate::pixel::Storage::F16).unwrap();
         let outer = crate::external_texture::CaptureTexture::new(texture.clone());
         let inner = crate::external_texture::CaptureTexture::new(texture.clone());
         let layout = pattern_texture_bgl(&gpu.device);
@@ -948,7 +925,7 @@ mod tests {
         cache.begin_frame();
         assert_eq!(cache.resident(), (0, 0));
         assert!(cache.borrowed_textures.is_empty());
-        exec.passes.download(&texture).expect("expiry must leave pooled texture alive");
+        crate::readback::read_texture_rgba(&gpu.device, &gpu.queue, texture.texture(), 4, 4).expect("expiry must leave pooled texture alive");
     }
 
     /// De-poison contract: a `Skipped` external upload (the wasm offscreen

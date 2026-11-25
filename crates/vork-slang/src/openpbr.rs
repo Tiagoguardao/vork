@@ -32,6 +32,15 @@ pub fn openpbr_fields() -> Vec<Field> {
         .collect()
 }
 
+/// The Slang `Closure`: every OpenPBR field on every build. Fields absent from `closure` (hair and test ABIs) never
+/// cross into the kernel.
+pub(super) fn declared_closure(closure: &[Field]) -> Vec<Field> {
+    openpbr_fields()
+        .into_iter()
+        .map(|p| closure.iter().find(|f| f.name == p.name).cloned().unwrap_or(p))
+        .collect()
+}
+
 pub(crate) fn module(closure: &[Field]) -> String {
     let fields = openpbr_fields();
     let mut s = String::from("// OpenPBR inputs.\npublic struct OpenPbr {\n");
@@ -221,7 +230,8 @@ fn blend_module_with_capacity(closure: &[Field], capacity: u32, layer_effects: b
 // the chosen Closure. No lobe-sized private arrays or aggregate copies reach a
 // driver, and neither lobe count nor expression depth needs a storage ceiling.
 fn replay_module(closure: &[Field]) -> String {
-    let zero=closure.iter().map(|f|format!("{}(0)",f.ty.slang())).collect::<Vec<_>>().join(",");
+    // Positional initialization must follow the declaration, including fields absent from transport.
+    let zero=declared_closure(closure).iter().map(|f|format!("{}(0)",f.ty.slang())).collect::<Vec<_>>().join(",");
     let opacity=if closure.iter().any(|f|f.name=="geometry_opacity") {"saturate(c.geometry_opacity)"} else {"1."};
     let set_opacity=if closure.iter().any(|f|f.name=="geometry_opacity") {"c.geometry_opacity=opacity;"} else {""};
     format!(r#"

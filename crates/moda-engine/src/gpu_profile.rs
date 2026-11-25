@@ -329,7 +329,7 @@ fn resolve_timer(
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let stamps: Vec<u64> = {
         let data = slice.get_mapped_range();
-        bytemuck::cast_slice::<u8, u64>(&data).to_vec()
+        stamps(&data)
     };
     t.readback.unmap();
     let to_ms = f64::from(t.period_ns) / 1e6;
@@ -530,7 +530,7 @@ impl PendingFrame {
         for t in self.0.blocks.iter().filter(|t| t.next_pair > 0) {
             {
                 let bytes = t.readback.get_mapped_range(..u64::from(t.next_pair) * 16);
-                for pair in bytemuck::cast_slice::<u8, u64>(&bytes).chunks_exact(2) {
+                for pair in stamps(&bytes).chunks_exact(2) {
                     if pair[0] == 0 || pair[1] < pair[0] {
                         time.untimed_passes += 1;
                         continue;
@@ -589,5 +589,26 @@ impl Drop for CaptureState {
             t.replace(self.frame.take());
         });
         ASYNC_ENABLED.with(|v| v.set(self.enabled));
+    }
+}
+
+/// Timestamp readbacks as u64s. A mapped range carries no alignment promise
+/// (AMD's Windows driver returns 4-byte-aligned ranges), so copy instead of
+/// casting in place.
+pub(crate) fn stamps(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .chunks_exact(8)
+        .map(|b| u64::from_ne_bytes(b.try_into().expect("8-byte chunk")))
+        .collect()
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    #[test]
+    fn reads_unaligned_timestamps() {
+        let mut raw = vec![0u8; 1];
+        raw.extend_from_slice(&7u64.to_ne_bytes());
+        raw.extend_from_slice(&9u64.to_ne_bytes());
+        assert_eq!(super::stamps(&raw[1..]), vec![7, 9]);
     }
 }

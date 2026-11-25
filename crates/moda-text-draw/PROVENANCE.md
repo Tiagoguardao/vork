@@ -66,7 +66,7 @@ slot, the ratio Moda's has to its slot. The order of any two depths is Moda's. T
 `GpuContext` with only its `device` and `queue` fields, which are all the text drawing reads; the adapter
 probing, sample-count and surface fields and the constructors are not ported.
 
-Added by vork: `PipelineHost`, `set_pipeline_host`, `forget_pipeline_host`, `create_render_pipeline` and
+Added by vork: `PipelineHost`, `PipelineDevice`, `create_render_pipeline` and
 `create_compute_pipeline`. The host of a device (vork's renderer) creates Moda's pipelines, so they use its
 persistent pipeline cache; `src/text_draw.rs` `ensure_pipeline` creates its pipeline through them.
 

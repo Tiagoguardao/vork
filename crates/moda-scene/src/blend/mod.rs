@@ -60,7 +60,7 @@ pub fn path_absolute_points(scene: &Scene, node: &RawNode) -> Option<Vec<BlendPa
     }
     let rounded = crate::path_geom::round_corners::round_path_corners_with(
         &parsed,
-        node.bool("closed").unwrap_or(false),
+        node.path_closure(),
         &corners,
     );
     Some(rounded.iter().map(|p| p.apply_affine(t)).collect())
@@ -70,15 +70,6 @@ pub fn path_absolute_points(scene: &Scene, node: &RawNode) -> Option<Vec<BlendPa
 /// `core/utils/shapeToPath.ts`). The shape → path conversions live engine-side (`tess::shape_paths`,
 /// `line_to_path`), so the engine injects this.
 pub type ShapeToAbsPoints<'a> = dyn Fn(&RawNode) -> Option<Vec<BlendPathPoint>> + 'a;
-
-/// Whether a node's outline is closed: a path's `closed`, never a line, always the box shapes.
-pub fn node_is_closed(node: &RawNode) -> bool {
-    match node.node_type() {
-        "path" => node.bool("closed").unwrap_or(false),
-        "line" => false,
-        _ => true,
-    }
-}
 
 /// The blend's object ids in chain order.
 pub fn source_ids(node: &RawNode) -> Vec<&str> {
@@ -114,7 +105,12 @@ fn node_shape(node: &RawNode, shape_to_abs: &ShapeToAbsPoints) -> Option<Shape> 
     if !BLENDABLE_TYPES.contains(&node.node_type()) {
         return None;
     }
-    let shape = Shape::from_points(&shape_to_abs(node)?, node_is_closed(node));
+    let closure = match node.node_type() {
+        "path" => node.path_closure(),
+        "line" => false.into(),
+        _ => true.into(),
+    };
+    let shape = Shape::from_points(&shape_to_abs(node)?, closure);
     (!shape.is_empty()).then_some(shape)
 }
 
@@ -222,8 +218,8 @@ pub fn blend_steps_json(request: &str) -> String {
             .iter()
             .filter_map(BlendPathPoint::from_json)
             .collect();
-        let closed = v.get("closed").and_then(Value::as_bool).unwrap_or(false);
-        Some(Shape::from_points(&pts, closed))
+        let closure = v.get("closed").map_or(false.into(), crate::path_points::PathClosure::from_field);
+        Some(Shape::from_points(&pts, closure))
     };
     let Some(items) = req.get("sources").and_then(Value::as_array) else {
         return error("bad_request", "sources must be an array");

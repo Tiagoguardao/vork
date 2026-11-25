@@ -36,7 +36,6 @@ pub enum RuntimeEvent {
     PlaceholderBaked {
         src: String,
         state: String,
-        shader_image: bool,
     },
     /// A source that DECODED SUCCESSFULLY but paints nothing — every
     /// pixel fully transparent (`coverage_permille == 0`). Not a decode failure:
@@ -47,17 +46,10 @@ pub enum RuntimeEvent {
     /// is telemetry about a working fetch and must not carry the signed-URL
     /// credentials that `AssetFailure::url` deliberately keeps for reproduction.
     ///
-    /// `shader_image` exists for shape parity with [`Self::PlaceholderBaked`]
-    /// and is ALWAYS `false` today: several shader processings re-encode
-    /// channels (`PoissonMask` puts the source alpha in `g` and a distance field
-    /// in `r`), so an all-zero alpha channel on a processed image is not
-    /// evidence that it paints nothing, and a false blank on a trust signal is
-    /// worse than no signal at all.
     BlankRasterDecoded {
         src: String,
         coverage_permille: u16,
         cause: String,
-        shader_image: bool,
     },
     /// renderWithMsdf fallback-class routing (browser-parity: the browser
     /// Canvas2D-renders these too — NOT a missing resource, but reported so
@@ -132,8 +124,7 @@ impl RuntimeEvent {
             RuntimeEvent::PlaceholderBaked {
                 src,
                 state,
-                shader_image,
-            } => format!("placeholder\u{1}{src}\u{1}{state}\u{1}{shader_image}"),
+            } => format!("placeholder\u{1}{src}\u{1}{state}"),
             // Keyed on `src` ALONE, unlike the other events: the same source
             // decoded twice at different min-raster sizes is one blank asset,
             // not two, and `coverage_permille` is exactly the kind of field that
@@ -263,7 +254,6 @@ fn collector() -> &'static Mutex<Collector> {
 /// (normally empty) event list and count its fallbacks without the unbounded growth
 /// described above.
 pub fn record(event: RuntimeEvent) {
-    capture_push(|| Captured::Event(event.clone()));
     let collecting = COLLECTING.load(std::sync::atomic::Ordering::Relaxed);
     if !collecting && !EVENTS_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -366,7 +356,7 @@ pub struct FontFallbackRecord {
 #[derive(Default)]
 pub struct RuntimeEventSummary {
     pub vector_nodes_served: u64,
-    pub never_prefetched: Vec<(String, String, bool)>,
+    pub never_prefetched: Vec<(String, String)>,
     pub blank: Vec<BlankAsset>,
     pub font_missing: Vec<(String, String)>,
     pub font_fallbacks: Vec<FontFallbackRecord>,
@@ -393,10 +383,9 @@ pub fn summarize_runtime_events(
             RuntimeEvent::PlaceholderBaked {
                 src,
                 state,
-                shader_image,
             } => {
                 if !known_failures.iter().any(|failure| failure.url == src) {
-                    summary.never_prefetched.push((src, state, shader_image));
+                    summary.never_prefetched.push((src, state));
                 }
             }
             RuntimeEvent::BlankRasterDecoded {
@@ -482,22 +471,8 @@ const VECTOR_TO_MSDF_PREFIX: &str = concat!(vector_lane_label!(), ":");
 /// row per node would add hundreds per page. It is deduped like the events (see
 /// `Collector::vector_served`).
 ///
-/// COUPLING worth knowing: a text batch served from the residency cache
-/// (`text_draw::build_richtext_item` returns before `try_build_vector_batch`)
-/// re-plans neither arm, so neither this nor a fallback event fires for it on its
-/// own. The one collecting lane on cached plans, an export job's caches
-/// (`moda_engine::export_job`, moda-cli `batch` and `slices`), captures what each
-/// batch's build recorded ([`capture_begin`]) and [`replay`]s it on every hit, so
-/// its report is the uncached one. The editor's cache-driven lanes never `reset()`
-/// and so never collect.
-///
-/// Any other collecting lane pointed at the retained path (moda-cli's `--retained`
-/// benchmarking flag) under-reports, and the SHARE skews — do NOT assume it cancels
-/// out. Cached and dirty nodes need not have the same engine mix: a page whose
-/// vector-served nodes are cached while its declining nodes are dirty reads as a far
-/// worse share than it is, and the reverse reads as an all-clear.
+/// A retained text cache hit bypasses layout, so this counts newly built batches.
 pub fn record_vector_text_served(node_id: &str) {
-    capture_push(|| Captured::VectorServed);
     // Only while a report lane is actually collecting. `reset()` arms this, and the
     // only callers of `reset()` are the lanes that later BUILD a report (moda-py per
     // render, moda-cli per invocation). The wasm editor and the desktop shell never
@@ -572,73 +547,6 @@ pub fn vector_text_served() -> u64 {
         .expect("resource report lock")
         .vector_served
         .len() as u64
-}
-
-/// One observation recorded while a capture was open ([`capture_begin`]): what a cached result's build reported,
-/// to [`replay`] when the result is served again.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Captured {
-    Event(RuntimeEvent),
-    /// [`record_vector_text_served`] for the captured layer.
-    VectorServed,
-}
-
-thread_local! {
-    /// The open captures, innermost last (each sees what is recorded while it is open).
-    static CAPTURES: std::cell::RefCell<Vec<Vec<Captured>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn capture_push(item: impl FnOnce() -> Captured) {
-    CAPTURES.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.is_empty() {
-            return;
-        }
-        let item = item();
-        for open in c.iter_mut() {
-            open.push(item.clone());
-        }
-    });
-}
-
-/// Start capturing what this thread records (whether or not a report is collecting), for a cache that keeps a
-/// built result and must report it again when it serves it ([`replay`]). Pair with [`capture_end`].
-pub fn capture_begin() {
-    CAPTURES.with(|c| c.borrow_mut().push(Vec::new()));
-}
-
-/// Close the innermost capture and return what it saw, in record order.
-pub fn capture_end() -> Vec<Captured> {
-    CAPTURES.with(|c| c.borrow_mut().pop().unwrap_or_default())
-}
-
-/// Record a captured build's observations again, as the layer `node_id` (the layer served the result now; the
-/// build may have been another layer's with the same content). Events that name no layer are recorded as they
-/// were. The same events, in the same order, that rebuilding the result for `node_id` records.
-pub fn replay(captured: &[Captured], node_id: &str) {
-    for c in captured {
-        match c {
-            Captured::VectorServed => record_vector_text_served(node_id),
-            Captured::Event(e) => record(e.clone().for_node(node_id)),
-        }
-    }
-}
-
-impl RuntimeEvent {
-    /// This event, naming `id` as its layer (events that name none are unchanged).
-    fn for_node(mut self, id: &str) -> RuntimeEvent {
-        match &mut self {
-            RuntimeEvent::FontFallbackClass { node_id, .. }
-            | RuntimeEvent::FontSubstituted { node_id, .. }
-            | RuntimeEvent::FontMissing { node_id, .. }
-            | RuntimeEvent::RenderQuality { node_id, .. } => *node_id = id.to_string(),
-            RuntimeEvent::PlaceholderBaked { .. }
-            | RuntimeEvent::BlankRasterDecoded { .. }
-            | RuntimeEvent::EmojiMissing { .. }
-            | RuntimeEvent::EmojiCoverageGap { .. } => {}
-        }
-        self
-    }
 }
 
 /// Drain all recorded events (dedup memory is kept, so a re-recorded event
@@ -810,7 +718,6 @@ pub(crate) mod tests {
         let e = RuntimeEvent::PlaceholderBaked {
             src: "https://x/a.png".into(),
             state: "failed".into(),
-            shader_image: false,
         };
         record(e.clone());
         record(e.clone()); // dedup
@@ -853,7 +760,6 @@ pub(crate) mod tests {
             src: "https://x/logo.svg".into(),
             coverage_permille: permille,
             cause: cause.into(),
-            shader_image: false,
         };
         record(blank("svg_text_no_fontdb", 0));
         // Same src, different payload — still ONE row (unlike the other events,
@@ -863,47 +769,17 @@ pub(crate) mod tests {
             src: "https://x/other.svg".into(),
             coverage_permille: 0,
             cause: "fully_transparent".into(),
-            shader_image: false,
         });
         let drained = drain();
         assert_eq!(drained.len(), 2);
         assert!(drained[0].is_missing_resource());
         assert!(matches!(
             &drained[0],
-            RuntimeEvent::BlankRasterDecoded { src, cause, coverage_permille, shader_image }
+            RuntimeEvent::BlankRasterDecoded { src, cause, coverage_permille }
                 if src == "https://x/logo.svg"
                     && cause == "svg_text_no_fontdb"
                     && *coverage_permille == 0
-                    && !*shader_image
         ));
-        reset();
-    }
-
-    /// A capture sees what is recorded while it is open, collecting or not, and a replay records it again as the
-    /// layer that serves the cached result: the report a rebuild for that layer would have made.
-    #[test]
-    fn a_capture_replays_as_the_serving_layer() {
-        let _guard = serial_globals();
-        reset();
-        capture_begin();
-        record(RuntimeEvent::FontSubstituted { node_id: "a".into(), requested: "Nope".into(), drawn: "Inter".into() });
-        record_vector_text_served("a");
-        record(RuntimeEvent::EmojiMissing { cluster: "x".into() });
-        let captured = capture_end();
-        assert_eq!(captured.len(), 3);
-        assert!(capture_end().is_empty(), "no capture left open");
-        let _ = drain();
-        replay(&captured, "b");
-        let replayed = drain();
-        assert_eq!(
-            replayed,
-            vec![
-                RuntimeEvent::FontSubstituted { node_id: "b".into(), requested: "Nope".into(), drawn: "Inter".into() },
-                // Already recorded once since the reset: deduped, as a rebuild's would be.
-            ]
-        );
-        assert!(vector_text_served_contains("a") && vector_text_served_contains("b"));
-        assert_eq!(vector_text_served(), 2);
         reset();
     }
 

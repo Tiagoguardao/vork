@@ -992,7 +992,6 @@ import bsdf;
         let hits = [crate::rt::hit_buffers_entry(0, ShaderStages::COMPUTE)];
         let path_groups: &[&[BindGroupLayoutEntry]] = &[&path, &tables[1], &[], &hits];
         let mut checked = vec![(&CLUSTERS_CULL, cluster_groups), (&MIP_VS, mip), (&MIP_FS, mip), (&DEFORM_EVALUATE, deform), (&DEFORM_CHAIN_EVALUATE, deform)];
-        checked.push((&PRESENT_FS, mip));
         for shader in [&DENOISE_PACK, &DENOISE_UNPACK] {checked.push((shader,denoise_groups));}
         let indirect_args = crate::passes::decoupled::indirect_arguments_entries();
         let indirect_args_groups: &[&[BindGroupLayoutEntry]] = &[&indirect_args];

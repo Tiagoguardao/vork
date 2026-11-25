@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vork-media = { path = "../vork-media" }
 anyhow = "1"
 hound = "3.5"
 rustfft = "6"
+serde_json = "1"

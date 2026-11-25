@@ -1,5 +1,5 @@
 //! Soundtrack muxing. The scene mixer supplies PCM. Call after finishing the movie encoder and
-//! before publishing complete output metadata. No audio is inferred from footage.
+//! before publishing complete output metadata.
 //!
 //! Decoding/resampling uses user-installed ffmpeg/ffprobe, never linked or bundled.
 //! FFmpeg's baseline is LGPL; the installed executable may enable other licences.
@@ -23,16 +23,18 @@ impl Drop for Temporary {
     }
 }
 
-pub(crate) fn sample_count(frames: u64, fps: Time) -> Result<i64> {
-    let samples = sample_offset(frames, fps)?;
+pub(crate) fn sample_range(
+    frames: std::ops::Range<u64>,
+    fps: Time,
+) -> Result<std::ops::Range<i64>> {
     ensure!(
-        samples > 0,
-        "audio output needs at least one sample of video duration"
+        frames.end >= frames.start,
+        "audio output frame range is reversed"
     );
-    Ok(samples)
+    Ok(sample_offset(frames.start, fps)?..sample_offset(frames.end, fps)?)
 }
 
-pub(crate) fn sample_offset(frames: u64, fps: Time) -> Result<i64> {
+fn sample_offset(frames: u64, fps: Time) -> Result<i64> {
     ensure!(
         fps > Time::ZERO,
         "audio output needs a positive frame count and fps"
@@ -56,7 +58,7 @@ pub(crate) fn mux_file(
     file: &Path,
     gain: f64,
     offset: f64,
-    frames: u64,
+    frames: std::ops::Range<u64>,
     fps: Time,
 ) -> Result<()> {
     // A sequence directory can itself have a .mov/.mp4 suffix.
@@ -67,7 +69,12 @@ pub(crate) fn mux_file(
     {
         return Ok(());
     }
-    let samples = sample_count(frames, fps)?;
+    let range = sample_range(frames, fps)?;
+    let samples = range.end - range.start;
+    ensure!(
+        samples > 0,
+        "audio output needs at least one sample of video duration"
+    );
     ensure!(
         gain.is_finite(),
         "audio gain must be finite; supply a linear amplitude"
@@ -157,6 +164,9 @@ pub(crate) fn mux_file(
             "48000",
             "-ac",
             "2",
+            // MP4 edit lists otherwise round AAC duration to whole milliseconds.
+            "-movie_timescale",
+            "48000",
         ])
         .arg(&temp.0)
         .stdin(Stdio::null())
@@ -298,6 +308,24 @@ mod tests {
     }
 
     #[test]
+    fn mux_preserves_nonzero_range_sample_boundaries() -> Result<()> {
+        let root = Workspace::new()?;
+        let source = root.path("tone.wav");
+        wav(&source, 0.1, 0., 2)?;
+        let fps = Time::new(30_000, 1001)?;
+        for extension in ["mov", "mp4"] {
+            let path = root.path(&format!("frame-1.{extension}"));
+            video(&path, 1, fps)?;
+            mux_file(&path, &source, 1., 0., 1..2, fps)?;
+            let streams = probe(&path)?;
+            let audio = &streams["streams"][1];
+            assert_eq!(audio["time_base"], "1/48000");
+            assert_eq!(audio["duration_ts"], 1601);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn movie_tone_sync_gain_padding_and_stream_copy() -> Result<()> {
         let root = Workspace::new()?;
         let source = root.path("tone.wav");
@@ -312,7 +340,7 @@ mod tests {
                 for gain in [1., 0.5] {
                     let output = root.path(&format!("gain-{gain}.{extension}"));
                     fs::copy(&silent, &output)?;
-                    mux_file(&output, &source, gain, onset, 30, fps)?;
+                    mux_file(&output, &source, gain, onset, 0..30, fps)?;
                     let streams = probe(&output)?;
                     let streams = streams["streams"].as_array().unwrap();
                     assert_eq!(streams.len(), 2);
@@ -351,7 +379,7 @@ mod tests {
                         (detected as f64 - expected as f64).abs() <= 24_000. / fps.as_f64(),
                         "{extension} onset {detected}, expected {expected}"
                     );
-                    let length = sample_count(30, fps)? as usize;
+                    let length = sample_range(0..30, fps)?.end as usize;
                     assert!(left.len() >= length);
                     assert!(
                         rms(&left[length - 2400..length]) < 0.0001,
@@ -389,7 +417,7 @@ mod tests {
         for offset in [-0.125, -3., 2., 1e10, 0.] {
             let movie = root.path("offset.mov");
             video(&movie, 24, Time::integer(24))?;
-            mux_file(&movie, &source, 1., offset, 24, Time::integer(24))?;
+            mux_file(&movie, &source, 1., offset, 0..24, Time::integer(24))?;
             let samples = decode(&movie)?;
             assert_eq!(
                 samples.len(),
@@ -428,7 +456,7 @@ mod tests {
         let original = fs::read(&movie)?;
         let bad = root.path("unreadable.bin");
         fs::write(&bad, b"not audio")?;
-        let error = mux_file(&movie, &bad, 1., 0., 1, Time::integer(24))
+        let error = mux_file(&movie, &bad, 1., 0., 0..1, Time::integer(24))
             .unwrap_err()
             .to_string();
         assert_eq!(error.lines().count(), 1);
@@ -440,7 +468,7 @@ mod tests {
             &root.path("missing\nfile.wav"),
             1.,
             0.,
-            1,
+            0..1,
             Time::integer(24),
         )
         .unwrap_err()
@@ -458,11 +486,11 @@ mod tests {
             let path = root.path(name);
             // Deliberately invalid input and clocks prove the still/sequence
             // return happens before any audio work or filesystem access.
-            mux_file(&path, &bad, f64::NAN, f64::INFINITY, 0, Time::ZERO)?;
+            mux_file(&path, &bad, f64::NAN, f64::INFINITY, 0..0, Time::ZERO)?;
             assert!(!path.exists());
         }
         for (gain, offset) in [(f64::NAN, 0.), (1., f64::INFINITY)] {
-            assert!(mux_file(&movie, &bad, gain, offset, 1, Time::integer(24)).is_err());
+            assert!(mux_file(&movie, &bad, gain, offset, 0..1, Time::integer(24)).is_err());
             assert_eq!(fs::read(&movie)?, original);
         }
         assert_eq!(
@@ -486,7 +514,7 @@ mod tests {
                 .arg(&source))?;
             let movie = root.path("decoded.mp4");
             video(&movie, 12, Time::integer(24))?;
-            mux_file(&movie, &source, 1., 0., 12, Time::integer(24))?;
+            mux_file(&movie, &source, 1., 0., 0..12, Time::integer(24))?;
             assert!(
                 rms(&decode(&movie)?[..4800]) > 0.1,
                 "{extension} must decode"
@@ -497,9 +525,12 @@ mod tests {
         let broken = root.path("unfinished.mov");
         fs::write(&broken, b"unfinished video")?;
         let before = fs::read_dir(&root.0)?.count();
-        let error = mux_file(&broken, &wav_source, 1., 0., 12, Time::integer(24)).unwrap_err();
+        let error = mux_file(&broken, &wav_source, 1., 0., 0..12, Time::integer(24)).unwrap_err();
         // The failed FFmpeg run is a device failure; failure.rs owns what exit code a category gets.
-        assert_eq!(error.downcast_ref::<crate::failure::FailureKind>(), Some(&crate::failure::FailureKind::Device));
+        assert_eq!(
+            error.downcast_ref::<crate::failure::FailureKind>(),
+            Some(&crate::failure::FailureKind::Device)
+        );
         let error = format!("{error:#}");
         assert_eq!(error.lines().count(), 1);
         assert!(error.contains("PCM WAV"));
@@ -510,12 +541,12 @@ mod tests {
 
     #[test]
     fn frame_clock_rounds_once_and_refuses_unrepresentable_lengths() -> Result<()> {
-        assert_eq!(sample_count(30, Time::new(30_000, 1001)?)?, 48_048);
-        assert_eq!(sample_count(1, Time::new(24_000, 1001)?)?, 2002);
-        assert_eq!(sample_count(1, Time::integer(29))?, 1655);
-        assert!(sample_count(0, Time::ONE).is_err());
-        assert!(sample_count(1, Time::ZERO).is_err());
-        assert!(sample_count(u64::MAX, Time::new(1, i64::MAX)?).is_err());
+        assert_eq!(sample_range(0..30, Time::new(30_000, 1001)?)?, 0..48_048);
+        assert_eq!(sample_range(0..1, Time::new(24_000, 1001)?)?, 0..2002);
+        assert_eq!(sample_range(0..1, Time::integer(29))?, 0..1655);
+        assert_eq!(sample_range(0..0, Time::ONE)?, 0..0);
+        assert!(sample_range(0..1, Time::ZERO).is_err());
+        assert!(sample_range(0..u64::MAX, Time::new(1, i64::MAX)?).is_err());
         Ok(())
     }
 }

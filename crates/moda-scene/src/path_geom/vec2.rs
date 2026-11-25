@@ -1,5 +1,5 @@
 //! Tiny 2D vector + cubic helpers shared by curve fitting (`fit.rs`) and the
-//! stroke outliner (`stroke_outline/`). Plain `f64` math, no allocation.
+//! path geometry operations. Plain `f64` math, no allocation.
 
 use std::ops::{Add, Mul, Neg, Sub};
 
@@ -91,41 +91,6 @@ impl Cubic {
             v.cross(d).abs() / length <= distance_epsilon
                 && (-parameter_epsilon..=1.0 + parameter_epsilon).contains(&t)
         })
-    }
-
-    /// Interior derivative roots of a linear coordinate projection. Partitioning
-    /// here makes each interval monotone, including collinear reversals.
-    pub fn extrema(&self, coord: impl Fn(V2) -> f64) -> Vec<f64> {
-        let [p0, p1, p2, p3] = self.0.map(coord);
-        let (d0, d1, d2) = (p1 - p0, p2 - p1, p3 - p2);
-        let (mut a, mut b, mut c) = (d0 - 2.0 * d1 + d2, 2.0 * (d1 - d0), d0);
-        let scale = a.abs().max(b.abs()).max(c.abs());
-        if scale == 0.0 || !scale.is_finite() {
-            return Vec::new();
-        }
-        a /= scale;
-        b /= scale;
-        c /= scale;
-        let mut roots = Vec::new();
-        if a == 0.0 {
-            if b != 0.0 {
-                roots.push(-c / b);
-            }
-        } else {
-            let disc = b * b - 4.0 * a * c;
-            if disc >= 0.0 {
-                let q = -0.5 * (b + disc.sqrt().copysign(b));
-                if q == 0.0 {
-                    roots.push(-b / (2.0 * a));
-                } else {
-                    roots.extend([q / a, c / q]);
-                }
-            }
-        }
-        roots.retain(|t| t.is_finite() && *t > 0.0 && *t < 1.0);
-        roots.sort_by(f64::total_cmp);
-        roots.dedup();
-        roots
     }
 
     pub fn line(a: V2, b: V2) -> Cubic {

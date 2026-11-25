@@ -11,10 +11,8 @@
 //! - page positions:                    `core/scene/scene.layout.ts:67-130`
 //! - accumulated transforms:            `core/scene/nodeTransformUtils.ts:95-311`
 
-use crate::charts::ticks::TickError;
-use crate::expansion::{
-    create_rectangle_from_page, expand_generated_graphic_node, expand_table_node,
-};
+use crate::value::Error as SceneError;
+use crate::page_background::create_rectangle_from_page;
 use crate::normalize::normalize_node_in_place;
 use crate::transform::{self, compose};
 use crate::types::{
@@ -394,51 +392,10 @@ fn push_page(doc: &mut SceneDocument, obj: crate::value::Map) {
 fn hydrate_envelope(doc: &mut SceneDocument, root: &crate::value::Map) {
     // Brush table (permissive: objects with a string id; everything else is
     // dropped, as the TS normaliser does before it ever reaches a feed).
-    if let Some(Value::Array(brushes)) = root.get("brushes") {
-        doc.brushes = std::sync::Arc::new(
-            brushes
-                .iter()
-                .filter(|b| b.get("id").and_then(Value::as_str).is_some())
-                .cloned()
-                .collect(),
-        );
-        doc.brush_hashes = doc
-            .brushes
-            .iter()
-            .map(|b| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                b.to_string().hash(&mut h);
-                h.finish()
-            })
-            .collect();
-    }
 
     // Pattern table (E8.5), as permissive as the brush table.
-    if let Some(Value::Array(patterns)) = root.get("patterns") {
-        doc.patterns = std::sync::Arc::new(
-            patterns
-                .iter()
-                .filter(|p| p.get("id").and_then(Value::as_str).is_some())
-                .cloned()
-                .collect(),
-        );
-        doc.pattern_hashes = doc
-            .patterns
-            .iter()
-            .map(|p| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                p.to_string().hash(&mut h);
-                h.finish()
-            })
-            .collect();
-    }
 
     // Code table (live-nodes.md §3.2): `CodeDef`s by content hash, for generator nodes.
-    if let Some(Value::Object(code)) = root.get("code") {
-        doc.code = code.clone();
-    }
 
     // Config: renderPageClipping ?? true (DEFAULT_SCENE_CONFIG, scene.config.ts).
     let raw_config = root
@@ -502,16 +459,7 @@ pub fn active_canvas(root: &crate::value::Map) -> Option<&crate::value::Map> {
 /// transient expansion — the moda-scene equivalent of the TS `Scene` object
 /// in its render-ready state.
 pub struct Scene {
-    /// What changed, by canonical node and column group ([`crate::stamps`]): the one record derived data is
-    /// validated against. The contract: every write to this scene advances its clock. The fields of a scene are
-    /// private to this crate, so no code outside it can write one without going through a method that marks.
-    /// - A write to one canonical node's own fields or to its own derived record, re-deriving nothing that reads
-    ///   other nodes, stamps that row (`write_placement`, `set_node_xy`, `node_mut`, `resolved_mut`,
-    ///   `re_resolve_node`, `prune_resolved`, and an `apply_node_edits` that re-derives no boolean, painted group,
-    ///   envelope, text flow or expansion).
-    /// - Every other writer dirties everything (`mark_all`): edits that re-derive records reading other nodes,
-    ///   structural and failed edits, font healing (`retry_*`, `refit_auto_tables`), re-expansion, envelopes,
-    ///   pages and transients.
+        ///   pages and transients.
     /// - A writer that writes nothing marks nothing.
     /// - Inside this crate, code that writes a field directly or calls [`Scene::store_resolved`] itself must
     ///   mark. Outside it there is no such code: the writers offered ([`Scene::page_mut`],
@@ -543,8 +491,7 @@ pub struct Scene {
     /// so a patched scene and a cold load of the same document hold the same
     /// map.
     pub(crate) resolved_by_id: HashMap<NodeId, RawNode>,
-    /// Transient nodes (table/generated expansion + page backgrounds).
-    pub(crate) transient_by_id: HashMap<NodeId, RawNode>,
+        pub(crate) transient_by_id: HashMap<NodeId, RawNode>,
     /// parent id (node or page) -> transient child ids in order.
     pub(crate) transient_by_parent: HashMap<NodeId, Vec<NodeId>>,
     /// transient id -> parent id.
@@ -561,15 +508,7 @@ pub struct Scene {
     /// (`threadPrev`), sorted. Text layout reads other nodes only through these, so a document without either
     /// pays nothing ([`Scene::refresh_text_flow_index`]).
     pub(crate) text_flow: TextFlowIndex,
-    /// Envelopes (E8.17, `crate::envelope`): every transient each envelope group draws in place of its children,
-    /// keyed by the envelope (present, possibly empty, for every resolved envelope).
-    pub(crate) envelope_transients: HashMap<NodeId, Vec<NodeId>>,
-    /// Each envelope's warped art as one compound path: what it clips with when it is a clip mask.
-    pub(crate) envelope_outline_by_id: HashMap<NodeId, RawNode>,
-    /// Envelopes still drawing their content unbent: text inside them waits for its fonts.
-    pub(crate) envelope_pending: Vec<NodeId>,
-    /// Transients that are clip-mask sources of an envelope's transient groups (never drawn themselves).
-    pub(crate) envelope_mask_sources: Vec<NodeId>,
+
     /// The accumulated transforms by row, derived from the fields above under the stamps rule
     /// ([`crate::worlds`]).
     pub(crate) worlds: crate::worlds::Worlds,
@@ -582,14 +521,14 @@ pub struct Scene {
 /// - Paint: a compositing parent's opacity while its isolation form stands, and external text paint values.
 ///   Opening or closing opacity isolation is Content (the writers check the before/after form).
 /// - Content: everything else. A `fills` or `strokes` field can change a paint's form or a stroke's geometry as well as a paint's values, so a
-///   field write of one is content too; the paint group is for a write that names a value of a paint that keeps
-///   its form.
-fn field_group(node: &RawNode, key: &str) -> crate::stamps::Group {
+///   field write of one is content unless the writer proves that only an opaque solid RGB value changed.
+fn field_group(node: &RawNode, key: crate::value::K) -> crate::stamps::Group {
+    use crate::value::K;
     match key {
-        "x" | "y" | "rotation" | "scaleX" | "scaleY" | "scale" | "skewX" => crate::stamps::Group::Placement,
-        "opacity" if !is_parent_node(node) => crate::stamps::Group::Placement,
-        "opacity" if is_opacity_group(node) => crate::stamps::Group::Paint,
-        "vorkPaint" if node.node_type() == "richtext" => crate::stamps::Group::Paint,
+        K::X | K::Y | K::Rotation | K::ScaleX | K::ScaleY | K::Scale | K::SkewX => crate::stamps::Group::Placement,
+        K::Opacity if !is_parent_node(node) => crate::stamps::Group::Placement,
+        K::Opacity if is_opacity_group(node) => crate::stamps::Group::Paint,
+        K::VorkPaint if node.node_type() == "richtext" => crate::stamps::Group::Paint,
         _ => crate::stamps::Group::Content,
     }
 }
@@ -603,26 +542,45 @@ pub struct RowFields<'a> {
     wrote: [bool; 3],
     /// The write named a field that is structure.
     structure: bool,
+    composition: bool,
 }
 
 impl RowFields<'_> {
     /// Set a field of the node. Its id, type, parent and children are not set: naming one refuses the write.
     pub fn set(&mut self, key: &str, value: impl Into<Value>) {
-        if matches!(key, "id" | "type" | "parentId" | "children") {
+        let value = value.into();
+        if let Some(key) = crate::value::K::lookup(key) {
+            self.set_known(key, value);
+        } else if !self.node.field_eq_json(key, &value) {
+            self.node.set(key, value);
+            self.wrote[crate::stamps::Group::Content as usize] = true;
+            self.composition = true;
+        }
+    }
+
+    /// Write a schema field directly from its compiled binding.
+    pub fn set_known(&mut self, key: crate::value::K, value: Value) {
+        use crate::value::K;
+        if matches!(key, K::Id | K::Type | K::ParentId | K::Children) {
             self.structure = true;
             return;
         }
-        let value = value.into();
-        if self.node.field_eq_json(key, &value) {
-            return;
-        }
+        if self.node.known_field_eq(key, &value) { return; }
+        let old_fills = (key == K::Fills).then(|| crate::paint::node_fills_shared(self.node));
+        let before = (key == K::Opacity).then(|| is_opacity_group(self.node));
+        let open = (key == K::Points).then(|| self.open_stroked_contours()).flatten();
         let group = field_group(self.node, key);
-        let composition = (key == "opacity" && group == crate::stamps::Group::Paint).then(|| is_opacity_group(self.node));
-        self.node.set(key, value);
+        self.node.set_known(key, value);
+        let recolour = old_fills.is_some_and(|old| crate::paint::recoloured(&old, &crate::paint::node_fills_shared(self.node)));
+        let group = if recolour { crate::stamps::Group::Paint } else { group };
         // A paint value keeps its form. Opening or closing an isolation changes content instead.
-        let group = if composition.is_some_and(|before| before != is_opacity_group(self.node)) {
+        let group = if group == crate::stamps::Group::Paint && before.is_some_and(|before| before != is_opacity_group(self.node)) {
             crate::stamps::Group::Content
         } else { group };
+        // Opacity feeds inherited composition. Content other than point coordinates
+        // can change which effects and paint layers participate.
+        self.composition |= key == K::Opacity || (group == crate::stamps::Group::Content && key != K::Points)
+            || open.is_some_and(|before| before != self.node.path_has_open_contours());
         self.wrote[group as usize] = true;
     }
 
@@ -631,8 +589,17 @@ impl RowFields<'_> {
         if self.node.shared_points().is_some_and(|held| std::sync::Arc::ptr_eq(held, &points) || **held == *points) {
             return;
         }
+        let open = self.open_stroked_contours();
         self.wrote[2] = true;
         self.node.set_shared_points(points);
+        self.composition |= open.is_some_and(|before| before != self.node.path_has_open_contours());
+    }
+
+    // A points edit can add a move into an open contour of a compound path.
+    // Its arrowed stroke then draws as a separate paint layer.
+    fn open_stroked_contours(&self) -> Option<bool> {
+        (self.node.array("closed").is_some() && self.node.has("strokes"))
+            .then(|| self.node.path_has_open_contours())
     }
 
     /// The node as written so far.
@@ -646,19 +613,19 @@ impl RowFields<'_> {
 struct Rederived {
     text_flow: bool,
     booleans: bool,
-    envelopes: bool,
+
     painted_groups: bool,
 }
 
 impl Rederived {
     fn any(self) -> bool {
-        self.text_flow || self.booleans || self.envelopes || self.painted_groups
+        self.text_flow || self.booleans || self.painted_groups
     }
     fn or(self, other: Rederived) -> Rederived {
         Rederived {
             text_flow: self.text_flow || other.text_flow,
             booleans: self.booleans || other.booleans,
-            envelopes: self.envelopes || other.envelopes,
+
             painted_groups: self.painted_groups || other.painted_groups,
         }
     }
@@ -753,18 +720,6 @@ impl Scene {
     pub fn text_flow(&self) -> &TextFlowIndex {
         &self.text_flow
     }
-    pub fn envelope_transients(&self) -> &HashMap<NodeId, Vec<NodeId>> {
-        &self.envelope_transients
-    }
-    pub fn envelope_outline_by_id(&self) -> &HashMap<NodeId, RawNode> {
-        &self.envelope_outline_by_id
-    }
-    pub fn envelope_pending(&self) -> &Vec<NodeId> {
-        &self.envelope_pending
-    }
-    pub fn envelope_mask_sources(&self) -> &Vec<NodeId> {
-        &self.envelope_mask_sources
-    }
 
     /// A page, to change: no canonical row holds a page, so everything is dirtied before it is handed out (an
     /// unknown page hands nothing out and leaves the clock as it was, as for the two accessors below). The
@@ -844,11 +799,12 @@ impl Scene {
     pub fn from_document(mut doc: SceneDocument) -> Result<Scene, crate::value::Error> {
         validate_hierarchy(doc.nodes.iter()).map_err(<crate::value::Error as serde::de::Error>::custom)?;
         // Flipbook onion skins (a preview aid): copies of the neighbouring drawings, before any index is built.
-        crate::flipbook::expand_onion(&mut doc);
         // -- indexes + sanitizers (Scene.ts:2772-2780 order) --
         let mut node_order: Vec<NodeId> = Vec::with_capacity(doc.nodes.len());
         let mut node_index: HashMap<NodeId, usize> = HashMap::default();
-        for (i, n) in doc.nodes.iter().enumerate() {
+        let mut layouts = crate::value::LayoutPool::default();
+        for (i, n) in doc.nodes.iter_mut().enumerate() {
+            n.share_layout(&mut layouts);
             // JS Map.set: later duplicate ids overwrite earlier — keep last,
             // preserving FIRST insertion position (JS Map semantics).
             if let Some(&existing) = node_index.get(n.id()) {
@@ -887,21 +843,14 @@ impl Scene {
             boolean_source_by_id: HashMap::default(),
             group_appearance_by_id: HashMap::default(),
             text_flow: TextFlowIndex::default(),
-            envelope_transients: HashMap::default(),
-            envelope_outline_by_id: HashMap::default(),
-            envelope_pending: Vec::new(),
-            envelope_mask_sources: Vec::new(),
+
             worlds: Default::default(),
         };
         // The scene's own derived columns follow its writes, as any consumer does; they subscribe first.
         scene.worlds.subscribe(&mut scene.stamps);
-        // Text flow first: a warped text layer's outlines (derived below, `crate::text_warp`) lay out in its wrap
-        // objects and thread frames.
         scene.refresh_text_flow_index();
         scene.compute_resolved_nodes()?;
         scene.compute_boolean_nodes();
-        scene.rederive_flowing_text_warps();
-        scene.compute_envelopes();
         // After the envelopes: a group's merged outline reads its children as they draw.
         scene.compute_group_appearances();
         Ok(scene)
@@ -952,155 +901,6 @@ impl Scene {
             }
         }
         false
-    }
-
-    /// Whether the scene has, or may now have, envelopes to resolve.
-    fn has_envelopes(&self) -> bool {
-        !self.envelope_transients.is_empty() || !self.envelope_pending.is_empty()
-    }
-
-    /// Drop every envelope's transients and records.
-    fn clear_envelopes(&mut self) -> Vec<NodeId> {
-        let mut removed = Vec::new();
-        let old = std::mem::take(&mut self.envelope_transients);
-        let mut envs: Vec<&NodeId> = old.keys().collect();
-        envs.sort();
-        for env in envs {
-            for id in &old[env] {
-                self.transient_by_id.remove(id);
-                self.transient_parent_of.remove(id);
-                self.transient_page_of.remove(id);
-                self.transient_by_parent.remove(id);
-                if self.node(id).is_none() {
-                    self.resolved_by_id.remove(id);
-                }
-                removed.push(id.clone());
-            }
-            self.transient_by_parent.remove(env);
-        }
-        self.envelope_outline_by_id.clear();
-        self.envelope_pending.clear();
-        self.envelope_mask_sources.clear();
-        removed
-    }
-
-    /// Resolve every envelope group (E8.17, `crate::envelope`), innermost first, replacing what they drew before.
-    /// A document without envelopes pays one scan of its nodes. Returns the envelope and transient ids now drawn.
-    pub fn compute_envelopes(&mut self) -> Vec<NodeId> {
-        // With no envelope now and none to resolve, nothing is written: the clock stands. Otherwise derived
-        // records are rewritten and no row can be attributed.
-        if self.has_envelopes() || !crate::envelope::envelope_ids(self).is_empty() {
-            self.stamps.mark_all();
-        }
-        if self.has_envelopes() {
-            self.clear_envelopes();
-        }
-        let mut touched = Vec::new();
-        for env in crate::envelope::envelope_ids(self) {
-            // A repeat (`crate::repeat`) resolves in the same pass: its copies are transients drawn in its place.
-            let r = if self.node(&env).is_some_and(crate::envelope::is_envelope) {
-                crate::envelope::resolve(self, &env)
-            } else {
-                crate::repeat::resolve(self, &env)
-            };
-            if r.pending {
-                self.envelope_pending.push(env.clone());
-                if r.transients.is_empty() {
-                    // Nothing bent yet (its text waits for fonts): it draws its content as it is for now.
-                    continue;
-                }
-            }
-            let page_id = self.page_of(&env);
-            let mut order: Vec<NodeId> = Vec::new();
-            let mut by_parent: HashMap<NodeId, Vec<RawNode>> = HashMap::default();
-            let mut ids = Vec::with_capacity(r.transients.len());
-            for (parent, n) in r.transients {
-                if !by_parent.contains_key(&parent) {
-                    order.push(parent.clone());
-                }
-                ids.push(n.id().to_string());
-                by_parent.entry(parent).or_default().push(n);
-            }
-            for parent in order {
-                let nodes = by_parent.remove(&parent).unwrap_or_default();
-                self.add_transients(nodes, &parent, page_id.as_deref());
-            }
-            if let Some(o) = r.outline {
-                self.envelope_outline_by_id.insert(env.clone(), o);
-            }
-            self.envelope_mask_sources.extend(r.mask_sources);
-            touched.push(env.clone());
-            touched.extend(ids.iter().cloned());
-            self.envelope_transients.insert(env, ids);
-        }
-        touched
-    }
-
-    /// Re-resolve the envelopes waiting for fonts (after a font install); returns the ids that changed when any
-    /// did (see [`Scene::retry_pending_text_warps`]).
-    pub fn retry_pending_envelopes(&mut self) -> Vec<NodeId> {
-        // Nothing pending writes nothing; `compute_envelopes` marks what it rewrites.
-        if self.envelope_pending.is_empty() {
-            return Vec::new();
-        }
-        let before = self.envelope_pending.clone();
-        let touched = self.compute_envelopes();
-        if self.envelope_pending == before && touched.iter().all(|id| !before.contains(id)) {
-            // Still waiting on the same fonts.
-            return Vec::new();
-        }
-        touched
-    }
-
-    /// Whether `id` draws through an envelope or a repeat: the group, anything inside one, or one of its transients.
-    pub fn in_envelope(&self, id: &str) -> bool {
-        if self.envelope_transients.contains_key(id) || self.envelope_pending.iter().any(|e| e == id) {
-            return true;
-        }
-        if self
-            .transient_by_id
-            .get(id)
-            .is_some_and(|n| n.has(crate::envelope::ENVELOPE_OF_KEY) || n.has(crate::repeat::REPEAT_OF_KEY))
-        {
-            return true;
-        }
-        let mut cur = id;
-        let mut steps = 0;
-        while let Some(p) = self.parent_map.get(cur) {
-            if self.node(p).is_some_and(|n| crate::envelope::is_envelope(n) || crate::repeat::is_repeat(n)) {
-                return true;
-            }
-            cur = p;
-            steps += 1;
-            if steps > 512 {
-                break;
-            }
-        }
-        self.node(id).is_some_and(|n| crate::envelope::is_envelope(n) || crate::repeat::is_repeat(n))
-    }
-
-    /// The compound path an envelope clips with when it is a clip mask (its warped art).
-    pub fn envelope_mask_record(&self, id: &str) -> Option<&RawNode> {
-        self.envelope_outline_by_id.get(id)
-    }
-
-    /// Warped text that lays out in the text flow (Text Wrap objects, threads) reads the OTHER nodes' drawn records
-    /// (a wrap object's effected or boolean outline, an earlier thread frame), which may not have been derived yet
-    /// when the text was: re-derive it once every other record is in. Only text with a geometry effect, and only
-    /// when the document has text flow.
-    fn rederive_flowing_text_warps(&mut self) {
-        if self.text_flow.wrap_ids.is_empty() && self.text_flow.thread_ids.is_empty() {
-            return;
-        }
-        let ids: Vec<NodeId> = self
-            .node_order
-            .iter()
-            .filter(|id| self.node(id).is_some_and(crate::text_warp::is_effected_text))
-            .cloned()
-            .collect();
-        for id in ids {
-            self.re_resolve_node(&id);
-        }
     }
 
     /// Rebuild [`Scene::text_flow`] from the nodes (an O(nodes) scan; edits call it only when a node in text flow
@@ -1214,9 +1014,6 @@ impl Scene {
             && self.boolean_source_by_id.is_empty()
             && self.group_appearance_by_id.is_empty()
             && !crate::appearance::group_has_appearance(node)
-            && !self.has_envelopes()
-            && !crate::envelope::is_envelope(node)
-            && !crate::repeat::is_repeat(node)
             && !node_in_text_flow(node)
             && !self.in_text_flow_index(id)
     }
@@ -1231,25 +1028,47 @@ impl Scene {
     /// that draws a body itself, paint for a compositing value, content when its isolation form changes). Returns whether anything changed.
     pub fn write_placement(&mut self, row: u32, transform: Option<NodePlacement>, opacity: Option<crate::value::Number>) -> bool {
         let Some(node) = self.doc.nodes.get_mut(row as usize) else { return false };
-        let mut moved = false;
-        if let Some(t) = transform {
-            for (key, number) in [("x", t.x), ("y", t.y), ("rotation", t.rotation), ("scaleX", t.scale_x), ("scaleY", t.scale_y)] {
-                moved |= node.set_placement_number(key, number);
+        PlacementMarks::write(node, transform, opacity).stamp(&mut self.stamps, row)
+    }
+
+    /// Prepare and apply disjoint placement writes concurrently, then publish their
+    /// stamps in authored order. A later edit of the same row sees the earlier write.
+    pub fn write_placements<T: Send>(&mut self, edits: &mut Vec<PlacementEdit<T>>,
+        numbers: impl Fn(&T) -> (Option<NodePlacement>, Option<crate::value::Number>) + Sync) -> bool {
+        if edits.is_empty() { return false; }
+        let mut worlds_current = self.worlds.current(self.stamps.clock());
+        crate::rows::visit_changed(&mut self.doc.nodes, edits, |edit| edit.row as usize, |node, edit| {
+            let (transform, opacity) = numbers(&edit.input);
+            let translation_only = opacity.is_none() && transform.as_ref().is_some_and(|t| {
+                t.translation.is_some() && t.rotation.is_none() && t.scale.is_none()
+            });
+            use crate::types::PlacementField;
+            // Opacity affects world rows only when it starts or stops hiding
+            // a subtree. Draw and plan subscribers still receive the write.
+            let same_visibility = worlds_current && transform.is_none() && opacity.as_ref().is_some_and(|next|
+                (node.placement_number(PlacementField::Opacity) == Some(0.0)) == (next.as_f64() == Some(0.0)));
+            edit.marks = PlacementMarks::write(node, transform, opacity);
+            edit.world = if same_visibility && edit.marks.other.is_none() {
+                WorldEdit::Unchanged
+            } else if worlds_current && translation_only && edit.marks.placed {
+                WorldEdit::Translate([PlacementField::X, PlacementField::Y]
+                    .map(|field| node.placement_number(field).unwrap_or(0.0)))
+            } else { WorldEdit::Refresh };
+            true
+        });
+        let mut changed = false;
+        for edit in edits.drain(..) {
+            if edit.marks.stamp(&mut self.stamps, edit.row) {
+                changed = true;
+                worlds_current = worlds_current && match edit.world {
+                    WorldEdit::Unchanged => true,
+                    WorldEdit::Translate(xy) => self.worlds.translate_leaf(edit.row as usize, xy),
+                    WorldEdit::Refresh => false,
+                };
             }
         }
-        let opacity_group = field_group(node, "opacity");
-        let composition = (opacity.is_some() && opacity_group == crate::stamps::Group::Paint).then(|| is_opacity_group(node));
-        let faded = opacity.is_some_and(|opacity| node.set_placement_number("opacity", opacity));
-        let opacity_group = if composition.is_some_and(|before| before != is_opacity_group(node)) {
-            crate::stamps::Group::Content
-        } else { opacity_group };
-        if moved || (faded && opacity_group == crate::stamps::Group::Placement) {
-            self.stamps.mark(row, crate::stamps::Group::Placement);
-        }
-        if faded && opacity_group != crate::stamps::Group::Placement {
-            self.stamps.mark(row, opacity_group);
-        }
-        moved || faded
+        if changed && worlds_current { self.worlds.finish_placements(&mut self.stamps); }
+        changed
     }
 
     /// Write fields of the node at `row` in place: `write` sets them on the node itself ([`RowFields`]). A node's
@@ -1275,15 +1094,16 @@ impl Scene {
         }
         let plain = self.placeable(row);
         let node = &mut self.doc.nodes[index];
-        let mut fields = RowFields { node: &mut *node, wrote: [false; 3], structure: false };
+        let mut fields = RowFields { node: &mut *node, wrote: [false; 3], structure: false, composition: false };
         write(&mut fields);
-        let (wrote, structure) = (fields.wrote, fields.structure);
+        let (wrote, structure, composition) = (fields.wrote, fields.structure, fields.composition);
         if wrote == [false; 3] {
             return if structure { Err(STRUCTURE.into()) } else { Ok(false) };
         }
-        // Paint revisions name external paint values; they cannot change normalized or derived geometry.
+        // External text paint and the opacity of an existing composition preserve its derived record.
         if plain && !structure && wrote == [false, true, false] {
-            self.stamps.mark(row, crate::stamps::Group::Paint);
+            self.stamps.mark_preserving_composition(row, crate::stamps::Group::Paint);
+            if composition { self.stamps.mark_composition(row); }
             return Ok(true);
         }
         crate::feed_points::resolve_node_feed_points(node);
@@ -1302,9 +1122,10 @@ impl Scene {
             // see a write to it whatever else was written with it.
             for (group, wrote) in [crate::stamps::Group::Placement, crate::stamps::Group::Paint, crate::stamps::Group::Content].into_iter().zip(wrote) {
                 if wrote {
-                    self.stamps.mark(row, group);
+                    self.stamps.mark_preserving_composition(row, group);
                 }
             }
+            if composition { self.stamps.mark_composition(row); }
         } else {
             self.stamps.mark_all();
         }
@@ -1325,8 +1146,7 @@ impl Scene {
             booleans: node.is_some_and(|n| n.node_type() == "boolean")
                 || (!self.boolean_source_by_id.is_empty()
                     && (self.boolean_source_by_id.contains_key(id) || self.has_boolean_ancestor(id))),
-            envelopes: self.has_envelopes()
-                || node.is_some_and(|n| crate::envelope::is_envelope(n) || crate::repeat::is_repeat(n)),
+
             painted_groups: node.is_some_and(crate::appearance::group_has_appearance)
                 || (!self.group_appearance_by_id.is_empty()
                     && (self.group_appearance_by_id.contains_key(id) || self.has_group_appearance_ancestor(id))),
@@ -1356,14 +1176,12 @@ impl Scene {
             self.refresh_text_flow_index();
         }
         for &row in rows {
-            self.refresh_resolved(row, out, prepared)?;
+            self.refresh_resolved(row, out, prepared).map_err(|e| e.to_string())?;
         }
         if rederived.booleans {
             self.compute_boolean_nodes();
         }
-        if rederived.envelopes {
-            self.envelope_edit(out);
-        }
+
         if rederived.painted_groups {
             self.compute_group_appearances();
         }
@@ -1405,60 +1223,14 @@ impl Scene {
         }
     }
 
-    /// The HTML variable fallbacks alone: `None` when `node` references no
-    /// variable (the resolved record would equal the canonical one, so it isn't
-    /// stored).
-    fn variable_resolved(&self, node: &RawNode) -> Option<RawNode> {
-        crate::variables::resolve_node_if_referenced(node).filter(|r| r != node)
-    }
-
     /// `node`'s derived record — HTML variable fallbacks, then live geometry
     /// effects — and,
     /// for an expanding host, its transient children (expanded from the
     /// variable-resolved record). `None` for the record means the node renders
     /// as its canonical self.
-    fn derive(&self, node: &RawNode) -> (Option<RawNode>, Result<Option<Vec<RawNode>>, TickError>) {
-        self.derive_with(node, |base| {
-            let expanded = match base.node_type() {
-                "table" => Some(expand_table_node(base)),
-                "generated" => Some(expand_generated_graphic_node(base)?),
-                // A nodes-mode generator draws its stored children: nothing to evaluate, unless it is drawn at a time
-                // inside a composition (`_compositionTime`, moda-render's graph lane) or handed a timed output
-                // (`_generatorOutput`, the editor's playback): then the timed output replaces the stored design.
-                "generator"
-                    if !matches!(base.json_field("children"), Some(Value::Array(_)))
-                        || base.json_field("_compositionTime").is_some()
-                        || base.json_field("_generatorOutput").is_some() =>
-                {
-                    Some(crate::generator::expand_generator_node(base, &self.doc))
-                }
-                _ => None,
-            };
-            let expanded = expanded.map(|children| inherit_blend_mode(base, children));
-            Ok(expanded)
-        })
-    }
+    fn derive(&self, _node: &RawNode) -> (Option<RawNode>, Result<Option<Vec<RawNode>>, SceneError>) { (None, Ok(None)) }
 
-    fn derive_record(&self, node: &RawNode) -> Option<RawNode> {
-        self.derive_with(node, |_| ()).0
-    }
-
-    fn derive_with<T>(&self, node: &RawNode, expand: impl FnOnce(&RawNode) -> T) -> (Option<RawNode>, T) {
-        let vars = self.variable_resolved(node);
-        let fitted = vars.as_ref().unwrap_or(node);
-        let fitted = if fitted.node_type() == "table" { crate::expansion::fit_table_rows(fitted) } else { None };
-        let base = fitted.as_ref().or(vars.as_ref()).unwrap_or(node);
-        let expanded = expand(base);
-        // Live geometry effects (E8.1): after variables, a shape with a
-        // visible geometry effect resolves to its effected path.
-        // A text layer's effects reshape its glyph outlines (`crate::text_warp`).
-        let effected = match crate::text_warp::resolve(self, base) {
-            crate::text_warp::TextWarp::Resolved(path) => Some(path),
-            crate::text_warp::TextWarp::Pending => None,
-            crate::text_warp::TextWarp::None => crate::live_effects::resolve_node_in(base, &self.doc),
-        };
-        (effected.or(fitted).or(vars), expanded)
-    }
+    fn derive_record(&self, _node: &RawNode) -> Option<RawNode> { None }
 
     /// A boolean node's own (variable-resolved) record — `effective_node` answers the path it
     /// draws as. `None` for any other node.
@@ -1525,12 +1297,6 @@ impl Scene {
         false
     }
 
-    /// Re-derive ONE leaf node's resolved record from its canonical node:
-    /// HTML variable fallbacks, then live geometry effects (as [`Scene::load`] does). The
-    /// incremental patch lane calls it after merging a patch into a node that
-    /// has (or had) geometry effects, whose resolved `points` are derived and
-    /// would otherwise go stale. Returns `false` (mutating nothing) for an
-    /// unknown id.
     pub fn re_resolve_node(&mut self, id: &str) -> bool {
         if self.node(id).is_none() {
             return false;
@@ -1544,44 +1310,6 @@ impl Scene {
             self.mark_record(id);
         }
         true
-    }
-
-    /// Text layers whose geometry effect is waiting for their fonts: effected text (`crate::text_warp`) still
-    /// drawing as plain text because its outlines could not be made yet.
-    pub fn pending_text_warps(&self) -> Vec<NodeId> {
-        self.node_order
-            .iter()
-            .filter(|id| {
-                self.node(id).is_some_and(crate::text_warp::is_effected_text)
-                    && self
-                        .effective_node(id)
-                        .is_some_and(|n| n.node_type() == "richtext")
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Re-resolve every [`Scene::pending_text_warps`] node (after a font install) and return the ones that now
-    /// draw warped.
-    pub fn retry_pending_text_warps(&mut self) -> Vec<NodeId> {
-        // `re_resolve_node` and the envelope pass mark what they rewrite; with nothing pending the clock stands.
-        let mut done = Vec::new();
-        for id in self.pending_text_warps() {
-            self.re_resolve_node(&id);
-            if self
-                .effective_node(&id)
-                .is_some_and(|n| n.node_type() != "richtext")
-            {
-                done.push(id);
-            }
-        }
-        // Envelopes bend text too: re-resolve them when a warped text healed or their own text waited.
-        if !done.is_empty() && self.has_envelopes() {
-            done.extend(self.compute_envelopes());
-        } else {
-            done.extend(self.retry_pending_envelopes());
-        }
-        done
     }
 
     /// Re-solve every boolean that cuts text (after a font install: its text operand was outlined with the faces
@@ -1610,6 +1338,20 @@ impl Scene {
             .or_else(|| self.transient_by_id.get(id))
     }
 
+    /// Visit the effective record of every document id. Unique rows are already in
+    /// document order. Duplicate ids retain their first position and resolve to the last row.
+    pub fn visit_effective_nodes(&self, mut visit: impl FnMut(&str, &RawNode)) {
+        if self.node_order.len() == self.doc.nodes.len() {
+            for node in &self.doc.nodes {
+                visit(node.id(), self.resolved_by_id.get(node.id()).unwrap_or(node));
+            }
+        } else {
+            for id in &self.node_order {
+                if let Some(node) = self.effective_node(id) { visit(id, node); }
+            }
+        }
+    }
+
     /// canonical ?? transient (selectors read this — scene.selectors.ts:67).
     pub fn canonical_or_transient(&self, id: &str) -> Option<&RawNode> {
         self.node(id).or_else(|| self.transient_by_id.get(id))
@@ -1636,27 +1378,7 @@ impl Scene {
         self.transient_by_parent.insert(parent_id.to_string(), ids);
     }
 
-    /// Refit auto tables after a font install. Canonical records stay authored.
-    pub fn refit_auto_tables(&mut self) -> Result<Vec<String>, TickError> {
-        // `reexpand_transient_host` marks each host it re-expands.
-        let ids: Vec<String> = self.doc.nodes.iter().filter(|n| n.node_type() == "table" && n.str("rowSizing") != Some("fixed")).map(|n| n.id().to_string()).collect();
-        let mut changed = Vec::new();
-        for id in ids {
-            let before = self.effective_node(&id).cloned();
-            self.reexpand_transient_host(&id)?;
-            if self.effective_node(&id) != before.as_ref() { changed.push(id); }
-        }
-        Ok(changed)
-    }
-
-    /// Re-derive the transient children of ONE expanding host (a `table` or a
-    /// `generated` node), in place, without touching the rest of the scene.
-    ///
-    /// **Why this exists.** Table cell / chart part geometry is *baked* at
-    /// expansion time — cell coordinates fold in the host's `x`/`y`
-    /// (`expansion::expand_table_node`), row/column sizes decide every border
-    /// line, and chart parts are generated from `generatedSource`. So the
-    /// incremental patch lane cannot just overlay a property onto the host's
+        /// incremental patch lane cannot just overlay a property onto the host's
     /// resolved record the way it does for a leaf node: the derived children
     /// would go stale. Before this, ANY property patch on a transient host
     /// forced a whole-scene JSON re-parse plus a cold plan rebuild (~150 ms on
@@ -1686,7 +1408,7 @@ impl Scene {
     ///
     /// Returns `None` — having mutated NOTHING — when `id` is unknown or is not
     /// an expanding host; the caller then has nothing to patch.
-    pub fn reexpand_transient_host(&mut self, id: &str) -> Result<Option<ReexpandOutcome>, TickError> {
+    pub fn reexpand_transient_host(&mut self, id: &str) -> Result<Option<ReexpandOutcome>, SceneError> {
         // Every early-out happens BEFORE the first mutation, so a `None` return
         // leaves the scene bit-identical (callers treat `None` as "not my job",
         // not as "the scene is now half-updated").
@@ -1811,9 +1533,7 @@ impl Scene {
         Some(ReexpandOutcome { removed, added })
     }
 
-    /// `computeResolvedNodes` (Scene.ts): HTML variable fallbacks first, then
-    /// table/generated expansion, then page-background rects.
-    fn compute_resolved_nodes(&mut self) -> Result<(), TickError> {
+        fn compute_resolved_nodes(&mut self) -> Result<(), SceneError> {
         for i in 0..self.node_order.len() {
             let id = &self.node_order[i];
             let Some(node) = self.node(id) else {
@@ -1901,21 +1621,17 @@ impl Scene {
         visible_only: bool,
         expand_transient: bool,
     ) -> Vec<NodeId> {
-        let mut ordered: Vec<NodeId> = vec![compute_page_bg_id(page_id)];
-        let top: Vec<NodeId> = self
-            .children_by_parent
-            .get(page_id)
-            .cloned()
-            .or_else(|| {
-                self.doc
-                    .pages
-                    .iter()
-                    .find(|p| p.id() == page_id)
-                    .map(|p| p.node_ids())
-            })
-            .unwrap_or_default();
-        self.visit_z(&top, visible_only, expand_transient, &mut ordered);
+        let mut ordered = Vec::new();
+        self.visit_page_z(page_id, visible_only, expand_transient, |id, _| ordered.push(id.to_owned()));
         ordered
+    }
+
+    /// Visit rows in page paint order. A retained traversal includes hidden sources,
+    /// with visibility propagated along the same edges that prune the visible traversal.
+    pub fn visit_page_z(&self, page_id: &str, visible_only: bool, expand_transient: bool, mut emit: impl FnMut(&str, bool)) {
+        emit(&compute_page_bg_id(page_id), true);
+        let top = self.page_top_level_ids(page_id);
+        self.visit_z_with(&top, visible_only, expand_transient, emit);
     }
 
     /// The renderer's flattened z-order (visible only, transients expanded) of
@@ -1962,7 +1678,8 @@ impl Scene {
     }
 
     pub(crate) fn hides_paint_subtree(node: &RawNode) -> bool {
-        node.truthy("hidden") || node.f64("opacity") == Some(0.0)
+        use crate::types::PlacementField;
+        RawNode::value_truthy(node.placement_field(PlacementField::Hidden)) || node.placement_number(PlacementField::Opacity) == Some(0.0)
     }
 
     fn visit_z(
@@ -1972,23 +1689,23 @@ impl Scene {
         expand_transient: bool,
         out: &mut Vec<NodeId>,
     ) {
-        let mut stack: Vec<(NodeId, bool)> = ids.iter().rev().map(|id| (id.clone(), false)).collect();
+        self.visit_z_with(ids, visible_only, expand_transient, |id, _| out.push(id.to_owned()));
+    }
+
+    fn visit_z_with(&self, ids: &[NodeId], visible_only: bool, expand_transient: bool, mut emit: impl FnMut(&str, bool)) {
+        let mut stack: Vec<_> = ids.iter().rev().map(|id| (id.as_str(), false, true)).collect();
         let mut active = HashSet::default();
-        while let Some((id, exit)) = stack.pop() {
+        while let Some((id, exit, visible_parent)) = stack.pop() {
             if exit {
-                active.remove(&id);
+                active.remove(id);
                 continue;
             }
-            if !active.insert(id.clone()) {
-                continue;
-            }
-            stack.push((id.clone(), true));
-            let id = &id;
             let Some(node) = self.canonical_or_transient(id) else {
                 continue;
             };
             // `node.hidden || node.opacity === 0` (scene.selectors.ts:69)
-            if visible_only && Self::hides_paint_subtree(node) {
+            let visible = visible_parent && !Self::hides_paint_subtree(node);
+            if visible_only && !visible {
                 continue;
             }
             if node.node_type() == "boolean" {
@@ -2000,63 +1717,36 @@ impl Scene {
                     .and_then(|n| n.points())
                     .is_some_and(|p| !p.is_empty());
                 if has_result || !visible_only {
-                    out.push(id.clone());
+                    emit(id, visible && has_result);
                 }
-            } else if expand_transient && self.envelope_transients.contains_key(id) {
-                // E8.17: an envelope draws its bent content (transients), never its children as they are.
-                out.push(id.clone());
-                let children = self.transient_by_parent.get(id).cloned().unwrap_or_default();
-                if !children.is_empty() {
-                    stack.extend(children.into_iter().rev().map(|id| (id, false)));
-                }
-            } else if expand_transient
-                && node.node_type() == "generator"
-                && self.transient_by_parent.get(id).is_some_and(|c| !c.is_empty())
-            {
-                // A nodes-mode generator drawn at a composition time: its timed output, not its stored children.
-                out.push(id.clone());
-                let children = self.transient_by_parent.get(id).cloned().unwrap_or_default();
-                stack.extend(children.into_iter().rev().map(|id| (id, false)));
             } else if is_parent_node(node) {
-                out.push(id.clone());
+                if !active.insert(id) { continue; }
+                stack.push((id, true, false));
+                emit(id, visible);
                 // A section with "Hide contents" (design-editor E7.10) draws its background only.
                 if node.node_type() == "section" && node.truthy("contentsHidden") {
                     continue;
                 }
-                let mut children = self
-                    .children_by_parent
-                    .get(id)
-                    .cloned()
-                    .or_else(|| children_of(node))
-                    .unwrap_or_default();
-                // A flipbook (motion-model.md §12.10) draws one drawing, and its onion skin when it has one.
-                if crate::flipbook::is_flipbook(node) {
-                    children = crate::flipbook::drawn_children(node, &children, |c| {
-                        self.canonical_or_transient(c).is_some_and(|n| n.has(crate::flipbook::ONION_KEY))
-                    });
-                }
-                // Canvas stacking "first on top" (E7.15): paint the frame's children last to first.
-                if first_child_on_top(node) {
-                    children.reverse();
-                }
-                if !children.is_empty() {
-                    stack.extend(children.into_iter().rev().map(|id| (id, false)));
-                }
-            } else if matches!(node.node_type(), "table" | "generated" | "generator") {
+                let indexed = self.children_by_parent.get(id);
+                let fallback = indexed.is_none().then(|| node.array("children")).flatten();
+                let children = indexed.into_iter().flatten().map(String::as_str)
+                    .chain(fallback.into_iter().flatten().filter_map(|child| child.as_str()))
+                    .map(|child| (child, false, visible));
+                // The stack visits the last entry first.
+                if first_child_on_top(node) { stack.extend(children); }
+                else { stack.extend(children.rev()); }
+            } else if matches!(node.node_type(), "generator") {
                 if expand_transient {
-                    let children = self
-                        .transient_by_parent
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_default();
-                    if !children.is_empty() {
-                        stack.extend(children.into_iter().rev().map(|id| (id, false)));
+                    if !active.insert(id) { continue; }
+                    stack.push((id, true, false));
+                    if let Some(children) = self.transient_by_parent.get(id) {
+                        stack.extend(children.iter().rev().map(|child| (child.as_str(), false, visible)));
                     }
                 } else {
-                    out.push(id.clone());
+                    emit(id, visible);
                 }
             } else {
-                out.push(id.clone());
+                emit(id, visible);
             }
         }
     }
@@ -2103,22 +1793,7 @@ impl Scene {
             .find(|s| !self.canonical_or_transient(s).is_some_and(|n| n.truthy("clipToBelow")))
     }
 
-    /// Product of every ancestor parent-node's (group/container) opacity,
-    /// walking from `id`'s parent up to the root. Returns 1.0 for a top-level
-    /// node.
-    ///
-    /// Parity with the WebGPU path (`displayListAdapter.ts`
-    /// `computeAncestorOpacityProduct`): the paint path applies only
-    /// each node's OWN `opacity`, so ancestor group/container opacity is folded
-    /// into a leaf's effective opacity (`own × this product`) as a leaf-only
-    /// multiply-down — NOT a flattened transparency group, so overlapping
-    /// descendants of a translucent group blend independently.
-    ///
-    /// The walk steps THROUGH transient hosts (tables / generated graphics):
-    /// their expanded cells/shapes are independent paint items whose own
-    /// opacity is already baked in at expansion time (`tableExpansion.ts` /
-    /// `generatedGraphicExpansion.ts`), so the host contributes nothing here —
-    /// but an enclosing group/container above it must still dim its contents.
+        /// but an enclosing group/container above it must still dim its contents.
     /// [`Self::ancestor_opacity_product`] without the ancestors `composited` says composite their subtree as one
     /// unit at their own opacity (the renderer fades that unit, so their layers draw at full opacity inside it).
     pub fn ancestor_opacity_product_except(&self, id: &str, composited: impl Fn(&str) -> bool) -> f64 {
@@ -2185,16 +1860,7 @@ impl Scene {
         product
     }
 
-    /// Rust twin of `isExportNodeIsolated` (`renderers/webgpu/exportExclusion.ts:36-47`),
-    /// the positive counterpart to `--exclude`: when an export isolates a set of
-    /// element subtrees (per-element alpha plates for the AE export
-    /// path), a paint item renders only when its node lies within one of
-    /// them.
-    ///
-    /// A node qualifies when itself OR any of its group / transient-host
-    /// ancestors is in `isolate` — so isolating a group keeps every descendant
-    /// leaf, and isolating a table/generated host keeps its expanded transient
-    /// cells. The chain is the same `parent_map ?? transient_parent_of` walk
+        /// cells. The chain is the same `parent_map ?? transient_parent_of` walk
     /// [`Self::ancestor_opacity_product`] uses (the TS
     /// `getNodeGroupId ?? getParentIdForTransientNode`), cycle-guarded.
     ///
@@ -2261,37 +1927,9 @@ impl Scene {
             } else if let Some(tp) = self.transient_parent_of.get(current) {
                 // transient branch: only native-children generated hosts act
                 // as transform parents (nodeTransformUtils.ts:157-172).
-                let Some(candidate) = self.effective_node(tp) else {
-                    break;
-                };
-                // An envelope's transients sit in its local space (E8.17): the envelope and its transient groups are
-                // their transform parents.
-                // A repeat's copies too (`crate::repeat`): each copy's group carries the copy's transform.
-                let envelope_parent = self.envelope_transients.contains_key(tp.as_str())
-                    || candidate.has(crate::envelope::ENVELOPE_OF_KEY)
-                    || candidate.has(crate::repeat::REPEAT_OF_KEY);
-                // A generator's output is in its local space (live-nodes.md §6.4), like a chart's parts.
-                if !envelope_parent
-                    && candidate.node_type() != "generator"
-                    && (candidate.node_type() != "generated"
-                        || candidate.str("renderMode") != Some("native-children"))
-                {
-                    // Transient children of every OTHER host carry the host's
-                    // transform themselves: table cells bake table.x/y
-                    // (expansion.rs) and generated raster/vector proxies copy
-                    // the host's x/y/rotation/scale. The host therefore
-                    // contributes no transform of its own — but its
-                    // group/container ancestors still do. Step THROUGH the
-                    // host without pushing it, matching the ancestor-opacity
-                    // walk above and the TS twin (nodeTransformUtils.ts
-                    // getParentChain).
-                    if !visited.insert(tp) {
-                        break;
-                    }
-                    current = tp;
-                    continue;
-                }
-                pid = tp.as_str();
+                if !visited.insert(tp) { break; }
+                current = tp;
+                continue;
             } else {
                 break;
             }
@@ -2471,11 +2109,80 @@ impl Scene {
 /// and scale. Each is the number a document edit would carry (`None` from a non-finite value is not one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePlacement {
-    pub x: crate::value::Number,
-    pub y: crate::value::Number,
-    pub rotation: crate::value::Number,
-    pub scale_x: crate::value::Number,
-    pub scale_y: crate::value::Number,
+    pub translation: Option<[crate::value::Number; 2]>,
+    pub rotation: Option<crate::value::Number>,
+    pub scale: Option<[crate::value::Number; 2]>,
+}
+
+impl NodePlacement {
+    fn fields(self) -> impl Iterator<Item = (crate::value::K, crate::value::Number)> {
+        use crate::value::K;
+        self.translation.into_iter().flat_map(|[x, y]| [(K::X, x), (K::Y, y)])
+            .chain(self.rotation.map(|rotation| (K::Rotation, rotation)))
+            .chain(self.scale.into_iter().flat_map(|[x, y]| [(K::ScaleX, x), (K::ScaleY, y)]))
+    }
+}
+
+/// An input to a row write. The worker records which groups changed beside the
+/// input so publishing the batch preserves the scene clock and dirty-list order.
+pub struct PlacementEdit<T> {
+    row: u32,
+    input: T,
+    marks: PlacementMarks,
+    world: WorldEdit,
+}
+
+enum WorldEdit {
+    Unchanged,
+    Translate([f64; 2]),
+    Refresh,
+}
+
+impl<T> PlacementEdit<T> {
+    pub fn new(row: u32, input: T) -> Self {
+        Self { row, input, marks: PlacementMarks::default(), world: WorldEdit::Refresh }
+    }
+}
+
+#[derive(Default)]
+struct PlacementMarks {
+    placed: bool,
+    opacity: bool,
+    other: Option<crate::stamps::Group>,
+}
+
+impl PlacementMarks {
+    fn write(node: &mut RawNode, transform: Option<NodePlacement>, opacity: Option<crate::value::Number>) -> Self {
+        use crate::{stamps::Group, value::K};
+        let mut marks = Self::default();
+        if let Some(t) = transform {
+            for (key, number) in t.fields() {
+                marks.placed |= node.set_placement_number(key, number);
+            }
+        }
+        if let Some(opacity) = opacity {
+            let group = field_group(node, K::Opacity);
+            let composition = (group == Group::Paint).then(|| is_opacity_group(node));
+            if node.set_placement_number(K::Opacity, opacity) {
+                marks.opacity = true;
+                if group == Group::Placement {
+                    marks.placed = true;
+                } else {
+                    marks.other = Some(if composition.is_some_and(|before| before != is_opacity_group(node)) {
+                        Group::Content
+                    } else { group });
+                }
+            }
+        }
+        marks
+    }
+
+    fn stamp(self, stamps: &mut crate::stamps::Stamps, row: u32) -> bool {
+        if self.placed { stamps.mark_preserving_composition(row, crate::stamps::Group::Placement); }
+        if self.opacity { stamps.mark_composition(row); }
+        if let Some(group) = self.other { stamps.mark(row, group); }
+        self.placed || self.other.is_some()
+    }
 }
 
 /// What [`Scene::apply_node_edits`] changed, for the caller's hash and cache
@@ -2494,8 +2201,7 @@ pub struct NodeEditOutcome {
     pub transients_added: Vec<NodeId>,
     /// Membership, hierarchy, type or order changed: the indexes were rebuilt.
     pub structural: bool,
-    /// Envelopes (E8.17) were re-resolved: every transient they draw may have changed.
-    pub envelopes_rebent: bool,
+
 }
 
 /// What an edit did besides the rows it reports as written, for the stamps ([`Scene::apply_node_edits`]).
@@ -2509,21 +2215,7 @@ struct EditEffects {
 }
 
 impl Scene {
-    /// Apply one edit batch in place: `upserts` are whole nodes (added, or
-    /// replacing the node with that id), `removes` are deleted ids,
-    /// `page_node_ids` replaces pages' top-level lists (z-order, membership),
-    /// and `canvas_root_node_ids`, when given, replaces the canvas root's list
-    /// (a page-less Design document's top level: its frames and loose layers).
-    ///
-    /// The post-call state equals `Scene::load` of the document with the same
-    /// edits applied (`residency::ResidentScene::divergence_from_full_load` is
-    /// the oracle): upserts are normalized as hydration normalizes them, a node
-    /// of an unknown type is dropped as hydration drops it, and every derived
-    /// map is brought to what a cold load builds. The cost is O(edited nodes) for
-    /// the resolved records and expansions, plus an O(nodes) index rebuild only
-    /// when the structure changed: no JSON parse, no re-resolution of untouched
-    /// nodes, no re-expansion of untouched tables and charts.
-    ///
+        ///
     /// Errors, having mutated nothing, on an upsert without an id or a page id
     /// that names no page.
     ///
@@ -2552,9 +2244,9 @@ impl Scene {
         match &result {
             // It began and wrote, removed and re-derived nothing.
             Ok(out) if !out.structural && out.written.is_empty() && out.removed.is_empty() && !effects.derived
-                && !out.envelopes_rebent && out.transients_removed.is_empty() && out.transients_added.is_empty() => {}
+                && out.transients_removed.is_empty() && out.transients_added.is_empty() => {}
             // Plain rows only: each written node is the whole of its change.
-            Ok(out) if !out.structural && out.removed.is_empty() && !effects.derived && !out.envelopes_rebent
+            Ok(out) if !out.structural && out.removed.is_empty() && !effects.derived
                 && out.transients_removed.is_empty() && out.transients_added.is_empty()
                 && out.written.iter().all(|id| !self.transient_by_parent.contains_key(id)) => {
                 for id in &out.written {
@@ -2594,7 +2286,7 @@ impl Scene {
         let rederived = upserts.iter().map(|n| self.rederived_by(n.id(), Some(n)))
             .chain(removes.iter().map(|id| self.rederived_by(id, None)))
             // A document with envelopes re-resolves them after any edit, one of page lists alone included.
-            .fold(Rederived { envelopes: self.has_envelopes(), ..Rederived::default() }, Rederived::or);
+            .fold(Rederived { ..Rederived::default() }, Rederived::or);
         for (pid, _) in page_node_ids {
             if !self.doc.pages.iter().any(|p| p.id() == pid) {
                 return Err(format!("unknown page '{pid}'"));
@@ -2657,17 +2349,8 @@ impl Scene {
             )?;
         }
 
-        // Expand the final upsert for each generated host before mutation.
-        // Its variables and brush table are unchanged by node edits; reuse this
-        // derivation below so atomic refusal does not double chart work.
         let mut prepared = HashMap::default();
-        let final_upserts: HashMap<&str, &RawNode> = kept.iter().map(|n| (n.id(), n)).collect();
-        for node in final_upserts.into_values() {
-            if node.node_type() == "generated" {
-                let (record, expanded) = self.derive(node);
-                prepared.insert(node.id().to_string(), (record, expanded?));
-            }
-        }
+
 
         // Every refusal is above this line; from here the scene is written.
         effects.began = true;
@@ -2768,15 +2451,6 @@ impl Scene {
         Ok(out)
     }
 
-    /// Re-resolve every envelope after an edit, reporting its transients as removed and added.
-    fn envelope_edit(&mut self, out: &mut NodeEditOutcome) {
-        out.envelopes_rebent = true;
-        let removed = self.clear_envelopes();
-        out.transients_removed.extend(removed);
-        let touched = self.compute_envelopes();
-        out.transients_added.extend(touched.into_iter().filter(|id| self.transient_by_id.contains_key(id)));
-    }
-
     /// `node_order` / `node_index` from `doc.nodes`, as `from_document` builds
     /// them (a duplicate id keeps its first position and points at its last copy).
     fn reindex_nodes(&mut self) {
@@ -2816,7 +2490,7 @@ impl Scene {
         row: u32,
         out: &mut NodeEditOutcome,
         prepared: &mut HashMap<String, (Option<RawNode>, Option<Vec<RawNode>>)>,
-    ) -> Result<(), TickError> {
+    ) -> Result<(), SceneError> {
         #[cfg(test)]
         if let Some(probe) = DERIVATION_PROBE.with(|probe| probe.get()) {
             probe(self);
@@ -2884,16 +2558,11 @@ pub fn is_opacity_group(node: &RawNode) -> bool {
         }
 }
 
-/// `isParentNode` (nodes.ts): group/container/section with a children array, or a nodes-mode generator (its
-/// `children` are its stored derived output, generated-content RFC §2).
 pub fn is_parent_node(node: &RawNode) -> bool {
     matches!(node.node_type(), "group" | "boolean" | "container" | "section" | "generator")
         && matches!(node.json_field("children"), Some(Value::Array(_)))
 }
 
-/// `createNodeModelMatrix`'s transform-id redirect (`WebGPUPathRenderer.ts:2202-2208`;
-/// also `WebGPUPathShadowRenderer.ts:98`): synthetic nodes — generated-graphic proxies
-/// (`generatedGraphicExpansion.ts:81,102`) and line body/arrow parts — carry
 /// `_transformSourceId` and resolve their model transform through the SOURCE node's
 /// chain. The proxy's own x/y are ignored on that path (the source transform already
 /// carries them). Critical for `raster-asset` generated hosts nested in containers:
@@ -3152,22 +2821,6 @@ pub fn extract_canvas_data_owned(mut root: Value) -> Value {
     }
 }
 
-
-/// A table's or generated graphic's blend mode, handed to the transient children it expands into (a child's
-/// own mode wins). They draw in its place, each blending with the host's mode, as each carries the host's
-/// opacity: exact for a single-child graphic (an image, a QR), per child for a table or a chart.
-fn inherit_blend_mode(host: &RawNode, mut children: Vec<RawNode>) -> Vec<RawNode> {
-    let Some(mode) = host.str("blendMode").filter(|m| !m.is_empty() && *m != "normal") else {
-        return children;
-    };
-    for child in &mut children {
-        if child.str("blendMode").is_none_or(|m| m.is_empty() || m == "normal") {
-            child.set("blendMode", crate::value::json!(mode));
-        }
-    }
-    children
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3230,33 +2883,6 @@ mod tests {
         assert_eq!(scene.stamps.clock(), clock);
         // The refusals cleared no consumer's dirty rows either.
         assert_eq!(scene.stamps.dirty(moved), [r as u32]);
-    }
-
-    #[test]
-    fn a_batch_with_nothing_applicable_re_derives_nothing() {
-        // A repeat is resolved with the envelopes, which every edit re-resolves: a batch that comes to nothing
-        // must not count as one.
-        let d = json!({"nodes": [
-            {"id": "rep", "type": "group", "x": 100, "y": 50, "children": ["a"], "repeat": {"type": "grid", "rows": 2, "columns": 3}},
-            {"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 40, "height": 20},
-            {"id": "plain", "type": "rectangle", "x": 0, "y": 0, "width": 10, "height": 10}],
-            "pages": [{"id": "p1", "width": 500, "height": 400, "nodeIds": ["rep", "plain"]}]});
-        let mut scene = Scene::load(&d).unwrap();
-        assert!(scene.has_envelopes(), "the repeat is resolved");
-        let clock = scene.stamps.clock();
-        let transients = scene.transient_by_id.clone();
-        let nothing = NodeEditOutcome::default();
-        assert_eq!(scene.apply_node_edits(vec![], &[], &[], None).unwrap(), nothing);
-        assert_eq!(scene.apply_node_edits(vec![], &["no such node".to_string()], &[], None).unwrap(), nothing);
-        let same = [("p1".to_string(), vec!["rep".to_string(), "plain".to_string()])];
-        assert_eq!(scene.apply_node_edits(vec![], &[], &same, None).unwrap(), nothing);
-        assert_eq!(scene.stamps.clock(), clock);
-        assert_eq!(scene.transient_by_id, transients);
-        // A real edit there still dirties everything: the envelopes are re-resolved.
-        let mut plain = scene.node("plain").unwrap().clone();
-        plain.set("x", json!(5));
-        scene.apply_node_edits(vec![plain], &[], &[], None).unwrap();
-        assert!(scene.stamps.all() > clock);
     }
 
     #[test]
@@ -3368,6 +2994,28 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_stroked_contour_stamps_composition_for_both_point_writers() {
+        let original = json!([{"type":"move","x":0,"y":0},{"type":"line","x":8,"y":8}]);
+        for compact in [false, true] {
+            let mut scene = Scene::load(&json!({"nodes":[{"id":"p","type":"path","closed":[true,false],
+                "points":original, "strokes":[{"id":"s","endArrowhead":"triangle"}]}],
+                "pages":[{"id":"page","nodeIds":["p"]}]})).unwrap();
+            let row = scene.row_of("p").unwrap();
+            for (kind, changes_mode) in [("line",false), ("move",true), ("line",true)] {
+                let points = json!([{"type":"move","x":0,"y":0},{"type":kind,"x":12,"y":7}]);
+                let at = scene.stamps.clock();
+                scene.write_row(row, |fields| {
+                    if compact {
+                        let points = crate::path_points::CompactPoints::from_json(points.as_array().unwrap()).unwrap();
+                        fields.set_shared_points(std::sync::Arc::new(points));
+                    } else { fields.set("points", points); }
+                }).unwrap();
+                assert_eq!(scene.stamps.composition_current(row, at), !changes_mode);
+            }
+        }
+    }
+
+    #[test]
     fn composition_values_and_form_changes_have_distinct_stamps() {
         use crate::stamps::Group;
         for typed in [false, true] {
@@ -3386,111 +3034,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn every_scene_writer_advances_the_clock() {
-        use crate::stamps::Group;
-        let d = json!({"nodes": [
-            {"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 10, "height": 10},
-            {"id": "b", "type": "rectangle", "x": 0, "y": 0, "width": 10, "height": 10}],
-            "pages": [{"id": "p", "width": 100, "height": 100, "nodeIds": ["a", "b"]}]});
-        let mut scene = Scene::load(&d).unwrap();
-        // A plain whole-node edit stamps its own row (it may have changed any field) and no other row.
-        let built = scene.stamps.clock();
-        let mut a = scene.node("a").unwrap().clone();
-        a.set("x", json!(5));
-        scene.apply_node_edits(vec![a], &[], &[], None).unwrap();
-        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(0, g, built)));
-        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| scene.stamps.current(1, g, built)));
-        assert!(scene.stamps.all() <= built, "a plain edit is attributed to its row");
-        // A typed placement write stamps placement alone.
-        let built = scene.stamps.clock();
-        scene.write_placement(0, None, crate::value::Number::from_f64(0.75));
-        assert!(!scene.stamps.current(0, Group::Placement, built));
-        assert!(scene.stamps.current(0, Group::Content, built) && scene.stamps.current(0, Group::Paint, built));
-        // A typed placement write and a mutable borrow stamp their row.
-        let built = scene.stamps.clock();
-        let row = scene.row_of("b").unwrap();
-        scene.write_placement(row, None, crate::value::Number::from_f64(0.5));
-        scene.node_mut("a");
-        assert!(!scene.stamps.current(1, Group::Placement, built) && !scene.stamps.current(0, Group::Content, built));
-        // An unrestricted write may have moved or repainted the node: what was derived from its placement or its
-        // paint is stale too, whether it came through a mutable borrow or a whole-node edit.
-        let built = scene.stamps.clock();
-        scene.node_mut("b").unwrap().set("x", json!(7));
-        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(1, g, built)));
-        let built = scene.stamps.clock();
-        let mut moved = scene.node("a").unwrap().clone();
-        moved.set("x", json!(9));
-        scene.apply_node_edits(vec![moved], &[], &[], None).unwrap();
-        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(0, g, built)));
-        // No write: an empty typed write, the same position again, a refused edit, an empty batch.
-        let clock = scene.stamps.clock();
-        scene.write_placement(0, None, None);
-        scene.set_node_xy("a", 9.0, 0.0);
-        scene.set_node_xy("a", 9.0, 0.0);
-        let after_first_xy = scene.stamps.clock();
-        scene.set_node_xy("a", 9.0, 0.0);
-        assert_eq!(scene.stamps.clock(), after_first_xy, "the same position again writes nothing");
-        assert!(scene.apply_node_edits(vec![RawNode::from_value(json!({"type": "rectangle"})).unwrap()], &[], &[], None).is_err());
-        assert!(scene.apply_node_edits(vec![], &[], &[("no such page".to_string(), vec![])], None).is_err());
-        scene.apply_node_edits(vec![], &[], &[], None).unwrap();
-        assert_eq!(scene.stamps.clock(), after_first_xy);
-        assert!(after_first_xy >= clock);
-        // A row write that fails to find its row changes nothing.
-        let built = scene.stamps.clock();
-        assert!(scene.write_row(7, |_| {}).is_err());
-        assert_eq!(scene.stamps.clock(), built);
-        // Structure is not a field of a row: the write is refused.
-        let row = scene.row_of("b").unwrap();
-        assert!(scene.write_row(row, |node| node.set("children", json!([]))).is_err());
-        assert!(scene.node("b").unwrap().json_field("children").is_none());
-        // A row write that sets nothing writes nothing.
-        let built = scene.stamps.clock();
-        scene.write_row(row, |_| {}).unwrap();
-        assert_eq!(scene.stamps.clock(), built);
-        // A page's background and a structural edit dirty everything.
-        for change in 0..2 {
-            let built = scene.stamps.clock();
-            match change {
-                0 => { scene.reexpand_page_background("p"); }
-                _ => { scene.apply_node_edits(vec![], &["b".to_string()], &[], None).unwrap(); }
-            }
-            assert!(scene.stamps.all() > built, "change {change}");
-            assert!(!scene.stamps.current(0, Group::Content, built), "change {change}");
-        }
-        assert_eq!(scene.stamps.len(), 1);
-        // A writer with nothing to write leaves the clock where it was: an unknown page, node or record, no
-        // pending fonts, no booleans, no envelopes, the same text-flow index again.
-        let clock = scene.stamps.clock();
-        assert!(scene.page_mut("no such page").is_none());
-        assert!(scene.resolved_mut("no such node").is_none());
-        assert!(scene.transient_mut("no such node").is_none());
-        assert!(scene.reexpand_page_background("no such page").is_none());
-        assert!(matches!(scene.reexpand_transient_host("no such node"), Ok(None)));
-        assert!(matches!(scene.reexpand_transient_host("a"), Ok(None)), "a rectangle expands into nothing");
-        assert!(!scene.re_resolve_node("no such node"));
-        assert!(scene.re_resolve_node("a"), "a plain rectangle re-derives to the record it has: none");
-        assert_eq!(scene.apply_node_edits(vec![], &["no such node".to_string()], &[], None).unwrap(), NodeEditOutcome::default());
-        scene.prune_resolved("a");
-        assert!(scene.retry_pending_text_warps().is_empty());
-        assert!(scene.retry_text_booleans().is_empty());
-        assert!(scene.retry_pending_envelopes().is_empty());
-        assert!(scene.compute_envelopes().is_empty());
-        assert!(matches!(scene.refit_auto_tables(), Ok(changed) if changed.is_empty()));
-        scene.refresh_text_flow_index();
-        assert_eq!(scene.stamps.clock(), clock);
-        // A replacement scene continues the clock; it never goes back.
-        let mut next = Scene::load(&d).unwrap();
-        let moved = scene.subscribe(Group::Placement);
-        next.continue_stamps_from(&scene);
-        assert!(next.stamps().clock() > scene.stamps().clock());
-        next.write_placement(0, None, crate::value::Number::from_f64(0.25));
-        assert_eq!(next.stamps().dirty(moved), [0]);
-        // The accessors that do hand something out mark first.
-        assert!(scene.page_mut("p").is_some());
-        assert!(scene.stamps.clock() > clock && scene.stamps.all() > clock);
     }
 
     #[test]
@@ -3523,23 +3066,6 @@ mod tests {
         assert_eq!(Scene::load(&fed).unwrap().doc.canvas_root_node_ids, vec!["c".to_string()]);
     }
 
-    #[test]
-    fn a_document_copy_shares_its_brush_and_pattern_tables_until_one_is_replaced() {
-        let doc = hydrate_document(&json!({
-            "nodes": [], "pages": [],
-            "brushes": [{"id": "nib", "type": "calligraphic", "angle": 30}, {"name": "no id"}],
-            "patterns": [{"id": "dots", "width": 4, "height": 4, "nodes": []}]
-        }));
-        assert_eq!(doc.brushes.len(), 1, "a brush without an id is dropped");
-        assert_eq!(doc.brush_hashes.len(), 1);
-        let mut copy = doc.clone();
-        assert!(std::sync::Arc::ptr_eq(&doc.brushes, &copy.brushes));
-        assert!(std::sync::Arc::ptr_eq(&doc.patterns, &copy.patterns));
-        copy.brushes = std::sync::Arc::new(vec![json!({"id": "nib", "type": "calligraphic", "angle": 60})]);
-        assert_eq!(doc.brush("nib").and_then(|b| b.get("angle")), Some(&json!(30)));
-        assert_eq!(copy.brush("nib").and_then(|b| b.get("angle")), Some(&json!(60)));
-        assert_eq!(copy.pattern("dots"), doc.pattern("dots"));
-    }
     use std::collections::{BTreeMap, BTreeSet};
 
     fn doc() -> Value {
@@ -3585,15 +3111,21 @@ mod tests {
             // A host keys some values as f32 and some as f64; each is the number its JSON edit would carry.
             let f32n = |v: f64| match Value::from(v as f32) { Value::Number(n) => n, _ => unreachable!() };
             let f64n = |v: f64| crate::value::Number::from_f64(v).unwrap();
-            let placement = NodePlacement { x: f32n(next() * 200. - 100.), y: f32n(next()),
-                rotation: f64n(next() * 720. - 360.), scale_x: f32n(next() * 4. - 2.), scale_y: f32n(next() * 3. + 0.25) };
+            let placement = NodePlacement { translation: (step % 5 != 0).then(|| [f32n(next() * 200. - 100.), f32n(next())]),
+                rotation: (step % 4 != 0).then(|| f64n(next() * 720. - 360.)), scale: (step % 7 != 0).then(|| [f32n(next() * 4. - 2.), f32n(next() * 3. + 0.25)]) };
             let transform = (step % 3 != 0).then(|| placement.clone());
             let opacity = (step % 3 != 1).then(|| f64n(next()));
             typed.write_placement(slot, transform.clone(), opacity.clone());
             let mut node = edited.node(id).unwrap().clone();
             if let Some(t) = transform {
-                for (key, value) in [("x", t.x), ("y", t.y), ("rotation", t.rotation), ("scaleX", t.scale_x), ("scaleY", t.scale_y)] {
-                    node.set(key, Value::Number(value));
+                if let Some([x, y]) = t.translation {
+                    node.set("x", Value::Number(x));
+                    node.set("y", Value::Number(y));
+                }
+                if let Some(r) = t.rotation { node.set("rotation", Value::Number(r)); }
+                if let Some([x, y]) = t.scale {
+                    node.set("scaleX", Value::Number(x));
+                    node.set("scaleY", Value::Number(y));
                 }
             }
             if let Some(opacity) = opacity { node.set("opacity", Value::Number(opacity)); }
@@ -3666,41 +3198,6 @@ mod tests {
                     assert!(typed.stamps.current(other, Group::Placement, built) && typed.stamps.current(other, Group::Content, built), "step {step}: row {other} stands");
                 }
             }
-        }
-    }
-
-    /// A row write that makes a plain row draw through a derived record, or back, dirties everything: what
-    /// `placeable` answered before no longer stands, and a consumer that keeps the answer sees that.
-    #[test]
-    fn a_row_write_across_the_plain_boundary_dirties_everything() {
-        use crate::stamps::Group;
-        let source = json!({"nodes":[
-            {"id":"p","type":"path","x":1,"y":2,"rotation":0,"scaleX":1,"scaleY":1,"opacity":1,
-             "points":[{"type":"move","x":0,"y":0},{"type":"line","x":40,"y":0},{"type":"line","x":40,"y":30},{"type":"line","x":0,"y":30}],
-             "closed":true,"fills":[{"id":"f","paint":{"type":"solid","color":"#ff0000"}}],"strokes":[]},
-            {"id":"q","type":"path","x":0,"y":0,
-             "points":[{"type":"move","x":0,"y":0},{"type":"line","x":4,"y":0},{"type":"line","x":4,"y":3}],
-             "closed":true,"fills":[{"id":"f","paint":{"type":"solid","color":"#00ff00"}}],"strokes":[]}],
-            "pages":[{"id":"page","width":128,"height":128,"nodeIds":["p","q"]}]});
-        let mut typed = Scene::load(&source).unwrap();
-        let mut edited = Scene::load(&source).unwrap();
-        let row = typed.row_of("p").unwrap();
-        assert!(typed.placeable(row));
-        // A live effect redraws the path's outline: the path now draws through a derived record.
-        let roughen = json!([{"id": "r", "type": "roughen", "size": 5, "sizeMode": "absolute", "detail": 10, "points": "corner", "seed": 1}]);
-        for effects in [roughen, json!([])] {
-            let before = (typed.placeable(row), typed.stamps.clock());
-            let written = effects.clone();
-            typed.write_row(row, move |node| node.set("effects", written)).unwrap();
-            let mut node = edited.node("p").unwrap().clone();
-            node.set("effects", effects);
-            edited.apply_node_edits(vec![node], &[], &[], None).unwrap();
-            for id in &edited.node_order {
-                assert_eq!(typed.effective_node(id).unwrap().to_json_map(), edited.effective_node(id).unwrap().to_json_map(), "node {id}");
-            }
-            assert_ne!(typed.placeable(row), before.0, "the write crossed the plain boundary");
-            assert!(typed.stamps.all() > before.1, "and dirtied everything");
-            assert_eq!(typed.resolved_by_id.contains_key("p"), !typed.placeable(row));
         }
     }
 
@@ -4134,63 +3631,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_table_transients_inherit_container_transform() {
-        // Table cells are expanded in the TABLE'S PARENT'S coordinate space
-        // (expansion.rs bakes table.x/y into cell coords), so a table nested in
-        // a container needs the container's translate applied by the transform
-        // walk — transform_parent_chain must step THROUGH the table host to the
-        // container (parity with nodeTransformUtils.ts getParentChain). Before
-        // the fix the chain broke at the table and nested tables rendered at
-        // container-local coords in page space.
-        let s = Scene::load(&json!({
-            "nodes": [
-                {"id":"card","type":"container","x":70.0,"y":648.0,"width":940.0,"height":276.0,
-                 "rotation":0,"scale":1,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#ffffff"}}],"children":["tbl"]},
-                {"id":"tbl","type":"table","x":28.0,"y":68.0,"width":60.0,"height":40.0,
-                 "rotation":0,"scale":1,
-                 "rows":[{"size":20.0},{"size":20.0}],
-                 "columns":[{"size":30.0},{"size":30.0}],
-                 "cells":[
-                    [{"id":"c00","textContent":"<p>a</p>"},{"id":"c01","textContent":"<p>b</p>"}],
-                    [{"id":"c10","textContent":"<p>c</p>"},{"id":"c11","textContent":"<p>d</p>"}]
-                 ]}
-            ],
-            "pages": [{"id":"p1","name":"P","width":1080.0,"height":1080.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],
-                       "nodeIds":["card"]}]
-        })).unwrap();
-
-        // The chain steps through the table host to the container, without
-        // pushing the table itself.
-        assert_eq!(
-            s.transform_parent_chain("c00_background"),
-            vec!["card".to_string()]
-        );
-
-        // Cell bg canvas position = container (70, 648) + baked table-parent-
-        // relative coords (28, 68).
-        let affine = s.node_canvas_affine("c00_background").unwrap();
-        let origin = transform::apply_point((0.0, 0.0), affine);
-        assert_eq!(origin, (98.0, 716.0));
-
-        // A page-root table keeps its previous (already correct) placement:
-        // empty chain, baked coords are page coords.
-        let s2 = Scene::load(&json!({
-            "nodes": [
-                {"id":"tbl","type":"table","x":28.0,"y":68.0,"width":60.0,"height":40.0,
-                 "rotation":0,"scale":1,
-                 "rows":[{"size":20.0}],
-                 "columns":[{"size":30.0}],
-                 "cells":[[{"id":"c00","textContent":"<p>a</p>"}]]}
-            ],
-            "pages": [{"id":"p1","name":"P","width":1080.0,"height":1080.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],
-                       "nodeIds":["tbl"]}]
-        })).unwrap();
-        assert!(s2.transform_parent_chain("c00_background").is_empty());
-        let affine2 = s2.node_canvas_affine("c00_background").unwrap();
-        assert_eq!(transform::apply_point((0.0, 0.0), affine2), (28.0, 68.0));
-    }
-
-    #[test]
     fn grouped_children_removed_from_top_level() {
         // sanitizeUniquePageMembership (scene.sanitizers.ts:24-40): r2 has a
         // group parent → dropped from page.nodeIds.
@@ -4303,37 +3743,6 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_opacity_walks_through_table_host_to_group() {
-        // A table inside a translucent group: its expanded transient children
-        // must inherit the GROUP's opacity even though the table host itself is
-        // not a parent node (its own opacity is already baked into the children).
-        let s = Scene::load(&json!({
-            "nodes": [
-                {"id":"g","type":"group","x":0,"y":0,"opacity":0.5,"children":["tbl"]},
-                {"id":"tbl","type":"table","x":0,"y":0,"rows":[50.0],"columns":[50.0]}
-            ],
-            "pages": [{"id":"p1","name":"P","width":100.0,"height":100.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["g"]}]
-        })).unwrap();
-        let child_ids: Vec<String> = s
-            .transient_parent_of
-            .iter()
-            .filter(|(_, parent)| parent.as_str() == "tbl")
-            .map(|(id, _)| id.clone())
-            .collect();
-        assert!(
-            !child_ids.is_empty(),
-            "table should expand into transient children"
-        );
-        for id in child_ids {
-            assert_eq!(
-                s.ancestor_opacity_product(&id),
-                0.5,
-                "transient child {id} should inherit the enclosing group's opacity"
-            );
-        }
-    }
-
-    #[test]
     fn group_transform_composes() {
         // nodeTransformUtils.ts:251-311: child (5,5) in group at (100,100)
         // scaled 2x1 → world (110, 105).
@@ -4341,134 +3750,6 @@ mod tests {
         let t = s.node_canvas_transform("r2").unwrap();
         assert_eq!((t.x, t.y), (110.0, 105.0));
         assert_eq!((t.scale_x, t.scale_y), (2.0, 1.0));
-    }
-
-    #[test]
-    fn table_expansion_replaces_host_in_z_order() {
-        let s = Scene::load(&json!({
-            "nodes": [{
-                "id":"tbl","type":"table","x":0.0,"y":0.0,"width":20.0,"height":10.0,
-                "rotation":0,"scale":1,
-                "rows":[{"size":10.0}],"columns":[{"size":20.0}],
-                "cells":[[{"id":"c0","textContent":"<p>x</p>"}]],
-                "columnStrokeConfig":"none","rowStrokeConfig":"none"
-            }],
-            "pages": [{"id":"p1","name":"P","width":100.0,"height":100.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["tbl"]}]
-        })).unwrap();
-        let order = s.flattened_z_order_for_page("p1");
-        assert_eq!(
-            order,
-            vec![
-                "__page_bg_p1".to_string(),
-                "c0_background".to_string(),
-                "c0_content".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_nodes_mode_generator_with_a_timed_output_draws_that_instead_of_its_children() {
-        // Inside a playing composition the editor hands the generator its timed output: that replaces the design.
-        let s = Scene::load(&json!({
-            "nodes": [
-                { "id": "g", "type": "generator", "x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0, "rotation": 0, "scale": 1,
-                  "code": "b3:missing", "params": {}, "children": ["g/bar:a"],
-                  "_generatorOutput": [{ "id": "g/bar:a@t", "type": "rectangle", "x": 1.0, "y": 2.0, "width": 9.0, "height": 9.0, "rotation": 0, "scale": 1 }] },
-                { "id": "g/bar:a", "type": "rectangle", "x": 1.0, "y": 2.0, "width": 5.0, "height": 5.0, "rotation": 0, "scale": 1,
-                  "genKey": "bar:a", "genHash": "0123456789abcdef" }
-            ],
-            "pages": [{"id":"p1","name":"P","width":1000.0,"height":1000.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["g"]}]
-        })).unwrap();
-        let order = s.flattened_z_order_for_page("p1");
-        assert!(order.contains(&"g/bar:a@t".to_string()), "{order:?}");
-        assert!(!order.contains(&"g/bar:a".to_string()), "the stored design is replaced: {order:?}");
-    }
-
-    #[test]
-    fn a_nodes_mode_generator_draws_its_stored_children_in_its_space() {
-        // Format 29: the derived cache is the generator's children; nothing is evaluated.
-        let s = Scene::load(&json!({
-            "nodes": [
-                { "id": "g", "type": "generator", "x": 50.0, "y": 60.0, "width": 100.0, "height": 100.0, "rotation": 0, "scale": 1,
-                  "code": "b3:missing", "params": {}, "children": ["g/bar:a", "g/bar:b"], "outputKey": "b3:k" },
-                { "id": "g/bar:a", "type": "rectangle", "x": 1.0, "y": 2.0, "width": 5.0, "height": 5.0, "rotation": 0, "scale": 1,
-                  "genKey": "bar:a", "genHash": "0123456789abcdef" },
-                { "id": "g/bar:b", "type": "rectangle", "x": 9.0, "y": 2.0, "width": 5.0, "height": 5.0, "rotation": 0, "scale": 1,
-                  "genKey": "bar:b", "genHash": "fedcba9876543210" }
-            ],
-            "pages": [{"id":"p1","name":"P","width":1000.0,"height":1000.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["g"]}]
-        })).unwrap();
-        let order = s.flattened_z_order_for_page("p1");
-        assert!(order.contains(&"g/bar:a".to_string()) && order.contains(&"g/bar:b".to_string()), "{order:?}");
-        assert!(!order.iter().any(|id| id.contains("placeholder")), "no evaluation, no placeholder: {order:?}");
-        let t = s.node_canvas_transform("g/bar:b").unwrap();
-        assert_eq!((t.x, t.y), (59.0, 62.0));
-    }
-
-    #[test]
-    fn chart_host_is_transform_parent_of_placeholder() {
-        let s = Scene::load(&json!({
-            "nodes": [{
-                "id":"ch","type":"generated","generatedKind":"chart",
-                "x":50.0,"y":60.0,"width":300.0,"height":200.0,"rotation":0,"scale":1,
-                "renderMode":"native-children",
-                "generatedSource":{"kind":"chart","chartVersion":1,"spec":{"type":"bar"},
-                    "data":{"columns":[],"rows":[],"series":[],"categories":[],"valueRange":[0,0]}}
-            }],
-            "pages": [{"id":"p1","name":"P","width":1000.0,"height":1000.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["ch"]}]
-        })).unwrap();
-        let order = s.flattened_z_order_for_page("p1");
-        assert_eq!(order[1], "ch_gen_proxy_0_placeholder");
-        // host x/y propagate via the transform parent chain
-        // (nodeTransformUtils.ts:157-172).
-        let t = s
-            .node_canvas_transform("ch_gen_proxy_0_placeholder")
-            .unwrap();
-        assert_eq!((t.x, t.y), (50.0, 60.0));
-    }
-
-    #[test]
-    fn raster_asset_proxy_transform_resolves_via_transform_source_id() {
-        // Attribution-sweep find (3d0f70ef p0 map / d31a991e p3 latex): a
-        // `raster-asset` generated host nested in a container expands to a
-        // pattern-rect proxy whose own parent chain BREAKS
-        // (nodeTransformUtils.ts:157-172 — only `native-children` hosts are
-        // transform parents), so the proxy's own affine is host-LOCAL. The
-        // production model matrix instead resolves through
-        // `_transformSourceId` (WebGPUPathRenderer.ts:2202-2208), landing the
-        // proxy on the host's full container chain. Mirrors canvas 3d0f70ef:
-        // container (16,2160) > generated LaTeX (18,48) => absolute (34,2208).
-        let s = Scene::load(&json!({
-            "nodes": [
-                {"id":"ct","type":"container","x":16.0,"y":2160.0,"width":358.0,"height":288.0,
-                 "children":["gen"]},
-                {"id":"gen","type":"generated","generatedKind":"latex","x":18.0,"y":48.0,
-                 "width":322.0,"height":150.0,"rotation":0,"scale":1,
-                 "renderMode":"raster-asset",
-                 "cachedAssetUrl":"https://assets/latex.png",
-                 "cachedNaturalDimensions":{"width":644.0,"height":300.0},
-                 "generatedSource":{"kind":"latex","latex":"x","displayMode":"display","fontSize":32}}
-            ],
-            "pages": [{"id":"p1","name":"P","width":390.0,"height":2956.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["ct"]}]
-        })).unwrap();
-        let proxy_id = "gen_gen_proxy_0";
-        let proxy = s.transient_by_id.get(proxy_id).expect("proxy expanded");
-        // the redirect target is the generated host
-        assert_eq!(paint_transform_id(proxy), "gen");
-        // The proxy's own chain now steps THROUGH the non-native-children host
-        // to the container (transform_parent_chain), so bounds/hit-test
-        // consumers that use the proxy's own id agree with paint. The proxy
-        // copies the host's local TRS, so through-stepping reproduces the
-        // host's accumulated transform exactly.
-        let bare = s.node_canvas_transform(proxy_id).unwrap();
-        assert_eq!((bare.x, bare.y), (34.0, 2208.0));
-        // redirected: the host's container chain applies (browser placement)
-        let redirected = s.node_canvas_transform(paint_transform_id(proxy)).unwrap();
-        assert_eq!((redirected.x, redirected.y), (34.0, 2208.0));
-        // nodes without `_transformSourceId` are unaffected ('' is falsy in
-        // the TS `||` — covered by the filter)
-        let host = s.node("gen").unwrap();
-        assert_eq!(paint_transform_id(host), "gen");
     }
 
     #[test]
@@ -4535,7 +3816,6 @@ mod tests {
             "pages": [{"id":"p1","name":"P","width":100.0,"height":100.0,
                        "fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],"nodeIds":["r"]}],
             "config": {"renderPageClipping": true},
-            "variables": [],
             "canvasRootNodeIds": ["r"],
             "layoutMode": "grid",
             "gridColumns": 3
@@ -4563,79 +3843,6 @@ mod tests {
             b.unknown_envelope_keys,
             vec!["someFutureLegacyKey".to_string()]
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Scoped transient re-expansion — CPU parity oracle.
-    //
-    // `reexpand_transient_host` exists to avoid a whole-scene reload when one
-    // table/chart host is edited, so its ONLY correctness criterion is that the
-    // scene it leaves behind is indistinguishable from the one
-    // `Scene::load(patched_json)` would have built. Every case below asserts
-    // exactly that, over all five transient maps plus `resolved_by_id`.
-    // -----------------------------------------------------------------------
-
-    fn table_doc() -> Value {
-        json!({
-            "nodes": [{
-                "id":"tbl","type":"table",
-                "x":100.0,"y":200.0,"width":60.0,"height":40.0,"rotation":0,"scale":1,
-                "rows":[{"size":20.0},{"size":20.0}],
-                "columns":[{"size":30.0},{"size":30.0}],
-                "cells":[
-                    [{"id":"c00","textContent":"<p>a</p>"},
-                     {"id":"c01","textContent":"<p>b</p>","textHorizontalAlign":"center"}],
-                    [{"id":"c10","textContent":"<p>c</p>"},
-                     {"id":"c11","textContent":"<p>d</p>"}]
-                ],
-                "backgroundColors":["#eeeeee","#dddddd"],
-                "headerBackgroundColor":"#222222",
-                "rowStrokeConfig":"all","columnStrokeConfig":"all",
-                "strokes":[{"id":"stroke-0","paint":{"type":"solid","color":"#000000"},"width":2.0}],"cornerRadius":8.0,"opacity":0.5
-            }],
-            "pages": [{"id":"p1","name":"P","width":1080.0,"height":1080.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],
-                       "nodeIds":["tbl"]}]
-        })
-    }
-
-    /// A genuinely-expanding bar chart (a `config` with a string palette is the
-    /// minimum that clears `chart_config_issue`'s throw gate, so this emits real
-    /// chart parts rather than the placeholder — see the non-vacuity assertion
-    /// in `assert_reexpand_matches_cold_load`).
-    fn chart_doc() -> Value {
-        json!({
-            "nodes": [{
-                "id":"ch","type":"generated","generatedKind":"chart",
-                "x":40.0,"y":60.0,"width":400.0,"height":300.0,"rotation":0,"scale":1,
-                "renderMode":"native-children",
-                "metadata":{"name":"Quarterly"},
-                "generatedSource":{
-                    "kind":"chart","chartVersion":1,
-                    "spec":{"type":"bar","x":0,"y":0,"width":400,"height":300,
-                            "config":{"palette":["#3b82f6","#ef4444"],
-                                      "fontFamily":"Inter","fontSize":12,
-                                      "showGrid":true,"showXAxis":true,"showYAxis":true,
-                                      "showXLabels":true,"showYLabels":true,"yTickCount":5,
-                                      "title":"Quarterly results"}},
-                    "data":{"columns":["category","series","value"],
-                            "rows":[{"category":"Q1","series":"Revenue","value":120},
-                                    {"category":"Q2","series":"Revenue","value":180}],
-                            "series":["Revenue"],"categories":["Q1","Q2"],
-                            "valueRange":[0,180]}
-                }
-            }],
-            "pages": [{"id":"p1","name":"P","width":800.0,"height":600.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],
-                       "nodeIds":["ch"]}]
-        })
-    }
-
-    fn host_node_mut<'a>(doc: &'a mut Value, host_id: &str) -> &'a mut Value {
-        doc.get_mut("nodes")
-            .and_then(Value::as_array_mut)
-            .expect("fixture carries a nodes array")
-            .iter_mut()
-            .find(|n| n.get("id").and_then(Value::as_str) == Some(host_id))
-            .expect("fixture carries the host node")
     }
 
     fn as_list_map(m: &HashMap<NodeId, Vec<NodeId>>) -> BTreeMap<&str, &Vec<NodeId>> {
@@ -4674,89 +3881,6 @@ mod tests {
             }
             assert_eq!(a, b, "{label}[{id}] differs but every field compared equal");
         }
-    }
-
-    /// The oracle: patch the host's canonical JSON, cold-load that, apply the
-    /// same property merge to a live scene, re-expand just the host, and require
-    /// the two to be indistinguishable.
-    fn assert_reexpand_matches_cold_load(
-        base: &Value,
-        host_id: &str,
-        patch: impl Fn(&mut Value),
-    ) -> ReexpandOutcome {
-        let mut scene = Scene::load(base).unwrap();
-        assert!(
-            scene
-                .transient_by_parent
-                .get(host_id)
-                .is_some_and(|ids| !ids.is_empty()),
-            "fixture host {host_id} must expand to at least one transient, or the \
-             parity assertions below are vacuous"
-        );
-
-        let mut patched = base.clone();
-        patch(host_node_mut(&mut patched, host_id));
-        let patched_host = host_node_mut(&mut patched, host_id).clone();
-        let cold = Scene::load(&patched).unwrap();
-        assert!(
-            cold.transient_by_parent
-                .get(host_id)
-                .is_some_and(|ids| !ids.is_empty()),
-            "patched fixture host {host_id} must still expand to at least one transient"
-        );
-
-        // Mirror the engine's incremental patch lane: the patched top-level
-        // props are merged into the canonical node (`ResidentScene::apply_props`
-        // → `Scene::node_mut`), and only then is the host re-expanded.
-        {
-            let live = scene.node_mut(host_id).expect("host node is canonical");
-            for (k, v) in patched_host.as_object().expect("host node is an object") {
-                live.set(k, v.clone());
-            }
-        }
-        assert_eq!(
-            scene.node(host_id),
-            cold.node(host_id),
-            "the merged canonical node must equal the cold-loaded one — otherwise \
-             this test measures hydration/migration drift, not re-expansion parity"
-        );
-
-        let outcome = scene
-            .reexpand_transient_host(host_id).unwrap()
-            .expect("a table/generated host re-expands");
-
-        assert_node_maps_eq(
-            "transient_by_id",
-            &scene.transient_by_id,
-            &cold.transient_by_id,
-        );
-        assert_node_maps_eq(
-            "resolved_by_id",
-            &scene.resolved_by_id,
-            &cold.resolved_by_id,
-        );
-        assert_eq!(
-            as_list_map(&scene.transient_by_parent),
-            as_list_map(&cold.transient_by_parent),
-            "transient_by_parent"
-        );
-        assert_eq!(
-            as_str_map(&scene.transient_parent_of),
-            as_str_map(&cold.transient_parent_of),
-            "transient_parent_of"
-        );
-        assert_eq!(
-            as_str_map(&scene.transient_page_of),
-            as_str_map(&cold.transient_page_of),
-            "transient_page_of"
-        );
-        assert_eq!(
-            Some(&outcome.added),
-            cold.transient_by_parent.get(host_id),
-            "the reported `added` sequence must be the cold load's transient order \
-             for this host — the caller splices the display list by it"
-        );
-        outcome
     }
 
     /// The page-background analogue of
@@ -4927,226 +4051,104 @@ mod tests {
     }
 
     #[test]
-    fn reexpand_table_cell_text_matches_cold_load() {
-        let outcome = assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["cells"][0][0]["textContent"] = json!("<p>edited</p>");
-        });
-        // A cell-text edit is shape-preserving: the ids are byte-identical, so a
-        // caller may patch the existing display items in place.
-        assert_eq!(outcome.removed, outcome.added);
-    }
-
-    #[test]
-    fn reexpand_table_row_resize_matches_cold_load() {
-        // Row heights drive every cell y, every content inset, and both
-        // horizontal border spans.
-        assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["rows"] = json!([{"size": 45.0}, {"size": 12.0}]);
-            host["height"] = json!(57.0);
-        });
-    }
-
-    #[test]
-    fn reexpand_table_columns_matches_cold_load() {
-        assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["columns"] = json!([{"size": 80.0}, {"size": 30.0}]);
-            host["width"] = json!(110.0);
-        });
-    }
-
-    #[test]
-    fn an_edit_that_re_derives_other_nodes_dirties_everything() {
+    fn every_scene_writer_advances_the_clock() {
         use crate::stamps::Group;
-        // A table's cells are transients derived from the host: an edit of the host is never one row's change.
-        let mut scene = Scene::load(&table_doc()).unwrap();
+        let d = json!({"nodes": [
+            {"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 10, "height": 10},
+            {"id": "b", "type": "rectangle", "x": 0, "y": 0, "width": 10, "height": 10}],
+            "pages": [{"id": "p", "width": 100, "height": 100, "nodeIds": ["a", "b"]}]});
+        let mut scene = Scene::load(&d).unwrap();
+        // A plain whole-node edit stamps its own row (it may have changed any field) and no other row.
         let built = scene.stamps.clock();
-        let mut host = scene.node("tbl").unwrap().clone();
-        host.set("x", json!(333.0));
-        scene.apply_node_edits(vec![host], &[], &[], None).unwrap();
-        assert!(scene.stamps.all() > built);
-        assert!(!scene.stamps.current(0, Group::Content, built));
-    }
-
-    #[test]
-    fn reexpand_table_host_move_matches_cold_load() {
-        // The load-bearing case for re-expansion existing at all: cell and
-        // border coordinates BAKE the host's x/y (expansion.rs:204-205,
-        // 260-263), so a move cannot be served by overlaying x/y on the host.
-        let outcome = assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["x"] = json!(333.0);
-            host["y"] = json!(-44.5);
-        });
-        assert_eq!(
-            outcome.removed, outcome.added,
-            "a move keeps the display-list shape — only geometry changes"
-        );
-    }
-
-    #[test]
-    fn reexpand_table_row_stroke_config_matches_cold_load() {
-        // `lineShouldRender` vocabulary (expansion.rs:37-56): dropping from
-        // 'all' to 'horizontal'-style configs removes border nodes entirely, so
-        // the transient id sequence shrinks.
-        for cfg in ["none", "outside", "inside", "after-first"] {
-            let outcome = assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-                host["rowStrokeConfig"] = json!(cfg);
-            });
-            assert!(
-                outcome.added.len() < outcome.removed.len(),
-                "rowStrokeConfig='{cfg}' must drop at least one border line"
-            );
+        let mut a = scene.node("a").unwrap().clone();
+        a.set("x", json!(5));
+        scene.apply_node_edits(vec![a], &[], &[], None).unwrap();
+        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(0, g, built)));
+        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| scene.stamps.current(1, g, built)));
+        assert!(scene.stamps.all() <= built, "a plain edit is attributed to its row");
+        // A typed placement write stamps placement alone.
+        let built = scene.stamps.clock();
+        scene.write_placement(0, None, crate::value::Number::from_f64(0.75));
+        assert!(!scene.stamps.current(0, Group::Placement, built));
+        assert!(scene.stamps.current(0, Group::Content, built) && scene.stamps.current(0, Group::Paint, built));
+        // A typed placement write and a mutable borrow stamp their row.
+        let built = scene.stamps.clock();
+        let row = scene.row_of("b").unwrap();
+        scene.write_placement(row, None, crate::value::Number::from_f64(0.5));
+        scene.node_mut("a");
+        assert!(!scene.stamps.current(1, Group::Placement, built) && !scene.stamps.current(0, Group::Content, built));
+        // An unrestricted write may have moved or repainted the node: what was derived from its placement or its
+        // paint is stale too, whether it came through a mutable borrow or a whole-node edit.
+        let built = scene.stamps.clock();
+        scene.node_mut("b").unwrap().set("x", json!(7));
+        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(1, g, built)));
+        let built = scene.stamps.clock();
+        let mut moved = scene.node("a").unwrap().clone();
+        moved.set("x", json!(9));
+        scene.apply_node_edits(vec![moved], &[], &[], None).unwrap();
+        assert!([Group::Placement, Group::Paint, Group::Content].into_iter().all(|g| !scene.stamps.current(0, g, built)));
+        // No write: an empty typed write, the same position again, a refused edit, an empty batch.
+        let clock = scene.stamps.clock();
+        scene.write_placement(0, None, None);
+        scene.set_node_xy("a", 9.0, 0.0);
+        scene.set_node_xy("a", 9.0, 0.0);
+        let after_first_xy = scene.stamps.clock();
+        scene.set_node_xy("a", 9.0, 0.0);
+        assert_eq!(scene.stamps.clock(), after_first_xy, "the same position again writes nothing");
+        assert!(scene.apply_node_edits(vec![RawNode::from_value(json!({"type": "rectangle"})).unwrap()], &[], &[], None).is_err());
+        assert!(scene.apply_node_edits(vec![], &[], &[("no such page".to_string(), vec![])], None).is_err());
+        scene.apply_node_edits(vec![], &[], &[], None).unwrap();
+        assert_eq!(scene.stamps.clock(), after_first_xy);
+        assert!(after_first_xy >= clock);
+        // A row write that fails to find its row changes nothing.
+        let built = scene.stamps.clock();
+        assert!(scene.write_row(7, |_| {}).is_err());
+        assert_eq!(scene.stamps.clock(), built);
+        // Structure is not a field of a row: the write is refused.
+        let row = scene.row_of("b").unwrap();
+        assert!(scene.write_row(row, |node| node.set("children", json!([]))).is_err());
+        assert!(scene.node("b").unwrap().json_field("children").is_none());
+        // A row write that sets nothing writes nothing.
+        let built = scene.stamps.clock();
+        scene.write_row(row, |_| {}).unwrap();
+        assert_eq!(scene.stamps.clock(), built);
+        // A page's background and a structural edit dirty everything.
+        for change in 0..2 {
+            let built = scene.stamps.clock();
+            match change {
+                0 => { scene.reexpand_page_background("p"); }
+                _ => { scene.apply_node_edits(vec![], &["b".to_string()], &[], None).unwrap(); }
+            }
+            assert!(scene.stamps.all() > built, "change {change}");
+            assert!(!scene.stamps.current(0, Group::Content, built), "change {change}");
         }
-    }
-
-    #[test]
-    fn reexpand_table_add_row_matches_cold_load() {
-        let outcome = assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["rows"] = json!([{"size": 20.0}, {"size": 20.0}, {"size": 20.0}]);
-            host["cells"].as_array_mut().unwrap().push(json!([
-                {"id":"c20","textContent":"<p>e</p>"},
-                {"id":"c21","textContent":"<p>f</p>"}
-            ]));
-            host["height"] = json!(60.0);
-        });
-        assert!(
-            outcome.added.len() > outcome.removed.len(),
-            "adding a row must add transients — the caller has to rebuild the slice"
-        );
-        assert_ne!(outcome.removed, outcome.added);
-    }
-
-    #[test]
-    fn reexpand_table_remove_row_matches_cold_load() {
-        let outcome = assert_reexpand_matches_cold_load(&table_doc(), "tbl", |host| {
-            host["rows"] = json!([{"size": 20.0}]);
-            host["cells"] = json!([[
-                {"id":"c00","textContent":"<p>a</p>"},
-                {"id":"c01","textContent":"<p>b</p>","textHorizontalAlign":"center"}
-            ]]);
-            host["height"] = json!(20.0);
-        });
-        assert!(
-            outcome.added.len() < outcome.removed.len(),
-            "removing a row must retire transients"
-        );
-        // The retired records are provably evicted rather than merely dropped
-        // from the host's list: the helper asserts the live transient/resolved id
-        // SETS equal the cold load's, which contains no trace of them.
-    }
-
-    /// A chart whose config/data the generator rejects silently degrades to ONE
-    /// placeholder rect, which would still satisfy the "expands to something"
-    /// guard — so the chart cases additionally require real generated parts.
-    fn assert_real_chart_parts(outcome: &ReexpandOutcome) {
-        assert!(
-            outcome.added.len() > 1 && !outcome.added.iter().any(|id| id.ends_with("_placeholder")),
-            "chart fixture degraded to the placeholder ({:?}) — the parity assertions \
-             would then never exercise the chart generator",
-            outcome.added
-        );
-    }
-
-    #[test]
-    fn reexpand_chart_data_matches_cold_load() {
-        // Chart parts are generated from `generatedSource`, so a data edit
-        // re-runs the whole generator.
-        let outcome = assert_reexpand_matches_cold_load(&chart_doc(), "ch", |host| {
-            host["generatedSource"]["data"] = json!({
-                "columns":["category","series","value"],
-                "rows":[{"category":"Q1","series":"Revenue","value":10},
-                        {"category":"Q2","series":"Revenue","value":20},
-                        {"category":"Q3","series":"Revenue","value":30}],
-                "series":["Revenue"],"categories":["Q1","Q2","Q3"],
-                "valueRange":[0,30]
-            });
-        });
-        assert_real_chart_parts(&outcome);
-    }
-
-    #[test]
-    fn reexpand_chart_host_move_matches_cold_load() {
-        let outcome = assert_reexpand_matches_cold_load(&chart_doc(), "ch", |host| {
-            host["x"] = json!(210.0);
-            host["y"] = json!(15.0);
-        });
-        assert_real_chart_parts(&outcome);
-    }
-
-    #[test]
-    fn reexpand_chart_resize_matches_cold_load() {
-        // Width feeds the chart layout (and the placeholder fallback geometry),
-        // so a resize re-lays-out every part.
-        let outcome = assert_reexpand_matches_cold_load(&chart_doc(), "ch", |host| {
-            host["width"] = json!(640.0);
-            host["generatedSource"]["spec"]["width"] = json!(640);
-        });
-        assert_real_chart_parts(&outcome);
-    }
-
-    #[test]
-    fn reexpand_table_inside_translucent_group_is_ancestor_free() {
-        // The doc comment's claim that no ancestor context is needed: the SAME
-        // table nested under a translated container inside a translucent group
-        // must re-expand to the same records a cold load produces. Ancestor
-        // opacity/transform are applied at paint time
-        // (`ancestor_opacity_product` / `transform_parent_chain`), never baked.
-        let nested = json!({
-            "nodes": [
-                {"id":"g","type":"group","x":0.0,"y":0.0,"opacity":0.4,"children":["card"]},
-                {"id":"card","type":"container","x":70.0,"y":648.0,"width":940.0,"height":276.0,
-                 "rotation":0,"scale":1,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#ffffff"}}],"children":["tbl"]},
-                {"id":"tbl","type":"table","x":28.0,"y":68.0,"width":60.0,"height":40.0,
-                 "rotation":0,"scale":1,
-                 "rows":[{"size":20.0},{"size":20.0}],
-                 "columns":[{"size":30.0},{"size":30.0}],
-                 "cells":[
-                    [{"id":"c00","textContent":"<p>a</p>"},{"id":"c01","textContent":"<p>b</p>"}],
-                    [{"id":"c10","textContent":"<p>c</p>"},{"id":"c11","textContent":"<p>d</p>"}]
-                 ]}
-            ],
-            "pages": [{"id":"p1","name":"P","width":1080.0,"height":1080.0,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#fff"}}],
-                       "nodeIds":["g"]}]
-        });
-        assert_reexpand_matches_cold_load(&nested, "tbl", |host| {
-            host["cells"][1][1]["textContent"] = json!("<p>nested edit</p>");
-            host["x"] = json!(31.0);
-        });
-    }
-
-    #[test]
-    fn reexpand_non_host_is_noop() {
-        // A `None` return must leave the scene bit-identical: the caller uses
-        // `None` to mean "this id owns no transients", and any partial mutation
-        // here would silently corrupt an unrelated node's records.
-        // A plain rectangle alongside the table, so the scene carries both.
-        let mut doc_with_rect = table_doc();
-        doc_with_rect["nodes"].as_array_mut().unwrap().push(json!(
-            {"id":"r1","type":"rectangle","x":1.0,"y":2.0,"width":3.0,"height":4.0,
-             "rotation":0,"scale":1,"fills":[{"id":"fill-0","paint":{"type":"solid","color":"#f00"}}]}
-        ));
-        doc_with_rect["pages"][0]["nodeIds"] = json!(["tbl", "r1"]);
-        let mut s = Scene::load(&doc_with_rect).unwrap();
-
-        let before = (
-            s.transient_by_id.clone(),
-            s.transient_by_parent.clone(),
-            s.transient_parent_of.clone(),
-            s.transient_page_of.clone(),
-            s.resolved_by_id.clone(),
-        );
-
-        assert!(s.reexpand_transient_host("r1").unwrap().is_none());
-        assert!(s.reexpand_transient_host("does-not-exist").unwrap().is_none());
-        assert!(
-            s.reexpand_transient_host("p1").unwrap().is_none(),
-            "a page is not a node"
-        );
-
-        assert_eq!(before.0, s.transient_by_id);
-        assert_eq!(before.1, s.transient_by_parent);
-        assert_eq!(before.2, s.transient_parent_of);
-        assert_eq!(before.3, s.transient_page_of);
-        assert_eq!(before.4, s.resolved_by_id);
+        assert_eq!(scene.stamps.len(), 1);
+        // A writer with nothing to write leaves the clock where it was: an unknown page, node or record, no
+        // pending fonts, no booleans, the same text-flow index again.
+        let clock = scene.stamps.clock();
+        assert!(scene.page_mut("no such page").is_none());
+        assert!(scene.resolved_mut("no such node").is_none());
+        assert!(scene.transient_mut("no such node").is_none());
+        assert!(scene.reexpand_page_background("no such page").is_none());
+        assert!(matches!(scene.reexpand_transient_host("no such node"), Ok(None)));
+        assert!(matches!(scene.reexpand_transient_host("a"), Ok(None)), "a rectangle expands into nothing");
+        assert!(!scene.re_resolve_node("no such node"));
+        assert!(scene.re_resolve_node("a"), "a plain rectangle re-derives to the record it has: none");
+        assert_eq!(scene.apply_node_edits(vec![], &["no such node".to_string()], &[], None).unwrap(), NodeEditOutcome::default());
+        scene.prune_resolved("a");
+        assert!(scene.retry_text_booleans().is_empty());
+        scene.refresh_text_flow_index();
+        assert_eq!(scene.stamps.clock(), clock);
+        // A replacement scene continues the clock; it never goes back.
+        let mut next = Scene::load(&d).unwrap();
+        let moved = scene.subscribe(Group::Placement);
+        next.continue_stamps_from(&scene);
+        assert!(next.stamps().clock() > scene.stamps().clock());
+        next.write_placement(0, None, crate::value::Number::from_f64(0.25));
+        assert_eq!(next.stamps().dirty(moved), [0]);
+        // The accessors that do hand something out mark first.
+        assert!(scene.page_mut("p").is_some());
+        assert!(scene.stamps.clock() > clock && scene.stamps.all() > clock);
     }
 
 }

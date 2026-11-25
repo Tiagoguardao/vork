@@ -29,16 +29,13 @@ use moda_text::TextHost;
 use crate::device::GpuContext;
 use crate::seams::TextQuadBatch;
 
-/// Min real local→screen axis scale of a model matrix — the model half of
-/// `analyticPadScale` (`try_build_vector_batch` bakes `min(sx, sy) ×
-/// render_scale` into every glyph's em_box AA padding). Shared by the pad
-/// computation and [`text_cache_key`] so the two derivations cannot drift.
-pub(crate) fn model_min_axis_scale(model_matrix: &[f32; 16]) -> f64 {
-    let sx = (model_matrix[0] as f64).hypot(model_matrix[1] as f64);
-    let sy = (model_matrix[4] as f64).hypot(model_matrix[5] as f64);
-    sx.min(sy)
+/// Local-to-screen scales shared with the prepared-batch cache. Outline AA uses
+/// the shorter axis and scalable glyph rasters sample at the longer axis.
+pub fn model_axis_scales(model_matrix: &[f32; 16]) -> [f64; 2] {
+    let sx = f64::from(model_matrix[0]).hypot(f64::from(model_matrix[1]));
+    let sy = f64::from(model_matrix[4]).hypot(f64::from(model_matrix[5]));
+    [sx.min(sy), sx.max(sy)]
 }
-
 
 /// Size of the vector-text `DrawUniforms` WGSL struct: model(64) + color(16)
 /// + params(16) + pageClip(16) + distort0/1/2(48, the warp rows)
@@ -46,25 +43,10 @@ pub(crate) fn model_min_axis_scale(model_matrix: &[f32; 16]) -> f64 {
 /// match the struct or wgpu rejects every vector-text draw.
 const VECTOR_DRAW_UNIFORM_BYTES: u64 = 160;
 
-/// The vector lane's emoji cells as `text-emoji` image ops, and the batch's deduped
-/// cluster list they index. On a vector batch the texture is the colour emoji font's
-/// glyph (`TextRenderer::vector_emoji_bind_group`), not the MSDF lane's Noto SVG.
-fn vector_emoji_ops(emojis: &[moda_text::vector::VectorEmoji]) -> (Vec<TextOp>, Vec<String>) {
+/// Each image op indexes the placed glyph that owns its face, raster scale and effect.
+fn vector_emoji_ops(emojis: &[moda_text::vector::VectorEmoji]) -> Vec<TextOp> {
     let mut ops = Vec::with_capacity(emojis.len());
-    let mut clusters: Vec<String> = Vec::new();
-    for e in emojis {
-        // An effect copy's key names its texture too (`EmojiEffect::key`).
-        let key = match &e.effect {
-            Some(fx) => fx.key(&e.cluster),
-            None => e.cluster.clone(),
-        };
-        let index = match clusters.iter().position(|c| c == &key) {
-            Some(i) => i,
-            None => {
-                clusters.push(key);
-                clusters.len() - 1
-            }
-        };
+    for (index, e) in emojis.iter().enumerate() {
         let c = e.corners;
         ops.push(TextOp {
             pipeline: TextOpPipeline::Emoji { emoji: index as u32 },
@@ -82,34 +64,12 @@ fn vector_emoji_ops(emojis: &[moda_text::vector::VectorEmoji]) -> (Vec<TextOp>, 
             indices: vec![0, 1, 2, 0, 2, 3],
         });
     }
-    (ops, clusters)
+    ops
 }
 
-/// The image of one emoji key of a batch (`TextQuadBatch::emojis`): the colour emoji
-/// face's cell for the cluster, or an effect pass's copy of it. An error when no face of
-/// the engine draws the cluster in colour.
-fn emoji_image(
-    engine: &moda_text::degraded::DegradedEngine,
-    key: &str,
-) -> Result<Arc<moda_text::host::RgbaImage>> {
-    let (effect, emoji) = moda_text::vector::EmojiEffect::parse_key(key);
-    let image = match effect {
-        Some(effect) => engine.emoji_effect_rgba(emoji, &effect),
-        None => engine.emoji_cell_rgba(emoji),
-    };
-    image.ok_or_else(|| {
-        anyhow!("emoji {emoji:?}: no installed font draws it in colour; install a colour emoji font or remove it from the text")
-    })
-}
-
-/// The pipeline an emoji op draws through: a text glow's copy of an emoji adds its light
-/// (`text-emoji-additive`), everything else paints over (`text-emoji`).
 fn emoji_module(b: &TextQuadBatch, emoji: u32) -> &'static str {
-    let additive = b.vector.is_some()
-        && b.emojis
-            .get(emoji as usize)
-            .and_then(|k| moda_text::vector::EmojiEffect::parse_key(k).0)
-            .is_some_and(|fx| fx.additive);
+    let additive = b.vector.as_ref().and_then(|v| v.emojis.get(emoji as usize))
+        .and_then(|e| e.effect.as_ref()).is_some_and(|fx| fx.additive);
     if additive {
         "text-emoji-additive"
     } else {
@@ -149,7 +109,7 @@ pub fn try_build_vector_batch(
     render_scale: f64,
     placement: moda_text::vector::VectorPlacement,
 ) -> Result<std::result::Result<TextBuildOutcome, String>> {
-    let layout = match moda_text::vector::accept_vector_layout(spec, store, &host.catalog, placement, false) {
+    let layout = match moda_text::vector::accept_vector_layout(spec, store, &host.catalog, placement, false, Some(host)) {
         Ok(layout) => layout,
         // The caller draws the node through the degraded tier (`vector_or_degraded`) or refuses it with this reason.
         Err(moda_text::vector::VectorDecline { reason, cause, families, .. }) => {
@@ -173,27 +133,30 @@ pub fn build_vector_batch(
     page_clip: [f32; 4],
     render_scale: f64,
 ) -> Result<std::result::Result<TextBuildOutcome, String>> {
-    let pad_scale = (model_min_axis_scale(&model_matrix) * render_scale).max(1e-6);
-    let ops = match layout.ops(spec, store, &host.catalog, pad_scale) {
+    let [min, max] = model_axis_scales(&model_matrix);
+    let font = layout.uniform_padding_font(spec);
+    let pad_scale = if font.is_some() { f64::INFINITY } else { (min * render_scale).max(1e-6) };
+    let mut ops = match layout.draw_ops(spec, store, &host.catalog, pad_scale, max * render_scale, Some(host)) {
         Ok(ops) => ops,
         Err(e) => {
             let families: Vec<String> = Vec::new();
             return Ok(Err(format!("vector-error: {} (vector-error; families {families:?})", e.message())));
         }
     };
+    ops.uniform_padding = font.map(|f| (f, render_scale));
     if ops.ops.is_empty() && ops.emojis.is_empty() {
         // "nothing visible, but handled (don't fall back)"
         // (drawRunsAnalytic:582) — consume the node, draw nothing.
         return Ok(Ok(TextBuildOutcome::Empty));
     }
-    let (emoji_ops, emojis) = vector_emoji_ops(&ops.emojis);
+    let emoji_ops = vector_emoji_ops(&ops.emojis);
     Ok(Ok(TextBuildOutcome::Item(std::sync::Arc::new(TextQuadBatch {
+        emoji_engine: (!ops.emojis.is_empty()).then(|| host.canvas_engine().clone()),
         node_id: spec.node_id.clone(),
         z,
         model_matrix,
         page_clip_bounds: page_clip,
         ops: emoji_ops,
-        emojis,
         degraded: None,
         vector: Some(ops),
         distort: spec.distort,
@@ -233,8 +196,7 @@ pub fn vector_or_degraded(
     })
 }
 
-/// M4d: build the Degraded-tier raster batch for a fallback-class node
-/// (`--best-effort-text`). Placement mirrors the Canvas2D display quad
+/// Build the raster batch for fallback text. Placement mirrors the Canvas2D display quad
 /// (`richtext/transforms.ts:77-117`): quad = texture logical size, alignment
 /// offsets against the node box, opacity × the raster's uniform-alpha
 /// `fill_alpha`.
@@ -250,17 +212,17 @@ pub fn build_degraded_batch(
     render_scale: f64,
 ) -> Result<TextBuildOutcome> {
     let raster = engine
-        .render_node_at(spec, render_scale * model_min_axis_scale(&model_matrix))
+        .render_node_at(spec, render_scale * model_axis_scales(&model_matrix)[0])
         .map_err(|e| anyhow!("degraded raster: {e}"))?;
     let (offset_x, offset_y) = moda_text::degraded::raster_quad_offset(spec, &raster);
     let opacity = (spec.opacity as f32) * raster.fill_alpha;
     Ok(TextBuildOutcome::Item(std::sync::Arc::new(TextQuadBatch {
+        emoji_engine: None,
         node_id: spec.node_id.clone(),
         z,
         model_matrix,
         page_clip_bounds: page_clip,
         ops: Vec::new(),
-        emojis: Vec::new(),
         degraded: Some(crate::seams::DegradedQuad {
             raster: Arc::new(raster),
             offset: [offset_x as f32, offset_y as f32],
@@ -273,7 +235,6 @@ pub fn build_degraded_batch(
         content_key: None, paint_geometry_key: None,
     })))
 }
-
 
 // ---------------------------------------------------------------------------
 // Plan side — node → TextQuadBatch
@@ -291,15 +252,14 @@ pub enum TextBuildOutcome {
     Empty,
 }
 
-
 // ---------------------------------------------------------------------------
 // GPU side
 // ---------------------------------------------------------------------------
 
-const UNIFORM_ALIGN: u64 = 256;
+pub(crate) const UNIFORM_ALIGN: u64 = 256;
 
 /// Per-Engine text renderer state (pipelines + texture caches).
-pub struct TextDraw {
+struct TextLayouts {
     sampler: wgpu::Sampler,
     bgl0: wgpu::BindGroupLayout,
     /// Group 1 of the textured modules (`text-emoji`, the degraded raster): sampler + texture.
@@ -319,11 +279,15 @@ pub struct TextDraw {
     layout_vec_tess: wgpu::PipelineLayout,
     layout_vec_analytic: wgpu::PipelineLayout,
     layout_vec_gradient: wgpu::PipelineLayout,
+}
+
+pub struct TextDraw {
+    layouts: Arc<TextLayouts>,
     /// (module id, sample_count) → pipeline. String keys: the per-shader
     /// `<id>.vector-text-fill` modules are dynamic.
-    pipelines: RefCell<HashMap<(String, u32), wgpu::RenderPipeline>>,
-    /// emoji cluster → texture bind group. Byte-capped LRU of drawn cells only.
-    emoji_bind_groups: RefCell<ByteLruCache<String, Arc<wgpu::BindGroup>>>,
+    pipelines: RefCell<Arc<HashMap<(String, u32), wgpu::RenderPipeline>>>,
+    /// Shaped run, resolution and optional silhouette effect → texture bind group.
+    emoji_bind_groups: RefCell<ByteLruCache<(u64, u32, Option<[u32; 9]>), Arc<wgpu::BindGroup>>>,
     /// T9 (perf): content-addressed GPU buffer cache for the node-LOCAL text
     /// arenas (`verts` / `indices` / per-node curve storage). Those are
     /// byte-identical across a transform-only drag — only the per-batch model
@@ -411,7 +375,7 @@ impl TextDraw {
             ..Default::default()
         });
         // Track C — vector text BGLs (vectorTextShaders.ts pipeline
-        // factories). binding 0: frame mat4 (VERTEX); binding 1:
+        // factories). binding 0: frame projection and pixel transform (VERTEX); binding 1:
         // DrawUniforms (VERTEX|FRAGMENT, 160 B, dynamic — model + color +
         // params + pageClip + the distort rows); binding 2: glyph
         // curves (FRAGMENT read-only storage); binding 3: GradientUniforms
@@ -497,21 +461,20 @@ impl TextDraw {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Ok(TextDraw {
-            frame_format,
-            working,
-            sampler,
-            bgl0,
-            texture_bgl,
-            layout_textured,
-            layout_solid,
-            vec_tess_bgl,
-            vec_analytic_bgl,
-            vec_gradient_bgl,
-            layout_vec_tess,
-            layout_vec_analytic,
-            layout_vec_gradient,
-            pipelines: Default::default(),
+        let layouts = Arc::new(TextLayouts {
+            sampler, bgl0, texture_bgl, layout_textured, layout_solid, vec_tess_bgl,
+            vec_analytic_bgl, vec_gradient_bgl, layout_vec_tess, layout_vec_analytic, layout_vec_gradient,
+        });
+        Ok(Self::from_layouts(frame_format, working, layouts, Default::default()))
+    }
+
+    pub fn replica(&self) -> Self {
+        Self::from_layouts(self.frame_format, self.working, self.layouts.clone(), self.pipelines.borrow().clone())
+    }
+
+    fn from_layouts(frame_format: wgpu::TextureFormat, working: Option<moda_shaders::WorkingColor>,
+        layouts: Arc<TextLayouts>, pipelines: Arc<HashMap<(String, u32), wgpu::RenderPipeline>>) -> Self {
+        Self { frame_format, working, layouts, pipelines: RefCell::new(pipelines),
             emoji_bind_groups: RefCell::new(ByteLruCache::new(
                 moda_text::host::emoji_cap_bytes(),
                 moda_text::host::EMOJI_CACHE_MAX_ENTRIES,
@@ -519,7 +482,7 @@ impl TextDraw {
             vec_arena_cache: RefCell::new(crate::vec_arena_cache::VecArenaCache::new(
                 crate::vec_arena_cache::VEC_ARENA_BUDGET_BYTES,
             )),
-        })
+        }
     }
 
     /// T9 cache gate: enable/disable the content-addressed node-local text arena
@@ -592,16 +555,16 @@ impl TextDraw {
             return Ok(());
         }
         let layout = match module_id {
-            "text-emoji" | "text-emoji-additive" => &self.layout_textured,
-            "text-decoration" => &self.layout_solid,
+            "text-emoji" | "text-emoji-additive" => &self.layouts.layout_textured,
+            "text-decoration" => &self.layouts.layout_solid,
             // Track C — vector text engine modules (manifest pipeline
             // layouts 313/317/321; vectorTextShaders.ts factories).
-            "vector-text-tess" => &self.layout_vec_tess,
+            "vector-text-tess" => &self.layouts.layout_vec_tess,
             // The additive (glow) variant shares the analytic BGL — only the
             // blend state differs, and that comes from its manifest
             // descriptor (TEXT_ADDITIVE_BLEND, vectorTextShaders.ts:92-95).
-            "vector-text-analytic" | "vector-text-analytic-additive" => &self.layout_vec_analytic,
-            "vector-text-analytic-gradient" => &self.layout_vec_gradient,
+            "vector-text-analytic" | "vector-text-analytic-additive" => &self.layouts.layout_vec_analytic,
+            "vector-text-analytic-gradient" => &self.layouts.layout_vec_gradient,
             other => bail!("unknown text module '{other}'"),
         };
         let manifest = moda_shaders::manifest();
@@ -750,24 +713,18 @@ impl TextDraw {
                 multiview_mask: None,
                 cache: None,
             });
-        self.pipelines
-            .borrow_mut()
-            .insert((module_id.to_string(), sample_count), pipeline);
+        Arc::make_mut(&mut self.pipelines.borrow_mut()).insert((module_id.to_string(), sample_count), pipeline);
         Ok(())
     }
 
-    /// The vector lane's emoji texture: the colour emoji font's glyph cell from the
-    /// degraded engine's font system ([`emoji_image`]). Keyed by that engine's id, so an
-    /// engine swap (the colour face installs once the scene holds an emoji) draws afresh.
-    /// Only drawn cells are kept: an emoji that cannot be drawn is an error every time it
-    /// is asked for, never a cached blank.
-    fn vector_emoji_bind_group(&self, gpu: &GpuContext, cluster: &str) -> Result<Arc<wgpu::BindGroup>> {
-        let engine = moda_text::degraded::engine().map_err(|e| anyhow!("emoji needs the font engine: {e}"))?;
-        let key = format!("vector-emoji\u{1f}{}\u{1f}{cluster}", engine.id());
-        if let Some(hit) = self.emoji_bind_groups.borrow_mut().get(&key) {
-            return Ok(hit);
-        }
-        let img = emoji_image(&engine, cluster)?;
+    fn vector_emoji_bind_group(&self, gpu: &GpuContext, batch: &TextQuadBatch, index: u32) -> Result<Arc<wgpu::BindGroup>> {
+        let emoji = batch.vector.as_ref().and_then(|v| v.emojis.get(index as usize))
+            .ok_or_else(|| anyhow!("emoji index {index} out of range"))?;
+        let run = emoji.shaped.as_ref().ok_or_else(|| anyhow!("unresolved colour emoji {:?}", emoji.cluster))?;
+        let engine = batch.emoji_engine.as_ref().ok_or_else(|| anyhow!("missing colour font engine"))?;
+        let key = (run.id, emoji.ppem, emoji.effect.as_ref().map(|fx| fx.key()));
+        if let Some(hit) = self.emoji_bind_groups.borrow_mut().get(&key) { return Ok(hit); }
+        let img = emoji.image(engine).ok_or_else(|| anyhow!("cannot rasterize colour emoji {:?}", emoji.cluster))?;
         let bytes = img.width as u64 * img.height as u64 * if self.working.is_some() { 8 } else { 4 };
         let made = Arc::new(self.create_texture_bind_group(gpu, &img.rgba, img.width, img.height, "emoji"));
         self.emoji_bind_groups.borrow_mut().insert(key, made.clone(), bytes);
@@ -802,7 +759,7 @@ impl TextDraw {
             // rgba8unorm, never -srgb (render-semantics §7).
             None => (rgba, 4, wgpu::TextureFormat::Rgba8Unorm),
         };
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
+        let tex = gpu.admission.texture(device, &wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
                 width,
@@ -816,6 +773,7 @@ impl TextDraw {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        gpu.admission.charge(0, texels.len() as u64);
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex,
@@ -838,11 +796,11 @@ impl TextDraw {
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
-            layout: &self.texture_bgl,
+            layout: &self.layouts.texture_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.layouts.sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -901,9 +859,7 @@ impl TextDraw {
                         moda_text::vector::VectorOpPipeline::AnalyticGradient => {
                             "vector-text-analytic-gradient".into()
                         }
-                        moda_text::vector::VectorOpPipeline::AnalyticShaderFill => {
-                            bail!("text shader fills are not ported ({})", b.node_id)
-                        }
+
                     };
                     if !want.contains(&m) {
                         want.push(m);
@@ -916,19 +872,21 @@ impl TextDraw {
         }
 
         // Uniform arena (256-aligned slots) + vertex/index arenas.
-        let mut uniforms: Vec<u8> = Vec::new();
+        let mut uniforms: Vec<UniformSlot> = Vec::new();
         let mut verts: Vec<u8> = Vec::new();
         let mut indices: Vec<u8> = Vec::new();
-        let alloc = |data: &[u8], uniforms: &mut Vec<u8>| -> u32 {
-            let off = uniforms.len() as u32;
-            uniforms.extend_from_slice(data);
-            let pad = (UNIFORM_ALIGN as usize - uniforms.len() % UNIFORM_ALIGN as usize)
-                % UNIFORM_ALIGN as usize;
-            uniforms.extend(std::iter::repeat_n(0u8, pad));
+        let alloc = |data: &[u8], uniforms: &mut Vec<UniformSlot>| -> u32 {
+            let off = (uniforms.len() as u64 * UNIFORM_ALIGN) as u32;
+            for chunk in data.chunks(UNIFORM_ALIGN as usize) {
+                let mut slot = [0; UNIFORM_ALIGN as usize];
+                slot[..chunk.len()].copy_from_slice(chunk);
+                uniforms.push(slot);
+            }
             off
         };
 
         let mut prepared_batches: Vec<PreparedBatch> = Vec::new();
+        let mut padding = Vec::new();
         let mut textures: Vec<Arc<wgpu::BindGroup>> = Vec::new();
         // Track C: vector-engine resources. Curve buffers are created
         // immediately (no arena dependency); group-0 bind groups are
@@ -941,8 +899,12 @@ impl TextDraw {
         // (0 for each cache hit) — folded into `uploaded_bytes`/`pf_text_bytes`.
         let mut curve_uploaded_bytes: u64 = 0;
         let mut pending_vec_groups: Vec<(usize, Option<usize>)> = Vec::new();
+        // The frame and uniform arena are shared by this chunk. A pipeline layout
+        // and its actual curve buffer identify the complete group; draws select
+        // their own uniform records through the existing dynamic offsets.
+        let mut group_indices = HashMap::new();
         let any_vector = batches.iter().any(|b| b.vector.is_some());
-        // Size the vertex arena for the vector ops up front (their triangles and 64-byte
+        // Size the vertex arena for the vector ops up front (their triangles and per-glyph
         // analytic instances are nearly all of it): grown by doubling, a frame with every
         // text node of a large document in view held up to three times its final size at
         // once (the old and new blocks of each realloc) — one of the biggest transients of
@@ -952,12 +914,20 @@ impl TextDraw {
                 .iter()
                 .filter_map(|b| b.vector.as_ref())
                 .flat_map(|v| v.ops.iter())
-                .map(|op| op.tris.len() * 4 + op.records.len() * 64)
+                .map(|op| op.tris.len() * 4 + op.records.len() * std::mem::size_of::<moda_text::vector::ops::VectorAnalyticRecord>())
                 .sum(),
         );
         for b in batches {
-            let model_off = alloc(bytemuck::cast_slice(&b.model_matrix), &mut uniforms);
-            let clip_off = alloc(bytemuck::cast_slice(&b.page_clip_bounds), &mut uniforms);
+            // Vector operations carry their own model and clip in DrawUniforms. Only
+            // quad draws bind separate dynamic ranges for these two fields.
+            let mut quad_uniforms = None;
+            let mut quad_offsets = |uniforms: &mut Vec<UniformSlot>, color, params| {
+                let (model, clip) = *quad_uniforms.get_or_insert_with(|| (
+                    alloc(bytemuck::cast_slice(&b.model_matrix), uniforms),
+                    alloc(bytemuck::cast_slice(&b.page_clip_bounds), uniforms),
+                ));
+                vec![model, color, params, clip]
+            };
             let depth = crate::depth::linear_depth(b.z) as f32;
 
             let mut draws: Vec<PreparedDraw> = Vec::new();
@@ -999,7 +969,7 @@ impl TextDraw {
                 indices.extend_from_slice(bytemuck::cast_slice(&quad_indices));
                 draws.push(PreparedDraw {
                     module: "text-emoji".into(),
-                    offsets: vec![model_off, color_off, params_off, clip_off],
+                    offsets: quad_offsets(&mut uniforms, color_off, params_off),
                     tex: Some(tex),
                     v_off,
                     v_len: (quad.len() * 4) as u64,
@@ -1013,14 +983,7 @@ impl TextDraw {
                 // Texture bind group (emoji).
                 let tex: Option<usize> = match op.pipeline {
                     TextOpPipeline::Emoji { emoji } => {
-                        let key = b
-                            .emojis
-                            .get(emoji as usize)
-                            .ok_or_else(|| anyhow!("emoji index {emoji} out of range"))?;
-                        // A cell that cannot be drawn fails the frame, like a failed
-                        // degraded raster: the text never draws with the emoji left out.
-                        let bg = self
-                            .vector_emoji_bind_group(gpu, key)
+                        let bg = self.vector_emoji_bind_group(gpu, b, emoji)
                             .map_err(|e| e.context(format!("text node {}", b.node_id)))?;
                         textures.push(bg);
                         Some(textures.len() - 1)
@@ -1036,7 +999,7 @@ impl TextDraw {
                 let i_off = indices.len() as u64;
                 indices.extend_from_slice(bytemuck::cast_slice(&op.indices));
 
-                let offsets: Vec<u32> = vec![model_off, color_off, params_off, clip_off];
+                let offsets: Vec<u32> = quad_offsets(&mut uniforms, color_off, params_off);
                 let module: String = match op.pipeline {
                     TextOpPipeline::Solid => "text-decoration".into(),
                     TextOpPipeline::Emoji { emoji } => emoji_module(b, emoji).into(),
@@ -1057,7 +1020,7 @@ impl TextDraw {
             if let Some(v) = &b.vector {
                 let depth = crate::depth::linear_depth(b.z) as f32;
                 // Per-node curve buffer (the GlyphCurveStore upload).
-                let curve_buf_idx: Option<usize> = if v.curve_points.is_empty() {
+                let curve_buffer = if v.curve_points.is_empty() {
                     None
                 } else {
                     // T9: content-addressed — a transform-only drag reuses the
@@ -1073,8 +1036,7 @@ impl TextDraw {
                         wgpu::BufferUsages::STORAGE,
                     );
                     curve_uploaded_bytes += up;
-                    curve_bufs.push(buf);
-                    Some(curve_bufs.len() - 1)
+                    Some(buf)
                 };
                 // Gradient uniforms: one contiguous 176-byte record
                 // (packTextGradientUniformFloats layout) per node.
@@ -1092,17 +1054,17 @@ impl TextDraw {
                     .gradient
                     .as_ref()
                     .map(|g| alloc(bytemuck::cast_slice(&gradient_floats(g)), &mut uniforms));
-                // Per-(batch, flavor) group-0 bind group requests, resolved
-                // after the uniform arena exists.
-                let mut flavor_groups: [Option<usize>; 3] = [None; 3];
                 let mut group_for = |flavor: usize| -> usize {
-                    if let Some(i) = flavor_groups[flavor] {
-                        return i;
-                    }
-                    pending_vec_groups.push((flavor, curve_buf_idx));
-                    let i = pending_vec_groups.len() - 1;
-                    flavor_groups[flavor] = Some(i);
-                    i
+                    let curve = if flavor == VEC_FLAVOR_TESS { None } else { curve_buffer.as_ref() };
+                    *group_indices.entry((flavor, curve.map(Arc::as_ptr))).or_insert_with(|| {
+                        let curve_idx = curve.map(|buffer| {
+                            curve_bufs.push(buffer.clone());
+                            curve_bufs.len() - 1
+                        });
+                        let index = pending_vec_groups.len();
+                        pending_vec_groups.push((flavor, curve_idx));
+                        index
+                    })
                 };
 
                 for op in &v.ops {
@@ -1110,25 +1072,8 @@ impl TextDraw {
                     // + distort0/1/2 (160 B; the warp rows —
                     // distort0.w is the enabled flag, disabled draws carry
                     // identity rows).
-                    let mut u: Vec<f32> = Vec::with_capacity(40);
-                    u.extend_from_slice(&b.model_matrix);
-                    u.extend_from_slice(&op.color);
-                    u.extend_from_slice(&[depth, op.opacity, op.blur_px, op.stroke_px]);
-                    u.extend_from_slice(&b.page_clip_bounds);
-                    match &b.distort {
-                        Some(h) => {
-                            u.extend_from_slice(&[h[0], h[1], h[2], 1.0]);
-                            u.extend_from_slice(&[h[3], h[4], h[5], 0.0]);
-                            u.extend_from_slice(&[h[6], h[7], h[8], 0.0]);
-                        }
-                        None => {
-                            u.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
-                            u.extend_from_slice(&[0.0, 1.0, 0.0, 0.0]);
-                            u.extend_from_slice(&[0.0, 0.0, 1.0, 0.0]);
-                        }
-                    }
-                    debug_assert_eq!(u.len() as u64 * 4, VECTOR_DRAW_UNIFORM_BYTES);
-                    let draw_off = alloc(bytemuck::cast_slice(&u), &mut uniforms);
+                    let uniform = vector_uniform(b, op, depth);
+                    let draw_off = alloc(bytemuck::bytes_of(&uniform), &mut uniforms);
 
                     use moda_text::vector::VectorOpPipeline as VP;
                     match op.pipeline {
@@ -1149,41 +1094,35 @@ impl TextDraw {
                                 v_len: (op.tris.len() * 4) as u64,
                             });
                         }
-                        VP::AnalyticShaderFill => {
-                            bail!("text shader fills are not ported ({})", b.node_id)
-                        }
+
                         VP::Analytic | VP::AnalyticGradient => {
                             if op.records.is_empty() {
                                 continue;
                             }
-                            let Some(_curve_idx) = curve_buf_idx else {
+                            if curve_buffer.is_none() {
                                 bail!("vector analytic op without curve points ({})", b.node_id);
                             };
-                            // packAnalyticInstances: base 7 f32 + 2 u32 (36 B),
-                            // then the KineticText per-glyph transform — 4 f32
-                            // glyph_lin + 2 f32 glyph_off + 1 f32 glyph_opacity
-                            // (28 B) → 64 B/instance, matching the analytic vertex
-                            // buffer layout (@location 5/6/7) in the shader manifest.
-                            let mut bytes: Vec<u8> = Vec::with_capacity(op.records.len() * 64);
+                            // Instance attribute order matches the analytic layouts in the shader manifest.
+                            let v_off = verts.len() as u64;
                             for r in op.records.iter() {
-                                bytes.extend_from_slice(&r.pen_x.to_le_bytes());
-                                bytes.extend_from_slice(&r.baseline_y.to_le_bytes());
-                                bytes.extend_from_slice(&r.font_size_px.to_le_bytes());
+                                verts.extend_from_slice(&r.pen_x.to_le_bytes());
+                                verts.extend_from_slice(&r.baseline_y.to_le_bytes());
+                                verts.extend_from_slice(&r.font_size_px.to_le_bytes());
                                 for c in r.em_box {
-                                    bytes.extend_from_slice(&c.to_le_bytes());
+                                    verts.extend_from_slice(&c.to_le_bytes());
                                 }
-                                bytes.extend_from_slice(&r.first_curve.to_le_bytes());
-                                bytes.extend_from_slice(&r.curve_count.to_le_bytes());
+                                verts.extend_from_slice(&r.first_curve.to_le_bytes());
+                                verts.extend_from_slice(&r.curve_count.to_le_bytes());
                                 for c in r.glyph_lin {
-                                    bytes.extend_from_slice(&c.to_le_bytes());
+                                    verts.extend_from_slice(&c.to_le_bytes());
                                 }
                                 for c in r.glyph_off {
-                                    bytes.extend_from_slice(&c.to_le_bytes());
+                                    verts.extend_from_slice(&c.to_le_bytes());
                                 }
-                                bytes.extend_from_slice(&r.glyph_opacity.to_le_bytes());
+                                verts.extend_from_slice(&r.glyph_opacity.to_le_bytes());
+                                verts.extend_from_slice(&r.local_aa_px.to_le_bytes());
                             }
-                            let v_off = verts.len() as u64;
-                            verts.extend_from_slice(&bytes);
+                            let v_len = verts.len() as u64 - v_off;
                             let kind = VectorDrawKind::Analytic {
                                 instance_count: op.records.len() as u32,
                             };
@@ -1204,7 +1143,7 @@ impl TextDraw {
                                     group: Some(group_for(VEC_FLAVOR_ANALYTIC)),
                                     dynamic_offsets: vec![draw_off],
                                     v_off,
-                                    v_len: bytes.len() as u64,
+                                    v_len,
                                 }),
                                 VP::AnalyticGradient => {
                                     // A text range's own gradient (`--nf-text-fill`), else the node's.
@@ -1224,22 +1163,28 @@ impl TextDraw {
                                         // dynamic offsets in binding order: 1 (draw), 3 (gradient)
                                         dynamic_offsets: vec![draw_off, g],
                                         v_off,
-                                        v_len: bytes.len() as u64,
+                                        v_len,
                                     });
                                 }
-                                VP::Tess | VP::AnalyticShaderFill => unreachable!(),
+                                VP::Tess => unreachable!(),
                             }
                         }
                     }
                 }
-                let _ = curve_buf_idx;
+            }
+            let params = b.vector.as_ref().and_then(|v| v.uniform_padding);
+            if padding.last().and_then(|&(_, previous)| previous) != params {
+                padding.push((prepared_batches.len(), params));
             }
             prepared_batches.push(PreparedBatch {
-                draws,
+                geometry: uniform_geometry(b), draws,
                 vector_draws,
             });
         }
 
+        if uniforms.is_empty() {
+            return Ok(PreparedText { batches: prepared_batches, padding, sample_count, ..Default::default() });
+        }
         let device = &gpu.device;
         let mk = |label: &str, data: &[u8], usage: wgpu::BufferUsages| -> wgpu::Buffer {
             create_filled_buffer(gpu, label, data, usage)
@@ -1247,7 +1192,7 @@ impl TextDraw {
         // The `uniforms` arena carries the per-batch MODEL MATRICES (and per-draw
         // depth/opacity/gradient), which change every pointermove — so it is
         // ALWAYS rebuilt + uploaded, never cached.
-        let uniform_buf = mk("text uniforms", &uniforms, wgpu::BufferUsages::UNIFORM);
+        let uniform_buf = mk("text uniforms", bytemuck::cast_slice(&uniforms), wgpu::BufferUsages::UNIFORM);
         // T9: the `verts`/`indices` arenas are node-LOCAL (position-independent —
         // the model matrix lives in `uniforms`), so they are byte-identical across
         // a transform-only drag and content-addressable. A hit reuses the
@@ -1297,14 +1242,14 @@ impl TextDraw {
             let bg = match flavor {
                 &VEC_FLAVOR_TESS => device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("vector text tess bind0"),
-                    layout: &self.vec_tess_bgl,
+                    layout: &self.layouts.vec_tess_bgl,
                     entries: &[frame_binding, draw_binding],
                 }),
                 &VEC_FLAVOR_ANALYTIC => {
                     let curve = &curve_bufs[curve_idx.expect("analytic group needs curves")];
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("vector text analytic bind0"),
-                        layout: &self.vec_analytic_bgl,
+                        layout: &self.layouts.vec_analytic_bgl,
                         entries: &[
                             frame_binding,
                             draw_binding,
@@ -1319,7 +1264,7 @@ impl TextDraw {
                     let curve = &curve_bufs[curve_idx.expect("gradient group needs curves")];
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("vector text gradient bind0"),
-                        layout: &self.vec_gradient_bgl,
+                        layout: &self.layouts.vec_gradient_bgl,
                         entries: &[
                             frame_binding,
                             draw_binding,
@@ -1355,7 +1300,7 @@ impl TextDraw {
         };
         let bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("text bind0"),
-            layout: &self.bgl0,
+            layout: &self.layouts.bgl0,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1407,7 +1352,7 @@ impl TextDraw {
             ibuf: Some(ibuf),
             bind0: Some(bind0),
             textures,
-            batches: prepared_batches,
+            batches: prepared_batches, padding,
             sample_count,
             quad_buf,
             vector_binds,
@@ -1418,11 +1363,11 @@ impl TextDraw {
             // (`curve_uploaded_bytes`), which was previously omitted, so
             // `pf_text_bytes` reflects reality and plateaus to ~uniforms-only
             // once a transform-only drag hits the arena cache every frame.
-            uploaded_bytes: uniforms.len() as u64
+            uploaded_bytes: uniforms.len() as u64 * UNIFORM_ALIGN
                 + verts_uploaded
                 + indices_uploaded
                 + curve_uploaded_bytes,
-            uniforms: std::cell::RefCell::new(Column::of(uniforms.chunks_exact(4).map(|b| b.try_into().unwrap()).collect())),
+            uniforms: std::cell::RefCell::new(Column::of(uniforms)),
         })
     }
 
@@ -1431,7 +1376,7 @@ impl TextDraw {
     /// re-bind its own pipeline/bind groups afterwards.
     pub fn draw_batch<'p>(
         &self,
-        pass: &mut wgpu::RenderPass<'p>,
+        pass: &mut impl wgpu::util::RenderEncoder<'p>,
         prepared: &'p PreparedText,
         batch_index: usize,
     ) {
@@ -1450,9 +1395,9 @@ impl TextDraw {
                 pass.set_pipeline(p);
                 current_module = Some(d.module.as_str());
             }
-            pass.set_bind_group(0, bind0, &d.offsets);
+            pass.set_bind_group(0, Some(bind0), &d.offsets);
             if let Some(tex) = d.tex {
-                pass.set_bind_group(1, prepared.textures[tex].as_ref(), &[]);
+                pass.set_bind_group(1, Some(prepared.textures[tex].as_ref()), &[]);
             }
             pass.set_vertex_buffer(0, vbuf.slice(d.v_off..d.v_off + d.v_len));
             pass.set_index_buffer(
@@ -1471,7 +1416,7 @@ impl TextDraw {
                 current_module = Some(d.module.as_str());
             }
             let group = &prepared.vector_binds[d.group.expect("vector group")];
-            pass.set_bind_group(0, group, &d.dynamic_offsets);
+            pass.set_bind_group(0, Some(group), &d.dynamic_offsets);
             match d.kind {
                 VectorDrawKind::Tess { vertex_count } => {
                     pass.set_vertex_buffer(0, vbuf.slice(d.v_off..d.v_off + d.v_len));
@@ -1498,9 +1443,11 @@ fn create_filled_buffer(
     data: &[u8],
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
+    let size = (data.len().max(4) as u64).next_multiple_of(4);
+    gpu.admission.charge(size, data.len() as u64);
     let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: (data.len().max(4) as u64).div_ceil(4) * 4,
+        size,
         usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1541,8 +1488,7 @@ const VEC_FLAVOR_GRADIENT: usize = 2;
 enum VectorDrawKind {
     /// `drawSolidTriangles`: slot 0 = flat xy triangles, non-indexed.
     Tess { vertex_count: u32 },
-    /// Instanced glyph quads: slot 0 = unit quad, slot 1 = 64-B instances
-    /// (16 floats: base 9 + KineticText glyph_lin/glyph_off/glyph_opacity).
+    /// Instanced glyph quads: slot 0 = unit quad, slot 1 = packed VectorAnalyticRecord instances.
     Analytic { instance_count: u32 },
 }
 
@@ -1557,7 +1503,66 @@ struct PreparedVectorDraw {
     v_len: u64,
 }
 
+// A packet needs a proof for the immutable part of the draw, even after the planner
+// evicts the source batch. The host key identifies node-local geometry. A scale change can
+// affect baked glyph padding. Batches with a padding uniform keep their local geometry at any affine.
+fn uniform_geometry(batch: &TextQuadBatch) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let key = batch.paint_geometry_key?;
+    let vector = batch.vector.as_ref()?;
+    if !batch.ops.is_empty() || batch.degraded.is_some()
+        || !vector.emojis.is_empty() || vector.gradient.is_some()
+        || vector.ops.iter().any(|op| op.gradient.is_some()) { return None; }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut model = batch.model_matrix;
+    if vector.uniform_padding.is_some() {
+        for i in [0, 1, 4, 5] { model[i] = 0.; }
+    }
+    model[12] = 0.;
+    model[13] = 0.;
+    vector.baked_padding_scale.map(f64::to_bits).hash(&mut hash);
+    (key, vector.uniform_padding.map(|(size, scale)| (size.to_bits(), scale.to_bits())), &batch.node_id, model.map(f32::to_bits), batch.z.to_bits(),
+        batch.page_clip_bounds.map(f32::to_bits), batch.distort.map(|h| h.map(f32::to_bits))).hash(&mut hash);
+    for op in &vector.ops {
+        (op.pipeline as u8, op.additive, op.stroke_px.to_bits(), op.blur_px.to_bits()).hash(&mut hash);
+    }
+    Some(hash.finish())
+}
+
+type UniformSlot = [u8; UNIFORM_ALIGN as usize];
+
+pub(crate) fn padding_words(pad: f64) -> [f32; 2] {
+    let hi = pad as f32;
+    [hi, (pad - f64::from(hi)) as f32]
+}
+
+/// The same DrawUniforms words for collection and for updates of the retained slot.
+fn vector_uniform(batch: &TextQuadBatch, op: &moda_text::vector::VectorOp, depth: f32) -> [f32; 40] {
+    let mut u = [0.; 40];
+    u[..16].copy_from_slice(&batch.model_matrix);
+    u[16..20].copy_from_slice(&op.color);
+    u[20..24].copy_from_slice(&[depth, op.opacity, op.blur_px, op.stroke_px]);
+    u[24..28].copy_from_slice(&batch.page_clip_bounds);
+    if let Some(h) = &batch.distort {
+        u[28..31].copy_from_slice(&h[..3]);
+        u[31] = 1.;
+        u[32..35].copy_from_slice(&h[3..6]);
+        u[36..39].copy_from_slice(&h[6..]);
+    } else {
+        u[28] = 1.;
+        u[33] = 1.;
+        u[38] = 1.;
+    }
+    let words = if batch.vector.as_ref().is_some_and(|v| v.uniform_padding.is_some()) {
+        padding_words(batch.quad_padding())
+    } else { [-1., 0.] };
+    u[35] = words[0];
+    u[39] = words[1];
+    u
+}
+
 struct PreparedBatch {
+    geometry: Option<u64>,
     draws: Vec<PreparedDraw>,
     /// Track C: vector-engine draws (set ⇔ the batch carries `vector` ops).
     vector_draws: Vec<PreparedVectorDraw>,
@@ -1573,7 +1578,7 @@ pub struct PreparedText {
     pipes: Vec<(String, wgpu::RenderPipeline)>,
     /// Kept for ownership clarity; the bind groups hold their own refs.
     _uniform_buf: Option<wgpu::Buffer>,
-    uniforms: std::cell::RefCell<Column<[u8; 4]>>,
+    uniforms: std::cell::RefCell<Column<UniformSlot>>,
     /// T9: `Arc` so a content-cache hit shares the already-uploaded buffer with
     /// the cache (an `Arc` pointer-bump, not a re-upload) while this
     /// `PreparedText` still keeps it alive for the frame.
@@ -1582,6 +1587,8 @@ pub struct PreparedText {
     bind0: Option<wgpu::BindGroup>,
     textures: Vec<Arc<wgpu::BindGroup>>,
     batches: Vec<PreparedBatch>,
+    /// Run starts in batch order. Fonts and render scales usually agree across a text chunk.
+    padding: Vec<(usize, Option<(f64, f64)>)>,
     sample_count: u32,
     /// Track C — vector engine: static unit quad, group-0 bind groups
     /// (tess/analytic/gradient flavors), shader-fill curve groups, and the
@@ -1600,25 +1607,59 @@ pub struct PreparedText {
 }
 
 impl PreparedText {
-    /// The host's content identity certifies the immutable geometry; only paint values differ.
-    pub fn can_repaint(&self, at: usize, old: &TextQuadBatch, new: &TextQuadBatch) -> bool {
-        old.paint_geometry_key.is_some() && old.paint_geometry_key == new.paint_geometry_key
-            && old.node_id == new.node_id && old.model_matrix == new.model_matrix && old.z == new.z
-            && old.page_clip_bounds == new.page_clip_bounds && old.distort == new.distort
-            && old.ops.is_empty() && new.ops.is_empty() && old.degraded.is_none() && new.degraded.is_none()
-            && self.batches.get(at).is_some_and(|b| new.vector.as_ref().is_some_and(|v|
-                v.ops.len() == b.vector_draws.len()))
+    /// A placement recipe preserves this batch's geometry and draw order. A
+    /// replacement also compares the host's content and immutable draw fields.
+    pub fn can_update_uniforms(&self, at: usize, new: &TextQuadBatch, placement_only: bool) -> bool {
+        // The vector uniform writer cannot install the selected face's texture binding.
+        // Check both sides, including a source re-emitted into a certified placement slot.
+        self.batches.get(at).is_some_and(|b| b.geometry.is_some()
+            && new.vector.as_ref().is_some_and(|v| v.emojis.is_empty() && v.ops.len() == b.vector_draws.len())
+            && (placement_only || b.geometry == uniform_geometry(new)))
+    }
+
+    pub fn retain_uniform_tails(&self, budget: &mut usize) {
+        self.uniforms.borrow_mut().retain_tails(budget);
+    }
+
+    pub fn padding_bytes(&self) -> usize {
+        self.padding.capacity() * std::mem::size_of::<(usize, Option<(f64, f64)>)>()
+    }
+
+    fn padding_at(&self, at: usize) -> Option<(f64, f64)> {
+        let end = self.padding.partition_point(|&(start, _)| start <= at);
+        self.padding.get(end.checked_sub(1)?)?.1
+    }
+
+    pub fn admits_matrix(&self, at: usize) -> bool {
+        self.batches.get(at).is_some_and(|batch| batch.geometry.is_some()) && self.padding_at(at).is_some()
+    }
+
+    pub fn stage_matrix(&self, at: usize, matrix: &[f32; 16]) {
+        let params = self.padding_at(at).expect("certified uniform padding");
+        let padding = padding_words(TextQuadBatch::matrix_padding(matrix, params));
+        let mut column = self.uniforms.borrow_mut();
+        for draw in &self.batches[at].vector_draws {
+            let index = draw.dynamic_offsets[0] / UNIFORM_ALIGN as u32;
+            column.put_matrix(index, matrix, Some(padding)).expect("prepared text uniform");
+        }
+    }
+
+    pub fn fit_uniforms(&self, bytes: usize) -> usize {
+        self.uniforms.borrow_mut().fit_budget(bytes)
     }
 
     /// Stage values by batch address; commit once for this retained uniform column.
-    pub fn stage_paint(&self, at: usize, batch: &TextQuadBatch) {
+    pub fn stage_paint(&self, at: usize, batch: &TextQuadBatch, translated: bool) {
         let mut column = self.uniforms.borrow_mut();
+        let depth = crate::depth::linear_depth(batch.z) as f32;
         for (draw, op) in self.batches[at].vector_draws.iter().zip(&batch.vector.as_ref().unwrap().ops) {
-            let start = draw.dynamic_offsets[0] / 4 + 16;
-            for (i, color) in op.color.iter().enumerate() {
-                column.put(start + i as u32, &color.to_ne_bytes()).expect("prepared text uniform");
-            }
-            column.put(start + 5, &op.opacity.to_ne_bytes()).expect("prepared text uniform");
+            let index = draw.dynamic_offsets[0] / UNIFORM_ALIGN as u32;
+            let mut slot = [0; UNIFORM_ALIGN as usize];
+            let uniform = vector_uniform(batch, op, depth);
+            let data = bytemuck::bytes_of(&uniform);
+            slot[..data.len()].copy_from_slice(data);
+            let range = if translated { 48..56 } else { 0..data.len() };
+            column.put_words(index, &slot, range).expect("prepared text uniform");
         }
     }
 
@@ -1651,13 +1692,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_emoji_no_face_draws_is_an_error_not_a_blank() {
-        // audit-2d 13: the draw used to skip the cell and return a finished frame.
-        let engine = moda_text::degraded::engine().expect("degraded engine");
-        // A letter has no colour glyph in any font set, the bundled one included.
-        for _ in 0..2 {
-            let error = emoji_image(&engine, "a").err().expect("no colour glyph for a letter").to_string();
-            assert!(error.contains("emoji \"a\"") && error.contains("colour"), "{error}");
+    fn uniform_updates_reject_recollected_baked_padding_at_another_scale() {
+        let batch = |scale| TextQuadBatch {
+            node_id: "stroke".into(), model_matrix: [0.; 16], z: 1., page_clip_bounds: [0.; 4],
+            ops: Vec::new(), degraded: None, emoji_engine: None, distort: None,
+            vector: Some(moda_text::vector::VectorNodeOps { baked_padding_scale: Some(scale), ..Default::default() }),
+            paint_geometry_key: Some([7; 4]), content_key: None,
+        };
+        let original = batch(1.);
+        let collected = PreparedText { batches: vec![PreparedBatch { geometry: uniform_geometry(&original),
+            draws: vec![], vector_draws: vec![] }], ..Default::default() };
+        assert!(collected.can_update_uniforms(0, &batch(1.), false));
+        assert!(!collected.can_update_uniforms(0, &batch(2.), false));
+
+        // An image in the restored source needs a texture binding even if the
+        // node key, baked padding and number of analytic draws still match.
+        let mut with_image = batch(1.);
+        with_image.vector.as_mut().unwrap().emojis.push(moda_text::vector::VectorEmoji {
+            cluster: "✅".into(), shaped: None, ppem: 64, corners: [0.; 8], opacity: 1., effect: None,
+        });
+        for placement_only in [false, true] {
+            assert!(!collected.can_update_uniforms(0, &with_image, placement_only));
         }
     }
 }

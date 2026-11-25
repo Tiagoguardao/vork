@@ -309,230 +309,6 @@ pub struct Dither {
     pub pixel_size: Option<f64>,
 }
 
-/// Roughen (Illustrator's Effect ▸ Distort & Transform ▸ Roughen): anchors
-/// added along the path at `detail` per inch, every anchor moved by a seeded
-/// random offset of at most `size`. Geometry: [`crate::live_effects`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Roughen {
-    /// Largest displacement: a percentage of the art's larger side
-    /// (`sizeMode` relative, the default) or canvas px (absolute).
-    #[serde(default)]
-    pub size: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_mode: Option<String>,
-    /// Anchors added per inch (72 px) of path.
-    #[serde(default)]
-    pub detail: f64,
-    /// `smooth` (default) or `corner`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub points: Option<String>,
-    /// Random seed; the same seed always gives the same shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<f64>,
-}
-
-/// Zig Zag: `ridges` extra anchors per segment, moved alternately either side
-/// of the path by `size`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ZigZag {
-    #[serde(default)]
-    pub size: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_mode: Option<String>,
-    #[serde(default)]
-    pub ridges: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub points: Option<String>,
-}
-
-/// Pucker & Bloat: `amount` in % (−200..200). Negative puckers (anchors out,
-/// segments in), positive bloats (anchors in, segments out).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct PuckerBloat {
-    #[serde(default)]
-    pub amount: f64,
-}
-
-/// Twist: rotates the art about its centre, `angle` degrees at the centre
-/// falling to 0 at the corners of its bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Twist {
-    #[serde(default)]
-    pub angle: f64,
-}
-
-/// Transform (with copies): scale / move / rotate / reflect about a reference
-/// point of the art's bounds; `copies` > 0 keeps the original and adds that
-/// many copies, each transformed once more than the last.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransformEffect {
-    /// Percent; absent = 100.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_x: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_y: Option<f64>,
-    /// Canvas px.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub move_x: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub move_y: Option<f64>,
-    /// Degrees, clockwise on screen (as a node's `rotation`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rotate: Option<f64>,
-    /// Reflect across the horizontal axis (y flips), as Illustrator's Reflect X.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reflect_x: Option<bool>,
-    /// Reflect across the vertical axis (x flips), as Illustrator's Reflect Y.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reflect_y: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copies: Option<f64>,
-    /// One of the 9 reference points (`top-left` … `bottom-right`); absent = `center`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    /// Illustrator's Random: each copy's scale, move and rotation are drawn
-    /// between none and the value, from `seed`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub random: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<f64>,
-}
-
-/// Scribble (Stylize): the fill (and the stroke's band) redrawn as one
-/// back-and-forth stroke of hatch lines. Geometry: `live_effects_distort`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScribbleEffect {
-    /// Hatch direction, degrees counter-clockwise from horizontal (Illustrator's dialog).
-    #[serde(default)]
-    pub angle: f64,
-    /// How far the strokes run past the edge (negative: stop inside it), px.
-    #[serde(default)]
-    pub path_overlap: f64,
-    #[serde(default)]
-    pub path_overlap_variation: f64,
-    #[serde(default)]
-    pub stroke_width: f64,
-    /// 0..100 %: how far the turns loop.
-    #[serde(default)]
-    pub curviness: f64,
-    #[serde(default)]
-    pub curviness_variation: f64,
-    /// Distance between hatch lines, px.
-    #[serde(default)]
-    pub spacing: f64,
-    #[serde(default)]
-    pub spacing_variation: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<f64>,
-    /// The preset the settings came from (a label; the numbers are what draw).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
-}
-
-/// Tweak (Distort & Transform): anchors and / or handles moved by seeded random
-/// offsets up to `horizontal` / `vertical` (percent of the art's width /
-/// height, or px when `sizeMode` is absolute).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TweakEffect {
-    #[serde(default)]
-    pub horizontal: f64,
-    #[serde(default)]
-    pub vertical: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_mode: Option<String>,
-    /// Modify anchor points; absent = true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchors: Option<bool>,
-    /// Modify "In" control points (the handle before each anchor); absent = true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub in_handles: Option<bool>,
-    /// Modify "Out" control points (the handle after each anchor); absent = true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub out_handles: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<f64>,
-}
-
-/// Free Distort (Distort & Transform): the art's bounds moved onto four
-/// corners, given in the bounds' unit space (0,0 = top-left, 1,1 =
-/// bottom-right), in the order top-left, top-right, bottom-right, bottom-left.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FreeDistortEffect {
-    #[serde(default)]
-    pub corners: Vec<[f64; 2]>,
-}
-
-/// Convert to Shape: the art replaced by a rectangle, rounded rectangle or
-/// ellipse over its bounds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConvertToShapeEffect {
-    /// `rectangle` (default), `rounded-rectangle` or `ellipse`.
-    #[serde(default)]
-    pub shape: String,
-    /// `relative` (default: the bounds plus `extraWidth` / `extraHeight` each
-    /// side) or `absolute` (`width` × `height` about the centre).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub width: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub height: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_width: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_height: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corner_radius: Option<f64>,
-}
-
-/// Round Corners (Stylize): every corner rounded by `radius` canvas px.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RoundCornersEffect {
-    #[serde(default)]
-    pub radius: f64,
-}
-
-/// Offset Path (Path): grown (positive) or shrunk by `offset` canvas px.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OffsetPathEffect {
-    #[serde(default)]
-    pub offset: f64,
-    /// `miter` (default), `round` or `bevel`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub miter_limit: Option<f64>,
-}
-
-/// Warp: one of Illustrator's 15 envelope presets over the art's bounds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WarpEffect {
-    /// `arc`, `arc-lower`, `arc-upper`, `arch`, `bulge`, `shell-lower`,
-    /// `shell-upper`, `flag`, `wave`, `fish`, `rise`, `fisheye`, `inflate`,
-    /// `squeeze`, `twist`.
-    #[serde(default)]
-    pub style: String,
-    /// Percent, −100..100.
-    #[serde(default)]
-    pub bend: f64,
-    /// Horizontal / vertical distortion, percent, −100..100.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub horizontal: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vertical: Option<f64>,
-    /// `horizontal` (default) or `vertical`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orientation: Option<String>,
-}
-
 /// What an effect draws. Tagged by `type` (kebab-case, as in TS).
 ///
 /// `Shader`, `Glow`, `InnerGlow`, `Echo` and `Extrude` keep their params as stored JSON:
@@ -547,6 +323,8 @@ pub enum EffectKind {
     Texture(Texture),
     Feather(Feather),
     FilterShadow(FilterShadow),
+    MaskCapture,
+    ColorMatrix { values: [f32; 20] },
     BackgroundBlur(RadiusBlur),
     Glass(Glass),
     Pixelate(Pixelate),
@@ -569,26 +347,12 @@ pub enum EffectKind {
     Desaturate(Map),
     GradientMap(Map),
     ChannelMixer(Map),
-    Shader(Map),
+
     Glow(Map),
     InnerGlow(Map),
     Echo(Map),
     Extrude(Map),
-    // Live geometry effects (E8.1): they reshape the outline before any fill or
-    // stroke draws. See `crate::live_effects`.
-    Roughen(Roughen),
-    ZigZag(ZigZag),
-    PuckerBloat(PuckerBloat),
-    Twist(Twist),
-    Transform(TransformEffect),
-    RoundCorners(RoundCornersEffect),
-    OffsetPath(OffsetPathEffect),
-    OutlineStroke(Map),
-    Warp(WarpEffect),
-    Scribble(ScribbleEffect),
-    Tweak(TweakEffect),
-    FreeDistort(FreeDistortEffect),
-    ConvertToShape(ConvertToShapeEffect),
+
 }
 
 /// One entry of a node's `effects`.
@@ -617,6 +381,8 @@ impl Effect {
             EffectKind::Texture(_) => "texture",
             EffectKind::Feather(_) => "feather",
             EffectKind::FilterShadow(_) => "filter-shadow",
+            EffectKind::MaskCapture => "mask-capture",
+            EffectKind::ColorMatrix { .. } => "color-matrix",
             EffectKind::BackgroundBlur(_) => "background-blur",
             EffectKind::Glass(_) => "glass",
             EffectKind::Pixelate(_) => "pixelate",
@@ -636,24 +402,12 @@ impl Effect {
             EffectKind::Desaturate(_) => "desaturate",
             EffectKind::GradientMap(_) => "gradient-map",
             EffectKind::ChannelMixer(_) => "channel-mixer",
-            EffectKind::Shader(_) => "shader",
+
             EffectKind::Glow(_) => "glow",
             EffectKind::InnerGlow(_) => "inner-glow",
             EffectKind::Echo(_) => "echo",
             EffectKind::Extrude(_) => "extrude",
-            EffectKind::Roughen(_) => "roughen",
-            EffectKind::ZigZag(_) => "zig-zag",
-            EffectKind::PuckerBloat(_) => "pucker-bloat",
-            EffectKind::Twist(_) => "twist",
-            EffectKind::Transform(_) => "transform",
-            EffectKind::RoundCorners(_) => "round-corners",
-            EffectKind::OffsetPath(_) => "offset-path",
-            EffectKind::OutlineStroke(_) => "outline-stroke",
-            EffectKind::Warp(_) => "warp",
-            EffectKind::Scribble(_) => "scribble",
-            EffectKind::Tweak(_) => "tweak",
-            EffectKind::FreeDistort(_) => "free-distort",
-            EffectKind::ConvertToShape(_) => "convert-to-shape",
+
         }
     }
 
@@ -682,28 +436,7 @@ impl Effect {
         )
     }
 
-    /// A live geometry effect (reshapes the outline; `crate::live_effects`).
-    pub fn is_geometry(&self) -> bool {
-        GEOMETRY_EFFECT_TYPES.contains(&self.type_name())
-    }
 }
-
-/// The live geometry effect types (E8.1), in the TS `GEOMETRY_EFFECT_TYPES` order.
-pub const GEOMETRY_EFFECT_TYPES: &[&str] = &[
-    "roughen",
-    "zig-zag",
-    "pucker-bloat",
-    "twist",
-    "transform",
-    "round-corners",
-    "offset-path",
-    "outline-stroke",
-    "warp",
-    "scribble",
-    "tweak",
-    "free-distort",
-    "convert-to-shape",
-];
 
 /// The backdrop effect types: the four original kinds, the filter kinds
 /// ([`crate::backdrop_kinds::FILTER_KINDS`]), then the adjustment kinds ([`crate::backdrop_kinds::ADJUSTMENT_KINDS`]).
@@ -980,42 +713,15 @@ pub fn feather(node: &RawNode) -> Option<Feather> {
 /// layer blur (uniform or progressive), noise, texture, feather or filter
 /// shadow (`hasLayerFilter`).
 pub fn has_active_layer_filter(node: &RawNode) -> bool {
+    let effects = node_effects_shared(node);
+    if effects.is_empty() { return false; }
     has_active_layer_blur(node)
+        || effects.iter().any(|effect| effect.is_visible()
+            && matches!(effect.kind, EffectKind::MaskCapture | EffectKind::ColorMatrix { .. }))
         || !filter_shadows(node).is_empty()
         || !noise_effects(node).is_empty()
         || texture(node).is_some()
         || feather(node).is_some()
-        || !agent_shader_effects(node).is_empty()
-}
-
-/// An agent shader as a layer effect (docs/design/effects-code-first.md §4.3): a visible `shader` entry of
-/// `effects` whose `shaderId` is a code key (`b3:…`) naming a WGSL code object in the document's code table. It runs
-/// over the layer as drawn (after its blur, noise, texture and feather), in list order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentShaderEffect {
-    /// The code key.
-    pub code: String,
-    /// Values for the code's schema parameters (and `seed`).
-    pub params: Map,
-    /// How far (layer px) the effect may draw outside the layer: the capture is padded by it.
-    pub pad: f64,
-}
-
-/// The node's agent shader effects, in list order.
-pub fn agent_shader_effects(node: &RawNode) -> Vec<AgentShaderEffect> {
-    node_effects_json(node)
-        .iter()
-        .filter(|e| e.get("type").and_then(Value::as_str) == Some("shader") && is_visible_json(e))
-        .filter(|e| e.get("mode").and_then(Value::as_str) != Some(crate::shader_effects::SOURCE_MASK_SHADER_EFFECT_MODE))
-        .filter_map(|e| {
-            let code = e.get("shaderId").and_then(Value::as_str).filter(|s| s.starts_with("b3:"))?;
-            Some(AgentShaderEffect {
-                code: code.to_string(),
-                params: e.get("params").and_then(Value::as_object).cloned().unwrap_or_default(),
-                pad: e.get("pad").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, 4096.0),
-            })
-        })
-        .collect()
 }
 
 /// The raw JSON of the node's visible glow / echo / extrude entries, back to
@@ -1057,51 +763,6 @@ mod tests {
 
     fn raw(v: Value) -> RawNode {
         RawNode::new(v.as_object().unwrap().clone())
-    }
-
-    #[test]
-    fn parses_every_type_and_round_trips() {
-        let v = json!([
-            {"id": "d", "type": "drop-shadow", "color": "#000", "blur": 4, "offset": {"x": 1, "y": 2}, "spread": -4, "opacity": 0.5, "showBehindNode": true},
-            {"id": "i", "type": "inner-shadow", "color": "#111", "blur": 2, "offset": {"x": 0, "y": 1}, "spread": 3},
-            {"id": "l", "type": "layer-blur", "radius": 6, "visible": false},
-            {"id": "lp", "type": "layer-blur", "radius": 6, "progressive": {"startRadius": 1, "start": {"x": 0, "y": 0}, "end": {"x": 1, "y": 1}}},
-            {"id": "n", "type": "noise", "mode": "duo", "color": "#000", "secondaryColor": "#fff", "size": 2, "density": 0.4, "opacity": 0.5},
-            {"id": "tx", "type": "texture", "size": 4, "radius": 3, "clipToShape": true},
-            {"id": "b", "type": "background-blur", "radius": 8},
-            {"id": "g", "type": "glass", "frost": 1, "refraction": 2, "depth": 3, "lightAngle": 4, "lightIntensity": 5, "dispersion": 6, "splay": 7},
-            {"id": "p", "type": "pixelate", "pixelSize": 9},
-            {"id": "t", "type": "dither", "brightness": 0, "contrast": 100, "pixelSize": 2},
-            {"id": "s", "type": "shader", "shaderId": "x", "mode": "post-process", "source": {"type": "self-asset"}, "params": {}},
-            {"id": "gl", "type": "glow", "color": "#fff", "radiusPx": 12},
-            {"id": "ig", "type": "inner-glow", "color": "#fff", "radiusPx": 8, "source": "center", "mode": "normal"},
-            {"id": "e", "type": "echo", "count": 3, "offsetX": 1, "offsetY": 1},
-            {"id": "x", "type": "extrude", "depthPx": 4, "color": "#444"},
-            {"id": "f", "type": "feather", "radius": 10},
-            {"id": "bad", "type": "nope"}
-        ]);
-        let effects = parse_effects(Some(&v));
-        assert_eq!(effects.len(), 16);
-        assert_eq!(effects[15].type_name(), "feather");
-        assert_eq!(effects[12].type_name(), "inner-glow");
-        let back = crate::value::to_value(&effects).unwrap();
-        for (a, b) in back.as_array().unwrap().iter().zip(v.as_array().unwrap()) {
-            assert_eq!(a.get("id"), b.get("id"));
-            assert_eq!(a.get("type"), b.get("type"));
-            assert_eq!(a.get("visible"), b.get("visible"));
-        }
-        assert_eq!(back[0]["showBehindNode"], json!(true));
-        assert_eq!(back[0]["spread"], json!(-4.0));
-        assert_eq!(back[3]["progressive"]["startRadius"], json!(1.0));
-        assert_eq!(back[4]["secondaryColor"], json!("#fff"));
-        assert_eq!(back[5]["clipToShape"], json!(true));
-        assert_eq!(back[10]["shaderId"], json!("x"));
-        assert_eq!(back[12]["source"], json!("center"));
-        assert_eq!(effects[9].type_name(), "dither");
-        assert!(
-            back[2].get("progressive").is_none(),
-            "a uniform blur writes no progressive key"
-        );
     }
 
     #[test]
@@ -1205,5 +866,54 @@ mod tests {
         );
         let i = inner_shadow(&n).unwrap();
         assert_eq!((i.opacity(), i.spread()), (1.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+    use crate::value::json;
+
+    #[test]
+    fn native_effects_round_trip() {
+        let v = json!([
+            {"id": "d", "type": "drop-shadow", "color": "#000", "blur": 4, "offset": {"x": 1, "y": 2}, "spread": -4, "opacity": 0.5, "showBehindNode": true},
+            {"id": "i", "type": "inner-shadow", "color": "#111", "blur": 2, "offset": {"x": 0, "y": 1}, "spread": 3},
+            {"id": "l", "type": "layer-blur", "radius": 6, "visible": false},
+            {"id": "lp", "type": "layer-blur", "radius": 6, "progressive": {"startRadius": 1, "start": {"x": 0, "y": 0}, "end": {"x": 1, "y": 1}}},
+            {"id": "n", "type": "noise", "mode": "duo", "color": "#000", "secondaryColor": "#fff", "size": 2, "density": 0.4, "opacity": 0.5},
+            {"id": "tx", "type": "texture", "size": 4, "radius": 3, "clipToShape": true},
+            {"id": "b", "type": "background-blur", "radius": 8},
+            {"id": "g", "type": "glass", "frost": 1, "refraction": 2, "depth": 3, "lightAngle": 4, "lightIntensity": 5, "dispersion": 6, "splay": 7},
+            {"id": "p", "type": "pixelate", "pixelSize": 9},
+            {"id": "t", "type": "dither", "brightness": 0, "contrast": 100, "pixelSize": 2},
+            {"id": "gl", "type": "glow", "color": "#fff", "radiusPx": 12},
+            {"id": "ig", "type": "inner-glow", "color": "#fff", "radiusPx": 8, "source": "center", "mode": "normal"},
+            {"id": "e", "type": "echo", "count": 3, "offsetX": 1, "offsetY": 1},
+            {"id": "x", "type": "extrude", "depthPx": 4, "color": "#444"},
+            {"id": "f", "type": "feather", "radius": 10},
+            {"id": "bad", "type": "nope"}
+        ]);
+        let effects = parse_effects(Some(&v));
+        assert_eq!(effects.len(), 15);
+        assert_eq!(effects[14].type_name(), "feather");
+        assert_eq!(effects[11].type_name(), "inner-glow");
+        let back = crate::value::to_value(&effects).unwrap();
+        for (a, b) in back.as_array().unwrap().iter().zip(v.as_array().unwrap()) {
+            assert_eq!(a.get("id"), b.get("id"));
+            assert_eq!(a.get("type"), b.get("type"));
+            assert_eq!(a.get("visible"), b.get("visible"));
+        }
+        assert_eq!(back[0]["showBehindNode"], json!(true));
+        assert_eq!(back[0]["spread"], json!(-4.0));
+        assert_eq!(back[3]["progressive"]["startRadius"], json!(1.0));
+        assert_eq!(back[4]["secondaryColor"], json!("#fff"));
+        assert_eq!(back[5]["clipToShape"], json!(true));
+        assert_eq!(back[11]["source"], json!("center"));
+        assert_eq!(effects[9].type_name(), "dither");
+        assert!(
+            back[2].get("progressive").is_none(),
+            "a uniform blur writes no progressive key"
+        );
     }
 }

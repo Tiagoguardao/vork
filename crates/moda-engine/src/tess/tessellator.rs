@@ -27,12 +27,13 @@
 //!   that last case: an open dash piece has no interior, so it stays centered.
 //! - Open subpaths are filled as if closed (:478-497). Quirk Q-51.
 
+use moda_scene::path_length::{distance_tolerance, elevated_controls};
 use super::arc::{arc_to_beziers, ArcParams};
 use super::dash::{
     aligned_dash_intervals, cubic_arc_length, dash_pieces, extract_path_segments_by_arc_length,
     intervals_as_walk_pattern, normalize_dash_pattern, quadratic_arc_length, scale_dash_pattern,
-    segment_corner_positions, walk_path_by_arc_length, walk_path_by_arc_length_phased,
-    PathSegment, Pt, Seg, BASE_DASH_STROKE_WIDTH,
+    segment_corner_positions, split_cubic, walk_path_by_arc_length, walk_path_by_arc_length_phased,
+    Cubic, PathSegment, Pt, Seg, BASE_DASH_STROKE_WIDTH,
 };
 use super::moda_engine_path_types::*;
 use super::trim_axis::{self, TrimBy};
@@ -123,7 +124,7 @@ pub(crate) fn flatness_tolerance() -> f64 {
 /// the render band less the bands `stroke_within_caps` / `fill_path` gave
 /// back (never below 1×).
 fn flatten_band() -> i32 {
-    let band = super::outline::current_band();
+    let band = super::curve_quality::current_band();
     if band < 0 {
         band
     } else {
@@ -192,7 +193,7 @@ fn stroke_within_caps(
         restore();
         return if complete { Ok(out) } else { Err(INCOMPLETE_PATH.into()) };
     }
-    let band = super::outline::current_band().max(0);
+    let band = super::curve_quality::current_band().max(0);
     // Up-front estimate: the first level whose flattening fits.
     let fits_estimate = |c: i32| {
         COARSEN.with(|k| k.set(c));
@@ -223,7 +224,7 @@ fn stroke_within_caps(
 const EST_VERTS_PER_SEGMENT: f64 = 9.0;
 
 /// Estimated flattened size of `points` at `flat`: (the largest subpath's
-/// segment count, the total). Mirrors `tessellate_cubic_bezier`'s midpoint
+/// segment count, the total). Mirrors `visit_flat_cubics`' midpoint
 /// recursion: control-point deviation shrinks ~4× per level, the control
 /// polygon's turn ~2× per level.
 fn estimate_flattened(points: &[PathCmd], flat: Flat) -> (usize, usize) {
@@ -312,19 +313,16 @@ fn estimate_flattened(points: &[PathCmd], flat: Flat) -> (usize, usize) {
     (worst.max(here), total)
 }
 
-/// The control points' largest distance from the chord (`is_curve_flat`'s
-/// measure).
+/// Largest distance from a control point to the finite chord, including overshoots.
 fn cubic_deviation(p0: P, p1: P, p2: P, p3: P) -> f64 {
     let (dx, dy) = (p3[0] - p0[0], p3[1] - p0[1]);
     let d2 = dx * dx + dy * dy;
-    let dist = |p: P| {
-        if d2 == 0.0 {
-            return (p[0] - p0[0]).hypot(p[1] - p0[1]);
-        }
-        let t = (((p[0] - p0[0]) * dx + (p[1] - p0[1]) * dy) / d2).clamp(0.0, 1.0);
-        (p[0] - (p0[0] + t * dx)).hypot(p[1] - (p0[1] + t * dy))
+    let distance_squared = |p: P| {
+        let (x, y) = (p[0] - p0[0], p[1] - p0[1]);
+        let t = if d2 == 0. { 0. } else { ((x * dx + y * dy) / d2).clamp(0., 1.) };
+        (x - t * dx).powi(2) + (y - t * dy).powi(2)
     };
-    dist(p1).max(dist(p2))
+    distance_squared(p1).max(distance_squared(p2)).sqrt()
 }
 
 fn has_curve_cmds(points: &[PathCmd]) -> bool {
@@ -332,7 +330,6 @@ fn has_curve_cmds(points: &[PathCmd]) -> bool {
         .iter()
         .any(|p| !matches!(p, PathCmd::Move { .. } | PathCmd::Line { .. }))
 }
-const POLY_EPS: f64 = 1e-4; // :56
 /// Cap on the vertices a fill may emit — both the UNIQUE vertices lyon
 /// creates and the EXPANDED stream the renderer consumes (three references
 /// per triangle). Enforced inside lyon's sweep by `BoundedFillBuilder`, so a
@@ -412,7 +409,7 @@ thread_local! {
 /// ends, adjusting lengths to fit") or laid out exactly (`false`, the
 /// default), restoring the previous setting after. Like [`with_miter_limit`],
 /// a per-node setting read by every dash walk under `f`: the uniform stroke's
-/// ([`apply_dash_to_path`]) and the outliner's dash windows
+/// ([`dash_contours`]) and the outliner's dash windows
 /// (`outline::arc_windows_on`). The renderer sets it per body item
 /// (`frame.rs` `build_body_item`), the outliner's own entry points
 /// (`tessellate_outlined_node`, the `stroke_outline` export) from the node.
@@ -437,10 +434,9 @@ pub fn dash_alignment_now() -> bool {
 /// [`segment_corner_positions`]), with each sub-path's measured length, in
 /// sub-path order — what the outliner needs to align its dash windows.
 pub fn subpath_corners(points: &[PathCmd], closed: bool) -> Vec<(f64, Vec<f64>)> {
-    split_subpaths(points)
-        .into_iter()
-        .map(|sp| {
-            let segs = path_points_to_segments(sp, closed);
+    PathContours::new(points, closed).iter()
+        .map(|c| {
+            let segs = path_points_to_segments(c.points, c.closed);
             let total: f64 = segs.iter().map(|s| s.arc_length).sum();
             (total, segment_corner_positions(&segs, closed))
         })
@@ -518,10 +514,10 @@ pub fn tessellate_combined_with_dash(
 /// byte-identical to [`tessellate_combined_with_dash`]. See
 /// `docs/roadmap/canvas/stroke-path-animation.md`.
 #[allow(clippy::too_many_arguments)]
-pub fn tessellate_combined_cached(
-    points: &[PathCmd],
+pub fn tessellate_combined_cached<'a>(
+    points: &'a [PathCmd],
     stroke_width: f64,
-    closed: bool,
+    closure: impl Into<PathClosure<'a>>,
     trim: Option<TrimParams>,
     dash: Option<&[f64]>,
     dash_offset: f64,
@@ -552,15 +548,16 @@ pub fn tessellate_combined_cached(
         static CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache::default());
     }
 
+    let closure = closure.into();
     if CAP_HIT.with(std::cell::Cell::get) {
-        return Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closed,
+        return Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closure,
             trim, dash, dash_offset, line_cap, line_join, fill_rule, stroke_align));
     }
 
     let mut key = vec![
-        stroke_width.to_bits(), closed as u64, dash_offset.to_bits(), line_cap as u64,
+        stroke_width.to_bits(), dash_offset.to_bits(), line_cap as u64,
         line_join as u64, fill_rule as u64, stroke_align as u64,
-        super::outline::current_band() as u64,
+        super::curve_quality::current_band() as u64,
         MITER_LIMIT_NOW.with(std::cell::Cell::get).to_bits(),
         DASH_ALIGN_NOW.with(std::cell::Cell::get) as u64,
         SWEEP_BUDGET.with(std::cell::Cell::get) as u64,
@@ -577,6 +574,14 @@ pub fn tessellate_combined_cached(
     if let Some(dash) = dash {
         key.push(dash.len() as u64);
         key.extend(dash.iter().map(|value| value.to_bits()));
+    }
+    match closure {
+        PathClosure::Uniform(closed) => key.push(closed as u64),
+        PathClosure::PerContour(_) => {
+            key.push(2);
+            key.extend(PathContours::new(points, closure).iter().map(|c| c.closed as u64));
+            key.push(2); // End of the closure flags.
+        }
     }
     key.push(points.len() as u64);
     for point in points {
@@ -604,7 +609,7 @@ pub fn tessellate_combined_cached(
     }) {
         return geometry;
     }
-    let geometry = Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closed,
+    let geometry = Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closure,
         trim, dash, dash_offset, line_cap, line_join, fill_rule, stroke_align));
     let bytes = 2 * key.capacity() * std::mem::size_of::<u64>()
         + geometry.positions.capacity() * std::mem::size_of::<f32>()
@@ -637,10 +642,10 @@ pub fn tessellate_combined_cached(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn tessellate_combined_with_dash_trim(
-    points: &[PathCmd],
+pub fn tessellate_combined_with_dash_trim<'a>(
+    points: &'a [PathCmd],
     stroke_width: f64,
-    closed: bool,
+    closure: impl Into<PathClosure<'a>>,
     trim: Option<TrimParams>,
     dash: Option<&[f64]>,
     dash_offset: f64,
@@ -652,7 +657,7 @@ pub fn tessellate_combined_with_dash_trim(
     let o = tessellate_combined_oracle(
         points,
         stroke_width,
-        closed,
+        closure,
         trim,
         dash,
         dash_offset,
@@ -661,6 +666,10 @@ pub fn tessellate_combined_with_dash_trim(
         fill_rule,
         stroke_align,
     );
+    geometry_from_oracle(o)
+}
+
+fn geometry_from_oracle(o: OracleGeometry) -> TessellatedGeometry {
     let vertex_count = (o.positions.len() / 2) as u32;
     TessellatedGeometry {
         positions: o.positions,
@@ -682,6 +691,71 @@ pub fn tessellate_combined_with_dash_trim(
 mod exact_cache_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn mixed_closure_keeps_the_compound_fill_and_each_stroke_seam() {
+        let points = [
+            PathCmd::Move { x: 0., y: 0. }, PathCmd::Line { x: 8., y: 0. },
+            PathCmd::Line { x: 8., y: 8. }, PathCmd::Move { x: 2., y: 2. },
+            PathCmd::Line { x: 6., y: 2. }, PathCmd::Line { x: 6., y: 6. },
+        ];
+        let mixed = tessellate_combined_with_dash_trim(&points, 2.,
+            PathClosure::PerContour(&[true.into(), false.into()]), None, None, 0.,
+            LineCap::Round, LineJoin::Round, FillRule::EvenOdd, StrokeAlign::Center);
+        let mesh = |cmds: &[PathCmd], width, closed| tessellate_combined(cmds, width, closed,
+            LineCap::Round, LineJoin::Round, FillRule::EvenOdd, StrokeAlign::Center);
+        let mut expected = mesh(&points, 0., false).positions;
+        for (contour, closed) in [(&points[..3], true), (&points[3..], false)] {
+            let part = mesh(contour, 2., closed);
+            for (xy, kind) in part.positions.chunks_exact(2).zip(part.vertex_types) {
+                if kind != 0. { expected.extend_from_slice(xy); }
+            }
+        }
+        assert_eq!(mixed.positions, expected);
+    }
+
+    #[test]
+    fn mixed_trim_and_dash_use_the_cached_compound() {
+        let points = [
+            PathCmd::Move { x: 10., y: 10. }, PathCmd::Line { x: 20., y: 10. },
+            PathCmd::Move { x: 30., y: 20. }, PathCmd::Line { x: 36., y: 20. },
+            PathCmd::Line { x: 36., y: 28. },
+        ];
+        let mixed = [false.into(), true.into()];
+        let reversed = [true.into(), false.into()];
+        let trim = TrimParams { start: 0.25, end: 0.75, offset: 0., individual: true, by: TrimBy::Length };
+        let cached = |flags: &[moda_scene::value::Value], trim| {
+            tessellate_combined_cached(
+                &points, 2., PathClosure::PerContour(flags), trim, Some(&[4., 6.]), 2.,
+                LineCap::Butt, LineJoin::Miter, FillRule::NonZero, StrokeAlign::Center,
+            )
+        };
+        let geo = cached(&mixed, Some(trim));
+        assert!(Arc::ptr_eq(&geo, &cached(&mixed, Some(trim))));
+        assert!(!Arc::ptr_eq(&geo, &cached(&reversed, Some(trim))));
+        assert!(!Arc::ptr_eq(&geo, &cached(&mixed, None)));
+
+        // Chromium getPointAtLength at 8.5 and 25.5 on the 34-unit compound
+        // locates the ends of the concatenated trim. Compare the exact
+        // stroke stream with the equivalent SVG path and dash distances.
+        let cut = [
+            PathCmd::Move { x: 18.5, y: 10. }, PathCmd::Line { x: 20., y: 10. },
+            points[2].clone(), points[3].clone(), points[4].clone(),
+            PathCmd::Line { x: 35.1, y: 26.8 },
+        ];
+        let expected = tessellate_combined_with_dash_trim(
+            &cut, 2., false, None, Some(&[4., 6.]), 2.,
+            LineCap::Butt, LineJoin::Miter, FillRule::NonZero, StrokeAlign::Center,
+        );
+        let stroke = |mesh: &TessellatedGeometry| {
+            mesh.positions.chunks_exact(2).zip(&mesh.vertex_types)
+                .filter(|(_, kind)| **kind == 1.)
+                .map(|(xy, _)| [xy[0], xy[1]]).collect::<Vec<_>>()
+        };
+        let vertices = stroke(&geo);
+        assert!(!vertices.is_empty());
+        assert_eq!(vertices, stroke(&expected));
+    }
 
     #[test]
     fn complete_inputs_reuse_only_identical_geometry() {
@@ -709,7 +783,7 @@ mod exact_cache_tests {
             let join = if variant == 10 { LineJoin::Bevel } else { LineJoin::Miter };
             let rule = if variant == 11 { FillRule::EvenOdd } else { FillRule::NonZero };
             let align = if variant == 12 { StrokeAlign::Outside } else { StrokeAlign::Center };
-            let _scale = super::super::outline::enter_plan(if variant == 13 { 4.0 } else { 1.0 });
+            let _scale = super::super::curve_quality::enter_plan(if variant == 13 { 4.0 } else { 1.0 });
             with_miter_limit(if variant == 14 { 1.0 } else { 4.0 }, || {
                 with_dash_alignment(variant == 15, || {
                     let cached = tessellate_combined_cached(&points, width, closed, trim,
@@ -770,10 +844,10 @@ mod exact_cache_tests {
 
 /// Full-precision variant used by the oracle dump (Moda's `examples/dump_tess.rs`; export-example-absent: Moda's example, not ported).
 #[allow(clippy::too_many_arguments)]
-pub fn tessellate_combined_oracle(
-    points: &[PathCmd],
+pub fn tessellate_combined_oracle<'a>(
+    points: &'a [PathCmd],
     stroke_width: f64,
-    closed: bool,
+    closure: impl Into<PathClosure<'a>>,
     trim: Option<TrimParams>,
     dash: Option<&[f64]>,
     dash_offset: f64,
@@ -796,12 +870,13 @@ pub fn tessellate_combined_oracle(
     // sliced here: MAX_PATH_SEGMENTS bounds each subpath's flattening (`subpath_to_line_segments`, reported through
     // `note_cap_hit`), and the fill and stroke streams have their own caps, each refused with a reason.
 
+    let path = PathContours::new(points, closure);
     // Fill (:104-112).
     let PathFill {
         tris: fill_tris,
         bounds: fill_bounds,
         dropped: fill_dropped,
-    } = fill_path(points, closed, fill_rule);
+    } = fill_path(path, fill_rule);
     // The TS post-hoc cap (:104-112) emptied the WHOLE item — fill and stroke —
     // with no reason. `BoundedFillBuilder` now bounds the expanded stream
     // inside the sweep, so an over-cap fill is a `fill_dropped` refusal with
@@ -815,112 +890,96 @@ pub fn tessellate_combined_oracle(
     // Stroke (:114-150). A dashed stroke is split into pieces first: open pieces
     // (caps at their ends, joins at interior vertices) and closed pieces (a dash
     // that never turned off around a closed sub-path, stroked as the contour).
-    let mut stroke: Option<(Vec<f64>, [f64; 4])> = None;
-    let mut stroke_dropped = None;
-    if stroke_width > 0.0 {
-        // Trim (stroke-only) runs BEFORE dash: it reshapes the stroke input into
-        // open sub-path windows, while the fill above stays computed from the
-        // untrimmed `points`. Trimmed output is always open — so, like dashing, it
-        // is never closed/joined/aligned (a trimmed closed shape's stroke falls
-        // back to centered; accepted, see the roadmap doc). Identity trim resolves
-        // to `None`, keeping the no-trim path byte-identical.
-        let trimmed: Option<Vec<PathCmd>> = trim.and_then(|t| {
-            if is_trim_identity(t.start, t.end, t.offset) {
-                None
-            } else {
-                Some(apply_trim_to_path(points, closed, t))
-            }
-        });
-        let (trim_points, trim_closed): (&[PathCmd], bool) = match &trimmed {
-            Some(tp) => (tp.as_slice(), false),
-            None => (points, closed),
-        };
-        // The dash's drawn fraction scales the estimated stroke vertices.
-        let on_fraction = match dash {
-            Some(d) if !d.is_empty() => {
-                let n = normalize_dash_pattern(scale_dash_pattern(d, stroke_width));
-                let total: f64 = n.iter().sum();
-                let on: f64 = n.iter().step_by(2).sum();
-                if total > 0.0 {
-                    (on / total).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                }
-            }
-            _ => 1.0,
-        };
-        // The stroke's outer offset, as `generate_stroke_geometry` flattens for.
-        let reach = match stroke_align {
-            StrokeAlign::Center => stroke_width / 2.0,
-            _ => stroke_width,
-        };
-        let dashed_run = dash.is_some_and(|d| !d.is_empty());
-        // An inside / outside stroke that is dashed or trimmed is cut into open
-        // pieces, which have no inside: Figma and Illustrator draw such a
-        // stroke centred at twice the width, caps included, and keep the half
-        // inside (outside) the shape. The pieces are stroked that way here and
-        // clipped to the shape's fill region.
-        let clip_aligned = closed
-            && stroke_align != StrokeAlign::Center
-            && (dashed_run || trimmed.is_some());
-        let (piece_width, piece_align) = if clip_aligned {
-            (stroke_width * 2.0, StrokeAlign::Center)
-        } else {
-            (stroke_width, stroke_align)
-        };
-        let dash_error = std::cell::RefCell::new(None);
-        let s = stroke_within_caps(trim_points, reach, on_fraction, || {
-            let pieces = match dash {
-                Some(d) if !d.is_empty() => {
-                    // The pattern stays scaled by the stroke's own width.
-                    let dashed = match apply_dash_to_path(trim_points, d, stroke_width, trim_closed, dash_offset) {
-                        Ok(dashed) => dashed,
-                        Err(reason) => {
-                            *dash_error.borrow_mut() = Some(reason);
-                            return (Vec::new(), [0.0; 4]);
-                        }
-                    };
-                    let open = generate_stroke_geometry(
-                        &dashed.open,
-                        piece_width,
-                        false,
-                        line_cap,
-                        line_join,
-                        piece_align,
-                    );
-                    let closed = generate_stroke_geometry(
-                        &dashed.closed,
-                        piece_width,
-                        true,
-                        line_cap,
-                        line_join,
-                        piece_align,
-                    );
-                    concat_strokes(open, closed)
-                }
-                _ => generate_stroke_geometry(
-                    trim_points,
-                    piece_width,
-                    trim_closed,
-                    line_cap,
-                    line_join,
-                    piece_align,
-                ),
-            };
-            if clip_aligned {
-                clip_stroke_to_shape(pieces, points, fill_rule, stroke_align)
-            } else {
-                pieces
-            }
-        });
-        stroke = filter_stroke(s, &mut stroke_dropped);
-        if let Some(reason) = dash_error.into_inner() {
-            stroke = None;
-            stroke_dropped = Some(reason);
-        }
+    let (stroke, stroke_dropped) = stroke_geometry(path, stroke_width, trim, dash,
+        dash_offset, line_cap, line_join, fill_rule, stroke_align);
+    combine(fill_tris, fill_bounds, fill_dropped, stroke, stroke_dropped)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_geometry(
+    path: PathContours<'_>, stroke_width: f64, trim: Option<TrimParams>,
+    dash: Option<&[f64]>, dash_offset: f64, line_cap: LineCap, line_join: LineJoin,
+    fill_rule: FillRule, stroke_align: StrokeAlign,
+) -> (Option<(Vec<f64>, [f64; 4])>, Option<String>) {
+    if stroke_width <= 0.0 || stroke_width.is_nan() {
+        return (None, None);
     }
 
-    combine(fill_tris, fill_bounds, fill_dropped, stroke, stroke_dropped)
+    // Cuts have open ends. For aligned strokes, keep track of which pieces
+    // came from closed contours so only those are clipped to the compound fill.
+    let trim = trim.filter(|t| !is_trim_identity(t.start, t.end, t.offset));
+    let dash = dash.filter(|d| !d.is_empty());
+    let clip_aligned = stroke_align != StrokeAlign::Center && (dash.is_some() || trim.is_some());
+    let trimmed = trim.map(|t| trim_contours(path, t, clip_aligned));
+    // Use one cap and retry budget for the entire stroke, including every contour.
+    let estimate = match trimmed.as_ref() {
+        Some([ordinary, aligned]) if aligned.is_empty() => ordinary.as_slice(),
+        Some([ordinary, aligned]) if ordinary.is_empty() => aligned.as_slice(),
+        _ => path.points,
+    };
+    let on_fraction = dash.map_or(1.0, |d| {
+        let n = normalize_dash_pattern(scale_dash_pattern(d, stroke_width));
+        let total: f64 = n.iter().sum();
+        let on: f64 = n.iter().step_by(2).sum();
+        if total > 0.0 { (on / total).clamp(0.0, 1.0) } else { 1.0 }
+    });
+    let reach = match stroke_align {
+        StrokeAlign::Center => stroke_width / 2.0,
+        _ => stroke_width,
+    };
+    let dash_error = std::cell::RefCell::new(None);
+    let stroke = stroke_within_caps(estimate, reach, on_fraction, || {
+        let source = trimmed.is_none().then_some(path).into_iter()
+            .flat_map(PathContours::iter).map(|c| (c, clip_aligned && c.closed));
+        let cuts = trimmed.as_ref().into_iter().flat_map(|[ordinary, aligned]| {
+            PathContours::new(ordinary, false).iter().map(|c| (c, false))
+                .chain(PathContours::new(aligned, false).iter().map(|c| (c, true)))
+        });
+        let contours = source.chain(cuts);
+        let (ordinary, aligned) = if let Some(d) = dash {
+            let [ordinary, aligned] = match dash_contours(contours, d, stroke_width, dash_offset) {
+                Ok(pieces) => pieces,
+                Err(reason) => {
+                    *dash_error.borrow_mut() = Some(reason);
+                    return (Vec::new(), [0.0; 4]);
+                }
+            };
+            let stroke_dashes = |pieces: &DashedStroke, width, align| {
+                generate_stroke_geometry(
+                    PathContours::new(&pieces.open, false).iter()
+                        .chain(PathContours::new(&pieces.closed, true).iter()),
+                    width, line_cap, line_join, align,
+                )
+            };
+            (
+                stroke_dashes(&ordinary, stroke_width, stroke_align),
+                stroke_dashes(&aligned, stroke_width * 2.0, StrokeAlign::Center),
+            )
+        } else if clip_aligned {
+            let ordinary = generate_stroke_geometry(
+                contours.clone().filter_map(|(c, aligned)| (!aligned).then_some(c)),
+                stroke_width, line_cap, line_join, stroke_align,
+            );
+            let aligned = generate_stroke_geometry(
+                contours.filter_map(|(c, aligned)| aligned.then_some(c)),
+                stroke_width * 2.0, line_cap, line_join, StrokeAlign::Center,
+            );
+            (ordinary, aligned)
+        } else {
+            return generate_stroke_geometry(
+                contours.map(|(c, _)| c), stroke_width, line_cap, line_join, stroke_align,
+            );
+        };
+        let aligned = clip_stroke_to_shape(aligned, path, fill_rule, stroke_align);
+        concat_strokes(ordinary, aligned)
+    });
+
+    if let Some(reason) = dash_error.into_inner() {
+        return (None, Some(reason));
+    }
+    let mut dropped = None;
+    let stroke = filter_stroke(stroke, &mut dropped);
+    (stroke, dropped)
 }
 
 /// The part of a centred stroke's triangles `tris` inside the shape `points`
@@ -930,7 +989,7 @@ pub fn tessellate_combined_oracle(
 /// that fails keeps the centred stroke.
 fn clip_stroke_to_shape(
     stroke: (Vec<f64>, [f64; 4]),
-    points: &[PathCmd],
+    path: PathContours<'_>,
     fill_rule: FillRule,
     align: StrokeAlign,
 ) -> (Vec<f64>, [f64; 4]) {
@@ -964,10 +1023,9 @@ fn clip_stroke_to_shape(
         .flatten()
         .filter(|c| c.len() >= 3)
         .collect();
-    let shape = split_into_subpaths(points)
-        .iter()
-        .filter(|sp| sp.len() >= 2)
-        .map(|sp| subpath_to_line_segments(sp, true, Flat::fill()).map(|s| clean_closed_contour(&s)))
+    let shape = path.iter()
+        .filter(|c| c.points.len() >= 2)
+        .map(|c| subpath_to_line_segments(c.points, false, Flat::fill()).map(clean_closed_contour))
         .collect::<Result<Vec<_>, _>>();
     let shape: Vec<_> = match shape {
         Ok(shape) => shape.into_iter().filter(|c| c.len() >= 3).collect(),
@@ -1007,284 +1065,6 @@ fn clip_stroke_to_shape(
         }
         Ok(_) => (Vec::new(), [0.0; 4]),
         Err(_) => stroke,
-    }
-}
-
-/// How a vector network's stroke is drawn (`tessellate_network`).
-#[derive(Debug, Clone, Copy)]
-pub struct NetworkStrokeStyle<'a> {
-    pub width: f64,
-    pub dash: Option<&'a [f64]>,
-    pub dash_offset: f64,
-    /// The stroke's cap: trimmed pieces and open arrow carets take it.
-    pub line_cap: LineCap,
-    pub line_join: LineJoin,
-    pub miter_limit: f64,
-    pub trim: Option<TrimParams>,
-    /// The arrowheads' length and width (`path_arrows::path_arrow_size`).
-    pub arrow_size: f64,
-}
-
-/// A vector network's body (E7.9, `tess::network`): every region filled on
-/// its own under its own rule, then every stroke piece (a dash runs along each
-/// piece; each open end with an arrow cap cut back under its arrowhead), the
-/// aligned region loops, the separately drawn caps and the junction wedges,
-/// and the arrowheads. A trim windows the pieces in order (see
-/// `tess::network`). One geometry, fill vertices first, like
-/// [`tessellate_combined_with_dash_trim`].
-pub fn tessellate_network(
-    fills: &[(Vec<PathCmd>, FillRule)],
-    stroke: &super::network::NetworkStroke,
-    style: &NetworkStrokeStyle,
-) -> TessellatedGeometry {
-    let stroke_width = style.width;
-    let line_join = style.line_join;
-    let mut fill_tris: Vec<f64> = Vec::new();
-    let mut fill_bounds = [0.0; 4];
-    let mut fill_dropped = None;
-    let mut first = true;
-    for (cmds, rule) in fills {
-        let f = fill_path(cmds, true, *rule);
-        if f.dropped.is_some() && fill_dropped.is_none() {
-            fill_dropped = f.dropped.clone();
-        }
-        if f.tris.is_empty() {
-            continue;
-        }
-        fill_bounds = if first {
-            f.bounds
-        } else {
-            union_bounds(fill_bounds, f.bounds)
-        };
-        first = false;
-        fill_tris.extend(f.tris);
-    }
-    let mut stroke_out = None;
-    let mut stroke_dropped = None;
-    let has_stroke = !stroke.pieces.is_empty() || !stroke.aligned.is_empty();
-    if stroke_width > 0.0 && has_stroke {
-        // Each piece's body (cut back under its arrowheads) and its heads, per end.
-        struct Body {
-            cmds: Vec<PathCmd>,
-            closed: bool,
-            cap: LineCap,
-            heads: [Option<super::path_arrows::PathArrows>; 2],
-        }
-        let bodies: Vec<Body> = stroke
-            .pieces
-            .iter()
-            .map(|p| {
-                let [a0, a1] = p.arrows;
-                if p.closed || (a0.is_none() && a1.is_none()) {
-                    return Body {
-                        cmds: p.cmds.clone(),
-                        closed: p.closed,
-                        cap: p.cap,
-                        heads: [None, None],
-                    };
-                }
-                let run = |s, e| {
-                    super::path_arrows::run_arrows(
-                        &p.cmds,
-                        s,
-                        e,
-                        style.arrow_size,
-                        Some("butt"),
-                        stroke_width,
-                    )
-                };
-                let body = run(a0, a1)
-                    .map(|a| a.body)
-                    .unwrap_or_else(|| p.cmds.clone());
-                Body {
-                    cmds: body,
-                    closed: false,
-                    cap: p.cap,
-                    heads: [
-                        a0.and_then(|s| run(Some(s), None)),
-                        a1.and_then(|e| run(None, Some(e))),
-                    ],
-                }
-            })
-            .collect();
-        let mut all: Vec<PathCmd> = bodies.iter().flat_map(|b| b.cmds.clone()).collect();
-        for l in &stroke.aligned {
-            all.extend(l.iter().cloned());
-        }
-        let dash = style.dash.filter(|d| !d.is_empty());
-        let on_fraction = match dash {
-            Some(d) => {
-                let n = normalize_dash_pattern(scale_dash_pattern(d, stroke_width));
-                let total: f64 = n.iter().sum();
-                let on: f64 = n.iter().step_by(2).sum();
-                if total > 0.0 {
-                    (on / total).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                }
-            }
-            None => 1.0,
-        };
-        let dash_error = std::cell::RefCell::new(None);
-        let stroke_run = |cmds: &[PathCmd], closed: bool, cap: LineCap| match dash {
-            Some(d) => {
-                let dashed = match apply_dash_to_path(cmds, d, stroke_width, closed, style.dash_offset) {
-                    Ok(dashed) => dashed,
-                    Err(reason) => {
-                        *dash_error.borrow_mut() = Some(reason);
-                        return (Vec::new(), [0.0; 4]);
-                    }
-                };
-                concat_strokes(
-                    generate_stroke_geometry(
-                        &dashed.open,
-                        stroke_width,
-                        false,
-                        cap,
-                        line_join,
-                        StrokeAlign::Center,
-                    ),
-                    generate_stroke_geometry(
-                        &dashed.closed,
-                        stroke_width,
-                        true,
-                        cap,
-                        line_join,
-                        StrokeAlign::Center,
-                    ),
-                )
-            }
-            None => generate_stroke_geometry(
-                cmds,
-                stroke_width,
-                closed,
-                cap,
-                line_join,
-                StrokeAlign::Center,
-            ),
-        };
-        let heads_geometry = |h: &super::path_arrows::PathArrows| {
-            let mut acc: (Vec<f64>, [f64; 4]) = (Vec::new(), [0.0; 4]);
-            if !h.filled.is_empty() {
-                let f = fill_path(&h.filled, true, FillRule::NonZero);
-                if !f.tris.is_empty() {
-                    acc = concat_strokes(acc, (f.tris, f.bounds));
-                }
-            }
-            if !h.open.is_empty() {
-                acc = concat_strokes(
-                    acc,
-                    generate_stroke_geometry(
-                        &h.open,
-                        stroke_width,
-                        false,
-                        style.line_cap,
-                        line_join,
-                        StrokeAlign::Center,
-                    ),
-                );
-            }
-            acc
-        };
-        let s = stroke_within_caps(&all, stroke_width / 2.0, on_fraction, || {
-            let mut acc: (Vec<f64>, [f64; 4]) = (Vec::new(), [0.0; 4]);
-            if let Some(t) = style.trim {
-                // The window runs along the pieces in order; what survives is
-                // stroked open with the stroke's cap.
-                let trimmed = apply_trim_to_path(&all, false, t);
-                acc = concat_strokes(acc, stroke_run(&trimmed, false, style.line_cap));
-                let ends: Vec<[f64; 2]> = split_subpaths(&trimmed)
-                    .into_iter()
-                    .flat_map(|sp| {
-                        let pt = |c: &PathCmd| cmd_end(c);
-                        [sp.first().map(pt), sp.last().map(pt)]
-                    })
-                    .flatten()
-                    .collect();
-                let visible = |p: Option<[f64; 2]>| {
-                    p.is_some_and(|p| ends.iter().any(|e| (e[0] - p[0]).hypot(e[1] - p[1]) < 1e-6))
-                };
-                for b in &bodies {
-                    let at = [b.cmds.first().map(cmd_end), b.cmds.last().map(cmd_end)];
-                    for k in 0..2 {
-                        if let Some(h) = &b.heads[k] {
-                            if visible(at[k]) {
-                                acc = concat_strokes(acc, heads_geometry(h));
-                            }
-                        }
-                    }
-                }
-                return acc;
-            }
-            for b in &bodies {
-                if !b.cmds.is_empty() {
-                    acc = concat_strokes(acc, stroke_run(&b.cmds, b.closed, b.cap));
-                }
-                for h in b.heads.iter().flatten() {
-                    acc = concat_strokes(acc, heads_geometry(h));
-                }
-            }
-            // Inside / outside: each region's loops, aligned (undashed only).
-            for l in &stroke.aligned {
-                acc = concat_strokes(
-                    acc,
-                    generate_stroke_geometry(
-                        l,
-                        stroke_width,
-                        true,
-                        style.line_cap,
-                        line_join,
-                        stroke.align,
-                    ),
-                );
-            }
-            // Caps and junctions sit on the vertices, so a dash does not cut them.
-            let extra = super::network::cap_and_junction_tris(
-                stroke,
-                stroke_width / 2.0,
-                style.miter_limit,
-                flatness_tolerance(),
-            );
-            if !extra.is_empty() {
-                let pts: Vec<P> = extra.chunks(2).map(|c| [c[0], c[1]]).collect();
-                let b = calc_bounds(&pts);
-                acc = concat_strokes(acc, (extra, b));
-            }
-            acc
-        });
-        stroke_out = filter_stroke(s, &mut stroke_dropped);
-        if let Some(reason) = dash_error.into_inner() {
-            stroke_out = None;
-            stroke_dropped = Some(reason);
-        }
-    }
-    let o = combine(fill_tris, fill_bounds, fill_dropped, stroke_out, stroke_dropped);
-    let vertex_count = (o.positions.len() / 2) as u32;
-    TessellatedGeometry {
-        positions: o.positions,
-        vertex_types: o.vertex_types,
-        vertex_count,
-        bounds: [
-            o.bounds[0] as f32,
-            o.bounds[1] as f32,
-            (o.bounds[2] - o.bounds[0]) as f32,
-            (o.bounds[3] - o.bounds[1]) as f32,
-        ],
-        fill_dropped: o.fill_dropped,
-        stroke_dropped: o.stroke_dropped,
-        // Filled in by `stroke_param::with_stroke_uv` when a path gradient needs it.
-        stroke_uv: Vec::new(),
-    }
-}
-
-/// A command's end point.
-fn cmd_end(c: &PathCmd) -> [f64; 2] {
-    match c {
-        PathCmd::Move { x, y }
-        | PathCmd::Line { x, y }
-        | PathCmd::Curve { x, y, .. }
-        | PathCmd::Quadratic { x, y, .. }
-        | PathCmd::Arc { x, y, .. } => [*x, *y],
     }
 }
 
@@ -1370,48 +1150,6 @@ fn combine(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Variable-width outlines (plan P8): the stroke is a filled outline
-// ---------------------------------------------------------------------------
-
-/// The body FILL of a path whose stroke is drawn as an outline — exactly the
-/// fill [`tessellate_combined_oracle`] computes.
-pub(crate) fn body_fill(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFill {
-    if points.is_empty() {
-        return PathFill::EMPTY;
-    }
-    fill_path(points, closed, fill_rule)
-}
-
-/// Fill a stroke outline's (already flattened, closed) contours under the
-/// nonzero rule. The outline is the STROKE: it takes the stroke vertex budget
-/// (`MAX_STROKE_VERTICES`), not the fill's, and is never truncated by
-/// `MAX_PATH_SEGMENTS` (that cap is on the input path). Err = the sweep was
-/// refused (caller decimates or falls back; never a page refusal).
-#[cfg(test)]
-pub(crate) fn fill_outline_contours(contours: &[Vec<P>]) -> Result<(Vec<f64>, [f64; 4]), String> {
-    fill_outline_banded(contours).map(|(tris, b, _)| (tris, b))
-}
-
-/// [`fill_outline_contours`] with the number of cells the fill took (1 =
-/// one sweep). See [`fill_cells`].
-pub(crate) fn fill_outline_banded(
-    contours: &[Vec<P>],
-) -> Result<(Vec<f64>, [f64; 4], usize), String> {
-    let contours: Vec<Vec<P>> = contours
-        .iter()
-        .map(|c| clean_closed_contour(c))
-        .filter(|c| c.len() >= 3)
-        .collect();
-    let (tris, cells) = fill_cells(&contours, FillRule::NonZero, MAX_STROKE_VERTICES)?;
-    let b = if tris.is_empty() {
-        [0.0; 4]
-    } else {
-        tris_bounds(&tris)
-    };
-    Ok((tris, b, cells))
-}
-
 fn tris_bounds(tris: &[f64]) -> [f64; 4] {
     let mut b = [
         f64::INFINITY,
@@ -1471,7 +1209,7 @@ pub(crate) fn fill_cells(
 ) -> Result<(Vec<f64>, usize), String> {
     FILL_VERTEX_PEAK.with(|c| c.set(0));
     FILL_CELL_COUNT.with(|c| c.set(0));
-    if contours.is_empty() {
+    if contours.iter().all(Vec::is_empty) {
         return Ok((Vec::new(), 1));
     }
     // lyon's event queue sorts on partial_cmp: a NaN would panic inside the
@@ -1483,22 +1221,13 @@ pub(crate) fn fill_cells(
     }) {
         return Err("non-finite coordinate".to_string());
     }
-    let mut rect = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    ];
-    for p in contours.iter().flatten() {
-        rect = [
-            rect[0].min(p[0]),
-            rect[1].min(p[1]),
-            rect[2].max(p[0]),
-            rect[3].max(p[1]),
-        ];
+    let rect = point_bounds(contours.iter().flatten());
+    if rect[0] == rect[2] || rect[1] == rect[3] {
+        return Ok((Vec::new(), 1));
     }
     let mut cells = CellFill {
         rule: fill_rule,
+        sweep_scale: sweep_scale(rect),
         cap,
         tris: Vec::new(),
         cells: 0,
@@ -1527,6 +1256,7 @@ enum FillRefusal {
 /// State of one [`fill_cells`] call: the stream so far, shared by all cells.
 struct CellFill {
     rule: FillRule,
+    sweep_scale: f64,
     cap: usize,
     tris: Vec<f64>,
     cells: usize,
@@ -1562,7 +1292,7 @@ impl CellFill {
         let can_split = depth < MAX_BAND_DEPTH && mid > rect[axis] && mid < rect[axis + 2];
         match check_fill_sweep_cost(contours, budget) {
             Ok(()) => {
-                let (t, sound) = sound_sweep(contours, self.rule, budget)?;
+                let (t, sound) = sound_sweep(contours, self.rule, budget, self.sweep_scale)?;
                 // An unsound triangulation (see `sound_sweep`) is re-cut:
                 // different cells give lyon different vertex configurations.
                 // Where the cell cannot be cut, it ships as lyon made it —
@@ -1768,36 +1498,6 @@ fn clip_half_plane(poly: &[P], axis: usize, at: f64, keep_above: bool) -> Vec<P>
     out
 }
 
-/// Combine a body fill with an outline fill emitted as STROKE vertices, so
-/// stroke paint (solid / gradient), opacity and blend apply unchanged.
-pub(crate) fn combine_fill_and_outline(
-    fill: PathFill,
-    outline: Option<(Vec<f64>, [f64; 4])>,
-) -> crate::seams::TessellatedGeometry {
-    let o = combine(
-        fill.tris,
-        fill.bounds,
-        fill.dropped,
-        outline.filter(|(t, _)| !t.is_empty()),
-        None,
-    );
-    let vertex_count = (o.positions.len() / 2) as u32;
-    crate::seams::TessellatedGeometry {
-        positions: o.positions,
-        vertex_types: o.vertex_types,
-        vertex_count,
-        bounds: [
-            o.bounds[0] as f32,
-            o.bounds[1] as f32,
-            (o.bounds[2] - o.bounds[0]) as f32,
-            (o.bounds[3] - o.bounds[1]) as f32,
-        ],
-        fill_dropped: o.fill_dropped,
-        stroke_dropped: o.stroke_dropped,
-        stroke_uv: Vec::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Dash (:205-432)
 // ---------------------------------------------------------------------------
@@ -1813,29 +1513,28 @@ pub struct DashedStroke {
 /// `applyDashToPath` (:218-242). Each sub-path is dashed on its own so a dash
 /// never bridges the gap to the next one (a compound path's inner contour, a
 /// trimmed shape's wrap runs, a connector body split around a text-gap label).
-fn apply_dash_to_path(
-    points: &[PathCmd],
+fn dash_contours<'a>(
+    contours: impl Iterator<Item = (Contour<'a>, bool)>,
     dash_pattern: &[f64],
     stroke_width: f64,
-    closed: bool,
     dash_offset: f64,
-) -> Result<DashedStroke, String> {
+) -> Result<[DashedStroke; 2], String> {
     let normalized = normalize_dash_pattern(scale_dash_pattern(dash_pattern, stroke_width));
     // `dashOffset` (marching ants) is authored in the same units as the dash
     // array and scaled the same way, so one full loop = the authored pattern
     // sum.
     let scaled_offset = dash_offset * stroke_width / BASE_DASH_STROKE_WIDTH;
     let aligned = dash_alignment_now();
-    let mut out = DashedStroke::default();
+    let mut out = [DashedStroke::default(), DashedStroke::default()];
     // Bound work, including gaps and runs too short to emit vertices. The stroke vertex
     // cap cannot bound those: tiny positive lengths can take billions of walk steps.
     const MAX_DASH_STEPS: f64 = 1_000_000.0;
     let period: f64 = normalized.iter().sum();
     let mut steps = 0.0;
-    for sp in split_subpaths(points) {
-        let raw = path_points_to_segments(sp, closed);
+    for (Contour { points, closed }, clip_aligned) in contours {
+        let raw = path_points_to_segments(points, closed);
         let total: f64 = raw.iter().map(|s| s.arc_length).sum();
-        if total < 0.001 { continue; } // The arc-length walker emits nothing for these subpaths.
+        if total == 0.0 { continue; }
         if period > 0.0 {
             // Each segment can start/end in a partial period; a phase adds at most one.
             steps += ((total / period).ceil() + raw.len() as f64 + 1.0) * normalized.len() as f64;
@@ -1873,6 +1572,7 @@ fn apply_dash_to_path(
         } else {
             walk_path_by_arc_length_phased(&segments, &normalized, scaled_offset)
         };
+        let out = &mut out[usize::from(clip_aligned)];
         for piece in dash_pieces(&walked, closed, seg_start(&first.seg), seg_end(&last.seg)) {
             let target = if piece.closed {
                 &mut out.closed
@@ -1907,7 +1607,8 @@ pub struct TrimParams {
     pub by: TrimBy,
 }
 
-const TRIM_EPS: f64 = 1e-4;
+// The authoring band is a fraction of the path, independent of its coordinate system.
+const TRIM_BAND: f64 = 1e-4;
 
 /// True when trim leaves the path unchanged (full path visible), so the caller
 /// can skip the pass and stay byte-identical to the untrimmed render.
@@ -1916,7 +1617,7 @@ const TRIM_EPS: f64 = 1e-4;
 /// loop is a no-op), so offset is intentionally ignored here — this keeps an
 /// untrimmed-but-offset closed shape from degrading to an open (unjoined) stroke.
 pub fn is_trim_identity(start: f64, end: f64, _offset: f64) -> bool {
-    start <= TRIM_EPS && end >= 1.0 - TRIM_EPS
+    start <= TRIM_BAND && end >= 1. - TRIM_BAND
 }
 
 /// A node's trim from its fields (`trimPathStart` / `trimPathEnd` / `trimPathOffset` / `trimPathMode` /
@@ -1984,21 +1685,37 @@ fn segments_to_cmds(segs: &[PathSegment], out: &mut Vec<PathCmd>) {
     }
 }
 
-/// Split a command stream into sub-paths at each `Move` (each slice keeps its
-/// leading `Move`).
-fn split_subpaths(points: &[PathCmd]) -> Vec<&[PathCmd]> {
-    let mut out: Vec<&[PathCmd]> = Vec::new();
-    let mut start = 0usize;
-    for (i, c) in points.iter().enumerate() {
-        if i > start && matches!(c, PathCmd::Move { .. }) {
-            out.push(&points[start..i]);
-            start = i;
-        }
+pub use moda_scene::path_points::PathClosure;
+
+/// A contour's commands and whether its endpoints meet at a close command.
+#[derive(Clone, Copy)]
+pub struct Contour<'a> {
+    pub points: &'a [PathCmd],
+    pub closed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct PathContours<'a> {
+    points: &'a [PathCmd],
+    closure: PathClosure<'a>,
+}
+
+impl<'a> PathContours<'a> {
+    pub fn new(points: &'a [PathCmd], closure: impl Into<PathClosure<'a>>) -> Self {
+        Self { points, closure: closure.into() }
     }
-    if start < points.len() {
-        out.push(&points[start..]);
+
+    /// Local length across contours, including each authored closing edge.
+    pub fn measured_length(self) -> f64 {
+        self.iter().map(|c| path_points_to_segments(c.points, c.closed)
+            .iter().map(|s| s.arc_length).sum::<f64>()).sum()
     }
-    out
+
+    pub fn iter(self) -> impl Iterator<Item = Contour<'a>> + Clone {
+        self.closure
+            .contours(self.points, |p| matches!(p, PathCmd::Move { .. }))
+            .map(|(points, closed)| Contour { points, closed })
+    }
 }
 
 /// Keep the arc-length window [a, b] of one sub-path as curve-preserving run(s).
@@ -2022,17 +1739,18 @@ fn window_runs(
     b: f64,
 ) -> Vec<Vec<PathSegment>> {
     let mut out: Vec<Vec<PathSegment>> = Vec::new();
-    if len <= TRIM_EPS || b - a <= TRIM_EPS {
+    let tolerance = distance_tolerance(len);
+    if b - a <= tolerance || len <= 0. {
         return out;
     }
     // Window covers the whole (or more than the whole) path → keep everything.
-    if b - a >= len - TRIM_EPS {
+    if b - a >= len - tolerance {
         out.push(segs.to_vec());
         return out;
     }
     let s = a.rem_euclid(len); // normalize start into [0, len) — wraps negatives too
     let e = s + (b - a);
-    if e <= len + TRIM_EPS {
+    if e <= len + tolerance {
         let r = extract_path_segments_by_arc_length(segs, s, e.min(len));
         if !r.is_empty() {
             out.push(r);
@@ -2063,24 +1781,25 @@ fn window_runs(
 
 /// Apply trim to a path, returning new OPEN sub-paths. The result feeds the
 /// stroke pipeline only (fill is tessellated from the untrimmed `points`).
-fn apply_trim_to_path(points: &[PathCmd], closed: bool, t: TrimParams) -> Vec<PathCmd> {
+fn trim_contours(path: PathContours<'_>, t: TrimParams, separate_closed: bool) -> [Vec<PathCmd>; 2] {
     // Per-subpath curve-preserving segments + arc lengths.
-    let mut subs: Vec<(Vec<PathSegment>, f64)> = Vec::new();
-    for sp in split_subpaths(points) {
-        let segs = path_points_to_segments(sp, closed);
+    let mut subs = Vec::new();
+    for Contour { points, closed } in path.iter() {
+        let segs = path_points_to_segments(points, closed);
         let len: f64 = segs.iter().map(|s| s.arc_length).sum();
-        if len > 0.001 && !segs.is_empty() {
-            subs.push((segs, len));
+        if len > 0. {
+            subs.push((segs, len, closed));
         }
     }
+    let mut out = [Vec::new(), Vec::new()];
     if subs.is_empty() {
-        return Vec::new();
+        return out;
     }
-    if let Some(cut) = axis_trim_runs(&subs, closed, t) {
-        let mut out = Vec::new();
-        for (segs, runs) in cut {
+    if let Some(cut) = axis_trim_runs(&subs, t) {
+        for ((segs, runs), (_, _, closed)) in cut.into_iter().zip(&subs) {
+            let out = &mut out[usize::from(separate_closed && *closed)];
             for run in runs {
-                segments_to_cmds(&trim_axis::run_segments(segs, &run), &mut out);
+                segments_to_cmds(&trim_axis::run_segments(segs, &run), out);
             }
         }
         return out;
@@ -2096,27 +1815,30 @@ fn apply_trim_to_path(points: &[PathCmd], closed: bool, t: TrimParams) -> Vec<Pa
     // ±total shift loop relies on this too).
     let off = t.offset.rem_euclid(1.0);
 
-    let mut out: Vec<PathCmd> = Vec::new();
+    // Keep the historical empty result for unresolved reveals. The old extractor's
+    // 0.001-unit cutoff alone swallowed substantial fractions of tiny artwork;
+    // applying the fraction band alone would erase visible pieces of long paths.
+    let empty_reveal = |fraction: f64, length: f64| {
+        fraction <= TRIM_BAND && fraction * length <= 0.001
+    };
 
     if t.individual && subs.len() > 1 {
-        let total: f64 = subs.iter().map(|(_, l)| *l).sum();
-        if total <= TRIM_EPS {
-            return out;
-        }
+        let total: f64 = subs.iter().map(|(_, l, _)| *l).sum();
         // `start > end` wraps across the concatenation when it is loop-like (any
         // sub-path closed); otherwise it selects nothing.
-        let end = if end0 < start && closed {
+        let end = if end0 < start && subs.iter().any(|(_, _, closed)| *closed) {
             end0 + 1.0
         } else {
             end0
         };
         let a = (start + off) * total;
         let b = (end + off) * total;
-        if b - a <= TRIM_EPS {
+        if empty_reveal(end - start, total) || b - a <= distance_tolerance(total) {
             return out;
         }
         let mut cursor = 0.0f64;
-        for (segs, len) in &subs {
+        for (segs, len, closed) in &subs {
+            let out = &mut out[usize::from(separate_closed && *closed)];
             let seg_start = cursor;
             cursor += *len;
             // Intersect the (possibly wrapping) global window with this sub-path's
@@ -2125,11 +1847,11 @@ fn apply_trim_to_path(points: &[PathCmd], closed: bool, t: TrimParams) -> Vec<Pa
             for shift in [-total, 0.0, total] {
                 let lo = (a + shift).max(seg_start);
                 let hi = (b + shift).min(seg_start + *len);
-                if hi - lo > TRIM_EPS {
+                if hi > lo {
                     // Windows are pre-bounded to [0,len] here, so no seam wrap; still
                     // iterate for the uniform return type.
                     for run in window_runs(segs, *len, false, lo - seg_start, hi - seg_start) {
-                        segments_to_cmds(&run, &mut out);
+                        segments_to_cmds(&run, out);
                     }
                 }
             }
@@ -2138,18 +1860,22 @@ fn apply_trim_to_path(points: &[PathCmd], closed: bool, t: TrimParams) -> Vec<Pa
     }
 
     // Simultaneous (default): each sub-path trims to [start,end] of its own length.
-    for (segs, len) in &subs {
+    for (segs, len, closed) in &subs {
+        let out = &mut out[usize::from(separate_closed && *closed)];
         // `start > end` wraps across the seam for closed sub-paths; open sub-paths
         // have no seam, so the window stays empty.
-        let end = if end0 < start && closed {
+        let end = if end0 < start && *closed {
             end0 + 1.0
         } else {
             end0
         };
+        if empty_reveal(end - start, *len) {
+            continue;
+        }
         let a = (start + off) * *len;
         let b = (end + off) * *len;
-        for run in window_runs(segs, *len, closed, a, b) {
-            segments_to_cmds(&run, &mut out);
+        for run in window_runs(segs, *len, *closed, a, b) {
+            segments_to_cmds(&run, out);
         }
     }
     out
@@ -2158,16 +1884,15 @@ fn apply_trim_to_path(points: &[PathCmd], closed: bool, t: TrimParams) -> Vec<Pa
 /// A trim along an axis (`trim_axis.rs`) on measured subpaths: each subpath's kept runs, or `None` when the trim is
 /// by length (or the path has no extent on the axis, which trims by length too).
 fn axis_trim_runs<'a>(
-    subs: &'a [(Vec<PathSegment>, f64)],
-    closed: bool,
+    subs: &'a [(Vec<PathSegment>, f64, bool)],
     t: TrimParams,
 ) -> Option<Vec<(&'a [PathSegment], Vec<Vec<trim_axis::Piece>>)>> {
     let axis = t.by.axis()?;
-    let ext = trim_axis::extent(subs.iter().map(|(s, _)| s.as_slice()), axis)?;
+    let ext = trim_axis::extent(subs.iter().map(|(s, _, _)| s.as_slice()), axis)?;
     let (lo, hi) = trim_axis::window(ext, t.start, t.end)?;
     Some(
         subs.iter()
-            .map(|(segs, _)| (segs.as_slice(), trim_axis::runs(segs, closed, axis, lo, hi)))
+            .map(|(segs, _, closed)| (segs.as_slice(), trim_axis::runs(segs, *closed, axis, lo, hi)))
             .collect(),
     )
 }
@@ -2182,19 +1907,18 @@ pub fn axis_trim_arc_windows(
     t: TrimParams,
 ) -> Option<Vec<(f64, Vec<(f64, f64)>)>> {
     t.by.axis()?;
-    let subs: Vec<(Vec<PathSegment>, f64)> = split_subpaths(points)
-        .into_iter()
-        .map(|sp| {
-            let segs = path_points_to_segments(sp, closed);
+    let subs: Vec<(Vec<PathSegment>, f64, bool)> = PathContours::new(points, closed).iter()
+        .map(|c| {
+            let segs = path_points_to_segments(c.points, c.closed);
             let len = segs.iter().map(|s| s.arc_length).sum();
-            (segs, len)
+            (segs, len, c.closed)
         })
         .collect();
-    let cut = axis_trim_runs(&subs, closed, t)?;
+    let cut = axis_trim_runs(&subs, t)?;
     Some(
         cut.into_iter()
             .zip(&subs)
-            .map(|((segs, runs), (_, len))| {
+            .map(|((segs, runs), (_, len, _))| {
                 (*len, runs.iter().map(|r| trim_axis::run_arc_window(segs, r)).collect())
             })
             .collect(),
@@ -2212,17 +1936,6 @@ pub struct PathEnd {
     pub out: Pt,
 }
 
-/// The first and last drawn segments of an open path's first and last sub-paths (sub-paths with no length are
-/// skipped), or `None` when nothing has length.
-fn end_segments(points: &[PathCmd]) -> Option<(PathSegment, PathSegment)> {
-    let subs: Vec<Vec<PathSegment>> = split_subpaths(points)
-        .into_iter()
-        .map(|sp| path_points_to_segments(sp, false))
-        .filter(|s| !s.is_empty())
-        .collect();
-    Some((subs.first()?.first()?.clone(), subs.last()?.last()?.clone()))
-}
-
 fn unit(v: Pt) -> Option<Pt> {
     let l = v[0].hypot(v[1]);
     (l > 1e-9 && l.is_finite()).then(|| [v[0] / l, v[1] / l])
@@ -2236,58 +1949,76 @@ fn tangent_from(p: Pt, candidates: &[Pt]) -> Option<Pt> {
     })
 }
 
-/// The start and end of an open path, each with its outward end tangent (E6.1): where a stroke's `startArrow`
-/// / `endArrow` sit. The start is the first sub-path's first anchor, the end the last sub-path's last anchor.
-pub fn open_path_ends(points: &[PathCmd]) -> Option<(PathEnd, PathEnd)> {
-    let (first, last) = end_segments(points)?;
-    let start = match first.seg {
-        Seg::Line { p0, p1 } => (p0, tangent_from(p0, &[p1])?),
-        Seg::Quadratic { p0, p1, cp } => (p0, tangent_from(p0, &[cp, p1])?),
-        Seg::Cubic { p0, p1, cp1, cp2 } => (p0, tangent_from(p0, &[cp1, cp2, p1])?),
+/// The first and last drawable contours' endpoints. A closed contour has
+/// no endpoint for an arrow, and empty contours do not claim an endpoint.
+pub(crate) fn path_ends(path: PathContours<'_>) -> Option<(Option<PathEnd>, Option<PathEnd>)> {
+    let mut runs = path.iter().filter_map(|contour| {
+        let segments = path_points_to_segments(contour.points, false);
+        (!segments.is_empty()).then_some((contour.closed, segments))
+    });
+    let first = runs.next()?;
+    let last = runs.last();
+    let start = if first.0 {
+        None
+    } else {
+        let (point, tangent) = match first.1.first()?.seg {
+            Seg::Line { p0, p1 } => (p0, tangent_from(p0, &[p1])?),
+            Seg::Quadratic { p0, p1, cp } => (p0, tangent_from(p0, &[cp, p1])?),
+            Seg::Cubic { p0, p1, cp1, cp2 } => (p0, tangent_from(p0, &[cp1, cp2, p1])?),
+        };
+        Some(PathEnd { point, out: [-tangent[0], -tangent[1]] })
     };
-    let end = match last.seg {
-        Seg::Line { p0, p1 } => (p1, tangent_from(p1, &[p0])?),
-        Seg::Quadratic { p0, p1, cp } => (p1, tangent_from(p1, &[cp, p0])?),
-        Seg::Cubic { p0, p1, cp1, cp2 } => (p1, tangent_from(p1, &[cp2, cp1, p0])?),
+    let last = last.as_ref().unwrap_or(&first);
+    let end = if last.0 {
+        None
+    } else {
+        let (point, tangent) = match last.1.last()?.seg {
+            Seg::Line { p0, p1 } => (p1, tangent_from(p1, &[p0])?),
+            Seg::Quadratic { p0, p1, cp } => (p1, tangent_from(p1, &[cp, p0])?),
+            Seg::Cubic { p0, p1, cp1, cp2 } => (p1, tangent_from(p1, &[cp2, cp1, p0])?),
+        };
+        Some(PathEnd { point, out: [-tangent[0], -tangent[1]] })
     };
-    // The tangents found point INTO the path; the arrowheads point out.
-    Some((
-        PathEnd {
-            point: start.0,
-            out: [-start.1[0], -start.1[1]],
-        },
-        PathEnd {
-            point: end.0,
-            out: [-end.1[0], -end.1[1]],
-        },
-    ))
+    Some((start, end))
 }
 
-/// An open path with `start` px of arc length cut off its first sub-path's start and `end` px off its last
-/// sub-path's end (curves kept): the stroke under a stroke's arrowheads. A sub-path cut to nothing is dropped.
-pub fn cut_open_path_ends(points: &[PathCmd], start: f64, end: f64) -> Vec<PathCmd> {
-    let subs: Vec<Vec<PathSegment>> = split_subpaths(points)
-        .into_iter()
-        .map(|sp| path_points_to_segments(sp, false))
-        .filter(|s| !s.is_empty())
-        .collect();
-    let n = subs.len();
+/// Cut the stroke back by arc length under its arrowheads. Preserve closed
+/// contours verbatim and keep the closure flags in the emitted contour order.
+pub(crate) fn cut_path_ends(
+    path: PathContours<'_>,
+    start: f64,
+    end: f64,
+) -> (Vec<PathCmd>, Vec<bool>) {
+    let runs: Vec<_> = path.iter().filter_map(|contour| {
+        let segments = path_points_to_segments(contour.points, false);
+        (!segments.is_empty()).then_some((contour, segments))
+    }).collect();
+    let n = runs.len();
     let mut out = Vec::new();
-    for (i, segs) in subs.iter().enumerate() {
+    let mut flags = Vec::new();
+    for (i, (contour, segs)) in runs.iter().enumerate() {
+        if contour.closed {
+            out.extend_from_slice(contour.points);
+            flags.push(true);
+            continue;
+        }
         let len: f64 = segs.iter().map(|s| s.arc_length).sum();
         let a = if i == 0 { start.max(0.0) } else { 0.0 };
         let b = len - if i + 1 == n { end.max(0.0) } else { 0.0 };
+        let before = out.len();
         if a <= 0.0 && b >= len {
             segments_to_cmds(segs, &mut out);
-        } else if b - a > TRIM_EPS {
+        } else if b - a > distance_tolerance(len) {
             segments_to_cmds(&extract_path_segments_by_arc_length(segs, a, b), &mut out);
         }
+        if out.len() > before {
+            flags.push(false);
+        }
     }
-    out
+    (out, flags)
 }
 
-/// Curved dash-walk segments → line pieces at `flat`, each curve's pieces
-/// scaled to sum to its measured arc length.
+/// Flatten for drawing, measuring the actual subcurve represented by each chord.
 fn flatten_path_segments(segs: &[PathSegment], flat: Flat) -> Vec<PathSegment> {
     // A memory bound only: dash GAPS flatten too, so the piece count says
     // nothing about the stroke's vertices (sparse dashes on a long curve have
@@ -2301,40 +2032,22 @@ fn flatten_path_segments(segs: &[PathSegment], flat: Flat) -> Vec<PathSegment> {
             note_cap_hit();
             break;
         }
-        let pts = match s.seg {
+        let (a, b, c, d) = match s.seg {
             Seg::Line { .. } => {
                 out.push(s.clone());
                 continue;
             }
             Seg::Quadratic { p0, p1, cp } => {
-                let c1 = [
-                    p0[0] + (2.0 / 3.0) * (cp[0] - p0[0]),
-                    p0[1] + (2.0 / 3.0) * (cp[1] - p0[1]),
-                ];
-                let c2 = [
-                    p1[0] + (2.0 / 3.0) * (cp[0] - p1[0]),
-                    p1[1] + (2.0 / 3.0) * (cp[1] - p1[1]),
-                ];
-                tessellate_cubic_bezier(p0, c1, c2, p1, 0, flat)
+                let (c1, c2) = elevated_controls(p0, cp, p1);
+                (p0, c1, c2, p1)
             }
-            Seg::Cubic { p0, p1, cp1, cp2 } => tessellate_cubic_bezier(p0, cp1, cp2, p1, 0, flat),
+            Seg::Cubic { p0, p1, cp1, cp2 } => (p0, cp1, cp2, p1),
         };
-        let chords: Vec<f64> = pts
-            .windows(2)
-            .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
-            .collect();
-        let total: f64 = chords.iter().sum();
-        let k = if total > 0.0 {
-            s.arc_length / total
-        } else {
-            0.0
-        };
-        for (w, c) in pts.windows(2).zip(&chords) {
-            out.push(PathSegment {
-                seg: Seg::Line { p0: w[0], p1: w[1] },
-                arc_length: c * k,
-            });
-        }
+        visit_flat_cubics((a, b, c, d), 0, flat, &mut |(a, b, c, d), depth| {
+            let arc_length = if depth == 0 { s.arc_length } else { cubic_arc_length(a, b, c, d) };
+            out.push(PathSegment { seg: Seg::Line { p0: a, p1: d }, arc_length });
+            true
+        });
     }
     out
 }
@@ -2352,7 +2065,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
                 if closed && subpath_has_segments {
                     let closing_length = (subpath_start[0] - current_pos[0])
                         .hypot(subpath_start[1] - current_pos[1]);
-                    if closing_length > 0.001 {
+                    if closing_length > 0.0 {
                         segments.push(PathSegment {
                             seg: Seg::Line {
                                 p0: current_pos,
@@ -2369,7 +2082,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
             PathCmd::Line { x, y } => {
                 let end_pos = [*x, *y];
                 let length = (end_pos[0] - current_pos[0]).hypot(end_pos[1] - current_pos[1]);
-                if length > 0.001 {
+                if length > 0.0 {
                     segments.push(PathSegment {
                         seg: Seg::Line {
                             p0: current_pos,
@@ -2386,7 +2099,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
                 let cp1p = [cp1.0, cp1.1];
                 let cp2p = [cp2.0, cp2.1];
                 let arc_length = cubic_arc_length(current_pos, cp1p, cp2p, end_pos);
-                if arc_length > 0.001 {
+                if arc_length > 0.0 {
                     segments.push(PathSegment {
                         seg: Seg::Cubic {
                             p0: current_pos,
@@ -2404,7 +2117,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
                 let end_pos = [*x, *y];
                 let cpp = [cp.0, cp.1];
                 let arc_length = quadratic_arc_length(current_pos, cpp, end_pos);
-                if arc_length > 0.001 {
+                if arc_length > 0.0 {
                     segments.push(PathSegment {
                         seg: Seg::Quadratic {
                             p0: current_pos,
@@ -2439,7 +2152,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
                 if beziers.is_empty() {
                     let end_pos = [*x, *y];
                     let length = (end_pos[0] - current_pos[0]).hypot(end_pos[1] - current_pos[1]);
-                    if length > 0.001 {
+                    if length > 0.0 {
                         segments.push(PathSegment {
                             seg: Seg::Line {
                                 p0: current_pos,
@@ -2457,7 +2170,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
                         let cp2p = [b.cp2[0], b.cp2[1]];
                         let end_pos = [b.end[0], b.end[1]];
                         let arc_length = cubic_arc_length(bezier_start, cp1p, cp2p, end_pos);
-                        if arc_length > 0.001 {
+                        if arc_length > 0.0 {
                             segments.push(PathSegment {
                                 seg: Seg::Cubic {
                                     p0: bezier_start,
@@ -2480,7 +2193,7 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
     if closed && subpath_has_segments {
         let closing_length =
             (subpath_start[0] - current_pos[0]).hypot(subpath_start[1] - current_pos[1]);
-        if closing_length > 0.001 {
+        if closing_length > 0.0 {
             segments.push(PathSegment {
                 seg: Seg::Line {
                     p0: current_pos,
@@ -2503,8 +2216,8 @@ fn path_points_to_segments(points: &[PathCmd], closed: bool) -> Vec<PathSegment>
 /// edge), then handed to lyon's sweep-line fill tessellator, which resolves
 /// self-intersections and holes from the fill rule alone. Public for the
 /// holes / fill-rule suites.
-pub fn tessellate_path(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> Vec<f64> {
-    fill_path(points, closed, fill_rule).tris
+pub fn tessellate_path(points: &[PathCmd], _closed: bool, fill_rule: FillRule) -> Vec<f64> {
+    fill_path(PathContours::new(points, false), fill_rule).tris
 }
 
 /// A path's fill: the triangle stream, its bounds, and — when the fill was
@@ -2542,17 +2255,17 @@ impl PathFill {
 /// fits), one band coarser whenever the fill is truncated or dropped over its
 /// vertex cap, and the pre-band 0.5-unit flattening as the last resort.
 /// Every attempt must produce the complete outline.
-fn fill_path(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFill {
+fn fill_path(path: PathContours<'_>, fill_rule: FillRule) -> PathFill {
     // A cap already hit by the caller's attempt: the fill may only add to it, which the memo doesn't model.
     if CAP_HIT.with(std::cell::Cell::get) {
-        return fill_path_uncached(points, closed, fill_rule);
+        return fill_path_uncached(path, fill_rule);
     }
-    let inputs = FillInputs::now(closed, fill_rule);
-    if let Some(hit) = FILL_MEMO.with(|m| m.borrow().get(points, &inputs)) {
+    let inputs = FillInputs::now(fill_rule);
+    if let Some(hit) = FILL_MEMO.with(|m| m.borrow().get(path.points, &inputs)) {
         return hit;
     }
-    let out = fill_path_uncached(points, closed, fill_rule);
-    FILL_MEMO.with(|m| m.borrow_mut().put(points, inputs, &out));
+    let out = fill_path_uncached(path, fill_rule);
+    FILL_MEMO.with(|m| m.borrow_mut().put(path.points, inputs, &out));
     out
 }
 
@@ -2560,7 +2273,6 @@ fn fill_path(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFill 
 /// band, coarsening, legacy flag, sweep budget and vertex cap.
 #[derive(Clone, Copy, PartialEq)]
 struct FillInputs {
-    closed: bool,
     fill_rule: FillRule,
     band: i32,
     coarsen: i32,
@@ -2570,11 +2282,10 @@ struct FillInputs {
 }
 
 impl FillInputs {
-    fn now(closed: bool, fill_rule: FillRule) -> FillInputs {
+    fn now(fill_rule: FillRule) -> FillInputs {
         FillInputs {
-            closed,
             fill_rule,
-            band: super::outline::current_band(),
+            band: super::curve_quality::current_band(),
             coarsen: COARSEN.with(std::cell::Cell::get),
             legacy: LEGACY.with(std::cell::Cell::get),
             sweep_budget: SWEEP_BUDGET.with(std::cell::Cell::get),
@@ -2624,7 +2335,6 @@ fn fill_memo_hash(points: &[PathCmd], inputs: &FillInputs) -> u64 {
             }
         }
     }
-    h.write_u8(u8::from(inputs.closed));
     h.write_u8(inputs.fill_rule as u8);
     h.write_i32(inputs.band);
     h.finish()
@@ -2668,7 +2378,7 @@ thread_local! {
     static FILL_MEMO: std::cell::RefCell<FillMemo> = std::cell::RefCell::new(FillMemo::default());
 }
 
-fn fill_path_uncached(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFill {
+fn fill_path_uncached(path: PathContours<'_>, fill_rule: FillRule) -> PathFill {
     let prev = (
         COARSEN.with(std::cell::Cell::get),
         LEGACY.with(std::cell::Cell::get),
@@ -2677,21 +2387,21 @@ fn fill_path_uncached(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> 
         COARSEN.with(|k| k.set(c));
         LEGACY.with(|k| k.set(legacy));
     };
-    let band = super::outline::current_band().max(0);
-    let out = if band == 0 || !has_curve_cmds(points) {
+    let band = super::curve_quality::current_band().max(0);
+    let out = if band == 0 || !has_curve_cmds(path.points) {
         set(0, false);
-        fill_path_at(points, closed, fill_rule)
+        fill_path_at(path, fill_rule)
     } else {
         let start = (0..=band).find(|&c| {
             set(c, false);
-            estimate_flattened(points, Flat::fill()).0 <= MAX_PATH_SEGMENTS
+            estimate_flattened(path.points, Flat::fill()).0 <= MAX_PATH_SEGMENTS
         });
         let mut done = None;
         if let Some(start) = start {
             for c in start..=band {
                 set(c, false);
                 CAP_HIT.with(|k| k.set(false));
-                let f = fill_path_at(points, closed, fill_rule);
+                let f = fill_path_at(path, fill_rule);
                 if !CAP_HIT.with(std::cell::Cell::get) && f.dropped.is_none() {
                     done = Some(f);
                     break;
@@ -2700,21 +2410,19 @@ fn fill_path_uncached(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> 
         }
         done.unwrap_or_else(|| {
             set(band, true);
-            fill_path_at(points, closed, fill_rule)
+            fill_path_at(path, fill_rule)
         })
     };
     set(prev.0, prev.1);
     out
 }
 
-fn fill_path_at(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFill {
-    if points.is_empty() {
+fn fill_path_at(path: PathContours<'_>, fill_rule: FillRule) -> PathFill {
+    if path.points.is_empty() {
         return PathFill::EMPTY;
     }
     // Every subpath is a closed contour to the fill (SVG semantics: a fill
     // implicitly closes an open subpath — Q-51 keeps open line bodies filled).
-    // `subpath_to_line_segments` keeps the `closed` distinction only for the
-    // strict-equality closing point, which the contour cleanup folds away.
     // Zoomed out (below 1×), a fill's outline also drops vertices the half-pixel tolerance can't see: a path of
     // hundreds of points a few pixels across drew every one of them (a 20k-layer vector document at fit was ~1 GB
     // of vertices, past the 256 MB buffer limit). Curves flatten to half the tolerance and the outline then
@@ -2729,12 +2437,12 @@ fn fill_path_at(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFi
         Flat::fill()
     };
     let mut contours = Vec::new();
-    for sp in split_into_subpaths(points).iter().filter(|sp| sp.len() >= 2) {
-        let segments = match subpath_to_line_segments(sp, closed, flat) {
+    for contour in path.iter().filter(|c| c.points.len() >= 2) {
+        let segments = match subpath_to_line_segments(contour.points, false, flat) {
             Ok(segments) => segments,
             Err(why) => return PathFill::dropped(why.into()),
         };
-        let c = clean_closed_contour(&segments);
+        let c = clean_closed_contour(segments);
         let c = if simplify { simplify_closed_contour(c, flatness_tolerance() * 0.5) } else { c };
         if c.len() >= 3 { contours.push(c); }
     }
@@ -2752,11 +2460,25 @@ fn fill_path_at(points: &[PathCmd], closed: bool, fill_rule: FillRule) -> PathFi
     }
 }
 
-/// Runs lyon over already-flattened contours. lyon works in f32; the vertices
-/// it emits for input points are those points cast to f32, which is exactly
-/// what `combine` casts the stream to, so the fill's outline stays bit-identical
-/// to what the ear clipper emitted for the same contour. Intersection points on
-/// self-intersecting outlines are the only vertices lyon invents.
+fn point_bounds<'a>(points: impl Iterator<Item = &'a P>) -> [f64; 4] {
+    points.fold(
+        [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        |[x0, y0, x1, y1], &[x, y]| [x0.min(x), y0.min(y), x1.max(x), y1.max(y)],
+    )
+}
+
+/// Lyon uses absolute distances both to classify points on edges and to snap
+/// intersections to endpoints. Scale all cells so one f32 ULP of the fill's
+/// extent is one sweep unit. A power of two preserves the significands, so
+/// input vertices round exactly as they would in their original coordinate system.
+fn sweep_scale([x0, y0, x1, y1]: [f64; 4]) -> f64 {
+    let extent = (x1 - x0).max(y1 - y0).max(f64::from(f32::from_bits(1)));
+    // Keep the exponent alone, the largest power of two at or below the extent.
+    let binade = f64::from_bits(extent.to_bits() & f64::INFINITY.to_bits());
+    1.0 / (binade * f64::from(f32::EPSILON))
+}
+
+/// Run lyon on the already-flattened contours in the fill's sweep space.
 ///
 /// A panic in the sweep is converted to an `Err`: lyon keeps release-mode
 /// asserts in its intersection handling, and on the server a panic is a failed
@@ -2770,6 +2492,7 @@ fn lyon_sweep(
     fill_rule: FillRule,
     cap: usize,
     horizontal: bool,
+    scale: f64,
 ) -> Result<(Vec<f64>, bool), FillRefusal> {
     use lyon_tessellation::math::point;
     use lyon_tessellation::path::PathEvent;
@@ -2787,7 +2510,10 @@ fn lyon_sweep(
             lyon_tessellation::Orientation::Vertical
         });
     let events = contours.iter().flat_map(|c| {
-        let pt = |p: &P| point(p[0] as f32, p[1] as f32);
+        let pt = |p: &P| point(
+            (p[0] * scale) as f32,
+            (p[1] * scale) as f32,
+        );
         let first = pt(&c[0]);
         let last = pt(&c[c.len() - 1]);
         std::iter::once(PathEvent::Begin { at: first })
@@ -2839,10 +2565,11 @@ fn lyon_sweep(
     }
 
     let mut tris = Vec::with_capacity(builder.indices.len() * 2);
+    let local_unit = scale.recip();
     for i in &builder.indices {
         let v = builder.vertices[*i as usize];
-        tris.push(v.x as f64);
-        tris.push(v.y as f64);
+        tris.push(f64::from(v.x) * local_unit);
+        tris.push(f64::from(v.y) * local_unit);
     }
     // lyon invents vertices only at crossings. A crossing outline's vertices
     // are placed to ~0.01 units, close enough to a neighbour to fail the
@@ -2866,12 +2593,13 @@ fn sound_sweep(
     contours: &[Vec<P>],
     fill_rule: FillRule,
     cap: usize,
+    scale: f64,
 ) -> Result<(Vec<f64>, bool), FillRefusal> {
-    let vertical = lyon_sweep(contours, fill_rule, cap, false)?;
+    let vertical = lyon_sweep(contours, fill_rule, cap, false, scale)?;
     if vertical.1 {
         return Ok(vertical);
     }
-    match lyon_sweep(contours, fill_rule, cap, true) {
+    match lyon_sweep(contours, fill_rule, cap, true, scale) {
         Ok(horizontal) if horizontal.1 => Ok(horizontal),
         _ => Ok(vertical),
     }
@@ -3181,24 +2909,6 @@ impl lyon_tessellation::geometry_builder::FillGeometryBuilder for BoundedFillBui
     }
 }
 
-/// `splitIntoSubpaths` (:895-918).
-fn split_into_subpaths(points: &[PathCmd]) -> Vec<Vec<PathCmd>> {
-    let mut out: Vec<Vec<PathCmd>> = Vec::new();
-    let mut cur: Vec<PathCmd> = Vec::new();
-    for p in points {
-        if matches!(p, PathCmd::Move { .. }) {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-        }
-        cur.push(p.clone());
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 const INCOMPLETE_PATH: &str = "path flattening exceeds its segment cap (split the path into several)";
 
 /// Flatten one complete subpath, or refuse it. Never expose a partial contour.
@@ -3223,43 +2933,13 @@ fn subpath_to_line_segments(points: &[PathCmd], closed: bool, flat: Flat) -> Res
                 cur = [*x, *y];
             }
             PathCmd::Curve { x, y, cp1, cp2 } => {
-                if segs.len() > MAX_PATH_SEGMENTS {
-                    note_cap_hit();
-                    return Err(INCOMPLETE_PATH);
-                }
-                let pts =
-                    tessellate_cubic_bezier(cur, [cp1.0, cp1.1], [cp2.0, cp2.1], [*x, *y], 0, flat);
-                for q in pts.iter().skip(1) {
-                    if segs.len() >= MAX_PATH_SEGMENTS {
-                        note_cap_hit();
-                        return Err(INCOMPLETE_PATH);
-                    }
-                    segs.push(*q);
-                }
+                append_flat_endpoints((cur, [cp1.0, cp1.1], [cp2.0, cp2.1], [*x, *y]), flat, &mut segs)?;
                 cur = [*x, *y];
             }
             PathCmd::Quadratic { x, y, cp } => {
-                if segs.len() > MAX_PATH_SEGMENTS {
-                    note_cap_hit();
-                    return Err(INCOMPLETE_PATH);
-                }
-                // q→c elevation (:997-1000).
-                let cp1 = [
-                    cur[0] + (2.0 / 3.0) * (cp.0 - cur[0]),
-                    cur[1] + (2.0 / 3.0) * (cp.1 - cur[1]),
-                ];
-                let cp2 = [
-                    *x + (2.0 / 3.0) * (cp.0 - *x),
-                    *y + (2.0 / 3.0) * (cp.1 - *y),
-                ];
-                let pts = tessellate_cubic_bezier(cur, cp1, cp2, [*x, *y], 0, flat);
-                for q in pts.iter().skip(1) {
-                    if segs.len() >= MAX_PATH_SEGMENTS {
-                        note_cap_hit();
-                        return Err(INCOMPLETE_PATH);
-                    }
-                    segs.push(*q);
-                }
+                let end = [*x, *y];
+                let (c1, c2) = elevated_controls(cur, [cp.0, cp.1], end);
+                append_flat_endpoints((cur, c1, c2, end), flat, &mut segs)?;
                 cur = [*x, *y];
             }
             PathCmd::Arc {
@@ -3289,30 +2969,9 @@ fn subpath_to_line_segments(points: &[PathCmd], closed: bool, flat: Flat) -> Res
                     // Degenerate arc → line to endpoint (:1031).
                     segs.push([*x, *y]);
                 } else {
-                    let mut bx = cur[0];
-                    let mut by = cur[1];
                     for b in &beziers {
-                        if segs.len() > MAX_PATH_SEGMENTS {
-                            note_cap_hit();
-                            return Err(INCOMPLETE_PATH);
-                        }
-                        let pts = tessellate_cubic_bezier(
-                            [bx, by],
-                            [b.cp1[0], b.cp1[1]],
-                            [b.cp2[0], b.cp2[1]],
-                            [b.end[0], b.end[1]],
-                            0,
-                            flat,
-                        );
-                        for q in pts.iter().skip(1) {
-                            if segs.len() >= MAX_PATH_SEGMENTS {
-                                note_cap_hit();
-                                return Err(INCOMPLETE_PATH);
-                            }
-                            segs.push(*q);
-                        }
-                        bx = b.end[0];
-                        by = b.end[1];
+                        append_flat_endpoints((cur, b.cp1, b.cp2, b.end), flat, &mut segs)?;
+                        cur = b.end;
                     }
                 }
                 cur = [*x, *y];
@@ -3330,123 +2989,69 @@ fn subpath_to_line_segments(points: &[PathCmd], closed: bool, flat: Flat) -> Res
     Ok(segs)
 }
 
-/// `tessellateCubicBezier` (:1082-1119) — recursive De Casteljau midpoint
-/// subdivision to `flat` (chord distance, and for strokes the piece's turn),
-/// depth ≤ 12.
-pub(crate) fn tessellate_cubic_bezier(
-    p0: P,
-    p1: P,
-    p2: P,
-    p3: P,
-    depth: u32,
-    flat: Flat,
-) -> Vec<P> {
-    let mut out = Vec::with_capacity(2);
-    out.push(p0);
-    append_cubic_endpoints(p0, p1, p2, p3, depth, flat, &mut out);
-    out
+fn append_flat_endpoints(curve: Cubic, flat: Flat, out: &mut Vec<P>) -> Result<(), &'static str> {
+    let complete = visit_flat_cubics(curve, 0, flat, &mut |(_, _, _, end), _| {
+        if out.len() >= MAX_PATH_SEGMENTS { return false; }
+        out.push(end);
+        true
+    });
+    if !complete {
+        note_cap_hit();
+        return Err(INCOMPLETE_PATH);
+    }
+    Ok(())
 }
 
-// The left-first subdivision emits one endpoint per leaf. Shared subdivision points
-// are already the preceding leaf's endpoint, so each right branch omits its start.
-fn append_cubic_endpoints(
-    p0: P,
-    p1: P,
-    p2: P,
-    p3: P,
-    depth: u32,
-    flat: Flat,
-    out: &mut Vec<P>,
-) {
-    if depth >= MAX_RECURSION_DEPTH {
-        out.push(p3);
-        return;
-    }
-    if is_curve_flat(p0, p1, p2, p3, flat.dist)
-        && flat.turn.is_none_or(|t| control_turn(p0, p1, p2, p3) <= t)
+// Each leaf is one drawing chord. Dashes also need the controls to measure
+// the arc distance along that leaf. Stop when the destination reaches its cap.
+fn visit_flat_cubics(
+    curve: Cubic, depth: u32, flat: Flat, emit: &mut impl FnMut(Cubic, u32) -> bool,
+) -> bool {
+    let (a, b, c, d) = curve;
+    if depth >= MAX_RECURSION_DEPTH || (cubic_deviation(a, b, c, d) <= flat.dist
+        && flat.turn.is_none_or(|limit| control_turn(a, b, c, d) <= limit))
     {
-        out.push(p3);
-        return;
+        return emit(curve, depth);
     }
-    let p01 = mid(p0, p1);
-    let p12 = mid(p1, p2);
-    let p23 = mid(p2, p3);
-    let p012 = mid(p01, p12);
-    let p123 = mid(p12, p23);
-    let p0123 = mid(p012, p123);
-    append_cubic_endpoints(p0, p01, p012, p0123, depth + 1, flat, out);
-    append_cubic_endpoints(p0123, p123, p23, p3, depth + 1, flat, out);
+    let (left, right) = split_cubic(a, b, c, d, 0.5);
+    visit_flat_cubics(left, depth + 1, flat, emit) && visit_flat_cubics(right, depth + 1, flat, emit)
 }
 
 /// Total turn of a cubic's control polygon (an upper bound on its tangent's turn).
 fn control_turn(p0: P, p1: P, p2: P, p3: P) -> f64 {
-    let dirs: Vec<P> = [
-        [p1[0] - p0[0], p1[1] - p0[1]],
-        [p2[0] - p1[0], p2[1] - p1[1]],
-        [p3[0] - p2[0], p3[1] - p2[1]],
-    ]
-    .into_iter()
-    .filter(|d| d[0].hypot(d[1]) > 1e-12)
-    .collect();
-    dirs.windows(2)
-        .map(|w| {
-            (w[0][0] * w[1][1] - w[0][1] * w[1][0])
-                .atan2(w[0][0] * w[1][0] + w[0][1] * w[1][1])
-                .abs()
-        })
-        .sum()
-}
-
-fn mid(a: P, b: P) -> P {
-    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
-}
-
-/// `isCurveFlat` (:1124-1153).
-fn is_curve_flat(p0: P, p1: P, p2: P, p3: P, tolerance: f64) -> bool {
-    let dx = p3[0] - p0[0];
-    let dy = p3[1] - p0[1];
-    let d2 = dx * dx + dy * dy;
-    if d2 == 0.0 {
-        return true;
+    let mut previous: Option<P> = None;
+    let mut turn = 0.;
+    for (a, b) in [(p0, p1), (p1, p2), (p2, p3)] {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        if d[0] * d[0] + d[1] * d[1] > 1e-24 {
+            if let Some([x, y]) = previous {
+                turn += (x * d[1] - y * d[0]).atan2(x * d[0] + y * d[1]).abs();
+            }
+            previous = Some(d);
+        }
     }
-    let dist = |p: P| -> f64 {
-        let t = ((p[0] - p0[0]) * dx + (p[1] - p0[1]) * dy) / d2;
-        let ex = p[0] - (p0[0] + t * dx);
-        let ey = p[1] - (p0[1] + t * dy);
-        (ex * ex + ey * ey).sqrt()
-    };
-    dist(p1).max(dist(p2)) <= tolerance
+    turn
 }
 
 // --- contour utilities (:665-890) ---
 
-fn points_almost_equal(a: P, b: P) -> bool {
-    (a[0] - b[0]).abs() <= POLY_EPS && (a[1] - b[1]).abs() <= POLY_EPS
-}
-
-/// `cleanClosedContour` (:720-743).
-fn clean_closed_contour(points: &[P]) -> Vec<P> {
-    if points.is_empty() {
-        return Vec::new();
+/// Remove only redundant vertices before the fill sweep. A short edge or a
+/// shallow turn can cover many pixels once the node transform is applied.
+fn clean_closed_contour(mut points: Vec<P>) -> Vec<P> {
+    // Flattening computes arc endpoints in f64. In a closed arc sin(pi) can
+    // leave the final point a rounding error away from the authored start.
+    let [x0, y0, x1, y1] = point_bounds(points.iter());
+    let roundoff = (x1 - x0).max(y1 - y0) * f64::EPSILON;
+    // Non-finite coordinates must reach the sweep's diagnostic.
+    let roundoff = if roundoff.is_finite() { roundoff } else { 0.0 };
+    let same = |a: &P, b: &P| {
+        (a[0] - b[0]).abs() <= roundoff && (a[1] - b[1]).abs() <= roundoff
+    };
+    points.dedup_by(|a, b| same(a, b));
+    if points.len() > 1 && same(&points[0], &points[points.len() - 1]) {
+        points.pop();
     }
-    let mut p: Vec<P> = points.to_vec();
-    if p.len() > 2 && points_almost_equal(p[0], p[p.len() - 1]) {
-        p.pop();
-    }
-    let mut deduped: Vec<P> = Vec::with_capacity(p.len());
-    for pt in p {
-        if deduped
-            .last()
-            .map(|prev| !points_almost_equal(*prev, pt))
-            .unwrap_or(true)
-        {
-            deduped.push(pt);
-        }
-    }
-    if deduped.len() > 2 && points_almost_equal(deduped[0], deduped[deduped.len() - 1]) {
-        deduped.pop();
-    }
-    remove_nearly_collinear(deduped)
+    remove_collinear(points)
 }
 
 /// A closed contour with the vertices within `tol` of the outline kept dropped (Douglas–Peucker, split at the
@@ -3549,8 +3154,8 @@ fn simplify_polyline(points: Vec<P>, tol: f64) -> Vec<P> {
     }
 }
 
-/// `removeNearlyCollinear` (:745-766).
-fn remove_nearly_collinear(points: Vec<P>) -> Vec<P> {
+/// A zero determinant removes no signed area, including on a retraced edge.
+fn remove_collinear(points: Vec<P>) -> Vec<P> {
     if points.len() < 4 {
         return points;
     }
@@ -3563,7 +3168,7 @@ fn remove_nearly_collinear(points: Vec<P>) -> Vec<P> {
         let next = result[(i + 1) % n];
         let area2 =
             (curr[0] - prev[0]) * (next[1] - prev[1]) - (curr[1] - prev[1]) * (next[0] - prev[0]);
-        if area2.abs() <= POLY_EPS {
+        if area2 == 0.0 {
             result.remove(i);
             continue;
         }
@@ -3610,15 +3215,14 @@ fn calc_bounds(points: &[P]) -> [f64; 4] {
 // ---------------------------------------------------------------------------
 
 /// `generateStrokeGeometry` (:1393-1595). Returns (triangle stream, bounds).
-fn generate_stroke_geometry(
-    points: &[PathCmd],
+fn generate_stroke_geometry<'a>(
+    contours: impl Iterator<Item = Contour<'a>>,
     stroke_width: f64,
-    closed: bool,
     line_cap: LineCap,
     line_join: LineJoin,
     stroke_align: StrokeAlign,
 ) -> (Vec<f64>, [f64; 4]) {
-    if points.is_empty() || stroke_width <= 0.0 {
+    if stroke_width <= 0.0 {
         return (Vec::new(), [0.0; 4]);
     }
     let mut tris: Vec<f64> = Vec::new();
@@ -3628,10 +3232,8 @@ fn generate_stroke_geometry(
         f64::NEG_INFINITY,
         f64::NEG_INFINITY,
     ];
-    let subpaths = split_into_subpaths(points);
-
-    for sp in &subpaths {
-        if sp.len() < 2 {
+    for Contour { points: sp, closed } in contours {
+        if sp.len() < 2 && !closed {
             continue;
         }
         // The flattening must hold at the stroke's outer offset: half the
@@ -3661,7 +3263,38 @@ fn generate_stroke_geometry(
                 Err(_) => return (Vec::new(), [0.0; 4]),
             }
         };
-        if segments.len() < 2 {
+        if segments.is_empty() {
+            continue;
+        }
+        let center = segments[0];
+        if segments.last() == Some(&center) && segments.iter().all(|&point| point == center) {
+            // A zero-length segment (including an explicit close) has a cap shape without a tangent.
+            // A lone move was skipped above, and a nonzero segment takes the ordinary route.
+            if line_cap != LineCap::Butt {
+                let half = stroke_width / 2.0;
+                let [x, y] = center;
+                let cap_bounds = [x - half, y - half, x + half, y + half];
+                if line_cap == LineCap::Square {
+                    let [left, top, right, bottom] = cap_bounds;
+                    tris.extend_from_slice(&[
+                        left, top, right, top, left, bottom,
+                        left, bottom, right, top, right, bottom,
+                    ]);
+                } else {
+                    let sweep = std::f64::consts::TAU;
+                    let count = round_arc_segments(half, sweep, 20).next_multiple_of(4);
+                    let point = |i| {
+                        let (sin, cos) = (sweep * (i % count) as f64 / count as f64).sin_cos();
+                        [x + half * cos, y + half * sin]
+                    };
+                    for i in 0..count {
+                        tris.extend_from_slice(&center);
+                        tris.extend_from_slice(&point(i));
+                        tris.extend_from_slice(&point(i + 1));
+                    }
+                }
+                bounds = union_bounds(bounds, cap_bounds);
+            }
             continue;
         }
         let mut effective: Vec<P> = segments.clone();
@@ -3960,36 +3593,23 @@ fn generate_stroke_offsets(
         let mut dy2 = next[1] - curr[1];
         let mut len2 = dx2.hypot(dy2);
 
-        // Zero-length lookback/lookahead (:1757-1779) — `(i - j + n) % n`
-        // with j in 2..=n, stopping when the index wraps to i.
-        if len1 <= EPS {
-            // JS `(i - j + n) % n` for 2 <= j <= n: i + n >= j always holds.
-            let mut j = 2usize;
-            while j <= n && len1 <= EPS {
-                let lb = (i + n - j) % n;
-                if lb == i {
-                    break;
-                }
-                prev = segments[lb];
-                dx1 = curr[0] - prev[0];
-                dy1 = curr[1] - prev[1];
-                len1 = dx1.hypot(dy1);
-                j += 1;
-            }
+        // A closed contour can search across its seam. An open join with
+        // no usable leg on one side inherits the tangent of its other leg.
+        let back = if closed { n - 1 } else { i };
+        let ahead = if closed { n - 1 } else { n - 1 - i };
+        for j in 2..=back {
+            if len1 > EPS { break; }
+            prev = segments[(i + n - j) % n];
+            dx1 = curr[0] - prev[0];
+            dy1 = curr[1] - prev[1];
+            len1 = dx1.hypot(dy1);
         }
-        if len2 <= EPS {
-            let mut j = 2usize;
-            while j <= n && len2 <= EPS {
-                let la = (i + j) % n;
-                if la == i {
-                    break;
-                }
-                next = segments[la];
-                dx2 = next[0] - curr[0];
-                dy2 = next[1] - curr[1];
-                len2 = dx2.hypot(dy2);
-                j += 1;
-            }
+        for j in 2..=ahead {
+            if len2 > EPS { break; }
+            next = segments[(i + j) % n];
+            dx2 = next[0] - curr[0];
+            dy2 = next[1] - curr[1];
+            len2 = dx2.hypot(dy2);
         }
         if len1 <= EPS && len2 <= EPS {
             left.push(curr);
@@ -4173,6 +3793,102 @@ mod trim_tests {
     }
 
     #[test]
+    fn open_miter_does_not_look_past_the_end_of_its_run() {
+        let pts = [
+            mv(0., 0.),
+            line(100., 0.),
+            line(100., 100.),
+            line(99.9999999, 100.),
+        ];
+        let (_, bounds) = generate_stroke_geometry(
+            PathContours::new(&pts, false).iter(),
+            10.,
+            LineCap::Butt,
+            LineJoin::Miter,
+            StrokeAlign::Center,
+        );
+        // The endpoint tangent includes the authored 1e-7 lateral displacement.
+        // At the precision of the emitted positions the butt cap ends at y=100.
+        assert_eq!(bounds[3] as f32, 100., "bounds {bounds:?}");
+    }
+
+    #[test]
+    fn dash_cut_at_a_corner_has_one_vertex_and_the_full_width() {
+        for (leg, width, on, off) in [(14., 2., 1.4_f32, 1.4_f32), (56., 6., 11.2, 2.8)] {
+            let pts = [mv(0., 0.), line(leg, 0.), line(leg, leg)];
+            let pattern = [on, off].map(|v| f64::from(v) * 2. / width);
+            let dashed = apply_dash_to_path(&pts, &pattern, width, false, 0.).unwrap();
+            let run = PathContours::new(&dashed.open, false)
+                .iter()
+                .find(|c| xy(c.points.last().unwrap()).1 > 0.)
+                .unwrap();
+            let (tris, _) = generate_stroke_geometry(
+                std::iter::once(run),
+                width,
+                LineCap::Butt,
+                LineJoin::Miter,
+                StrokeAlign::Center,
+            );
+            let area: f64 = tris
+                .chunks_exact(6)
+                .map(|v| {
+                    0.5 * ((v[2] - v[0]) * (v[5] - v[1]) - (v[4] - v[0]) * (v[3] - v[1])).abs()
+                })
+                .sum();
+            assert!(
+                (area - width * f64::from(on)).abs() < 1e-5,
+                "{leg}: area {area}"
+            );
+            assert_eq!(
+                run.points.len(),
+                2,
+                "cut at an authored vertex: {:?}",
+                run.points
+            );
+        }
+    }
+
+    #[test]
+    fn trim_and_text_gap_cut_once_at_a_vertex() {
+        let pts = [mv(0., 0.), line(29., 0.), line(29., 71.)];
+        let trimmed = apply_trim_to_path(&pts, false, t(0.29, 1., 0., false));
+        assert_eq!(
+            trimmed.iter().map(xy).collect::<Vec<_>>(),
+            [(29., 0.), (29., 71.)]
+        );
+        // Text gaps use the same arc-length extraction, also when the cut ends at the vertex.
+        let segs = path_points_to_segments(&pts, false);
+        let kept = extract_path_segments_by_arc_length(&segs, 0., 29_f64.next_up());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(seg_end(&kept[0].seg), [29., 0.]);
+    }
+
+    #[test]
+    fn a_short_dash_straddling_an_interior_vertex_keeps_its_caps() {
+        let path = [mv(0., 0.), line(100., 0.), line(100., 20.)];
+        let dash = apply_dash_to_path(&path, &[1e-6, 100. - 1.5e-6], 2., false, 0.).unwrap();
+        let corner_run = PathContours::new(&dash.open, false).iter().nth(1).unwrap();
+        let (x, _) = xy(&corner_run.points[0]);
+        let (_, y) = xy(corner_run.points.last().unwrap());
+        assert!(100. - x + y >= 0.5e-6, "short dash lost at the cut");
+    }
+
+    #[test]
+    fn near_empty_trim_preserves_main_at_both_path_sizes() {
+        for (side, empty) in [(1., true), (100., false)] {
+            let square = [mv(0., 0.), line(side, 0.), line(side, side), line(0., side)];
+            let cut = apply_trim_to_path(&square, true, t(0., 5e-5, 0., false));
+            assert_eq!(cut.is_empty(), empty, "side {side}");
+        }
+    }
+
+    #[test]
+    fn near_full_trim_preserves_the_closed_join() {
+        assert!(is_trim_identity(0., 0.99999, 0.25));
+        assert!(!is_trim_identity(0., 0.999, 0.25));
+    }
+
+    #[test]
     fn identity_guard() {
         assert!(is_trim_identity(0.0, 1.0, 0.0));
         // A full [0,1] window is identity for ANY offset (rotating a full loop is
@@ -4190,6 +3906,18 @@ mod trim_tests {
         assert_eq!(out.len(), 2);
         approx(xy(&out[0]).0, 0.0);
         approx(xy(&out[1]).0, 50.0);
+    }
+
+    fn apply_trim_to_path(points: &[PathCmd], closed: bool, trim: TrimParams) -> Vec<PathCmd> {
+        let [ordinary, _] = trim_contours(PathContours::new(points, closed), trim, false);
+        ordinary
+    }
+
+    fn apply_dash_to_path(
+        points: &[PathCmd], dash: &[f64], width: f64, closed: bool, offset: f64,
+    ) -> Result<DashedStroke, String> {
+        dash_contours(PathContours::new(points, closed).iter().map(|c| (c, false)), dash, width, offset)
+            .map(|[ordinary, _]| ordinary)
     }
 
     #[test]
@@ -4325,6 +4053,111 @@ mod trim_tests {
         let wrapped = apply_trim_to_path(&pts, false, t(0.0, 0.5, 3.0, true));
         assert_eq!(count_moves(&wrapped), count_moves(&base));
         assert!(!wrapped.is_empty(), "offset 3.0 must not drop all geometry");
+    }
+
+    #[test]
+    fn a_calibrated_gap_covering_a_ring_has_no_spurious_round_cap() {
+        for radius in [150., 200., 250., 300.] {
+            let arc = |x| PathCmd::Arc {
+                x, y: 0., rx: radius, ry: radius, x_axis_rotation: 0., large_arc: true, sweep: false,
+            };
+            let ring = [mv(-radius, 0.), arc(radius), arc(-radius)];
+            let length = PathContours::new(&ring, true).measured_length();
+            let to_moda = |value| value * (length / 100.) * 2. / 18.;
+            let pattern = [to_moda(100.); 2];
+            let render = |offset| apply_dash_to_path(&ring, &pattern, 18., true, to_moda(offset)).unwrap();
+            let gap = render(100.);
+            assert!(gap.open.is_empty() && gap.closed.is_empty());
+            assert!(!render(99.99).open.is_empty());
+        }
+    }
+
+    #[test]
+    fn calibrated_line_ends_in_its_fiftieth_gap() {
+        let length = 100.00390625;
+        let cmds = [mv(0., 0.), line(length, 0.)];
+        let dash = apply_dash_to_path(&cmds, &[length / 100.; 2], 2., false, 0.).unwrap();
+        assert_eq!(dash.open.len(), 100, "fifty move/line pairs");
+
+        // Chromium paints the final round cap one representable SVG length later.
+        let calibrated = f64::from(100_f32.next_up());
+        let dash = apply_dash_to_path(&cmds, &[length / calibrated; 2], 2., false, 0.).unwrap();
+        assert_eq!(dash.open.len(), 102, "keep the authored last dash");
+    }
+
+    #[test]
+    fn full_gap_includes_a_short_final_edge() {
+        let end = 100. + 1e-7;
+        let cmds = [mv(0., 0.), line(100., 0.), line(end, 0.)];
+        let dash = apply_dash_to_path(&cmds, &[end; 2], 2., false, end).unwrap();
+        assert!(dash.open.is_empty());
+    }
+
+    #[test]
+    fn calibrated_offset_starts_in_the_gap() {
+        // Chromium represents the SVG endpoint 100.8448 by this exact f32 value.
+        let length = f64::from(100.8448_f32);
+        let cmds = [mv(0., 0.), line(length, 0.)];
+        let to_moda = |v| v * (length / 100.) * 2. / 4.;
+        let dash = apply_dash_to_path(&cmds, &[to_moda(5.); 2], 4., false, to_moda(55.)).unwrap();
+        assert!((xy(&dash.open[0]).0 - 5. * length / 100.).abs() < 1e-10);
+    }
+
+    #[test]
+    fn tiny_quarter_arc_measures_the_same_fraction_of_a_circle() {
+        let radius = 0.05;
+        let cmds = [mv(radius, 0.), PathCmd::Arc {
+            rx: radius, ry: radius, x: 0., y: radius,
+            sweep: true, large_arc: false, x_axis_rotation: 0.,
+        }];
+        let length = PathContours::new(&cmds, false).measured_length();
+        // A cubic quarter-circle itself differs from a circle by about 0.014%.
+        assert!((length / radius - std::f64::consts::FRAC_PI_2).abs() < 0.0003, "{length}");
+    }
+
+    #[test]
+    fn small_cubic_trim_resolves_nine_percent_of_its_length() {
+        // This monotone cubic has exact distance x(t) = length * t³.
+        for length in [0.000104, 0.104, 104.] {
+            let cmds = [mv(0., 0.), PathCmd::Curve {
+                x: length, y: 0., cp1: (0., 0.), cp2: (0., 0.),
+            }];
+            let trimmed = apply_trim_to_path(&cmds, false, t(0., 0.09, 0., false));
+            let x = xy(trimmed.last().expect("positive trim window")).0;
+            assert!((x / length - 0.09).abs() < 1e-7, "{length}: {x}");
+        }
+    }
+
+    #[test]
+    fn thin_solid_reversal_reaches_its_tip() {
+        let cmds = [mv(0., 0.), PathCmd::Quadratic { cp: (100., 0.), x: 0., y: 0. }];
+        let points = subpath_to_line_segments(&cmds, false, Flat::stroke(0.5)).unwrap();
+        assert!(points.iter().any(|p| (p[0] - 50.).abs() < 1e-10), "{points:?}");
+    }
+
+    #[test]
+    fn a_thin_retracing_dash_preserves_its_turn_and_length_at_every_band() {
+        let cmds = [
+            PathCmd::Move { x: 0., y: 0. },
+            PathCmd::Quadratic { cp: (100., 0.), x: 0., y: 0. },
+        ];
+        let curve = path_points_to_segments(&cmds, false);
+        for dist in [4., 0.5, 0.01] {
+            let pieces = flatten_path_segments(&curve, Flat { dist, turn: None });
+            let tip = pieces.iter().map(|s| seg_end(&s.seg)[0]).fold(0.0, f64::max);
+            assert!((tip - 50.).abs() < 1e-10, "tip at {tip}");
+            assert!((pieces.iter().map(|s| s.arc_length).sum::<f64>() - curve[0].arc_length).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn short_positive_segments_consume_dash_distance() {
+        let mut cmds = vec![PathCmd::Move { x: 0., y: 0. }];
+        cmds.extend((1..=2048).map(|i| PathCmd::Line { x: f64::from(i) / 2048., y: 0. }));
+        cmds.push(PathCmd::Line { x: 5., y: 0. });
+        let dashes = apply_dash_to_path(&cmds, &[2., 2.], 2., false, 0.).unwrap().open;
+        assert!(dashes.iter().any(|c| matches!(c, PathCmd::Line { x: 2., .. })));
+        assert!(dashes.iter().any(|c| matches!(c, PathCmd::Move { x: 4., .. })));
     }
 
     #[test]
@@ -4476,7 +4309,7 @@ mod stroke_cap_tests {
     #[test]
     fn incomplete_curves_are_refused_at_every_zoom() {
         for band in [0, 3] {
-            let _scale = super::super::outline::enter_plan(2.0f64.powi(band));
+            let _scale = super::super::curve_quality::enter_plan(2.0f64.powi(band));
             for curve in [
                 PathCmd::Curve { x: 100.0, y: 100.0, cp1: (100.0, 30.0), cp2: (100.0, 70.0) },
                 PathCmd::Quadratic { x: 100.0, y: 100.0, cp: (100.0, 50.0) },
@@ -4487,7 +4320,7 @@ mod stroke_cap_tests {
                 points.push(curve);
                 points.push(PathCmd::Line { x: 0.0, y: 100.0 });
                 CAP_HIT.with(|c| c.set(false));
-                let fill = fill_path(&points, true, FillRule::NonZero);
+                let fill = fill_path(PathContours::new(&points, true), FillRule::NonZero);
                 assert!(fill.dropped.is_some(), "band {band}: partial fill accepted");
                 assert!(fill.tris.is_empty());
                 CAP_HIT.with(|c| c.set(false));
@@ -4503,7 +4336,7 @@ mod stroke_cap_tests {
         let mut points = vec![PathCmd::Move { x: 0.0, y: 0.0 }];
         points.extend((1..=MAX_PATH_SEGMENTS).map(|i| PathCmd::Line { x: 100.0 * i as f64 / MAX_PATH_SEGMENTS as f64, y: 0.0 }));
         points.extend([PathCmd::Line { x: 100.0, y: 100.0 }, PathCmd::Line { x: 0.0, y: 100.0 }]);
-        let fill = fill_path(&points, true, FillRule::NonZero);
+        let fill = fill_path(PathContours::new(&points, true), FillRule::NonZero);
         assert!(fill.dropped.is_none());
         assert!(!fill.tris.is_empty());
     }
@@ -4616,6 +4449,55 @@ mod banded_fill_tests {
             .count()
     }
 
+    /// Moving a uniform scale from the node to its path preserves the picture.
+    /// Compare subpixel sample coverage with the original contour's winding. Skip
+    /// samples within one f32 ULP of the picture extent of an authored edge,
+    /// where rounding the input or an intersection can change the sample.
+    #[test]
+    fn fill_coverage_is_independent_of_path_units() {
+        let mut seed = 0x9a03_d51e_u32;
+        let mut coord = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(seed >> 24) / 8.0
+        };
+        for _ in 0..12 {
+            // Include concave paths, crossings, a second contour and a repeated vertex.
+            let ring: Vec<P> = (0..7).map(|_| [coord(), coord()]).collect();
+            let contours = vec![ring, vec![[5.0, 3.0], [21.0, 3.0], [21.0, 3.0], [5.0, 14.0]]];
+            for scale in [1.0, 1e-6, 1e6, 262144.0] {
+                let cmds: Vec<_> = contours.iter().flat_map(|c| {
+                    c.iter().enumerate().map(|(i, p)| {
+                        let (x, y) = (p[0] / scale, p[1] / scale);
+                        if i == 0 { PathCmd::Move { x, y } } else { PathCmd::Line { x, y } }
+                    })
+                }).collect();
+                let _node = super::super::curve_quality::enter_node_scale(scale);
+                for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+                    let mut tris = tessellate_path(&cmds, true, rule);
+                    for v in &mut tris {
+                        *v = f64::from(*v as f32) * scale;
+                    }
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            // Off the regular vertex grid, including internal triangulation edges.
+                            let p = [f64::from(x) + 0.451, f64::from(y) + 0.537];
+                            if edge_distance(&contours, p) <= 32.0 * f64::from(f32::EPSILON) {
+                                continue;
+                            }
+                            let w = winding(&contours, p);
+                            let inside = match rule {
+                                FillRule::NonZero => w != 0,
+                                FillRule::EvenOdd => w % 2 != 0,
+                            };
+                            assert_eq!(coverage(&tris, p), usize::from(inside),
+                                "scale {scale}, {rule:?} at {p:?}, contours {contours:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Deterministic self-crossing polygons (plus a hole-like second
     /// contour): forced into many cells, the stream covers every sample
     /// exactly as the fill rule says — once inside, never outside, never
@@ -4676,27 +4558,6 @@ mod banded_fill_tests {
         }
     }
 
-    /// A dense scribble is over one sweep's bound; it now bisects instead of
-    /// being refused.
-    #[test]
-    fn dense_scribble_bisects_instead_of_refusing() {
-        let mut c = Vec::new();
-        for i in 0..6000 {
-            let t = i as f64;
-            c.push([
-                300.0 + 280.0 * (t * 0.05).sin(),
-                300.0 + 20.0 * (t * 0.3).cos() + (t * 0.001),
-            ]);
-        }
-        let contours = vec![c];
-        assert!(matches!(
-            check_fill_sweep_cost(&contours, MAX_STROKE_VERTICES),
-            Err(FillRefusal::Complexity(_))
-        ));
-        let (_, _, cells) = fill_outline_banded(&contours).unwrap();
-        assert!(cells > 1);
-    }
-
     /// A lyon 1.0.22 mis-triangulation (see `sound_sweep`): a chevron whose
     /// bottom edge is horizontal gets a triangle across its notch. The check
     /// flags it, and the fill that ships covers exactly the polygon.
@@ -4721,7 +4582,7 @@ mod banded_fill_tests {
         };
         let contours = vec![chevron];
         for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-            let (raw, sound) = lyon_sweep(&contours, rule, MAX_FILL_VERTICES, false).unwrap();
+            let (raw, sound) = lyon_sweep(&contours, rule, MAX_FILL_VERTICES, false, sweep_scale([0.0, -7.0, 12.0, 18.0])).unwrap();
             assert!(!sound, "the check flags lyon's triangulation");
             assert!(area(&raw) > polygon + 1.0, "lyon paints outside the notch");
             let (tris, _) = fill_cells(&contours, rule, MAX_FILL_VERTICES).unwrap();
@@ -4758,7 +4619,7 @@ mod band_cap_tests {
     use super::*;
 
     fn fill_at(cmds: &[PathCmd], scale: f64) -> OracleGeometry {
-        let _g = super::super::outline::enter_plan(scale);
+        let _g = super::super::curve_quality::enter_plan(scale);
         tessellate_combined_oracle(
             cmds,
             0.0,
@@ -4872,7 +4733,7 @@ mod band_cap_tests {
         join: LineJoin,
         align: StrokeAlign,
     ) -> (usize, f64, u32) {
-        let _g = super::super::outline::enter_plan(scale);
+        let _g = super::super::curve_quality::enter_plan(scale);
         let g = tessellate_combined_oracle(
             cmds,
             width,
@@ -5002,7 +4863,7 @@ mod band_cap_tests {
                 .collect()
         };
         let at = |cmds: &[PathCmd], scale: f64, cap: LineCap, join: LineJoin, dash: Option<&[f64]>| {
-            let _g = super::super::outline::enter_plan(scale);
+            let _g = super::super::curve_quality::enter_plan(scale);
             tessellate_combined_oracle(
                 cmds,
                 16.0,
@@ -5058,7 +4919,7 @@ mod band_cap_tests {
     }
 
     fn stroke_at(scale: f64, dash: Option<&[f64]>) -> OracleGeometry {
-        let _g = super::super::outline::enter_plan(scale);
+        let _g = super::super::curve_quality::enter_plan(scale);
         tessellate_combined_oracle(
             &waves(),
             10.0,
@@ -5119,7 +4980,7 @@ mod band_cap_tests {
             },
         ];
         let n = |scale: f64| {
-            let _g = super::super::outline::enter_plan(scale);
+            let _g = super::super::curve_quality::enter_plan(scale);
             let g = tessellate_combined_oracle(
                 &c,
                 4.0,
@@ -5255,7 +5116,7 @@ mod join_tests {
 /// scale (about √8 more segments per 8× zoom), clamped at the band limits.
 #[cfg(test)]
 mod zoom_adaptive_flattening_tests {
-    use super::super::outline::{enter_plan, MAX_BAND, MIN_BAND};
+    use super::super::curve_quality::{enter_plan, MAX_BAND, MIN_BAND};
     use super::*;
 
     const KAPPA: f64 = 0.552_284_749_830_793_6;

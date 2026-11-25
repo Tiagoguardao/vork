@@ -13,8 +13,7 @@ pub(crate) struct UploadCache {
 }
 impl UploadCache {
     fn changed(&mut self, offset: usize, bytes: &[u8]) -> bool {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("byte_compare");
+        profile_span!(_profile, "byte_compare");
         let end = offset + bytes.len();
         if self.bytes.len() < end {
             self.bytes.resize(end, 0);
@@ -50,6 +49,7 @@ pub(crate) enum ChangeKey {
     ComputedGeometry(usize),
     ComputedPositions(usize),
     MaterialAttributes,
+    MaterialColumn(usize),
     /// Source publication consumed by an installed shared field index.
     FieldIndex(wgpu::Buffer),
     /// Logical named stream publication, independent of packed GPU page identity.
@@ -99,8 +99,7 @@ impl LightingTracker {
             .is_some_and(|h| h.stamp == self.sample)
     }
     pub(crate) fn changed(&mut self, key: LightingKey, bytes: &[u8]) -> bool {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("track_change");
+        profile_span!(_profile, "track_change");
         let history = self.history.entry(key).or_default();
         let resized = history.bytes.len() != bytes.len();
         let changed = history.changed(0, bytes);
@@ -115,6 +114,14 @@ impl LightingTracker {
 
 }
 impl ChangeTracker {
+    /// Keep only the inputs whose GPU destinations survive a recording eviction.
+    /// Discarding other buffer keys also releases their old view handles.
+    pub(crate) fn retain_ray_history(&mut self, objects: &wgpu::Buffer) {
+        self.history.retain(|key, _| matches!(key, ChangeKey::RayStructures)
+            || matches!(key, ChangeKey::Buffer(buffer) if buffer == objects));
+        self.bytes.clear();
+        self.uploads.clear();
+    }
     pub(crate) fn observe_stream(&mut self, resource: &str, version: u64) {
         self.changed(ChangeKey::Stream(resource.into()), &version.to_le_bytes());
     }
@@ -163,8 +170,7 @@ impl ChangeTracker {
     }
     pub(crate) fn dirty(&self, key: ChangeKey) -> bool { self.history.get(&key).is_some_and(|h|h.stamp == self.sample) }
     pub(crate) fn changed(&mut self, key: ChangeKey, bytes: &[u8]) -> bool {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("track_change");
+        profile_span!(_profile, "track_change");
         let history = self.history.entry(key).or_default();
         let resized = history.bytes.len() != bytes.len();
         let changed = history.changed(0, bytes);
@@ -194,8 +200,7 @@ impl ChangeTracker {
         Ok(value)
     }
     pub(crate) fn upload(&mut self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("track_upload");
+        profile_span!(_profile, "track_upload");
         let history = self
             .history
             .entry(ChangeKey::Buffer(buffer.clone()))
@@ -207,8 +212,7 @@ impl ChangeTracker {
         self.record_upload(buffer, offset, bytes);
     }
     fn record_upload(&mut self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("pack_upload");
+        profile_span!(_profile, "pack_upload");
         #[cfg(feature = "frame-profile")]
         crate::frame_profile::count("dirty_upload_bytes", bytes.len() as u64);
         let source = self.bytes.len() as u64;
@@ -336,8 +340,7 @@ pub(crate) fn sample_frame(
     values: &mut [Option<EvalNode>],
     worlds: &mut [Mat4],
 ) -> Result<()> {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("scene_evaluation");
+        profile_span!(_profile, "scene_evaluation");
     let request=request.into();
     let time=request.numeric()?;
     sample_pose(&s.nodes, &s.assets, &s.animation, &s.targets, &s.environment, &request, samples, values, worlds)?;
@@ -467,8 +470,7 @@ impl FrameSlot {
         frame_time: f32,
         shadow_changes: &mut LightingTracker,
     ) -> Result<(Vec<u8>, Vec<Upload>, Mat4, Uniform)> {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("prepare_values_inclusive");
+        profile_span!(_profile, "prepare_values_inclusive");
         self.sample_request=request.into();
         let time=self.sample_request.numeric()?;
         let exact=!s.footage.is_empty() || s.compute.is_some() || s.animation.has_camera_tracks() || s.environment.has_media() || s.animation.has_discrete_tracks() || s.animation.has_clocks();
@@ -483,8 +485,7 @@ impl FrameSlot {
         changes.bytes.clear();
         changes.uploads.clear();
         let camera_index = s.animation.camera_at_request(&self.sample_request,s.camera)?;
-        let generation = s.animation.live_generation();
-        let sample_key=[time.to_bits(),camera_index as u32,generation as u32,(generation >> 32) as u32];
+        let sample_key=[time.to_bits(),camera_index as u32,0,0];
         let mut discrete_key=Vec::new();
         s.animation.append_discrete_key(&self.sample_request,&mut discrete_key)?;
         if s.animation.has_discrete_tracks() {
@@ -512,6 +513,7 @@ impl FrameSlot {
         ensure!(!s.animation.absent(&self.animation_values, camera_index),
             "render.camera: camera {:?} is absent (active); render through a camera that exists at sample time {time}", s.nodes[camera_index].node.name);
         let render = self.animation_values.render.as_ref().unwrap();
+        let indirect = s.plan.effects.indirect && render.settings.integrator.indirect().is_some();
         let nodes = SampledNodes::new(&s.nodes, &self.sampled_nodes);
         let cut=self.exposure_cut;
         let previous_time=self.previous_request.numeric()?;
@@ -522,7 +524,7 @@ impl FrameSlot {
         }
         // Spatial AA/aperture samples at one time reuse the evaluated pose and render values.
         let previous_key = [previous_time.to_bits(), u32::from(cut),s.animation.camera_at_request(&self.previous_request,s.camera)? as u32,
-            generation as u32,(generation >> 32) as u32];
+            0,0];
         discrete_key.clear();
         s.animation.append_discrete_key(&self.previous_request,&mut discrete_key)?;
         if s.animation.has_discrete_tracks() {
@@ -668,18 +670,11 @@ impl FrameSlot {
             light_vp: Mat4::IDENTITY,
             inverse_vp: vp.inverse(),
             view,
-            ao: ao_uniform(s.plan.effects.indirect),
+            ao: ao_uniform(indirect),
             projection: [
                 projection.y_axis.y,
                 projection.x_axis.x,
-                match render.settings.integrator.reflections() {
-                    None => constants::REFLECTIONS_OFF,
-                    Some(vork_scene::Reflections::Environment) => constants::REFLECTIONS_ENVIRONMENT,
-                    // Ray hits replace the environment through the same screen-correction contract.
-                    Some(vork_scene::Reflections::Auto | vork_scene::Reflections::Ray) => {
-                        constants::REFLECTIONS_RAY
-                    }
-                },
+                reflection_mode(render),
                 ((u32::from(self.view.write_color && !self.view.nominal_sample)
                     * constants::OUTPUT_GPU_COLOR)
                     // 16-bit colour also publishes the 8-bit plane that exposure metering reads.
@@ -807,7 +802,7 @@ impl FrameSlot {
                 } else {
                     0.
                 },
-                if s.plan.effects.indirect { 1. } else { 0. },
+                f32::from(indirect),
             ],
         };
         self.view.post.compositor_inputs.upload(s, frame_time, changes)?;
@@ -1115,8 +1110,7 @@ impl FrameSlot {
         uploads: &[Upload],
         batch: bool,
     ) {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("copy_values");
+        profile_span!(_profile, "copy_values");
         if upload_bytes.is_empty() { return; }
         let size = upload_bytes.len() as u64;
         // Batched commands must retain distinct immutable sources until publication.
@@ -1274,232 +1268,16 @@ pub(super) fn view_axis(eye: Vec3, direction: Vec3) -> Vec3 {
 }
 
 #[cfg(test)]
-mod orientation_tests {
-    use super::*;
-    #[test]
-    fn change_keys_detect_length_changes_and_equal_prefixes() {
-        let mut changes = super::LightingTracker::default();
-        let key = super::LightingKey::Probes;
-        assert!(changes.changed(key.clone(), &[1, 2, 3, 4]));
-        assert!(!changes.changed(key.clone(), &[1, 2, 3, 4]));
-        assert!(changes.changed(key.clone(), &[1, 2]));
-        assert!(!changes.changed(key.clone(), &[1, 2]));
-        assert!(changes.changed(key, &[1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn camera_view_accepts_zero_and_small_nonzero_scale() {
-        for scale in [0.,1e-8] {
-            let world=Mat4::from_scale(Vec3::new(1.,1.,scale));
-            let nodes=vec![EvalNode { camera: None,node:vork_scene::v2::from_test_value(serde_json::json!({"type":"camera","scale":[1.,1.,scale]})).unwrap(),
-                world,parent:None,dynamic:false,embedded:None}];
-            let view=node_view(0,&nodes,&[world]).unwrap();
-            assert!(view.is_finite());
-            assert!(view.abs_diff_eq(Mat4::IDENTITY,1e-6));
-        }
-    }
-
-    #[test]
-    fn zero_scale_light_retains_target_orientation() {
-        let node: Node = vork_scene::v2::from_test_value(serde_json::json!({
-            "type":"light","shape":"sun","scale":[0,0,0],"target":[1,0,0]})).unwrap();
-        let world = node.transform.matrix();
-        let nodes = vec![EvalNode { camera: None,node,world,parent:None,dynamic:false,embedded:None}];
-        let frame = node_view(0,&nodes,&[world]).unwrap().inverse();
-        assert!(frame.is_finite());
-        assert!(frame.transform_vector3(Vec3::NEG_Z).abs_diff_eq(Vec3::X,1e-6));
-    }
-
-    #[test]
-    fn rounded_view_axis_keeps_unit_length_when_only_magnitude_is_quantized() {
-        let direction = Vec3::ONE.normalize();
-        let eye = Vec3::splat(1_048_576.);
-        let axis = view_axis(eye, direction);
-        assert!(axis.abs_diff_eq(direction, 1e-6));
-        let view = Mat4::look_to_rh(eye, axis, Vec3::Y);
-        for basis in [Vec3::X, Vec3::Y, Vec3::Z] {
-            assert!((view.transform_vector3(basis).length() - 1.).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn ordinary_camera_view_retains_the_shadow_fit_frame() {
-        let eye = Vec3::new(7., 5., 11.);
-        let rotation = glam::Quat::from_xyzw(-0.14237286, 0.27649665, 0.041459076, 0.9495055);
-        let world = Mat4::from_rotation_translation(rotation, eye);
-        let nodes = vec![EvalNode { camera: None, node: vork_scene::v2::from_test_value(serde_json::json!({"type":"camera"})).unwrap(),
-            world, parent: None, dynamic: false, embedded: None }];
-        let target = eye + world.transform_vector3(Vec3::NEG_Z).normalize();
-        let expected = Mat4::look_at_rh(eye, target, world.transform_vector3(Vec3::Y).normalize());
-        assert_eq!(node_view(0, &nodes, &[world]).unwrap(), expected);
-    }
-
-    #[test]
-    fn camera_orientation_is_independent_of_world_translation() {
-        let rotation=glam::Quat::from_rotation_y(0.3)*glam::Quat::from_rotation_z(0.2);
-        for offset in [0.,10_000_000.,100_000_000.] {
-            let world=Mat4::from_rotation_translation(rotation,Vec3::splat(offset));
-            let nodes=vec![EvalNode { camera: None,node:vork_scene::v2::from_test_value(serde_json::json!({"type":"camera"})).unwrap(),
-                world,parent:None,dynamic:false,embedded:None}];
-            let view=node_view(0,&nodes,&[world]).unwrap();
-            for axis in [Vec3::X,Vec3::Y,Vec3::Z] {
-                assert!(view.transform_vector3(rotation*axis).abs_diff_eq(axis,1e-6));
-            }
-        }
-    }
-
-    #[test]
-    fn rotation_roll_and_parent_space_transform() {
-        let node: Node = vork_scene::v2::from_test_value(serde_json::json!({
-            "type": "camera", "rotation": [0.,0.,0.70710677,0.70710677]
-        }))
-        .unwrap();
-        let world = node.transform.matrix();
-        let mut nodes = vec![EvalNode { camera: None,
-            node,
-            world,
-            parent: None,
-            dynamic: false,
-            embedded: None,
-        }];
-        let rolled = node_view(0, &nodes, &[world]).unwrap().inverse();
-        assert!(rolled.transform_vector3(Vec3::X).abs_diff_eq(Vec3::Y, 1e-5));
-        assert!(
-            rolled
-                .transform_vector3(Vec3::NEG_Z)
-                .abs_diff_eq(Vec3::NEG_Z, 1e-5)
-        );
-        // Camera orientation composes with the parent transform.
-        nodes[0].node.transform.rotation =
-            Some(glam::Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2).to_array());
-        nodes[0].parent = Some(1);
-        let parent = Mat4::from_translation(Vec3::new(5., 2., 3.));
-        nodes.push(EvalNode { camera: None,
-            node: vork_scene::v2::from_test_value(serde_json::json!({"type":"node","children":[]})).unwrap(),
-            world: parent,
-            parent: None,
-            dynamic: false,
-            embedded: None,
-        });
-        let aimed_world = node_world(&nodes[0].node, parent).unwrap();
-        let aimed = node_view(0, &nodes, &[aimed_world, parent])
-            .unwrap()
-            .inverse();
-        assert!(
-            aimed
-                .transform_vector3(Vec3::NEG_Z)
-                .abs_diff_eq(Vec3::X, 1e-5)
-        );
-    }
-}
+#[path = "values_orientation_tests.rs"]
+mod orientation_tests;
 
 #[cfg(test)]
-mod upload_cache_tests {
-    use super::UploadCache;
-    #[test]
-    fn external_gpu_replacement_invalidates_outputs_and_derivation_together() {
-        use super::{ChangeKey, ChangeTracker};
-        let (device, _) = wgpu::Device::noop(&Default::default());
-        let [commands, instances, other] = std::array::from_fn(|_| device.create_buffer(
-            &wgpu::BufferDescriptor { label: None, size: 16,
-                usage: wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
-        let key = ChangeKey::CameraSelection(commands.clone());
-        let mut changes = ChangeTracker::default();
-        changes.sample = 1;
-        changes.changed(ChangeKey::CameraSelection(other.clone()), b"other camera");
-        changes.upload(&other, 0, &[7; 16]);
-        // A replacement can precede the first CPU publication, occur repeatedly
-        // in one sample, or follow retained values from an earlier sample.
-        for advance in [false, false, true, false] {
-            if advance { changes.sample += 1; }
-            changes.replace_gpu(&[&commands, &instances], key.clone());
-            assert!(changes.changed(key.clone(), b"same camera"));
-            assert!(!changes.changed(key.clone(), b"same camera"));
-            changes.bytes.clear();
-            changes.uploads.clear();
-            changes.upload(&commands, 0, &[0; 16]);
-            changes.upload(&instances, 4, &[2; 8]);
-            assert_eq!(changes.uploads.len(), 2, "equal prior CPU bytes must republish every destination");
-            assert!(changes.buffer_dirty(&commands));
-            assert!(changes.buffer_dirty(&instances));
-            changes.bytes.clear();
-            changes.uploads.clear();
-            changes.upload(&commands, 4, &[0; 4]);
-            changes.upload(&instances, 8, &[2; 4]);
-            changes.upload(&other, 0, &[7; 16]);
-            assert!(changes.uploads.is_empty(), "CPU history resumes and unrelated outputs stay retained");
-            assert!(!changes.changed(ChangeKey::CameraSelection(other.clone()), b"other camera"));
-        }
-    }
-
-    #[test]
-    fn upload_publication_survives_merging_and_drain_until_the_next_sample() {
-        let (device, _) = wgpu::Device::noop(&Default::default());
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None, size: 16, usage: wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let other = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None, size: 16, usage: wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut changes = super::ChangeTracker::default();
-        changes.sample = 1;
-        assert!(!changes.buffer_dirty(&buffer));
-        changes.upload(&buffer, 4, &[0; 4]); // First zero write is a publication.
-        changes.upload(&buffer, 8, &[1; 4]); // Adjacent ranges merge.
-        assert_eq!(changes.uploads.len(), 1);
-        assert!(changes.buffer_dirty(&buffer));
-        assert!(!changes.buffer_dirty(&other));
-        changes.uploads.clear(); // Submission takes the work list, not its history.
-        changes.bytes.clear();
-        assert!(changes.buffer_dirty(&buffer));
-        changes.sample += 1;
-        changes.upload(&buffer, 4, &[0; 4]);
-        assert!(!changes.buffer_dirty(&buffer));
-        assert!(changes.uploads.is_empty());
-        changes.upload(&buffer, 6, &[2; 4]); // Partial overlap.
-        changes.upload(&buffer, 6, &[2; 4]); // Unchanged write cannot clear dirty.
-        assert!(changes.buffer_dirty(&buffer));
-        assert_eq!(changes.uploads.len(), 1);
-        changes.sample += 1;
-        assert!(!changes.buffer_dirty(&buffer));
-    }
-
-    #[test]
-    fn partial_overlaps_and_first_zero_writes_remain_dirty() {
-        let mut cache = UploadCache::default();
-        assert!(cache.changed(4, &[1, 2, 3, 4]));
-        assert!(!cache.changed(4, &[1, 2, 3, 4]));
-        assert!(cache.changed(6, &[0, 0]));
-        assert!(!cache.changed(6, &[0, 0]));
-        assert!(cache.changed(4, &[1, 2, 3, 4]));
-        assert!(cache.changed(0, &[0, 0, 0, 0]));
-        assert!(!cache.changed(0, &[0, 0, 0, 0, 1, 2, 3, 4]));
-    }
-}
+#[path = "values_upload_cache_tests.rs"]
+mod upload_cache_tests;
 
 #[cfg(test)]
-mod deformation_bounds_tests {
-    use super::*;
-    #[test]
-    fn two_joint_bounds_include_positive_and_negative_morphs() {
-        let bounds = vec![
-            vec![(Vec3::ZERO, Vec3::ONE), (Vec3::ZERO, Vec3::X)],
-            vec![(Vec3::ZERO, Vec3::ONE), (Vec3::ZERO, Vec3::Y)],
-        ];
-        let matrices = [
-            Mat4::IDENTITY,
-            Mat4::from_translation(Vec3::new(2., 0., 0.)),
-        ];
-        let (lo, hi) = deformed_bounds(&bounds, &matrices, &[0.5]);
-        assert_eq!(lo, Vec3::ZERO);
-        assert_eq!(hi, Vec3::new(3., 1.5, 1.));
-        let (lo, hi) = deformed_bounds(&bounds, &matrices, &[-0.5]);
-        assert_eq!(lo, Vec3::new(-0.5, -0.5, 0.));
-        assert_eq!(hi, Vec3::new(3., 1., 1.));
-    }
-}
+#[path = "values_deformation_bounds_tests.rs"]
+mod deformation_bounds_tests;
 
 /// frame.environment_links.w: environment refraction (bit 0) and the solid
 /// glass thickness technique (2 approximate, 0 mesh exits; transmission.slang).
@@ -1580,6 +1358,7 @@ pub(crate) fn capture_uniform(
     u.params[1] = far;
     u.projection[0] = projection.y_axis.y;
     u.projection[1] = projection.x_axis.x;
+    u.projection[2] = reflection_mode(render);
     u.projection[3] = (constants::OUTPUT_FLOAT_COLOR | (crate::compositor::channel_flags(s, &render.compositor))) as f32;
     u.sampling = s.sampling.uniform(render.settings.samples as usize, visibility_samples as usize);
     u.sampling[3] = if s.plan.decoupled { visibility_samples } else { 0 };
@@ -1596,7 +1375,9 @@ pub(crate) fn capture_uniform(
     let camera_world = u.environment_links[0] & constants::RAY_CAMERA != 0;
     u.environment[3] =
         f32::from(render.background.is_environment() && camera_world);
-    u.ao = ao_uniform(s.plan.effects.indirect);
+    let indirect = s.plan.effects.indirect && render.settings.integrator.indirect().is_some();
+    u.ao = ao_uniform(indirect);
+    u.flags[3] = f32::from(indirect);
     u.aperture = aperture_shape(node,aspect);
     u.lens = [lens.as_ref().map_or(0., sampling::aperture_radius),
         lens.as_ref().map_or(0., |p| p.focus_distance), 2. / w as f32, 2. / h as f32];
@@ -1618,73 +1399,16 @@ pub(crate) fn capture_uniform(
 }
 
 #[cfg(test)]
-mod capture_lens_tests {
-    use super::*;
+#[path = "values_capture_lens_tests.rs"]
+mod capture_lens_tests;
 
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn imported_visible_keys_reach_objects_lights_and_shadow_reservations() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let mut gltf: serde_json::Value = vork_scene::v2::from_test_str(include_str!("../tests/goldens/skinned-box.gltf"))?;
-        gltf["nodes"].as_array_mut().unwrap().push(serde_json::json!({"name":"parent","children":[0,3]}));
-        gltf["nodes"].as_array_mut().unwrap().push(serde_json::json!({"name":"lamp","translation":[0,2,3],"extensions":{"KHR_lights_punctual":{"light":0}}}));
-        gltf["scenes"][0]["nodes"] = serde_json::json!([1,2]);
-        gltf["extensionsUsed"] = serde_json::json!(["KHR_lights_punctual"]);
-        gltf["extensions"] = serde_json::json!({"KHR_lights_punctual":{"lights":[{"type":"point","intensity":100}]}});
-        let file = std::env::temp_dir().join(format!("vork-visible-import-{}.gltf",std::process::id()));
-        std::fs::write(&file,serde_json::to_vec(&gltf)?)?;
-        let input = vork_scene::v2::from_test_value(serde_json::json!({"version":2,
-            "render":{"resolution":[16,16],"settings":{"samples":1}},
-            "materials":{"plain":{"inputs":{"base_color":[1,0,0],"emission_color":[1,0,0],"emission_luminance":1}}},
-            "nodes":[{"type":"camera","name":"cam","translation":[0,0,4]},
-                {"type":"asset","name":"actor","file":file,"materials":{"*":"plain"},"nodes":{"parent":{"visible":false}}}],
-            "animation":[{"tracks":[{"path":["nodes","actor","nodes","parent","visible"],"keys":[[0,false],[1,true]]}]}]
-        }))?;
-        let installed = renderer.install(input,Path::new("."));
-        std::fs::remove_file(&file)?;
-        let mut installed = installed?;
-        assert!(installed.plan.draws.iter().all(|draw| draw.casts_shadows));
-        let mut frame = installed.create_frame_slot(&renderer,crate::ReadbackPrecision::Float)?;
-        for (time,shown) in [(0.,false),(1.,true),(0.,false)] {
-            let output = installed.render_frame(&renderer, &mut frame, time)?;
-            assert_eq!(output.ids.iter().any(|id| *id != 0),shown,"imported visibility at {time}");
-            assert!(!frame.evaluated_lights.is_empty());
-            for light in &frame.evaluated_lights {
-                assert_eq!(light.shadow_offsets[constants::LIGHT_CONTRIBUTION_WORD] & constants::RAY_VISIBILITY_ALL,
-                    if shown {constants::RAY_VISIBILITY_ALL} else {0});
-            }
-        }
-        Ok(())
+// These are view choices, unlike the installed union of shader/resources.
+fn reflection_mode(render: &vork_scene::Render) -> f32 {
+    match render.settings.integrator.reflections() {
+        None => constants::REFLECTIONS_OFF,
+        Some(vork_scene::Reflections::Environment) => constants::REFLECTIONS_ENVIRONMENT,
+        Some(vork_scene::Reflections::Auto | vork_scene::Reflections::Ray) => constants::REFLECTIONS_RAY,
     }
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn animated_visible_hides_environment_and_lights_through_parents() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let input = vork_scene::v2::from_test_value(serde_json::json!({
-            "version":2,"render":{"resolution":[16,16],"duration":2,"settings":{"samples":1}},
-            "nodes":[{"type":"camera","name":"cam"},
-                {"type":"node","name":"rig","visible":false,"children":[
-                    {"type":"light","name":"world","shape":"environment","color":[1,1,1]},
-                    {"type":"light","name":"lamp","shape":"point","shadowed_by":[]}]}],
-            "animation":[{"tracks":[{"path":["nodes","rig","visible"],"keys":[[0,false],[1,true]]}]}]
-        }))?;
-        let installed = renderer.install(input, Path::new("."))?;
-        let mut frame = installed.create_frame_slot(&renderer, crate::ReadbackPrecision::Float)?;
-        let mut changes = LightingTracker::default();
-        for (time, visible) in [(0.,false),(0.999,false),(1.,true),(0.5,false)] {
-            let (_,_,_,uniform) = frame.prepare_values(&installed,&renderer,time,time,&mut changes)?;
-            assert_eq!(uniform.environment_links[0] & constants::RAY_VISIBILITY_ALL,
-                if visible {constants::RAY_VISIBILITY_ALL} else {0});
-            assert_eq!(uniform.medium[3],u32::from(visible));
-            assert!(!frame.evaluated_lights.is_empty());
-            for light in &frame.evaluated_lights {
-                assert_eq!(light.shadow_offsets[constants::LIGHT_CONTRIBUTION_WORD] & constants::RAY_VISIBILITY_ALL,
-                    if visible {constants::RAY_VISIBILITY_ALL} else {0});
-            }
-        }
-        Ok(())
-    }
-
 }
 
 /// Fixed diffuse-query budgets, shared with the GI shader.
@@ -1698,332 +1422,9 @@ fn post_mode(render: &vork_scene::Render) -> f32 {
 }
 
 #[cfg(test)]
-mod aim_tests {
-    use super::*;
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn installation_uses_animated_poses_and_reports_evaluated_coincidence() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let document = serde_json::json!({"version":2,
-            "render":{"resolution":[8,8]},
-            "buffers":{"p":{"type":"vec3","data":[[0,0,0],[1,0,0],[0,1,0]]}},
-            "geometry":{"triangle":{"attributes":{"POSITION":"p"}}},
-            "nodes":[{"type":"node","name":"rig","children":[
-                {"type":"camera","name":"cam","target":"subject"},
-                {"type":"mesh","name":"aimed","geometry":"triangle","target":"subject"}]},
-                {"type":"node","name":"subject"}],
-            "animation":[{"tracks":[
-                {"path":["nodes","rig","translation"],"keys":[[0,[0,0,3]],[1,[0,0,4]]]},
-                {"path":["nodes","subject","translation"],"keys":[[0,[1,0,0]],[1,[2,0,0]]]}]}]});
-        let installed = renderer.install(vork_scene::v2::from_test_value(document.clone())?, Path::new("."))?;
-        let mut values = offset_storage(&installed);
-        sample_frame(&installed, 0., &mut values.samples, &mut values.nodes, &mut values.worlds)?;
-        for (node, world) in installed.nodes.iter().zip(&values.worlds) {
-            assert!(node.world.abs_diff_eq(*world, 1e-6));
-        }
-        for (root, object) in installed.roots.iter().zip(&installed.objects) {
-            assert!(object.model.abs_diff_eq(root.world(&values.worlds), 1e-6));
-        }
-        let mut coincident = document;
-        coincident["animation"][0]["tracks"][0]["keys"][0][1] = serde_json::json!([1,0,0]);
-        let error = renderer.install(vork_scene::v2::from_test_value(coincident)?, Path::new(".")).err().expect("evaluated coincidence");
-        assert!(error.to_string().contains("node \"cam\""), "{error:#}");
-        assert!(error.to_string().contains("sample time 0"), "{error:#}");
-        Ok(())
-    }
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn keyed_camera_uses_requested_initial_time_and_checks_sampled_poses() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let document = serde_json::json!({"version":2,
-            "render":{"resolution":[8,8],"fps":1,"duration":2},
-            "nodes":[{"type":"camera","name":"cam","target":"subject"},
-                {"type":"node","name":"subject"}],
-            "animation":[{"tracks":[{"path":["nodes","cam","translation"],
-                "keys":[[0,[0,0,0]],[1,[0,0,3]]]}]}]});
-        let installed = renderer.install_with_options(vork_scene::v2::from_test_value(document.clone())?, Path::new("."),
-            InstallOptions { initial_time: 1_f32.into(), ..Default::default() })?;
-        assert!(installed.nodes[installed.camera].world.w_axis.truncate().abs_diff_eq(Vec3::new(0.,0.,3.), 1e-6));
-        // Repeated seeking must sample authoring defaults rather than the installed pose.
-        let mut values = offset_storage(&installed);
-        for time in [0.5,1.,0.25] {
-            sample_frame(&installed, time, &mut values.samples, &mut values.nodes, &mut values.worlds)?;
-            assert!((values.worlds[installed.camera].w_axis.z - 3.*time).abs() < 1e-6);
-        }
-        let mut valid = document.clone();
-        valid["animation"][0]["tracks"][0]["keys"][0][1] = serde_json::json!([0,0,3]);
-        let mut installed = renderer.install(vork_scene::v2::from_test_value(valid.clone())?, Path::new("."))?;
-        let mut slot = installed.create_frame_slot(&renderer, crate::ReadbackPrecision::Float)?;
-        installed.render_frame(&renderer, &mut slot, 0.)?;
-        valid["render"]["motion_blur"] = serde_json::json!({"shutter":1,"position":"start"});
-        valid["render"]["settings"] = serde_json::json!({"samples":1});
-        valid["animation"][0]["tracks"][0]["keys"][1][1] = serde_json::json!([0,0,0]);
-        let mut installed = renderer.install(vork_scene::v2::from_test_value(valid)?, Path::new("."))?;
-        let mut slot = installed.create_frame_slot(&renderer, crate::ReadbackPrecision::Float)?;
-        // Sampled motion blur does not evaluate unused shutter endpoints.
-        installed.render_frame(&renderer, &mut slot, 0.)?;
-        let error = installed.render_frame(&renderer, &mut slot, 1.).err().expect("coincident sampled pose");
-        // The frame-abort context wraps the pose error; the cause names the node
-        // and the one evaluated shutter sample: the middle of [1, 2] at 1 fps.
-        let chain = format!("{error:#}");
-        assert!(chain.ends_with("node \"cam\": target coincides with the node origin at sample time 1.5"), "{chain}");
-        Ok(())
-    }
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn offset_instances_use_aimed_worlds_and_shifted_parents() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let mut input: serde_json::Value = vork_scene::v2::from_test_str(include_str!("../tests/fixtures/analytic.json"))?;
-        input["render"] = serde_json::json!({"resolution":[8,8],"duration":3,"settings":{"samples":1}});
-        input["buffers"]["translations"] = serde_json::json!({"type":"vec3","data":[[0,0,0],[0,0,0]]});
-        input["buffers"]["offsets"] = serde_json::json!({"type":"f32","data":[0,1]});
-        input["nodes"] = serde_json::json!([
-            {"type":"camera","translation":[0,0,8]},
-            {"type":"node","name":"parent","children":[
-                {"type":"mesh","name":"aimed","geometry":"shape_box","target":[4,0,-2],
-                 "instances":{"attributes":{"TRANSLATION":"translations","time_offset":"offsets"}}}]}]);
-        input["animation"] = serde_json::json!([{"tracks":[
-            {"path":["nodes","parent","translation"],"keys":[[0,[0,0,0]],[2,[2,0,0]]]}
-        ]}]);
-        let base=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let mut installed=renderer.install(vork_scene::v2::from_test_value(input)?,&base)?;
-        assert_eq!(installed.roots.len(),2);
-        let mut frame=installed.create_frame_slot(&renderer,crate::ReadbackPrecision::Float)?;
-        for time in [0.,1.,0.25] {
-            installed.render_frame(&renderer, &mut frame, time)?;
-            for (object,root) in installed.roots.iter().enumerate() {
-                let eye=Vec3::new(time+root.time_offset,0.,0.);
-                let expected=Mat4::look_to_rh(eye,(Vec3::new(4.,0.,-2.)-eye).normalize(),Vec3::Y).inverse();
-                assert!(frame.object_values[object].model.abs_diff_eq(expected,1e-5),"time {time}, offset {}",root.time_offset);
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn additive_rotation_layers_compose_after_target_and_move_children() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let input=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
-            "render":{"resolution":[8,8],"duration":2},
-            "nodes":[{"type":"camera","name":"cam","translation":[0,0,6]},
-                {"type":"node","name":"aimed","target":"subject","rotation":{"euler":[0,0,0.2]},
-                    "children":[{"type":"node","name":"child","translation":[0,0,-2]}]},
-                {"type":"node","name":"subject","translation":[0,0,-3]}],
-            "animation":[{"tracks":[{"path":["nodes","subject","translation"],"keys":[[0,[0,0,-3]],[1,[2,0,-3]]]}]},
-                {"blend":"combine","tracks":[{"path":["nodes","aimed","rotation"],"keys":[[0,{"euler":[0,0,0]}],[1,{"euler":[0,0.7,0]}]]}]}]
-        }))?;
-        let installed=renderer.install(input,Path::new("."))?;
-        let index=|name:&str| installed.nodes.iter().position(|node|node.node.name==name).unwrap();
-        let mut values=offset_storage(&installed);
-        for time in [0.,0.25,1.,0.5] {
-            sample_frame(&installed,time,&mut values.samples,&mut values.nodes,&mut values.worlds)?;
-            let target=Vec3::new(2.*time,0.,-3.);
-            let expected=Mat4::look_to_rh(Vec3::ZERO,target.normalize(),Vec3::Y).inverse()
-                * Mat4::from_rotation_z(0.2) * Mat4::from_rotation_y(0.7*time);
-            assert!(values.worlds[index("aimed")].abs_diff_eq(expected,1e-5),"aim at {time}");
-            assert!(values.worlds[index("child")].w_axis.truncate().abs_diff_eq(expected.transform_point3(Vec3::new(0.,0.,-2.)),1e-5),"child at {time}");
-        }
-        Ok(())
-    }
-    // Aim and focus follow animated targets at every evaluated time, including
-    // shutter sub-frame times: keyed targets and targets under an animated parent.
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn aim_and_focus_follow_animated_targets_at_any_time() -> Result<()> {
-        let renderer = crate::test_renderer()?;
-        let base = std::path::Path::new(".");
-        let scene = serde_json::json!({"version":2,
-            "render":{"resolution":[16,16],"fps":24,"duration":2,"motion_blur":{"shutter":0.5},"settings":{"samples":2}},
-            "nodes":[
-                {"type":"camera","name":"cam","target":"subject","translation":[0,1,6],"focus_object":"held","material":{"program":"std/camera","inputs":{"use_dof":true}}},
-                {"type":"light","name":"spot","shape":"spot","target":"subject","translation":[3,4,2]},
-                {"type":"light","name":"key","shape":"sun","target":"held"},
-                {"type":"node","name":"rig","children":[{"type":"node","name":"held","translation":[0,0,-1]}]},
-                {"type":"node","name":"subject"}],
-            "animation":[
-                {"tracks":[{"path":["nodes","subject","translation"],"keys":[[0,[-2,0,0]],[2,[2,1,-3]]]},
-                    {"path":["nodes","rig","rotation"],"keys":[[0,[0,0,0,1]],[2,[0,0.7071068,0,0.7071068]]]},
-                    {"path":["nodes","rig","translation"],"keys":[[0,[0,5,0]],[2,[4,2,1]]]}]}]});
-        let s = renderer.install(vork_scene::v2::from_test_value(scene)?, &base)?;
-        let index = |name: &str| s.nodes.iter().position(|n| n.node.name == name).unwrap();
-        let (cam, subject, spot, key, held) = (index("cam"), index("subject"), index("spot"), index("key"), index("held"));
-        let mut values = offset_storage(&s);
-        let mut targets = Vec::new();
-        // Frame and sub-frame (shutter) times.
-        for time in [0., 0.3, 0.5 + 1. / 96., 1.13, 1.75] {
-            sample_frame(&s, time, &mut values.samples, &mut values.nodes, &mut values.worlds)?;
-            let worlds = &values.worlds;
-            let aims = |from: usize, to: usize| {
-                let eye = worlds[from].w_axis.truncate();
-                let forward = worlds[from].transform_vector3(Vec3::NEG_Z).normalize();
-                forward.dot((worlds[to].w_axis.truncate() - eye).normalize())
-            };
-            assert!(aims(cam, subject) > 0.99999, "camera at {time}: {}", aims(cam, subject));
-            assert!(aims(spot, subject) > 0.99999, "spot at {time}: {}", aims(spot, subject));
-            assert!(aims(key, held) > 0.99999, "sun at {time}: {}", aims(key, held));
-            let dof = values.nodes[cam].as_ref().unwrap().camera.as_ref().unwrap();
-            assert!((dof.focus - crate::targets::focus_distance(worlds[cam], worlds[held])).abs() < 1e-5, "focus at {time}");
-            targets.push((worlds[subject].w_axis.truncate(), worlds[held].w_axis.truncate()));
-        }
-        assert!(targets.windows(2).all(|pair| pair[0].0.distance(pair[1].0) > 1e-4 && pair[0].1.distance(pair[1].1) > 1e-4), "{targets:?}");
-        Ok(())
-    }
-}
+#[path = "values_aim_tests.rs"]
+mod aim_tests;
 
 #[cfg(test)]
-mod retained_selection_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn scene() -> Result<Scene> {
-        Ok(vork_scene::v2::from_test_value(json!({"version":2,
-            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[16,16],"fps":2,"duration":2,"settings":{"integrator":"raster","samples":1}},
-            "nodes":[{"type":"camera","name":"cam"},{"type":"mesh","geometry":"g","name":"actors","materials":["m"],"instances":{"attributes":{"TRANSLATION":"positions"}}}],
-            "buffers":{"p":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[0,1,0]]},"positions":{"type":"vec3","data":[[0,0,-5],[8,0,-5],[30,0,-5],[40,0,-5]]}},
-            "geometry":{"g":{"attributes":{"POSITION":"p"}}},
-            "materials":{"m":{"inputs":{"base_weight":0,"specular_weight":0,"emission_color":[1,0,0],"emission_luminance":1}}},
-            "animation":[{"tracks":[
-                {"path":["nodes","cam","translation"],"interpolation":"STEP","keys":[[0,[0,0,0]],[1,[8,0,0]]]},
-                {"path":["materials","m","inputs","emission_color"],"keys":[[0,[1,0,0]],[0.5,[0,1,0]],[1,[0,0,1]]]}
-            ]}]}))?)
-    }
-
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn static_selection_retains_work_across_shading_slots_repeat_and_seek() -> Result<()> {
-        let r = crate::test_renderer()?;
-        for blur in [false,true] {
-        let mut input = scene()?;
-        if blur {
-            input.render.motion_blur = Some(vork_scene::v2::from_test_value(json!({"shutter":0.5,"position":"center"}))?);
-            input.render.settings.samples = 4;
-        }
-        let mut s = r.install(input, Path::new("."))?;
-        let mut slots = [s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?,s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?];
-        let mut first: [Option<Vec<[f32;4]>>;2] = [None,None];
-        for (slot,time,changes_camera) in [(0,0.,true),(1,0.5,true),(0,0.5,false),(1,0.,false),(0,1.,true),(1,0.5,false),(0,0.,true)] {
-            let before = slots[slot].view.camera_cull.test_visits();
-            let actual = s.render_frame(&r,&mut slots[slot],time)?;
-            let after = slots[slot].view.camera_cull.test_visits();
-            if !blur && changes_camera { assert!(after > before,"camera must prepare at {time}"); }
-            else if !blur { assert_eq!(after,before,"shading-only time {time} rescanned objects"); }
-            let mut fresh = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
-            let expected = s.render_frame(&r,&mut fresh,time)?;
-            crate::test_linear::assert_linear_eq((actual).linear_rgba.as_ref().expect("linear readback"), (expected).linear_rgba.as_ref().expect("linear readback"));
-            assert_eq!(actual.ids,expected.ids);
-            crate::test_linear::assert_depth_eq(actual.depth_f32.as_ref().expect("float depth readback"), expected.depth_f32.as_ref().expect("float depth readback"));
-            assert!(actual.ids.iter().any(|&id|id!=0),"selected actor must remain visible");
-            if let Some(prior) = first[slot].as_ref() {
-                if time == 0. && slot == 0 { crate::test_linear::assert_linear_eq(actual.linear_rgba.as_ref().unwrap(),prior); }
-            } else { first[slot] = actual.linear_rgba; }
-        }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn preparing_capture_staging_preserves_live_selection() -> Result<()> {
-        let r = crate::test_renderer()?;
-        let s = r.install(scene()?, Path::new("."))?;
-        let frame = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
-        let cull = &frame.view.camera_cull;
-        let vp = Mat4::perspective_rh(1., 1., 0.1, 100.);
-        let mut changes = ChangeTracker::default();
-        changes.sample = 1;
-        cull.prepare_exposure(vp, &frame.object_values, &[], &mut changes, false);
-        let samples = cull.sample_values(&r.device, 1).unwrap();
-        cull.prepare_sample(vp * Mat4::from_translation(Vec3::new(-8., 0., 0.)),
-            &frame.object_values, &[], &mut changes, &samples, 0);
-        let before = cull.test_visits();
-        changes.sample += 1;
-        changes.bytes.clear();
-        changes.uploads.clear();
-        cull.prepare_exposure(vp, &frame.object_values, &[], &mut changes, false);
-        assert_eq!(cull.test_visits(), before, "staging did not replace live destinations");
-        assert!(changes.uploads.is_empty(), "staging must not invalidate live CPU byte history");
-        r.errors.check()?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
-    fn selection_observes_publications_bounds_and_capture_buffer_replacement() -> Result<()> {
-        let r = crate::test_renderer()?;
-        let mut s = r.install(scene()?, Path::new("."))?;
-        let frame = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
-        // Exercise the CPU receiver contract with a producer-owned local bound.
-        // No modified scene is rendered: ownership is supplied to selection here.
-        s.draws[0].computed = true;
-        let cull = crate::passes::camera_cull::Resources::new(&s,&r,&frame.view.uniform,&frame.objects,s.material_table.records(),None,None);
-        let mut objects = frame.object_values.clone();
-        let vp = Mat4::perspective_rh(1.,1.,0.1,100.);
-        let mut changes = ChangeTracker::default();
-        changes.sample = 1;
-        cull.prepare_exposure(vp,&objects,&[None],&mut changes,false);
-        let count = cull.test_visits();
-        assert_eq!(count,objects.len());
-        let next = |changes: &mut ChangeTracker| { changes.sample+=1;changes.bytes.clear();changes.uploads.clear(); };
-        next(&mut changes);
-        cull.prepare_exposure(vp,&objects,&[None],&mut changes,false);
-        assert_eq!(cull.test_visits(),count);
-        assert!(changes.uploads.is_empty());
-        let outside = Some((Vec3::splat(100.),Vec3::splat(101.)));
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),2*count,"new evaluated bounds invalidate");
-        assert!(!changes.uploads.is_empty(),"changed bounds must publish selection");
-        next(&mut changes);
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),2*count);
-        objects[0].model = Mat4::from_translation(Vec3::new(1.,0.,-5.));
-        changes.upload(&frame.objects,0,bytemuck::bytes_of(&objects[0].gpu()));
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),3*count);
-        // A second publication has the same sample stamp; it must not retain
-        // the first publication's selection.
-        objects[0].metadata[1] = 0;
-        changes.upload(&frame.objects,0,bytemuck::bytes_of(&objects[0].gpu()));
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),4*count);
-        next(&mut changes);
-        changes.upload(s.material_table.records(),0,&[1,2,3,4]);
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),4*count,"shading publication must retain selection");
-        let samples = cull.sample_values(&r.device,2).unwrap();
-        cull.prepare_sample(vp,&objects,&[None],&mut changes,&samples,0);
-        cull.prepare_sample(vp*Mat4::from_translation(Vec3::new(-8.,0.,0.)),&objects,&[None],&mut changes,&samples,1);
-        let mut encoder = r.device.create_command_encoder(&Default::default());
-        cull.copy_sample(&mut encoder,&mut changes,&samples,0);
-        for (buffer,offset,source,size) in &changes.uploads {
-            r.queue.write_buffer(buffer,*offset,&changes.bytes[*source as usize..(*source+*size) as usize]);
-        }
-        r.queue.submit([encoder.finish()]);
-        let before = cull.test_visits();
-        next(&mut changes);
-        cull.prepare_exposure(vp,&objects,&[outside],&mut changes,false);
-        assert_eq!(cull.test_visits(),before+count,"capture restoration invalidates the live selection");
-        for (buffer,offset,source,size) in &changes.uploads {
-            r.queue.write_buffer(buffer,*offset,&changes.bytes[*source as usize..(*source+*size) as usize]);
-        }
-        let commands = cull.commands().unwrap();
-        let read = r.device.create_buffer(&wgpu::BufferDescriptor { label:None,size:commands.size()+cull.instances.size(),
-            usage:wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,mapped_at_creation:false });
-        let mut encoder = r.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(commands,0,&read,0,commands.size());
-        encoder.copy_buffer_to_buffer(&cull.instances,0,&read,commands.size(),cull.instances.size());
-        let submission = r.queue.submit([encoder.finish()]);
-        let (tx,rx) = std::sync::mpsc::channel();
-        read.map_async(wgpu::MapMode::Read,..,move |result| {let _=tx.send(result);});
-        r.device.poll(wgpu::PollType::Wait {submission_index:Some(submission),timeout:None})?;
-        rx.recv()??;
-        let mapped = read.get_mapped_range(..);
-        let words: &[u32] = bytemuck::cast_slice(&mapped);
-        assert_eq!(words[1],0,"CPU selection must replace the capture's nonzero GPU count, even when its bytes equal the earlier CPU selection");
-        assert!(words[commands.size() as usize / 4..].iter().all(|&word| word==0),
-            "CPU selection must also replace the capture's instance map");
-        drop(mapped);
-        read.unmap();
-        r.errors.check()?;
-        Ok(())
-    }
-}
+#[path = "values_retained_selection_tests.rs"]
+mod retained_selection_tests;

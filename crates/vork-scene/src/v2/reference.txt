@@ -57,7 +57,7 @@ geometry.widths: f32 buffer; diameter per point; curves and points; required; JS
 image.color_space: sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB; default null; JSON shape: "sRGB"|"Linear Rec.709"|"Linear Rec.2020"|"ACEScg"|"Display P3"|"Non-Color"|null
 image.composition: {compositor}|null; a rendered image's image graph; requires render; JSON shape: ImageComposition object|null
 image.composition.compositor: same ordered image graph as composition.compositor; names local to this capture; JSON shape: (string|Material object|CompositeNode object)[]
-image.file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C; JSON shape: string|null
+image.file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv webm or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C; JSON shape: string|null
 image.mag_filter: nearest|linear; default linear; JSON shape: "nearest"|"linear"
 image.min_filter: nearest|linear|nearest_mipmap_nearest|linear_mipmap_nearest|nearest_mipmap_linear|linear_mipmap_linear; default linear_mipmap_linear; JSON shape: "nearest"|"linear"|"nearest_mipmap_nearest"|"linear_mipmap_nearest"|"nearest_mipmap_linear"|"linear_mipmap_linear"
 image.render: ImageRender; renders a camera view into the texture; inherits integrator, fps, AOVs; sampling budget follows quality/cost level; closed shutter; scene-linear premultiplied RGBA; default null; JSON shape: ImageRender object|null
@@ -156,7 +156,7 @@ node.nodes (asset): {imported-name|#index: overrides}; #index = glTF node index;
 node.nodes.<name>.light_link_tags (asset): string[]|null; replaces inherited tags; JSON shape: string[]|null
 node.nodes.<name>.pass_index (asset): u32|null; 1..65535; object ID; JSON shape: integer|null
 node.audio: {file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch; JSON shape: Audio object|null
-node.audio.file: file-path|null; mono/stereo; relative to scene; omitted = children only; JSON shape: string|null
+node.audio.file: file-path|null; mono/stereo; relative to scene; omitted = movie soundtracks and children; JSON shape: string|null
 node.audio.gain: number; linear amplitude over source plus children; default 1; keyable; default 1; JSON shape: number
 node.children: node[]; default []; JSON shape: Node object[]
 node.clip-path: node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself; JSON shape: string|null
@@ -168,7 +168,7 @@ node.fill (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|
 node.fill (text): "none"|CSS colour|CSS gradient|{image, fit}; default #000; JSON shape: "none"|string|ImagePaint object
 node.fill-opacity (path): number; 0..1; default 1; JSON shape: number
 node.fill-rule (path): nonzero|evenodd; default nonzero; JSON shape: "nonzero"|"evenodd"
-node.filter: string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses; JSON shape: string|null
+node.filter: string|null; 2D; blur(), brightness(), contrast(), drop-shadow(), grayscale(), hue-rotate(), invert(), opacity(), saturate(), sepia(); nonzero lengths require px; blur length is the Gaussian standard deviation before transforms; JSON shape: string|null
 node.font (text): file-path|file-path[]; .ttf/.otf; a list offers faces font-weight and font-style choose from; JSON shape: string|string[]
 node.font-feature-settings (text): string; default normal; JSON shape: string
 node.font-size (text): number; px; default 16; JSON shape: number
@@ -177,11 +177,13 @@ node.font-variation-settings (text): string; default normal; JSON shape: string
 node.font-weight (text): number|normal|bold; default normal; JSON shape: "normal"|"bold"|number
 node.is_holdout: bool; RGB 0; alpha 0 on transparent background, 1 on opaque background; default false; JSON shape: boolean
 node.is_shadow_catcher: bool; shadow_catcher channel is material light with CG / without CG, unclamped; zero baseline gives neutral 1; CG light on an otherwise unlit catcher cannot be represented; default false; JSON shape: boolean
+node.isolation: auto|isolate; default auto; JSON shape: "auto"|"isolate"
 node.letter-spacing (text): number; px; default 0; JSON shape: number
 node.light_link_tags: string[]; matched by light illuminates/shadowed_by; inherited; default []; JSON shape: string[]
 node.line-break (text): auto; the others are not built; default auto; JSON shape: "auto"|"loose"|"normal"|"strict"|"anywhere"
 node.line-height (text): normal|number; a multiple of the font size; default normal; JSON shape: "normal"|number
-node.mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself; JSON shape: string|null
+node.mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node; it is not painted itself; JSON shape: string|null
+node.mask-type: luminance|alpha; default luminance; JSON shape: "luminance"|"alpha"
 node.geometry (mesh): geometry-name|inline geometry; JSON shape: string|Geometry object
 node.instances (mesh): instances|null; JSON shape: Instances object|null
 node.instances.attributes (mesh): equal-length buffers: TRANSLATION vec3, ROTATION vec4 (xyzw), SCALE vec3 (omitted = identity; any zero world-scale component hides the instance), time_offset f32, pass_index u32, custom columns bind to material inputs; JSON shape: {name: string|Buffer object}
@@ -191,6 +193,7 @@ node.morph_weights (mesh): {name:number}; default {}; JSON shape: {name: number}
 node.skin (mesh): skin|null; JSON shape: Skin object|null
 node.skin.inverse_bind_matrices (mesh): mat4-buffer-name|inline buffer; JSON shape: string|Buffer object
 node.skin.joints (mesh): node-name[]; JSON shape: string[]
+node.mix-blend-mode: normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity; default normal; JSON shape: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"color-dodge"|"color-burn"|"hard-light"|"soft-light"|"difference"|"exclusion"|"hue"|"saturation"|"color"|"luminosity"
 node.name: string; globally unique, including imported nodes; default ""; JSON shape: string
 node.opacity: number; 2D; 0..1; the node's picture, children included, placed once; default 1; JSON shape: number
 node.paint-order (path): string; normal, or the layers to paint first out of fill, stroke, markers ("stroke" puts the stroke under the fill); default normal; JSON shape: string
@@ -332,7 +335,7 @@ std/openpbr.transmission_dispersion_scale: number; Linearly scales the amount of
 std/openpbr.transmission_scatter: color3; Interior scattering albedo; approximated with Beer-only transmission; range [0,1] per channel; units dimensionless; constant|texture|attribute; animatable; default (0, 0, 0)
 std/openpbr.transmission_scatter_anisotropy: number; Henyey-Greenstein anisotropy; approximated without interior scattering; range [-1,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 std/openpbr.transmission_weight: number; Mix weight between translucent base and opaque base slabs; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
-animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible
+animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, mask-type, mix-blend-mode, isolation, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible
 animation.track.path render properties: camera|background (RGB; CSS colour on a canvas)|motion_blur,shutter
 animation.track.path text pieces: fill and stroke [r,g,b,a] 0..1 or CSS colour/gradient or image paint; transform-origin CSS, default the ink box centre
 coordinates: glTF right-handed Y-up; cameras look along local -Z

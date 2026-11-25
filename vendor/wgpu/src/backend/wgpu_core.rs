@@ -154,6 +154,8 @@ impl ContextWgpuCore {
             );
         }
         CoreTexture {
+            #[cfg(std)]
+            binding_size: Default::default(),
             context: self.clone(),
             id,
             error_sink: Arc::clone(&device.error_sink),
@@ -491,6 +493,8 @@ pub struct CoreBindGroup {
 
 #[derive(Debug)]
 pub struct CoreTexture {
+    #[cfg(std)]
+    pub(crate) binding_size: std::sync::OnceLock<Option<u64>>,
     pub(crate) context: ContextWgpuCore,
     id: wgc::id::TextureId,
     error_sink: ErrorSink,
@@ -1040,6 +1044,15 @@ impl dispatch::AdapterInterface for CoreAdapter {
 impl Drop for CoreAdapter {
     fn drop(&mut self) {
         self.context.0.adapter_drop(self.id)
+    }
+}
+
+impl CoreDevice {
+    pub(crate) fn is_lost(&self) -> bool { self.context.0.device_is_lost(self.id) }
+
+    pub(crate) fn texture_binding_size(&self, desc: &crate::TextureDescriptor<'_>) -> Option<u64> {
+        let desc = desc.map_label_and_view_formats(|l| l.map(Borrowed), |v| v.to_vec());
+        self.context.0.device_texture_binding_size(self.id, &desc)
     }
 }
 
@@ -1673,6 +1686,8 @@ impl dispatch::DeviceInterface for CoreDevice {
         }
 
         CoreTexture {
+            #[cfg(std)]
+            binding_size: Default::default(),
             context: self.context.clone(),
             id,
             error_sink: Arc::clone(&self.error_sink),
@@ -3957,6 +3972,8 @@ impl dispatch::SurfaceInterface for CoreSurface {
             }) => {
                 let data = texture_id
                     .map(|id| CoreTexture {
+                        #[cfg(std)]
+                        binding_size: Default::default(),
                         context: self.context.clone(),
                         id,
                         error_sink,

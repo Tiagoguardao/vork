@@ -12,6 +12,8 @@ vork render scene.json --out shot.png
 vork help
 Scaffold languages, files and conflict policy: vork help init. SDK setup: vork help sdk.
 Edit SDK source, regenerate JSON, then render.
+For repeated looks, keep the GPU open with SDK Session. See the Python example in vork help sdk
+and the SESSION section of vork help render.
 Paths are relative to scene.json. RGB background changes the backdrop, not lighting.
 
 Sun angular size: `vork help lights`. Tone curve and grain: `vork help render`.
@@ -90,13 +92,16 @@ Node {
   active: true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)
   animation: layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself
   audio: {file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch
-  audio.file: file-path|null; mono/stereo; relative to scene; omitted = children only
+  audio.file: file-path|null; mono/stereo; relative to scene; omitted = movie soundtracks and children
   audio.gain: number = 1; linear amplitude over source plus children; default 1; keyable
   children: node[] = []
   clip-path: node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself
   composition: composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box
-  filter: string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses
-  mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself
+  filter: string|null; 2D; blur(), brightness(), contrast(), drop-shadow(), grayscale(), hue-rotate(), invert(), opacity(), saturate(), sepia(); nonzero lengths require px; blur length is the Gaussian standard deviation before transforms
+  isolation: auto|isolate = auto
+  mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node; it is not painted itself
+  mask-type: luminance|alpha = luminance
+  mix-blend-mode: normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity = normal
   name: string = ""; globally unique, including imported nodes
   opacity: number = 1; 2D; 0..1; the node's picture, children included, placed once
   rotation: [x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ) = [0,0,0,1]
@@ -166,7 +171,7 @@ Texture binding {
 
 Image {
   color_space: sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null = null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB
-  file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C
+  file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv webm or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C
 }
 
 Render {
@@ -225,7 +230,7 @@ diagnostics: timings and environment variables
 limits: hardware and rendering limits
 build: source build prerequisites
 
-Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.1/packages/ts/scene.schema.json"` for editor
+Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.2/packages/ts/scene.schema.json"` for editor
 completion and validation. `vork init` includes it; SDK writers preserve an explicit
 $schema but do not insert one. vork never fetches it or changes the render.
 

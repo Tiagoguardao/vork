@@ -16,6 +16,11 @@ import zipfile
 from shader_bundle import package as package_shaders
 from runtime_platform import check_runtime_platform, macos_manifest
 
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
 ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--binary', type=Path, required=True)
@@ -218,11 +223,11 @@ with tempfile.TemporaryDirectory(dir=a.output) as tmp:
     if a.platform == 'darwin-arm64':
         (stage / 'macos-runtime.json').write_text(json.dumps(macos_manifest(stage), indent=2) + '\n')
     if a.sign_windows:
-        prepared_digest = hashlib.sha256((stage / 'vork.exe').read_bytes()).hexdigest()
+        prepared_digest = digest(stage / 'vork.exe')
         subprocess.run(['pwsh', '-NoProfile', '-File', str(ROOT / 'scripts/sign-windows.ps1'),
                         '-Root', str(stage.resolve()), '-NoticeFile',
                         str((stage / 'licenses/windows-signing.txt').resolve())], check=True)
-        if hashlib.sha256((stage / 'vork.exe').read_bytes()).hexdigest() != prepared_digest:
+        if digest(stage / 'vork.exe') != prepared_digest:
             p.error('sign vork.exe before preparing shaders; signing changed the prepared binary')
     archive = a.output / f'vork-{cargo_version}-{a.platform}.{"zip" if windows else "tar.gz"}'
     if windows:
@@ -245,7 +250,7 @@ with tempfile.TemporaryDirectory(dir=a.output) as tmp:
     rows = sums.read_text(encoding='utf-8').splitlines() if sums.exists() else []
     names = {archive.name for archive in archives}
     rows = [r for r in rows if r.split()[-1] not in names]
-    rows += [f'{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}' for archive in archives]
+    rows += [f'{digest(archive)}  {archive.name}' for archive in archives]
     sums.write_text('\n'.join(sorted(rows)) + '\n', encoding='utf-8', newline='\n')
     for archive in archives:
         print(f'{archive}: {archive.stat().st_size} bytes')

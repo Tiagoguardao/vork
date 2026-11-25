@@ -15,11 +15,10 @@ fn same_paint(a: &crate::seams::BodyPaint, b: &crate::seams::BodyPaint) -> bool 
     use crate::seams::BodyPaint;
     match (a, b) {
         (BodyPaint::Solid, BodyPaint::Solid) => true,
-        (BodyPaint::Gradient(a), BodyPaint::Gradient(b))
-        | (BodyPaint::PostShaderGradientStroke(a), BodyPaint::PostShaderGradientStroke(b)) => {
+        (BodyPaint::Gradient(a), BodyPaint::Gradient(b)) => {
             a == b
         }
-        (BodyPaint::Shader(a), BodyPaint::Shader(b)) => a == b,
+
         (BodyPaint::Pattern(a), BodyPaint::Pattern(b)) => {
             let (at, bt) = (&a.texture, &b.texture);
             let (ai, bi) = (&at.image, &bt.image);
@@ -333,6 +332,7 @@ struct Composition {
     isolation: Option<OrderedBounds>,
     isolation_inputs: Vec<usize>,
     isolation_slots: HashMap<usize, usize>,
+    pending_bounds: Vec<(usize, Option<Rect>)>,
 }
 struct Capture {
     recipe: crate::frame::CaptureRecipe,
@@ -358,13 +358,17 @@ pub(super) struct OutputRecords {
     leaves: Vec<Leaf>,
     compositions: Vec<Composition>,
     captures: Vec<Capture>,
-    readers: HashMap<u32, [Vec<usize>; 3]>,
-    held: HashMap<u32, u8>,
-    /// Sources whose ordinary paint-order visibility read returned hidden.
-    hidden: std::collections::HashSet<u32>,
+    inputs: Vec<(u32, SourceEdges)>,
     capture_owner: Vec<Option<usize>>,
-    composition_sources: HashMap<u32, Vec<usize>>,
     isolation_parents: HashMap<usize, Vec<(usize, usize)>>,
+}
+
+#[derive(Default)]
+struct SourceEdges {
+    readers: [Vec<usize>; 3],
+    held: u8,
+    hidden: bool,
+    compositions: Vec<usize>,
 }
 
 struct Sources<'a> {
@@ -374,13 +378,21 @@ struct Sources<'a> {
 }
 
 impl OutputRecords {
+    pub(super) fn capture_bounds(&self, row: u32) -> Option<Rect> {
+        self.captures.iter().find(|c| self.valid && c.recipe.row == row).map(|c| c.recipe.bounds)
+    }
+
     #[cfg(test)]
     pub(super) fn leaf_storage(&self) -> usize { self.leaves.as_ptr() as usize }
 
     /// No emitted operation reads this source, including through a prepared child's ancestors.
     pub(super) fn ignores_source(&self, row: u32) -> bool {
-        self.valid && !self.readers.contains_key(&row) && !self.held.contains_key(&row)
-            && !self.composition_sources.contains_key(&row)
+        self.valid && self.input(row).is_none_or(|edges| edges.held == 0 && edges.compositions.is_empty()
+            && edges.readers.iter().all(Vec::is_empty))
+    }
+
+    fn input(&self, row: u32) -> Option<&SourceEdges> {
+        self.inputs.binary_search_by_key(&row, |(source, _)| *source).ok().map(|i| &self.inputs[i].1)
     }
 
     pub(super) fn read(
@@ -390,17 +402,16 @@ impl OutputRecords {
         items: &[DrawItem],
         prepared: Option<&crate::prepared_rows::PreparedRows>,
     ) -> Option<Self> {
-        if !unit.skipped.is_empty()
-            || !unit.dropped.is_empty()
+        if !unit.details().skipped.is_empty()
+            || !unit.details().dropped.is_empty()
             || unit.culled
             || unit.part_culled
-            || items_use_shader_time(items)
         {
             return None;
         }
         let prepared = prepared?;
         if unit.compositions.is_empty()
-            && unit.captures.is_empty()
+            && unit.details().captures.is_empty()
             && !items
                 .first()
                 .and_then(drawitem_node_id)
@@ -416,11 +427,8 @@ impl OutputRecords {
             leaves: Vec::new(),
             compositions: Vec::new(),
             captures: Vec::new(),
-            readers: HashMap::default(),
-            held: HashMap::default(),
-            hidden: Default::default(),
+            inputs: Vec::new(),
             capture_owner: Vec::new(),
-            composition_sources: HashMap::default(),
             isolation_parents: HashMap::default(),
         };
         let sources = Sources {
@@ -440,18 +448,19 @@ impl OutputRecords {
                 .map(|recipe| (recipe.row, recipe))
                 .collect(),
             captures: unit
-                .captures
+                .details().captures
                 .iter()
                 .map(|recipe| (recipe.row, recipe))
                 .collect(),
         };
-        graph.read_container(scene, &sources, items, Vec::new(), None, prepared)?;
+        let mut edges = BTreeMap::<u32, SourceEdges>::new();
+        graph.read_container(scene, &sources, &mut edges, items, Vec::new(), None, prepared)?;
         let compositions: HashMap<_, _> = unit.compositions.iter().map(|r| (r.row, r)).collect();
-        let captures: std::collections::HashSet<_> = unit.captures.iter().map(|r| r.row).collect();
+        let captures: std::collections::HashSet<_> = unit.details().captures.iter().map(|r| r.row).collect();
         let leaves: std::collections::HashSet<_> = graph.leaves.iter().map(|r| r.row).collect();
         for primary in dl.iter().filter(|item| item.is_primary_node_item) {
             let row = scene.row_of(&primary.node_id)?;
-            if scene.hidden_from_paint_order(&primary.node_id) { graph.hidden.insert(row); continue; }
+            if scene.hidden_from_paint_order(&primary.node_id) { edges.entry(row).or_default().hidden = true; continue; }
             if leaves.contains(&row) {
                 continue;
             }
@@ -471,11 +480,7 @@ impl OutputRecords {
                 } else {
                     0b1111
                 };
-                graph
-                    .held
-                    .entry(source)
-                    .and_modify(|bits| *bits |= groups)
-                    .or_insert(groups);
+                edges.entry(source).or_default().held |= groups;
                 let Some(parent) = scene.parent_map().get(scene.row(source)?.id()) else {
                     break;
                 };
@@ -490,11 +495,7 @@ impl OutputRecords {
             graph.capture_owner[capture.container] = Some(index);
         }
         for (index, composition) in graph.compositions.iter().enumerate() {
-            graph
-                .composition_sources
-                .entry(composition.recipe.row)
-                .or_default()
-                .push(index);
+            edges.entry(composition.recipe.row).or_default().compositions.push(index);
             let container = &mut graph.containers[composition.container];
             container.compositions.push(index);
             for slot in composition.slots[0] + 1..composition.slots[1] {
@@ -510,12 +511,14 @@ impl OutputRecords {
                 }
             }
         }
+        graph.inputs = edges.into_iter().collect();
         Some(graph)
     }
     fn read_container(
         &mut self,
         scene: &Scene,
         sources: &Sources<'_>,
+        edges: &mut BTreeMap<u32, SourceEdges>,
         items: &[DrawItem],
         path: Address,
         root: Option<u32>,
@@ -561,6 +564,7 @@ impl OutputRecords {
                     let child = self.read_container(
                         scene,
                         sources,
+                        edges,
                         &group.items,
                         child_path,
                         Some(row),
@@ -610,7 +614,7 @@ impl OutputRecords {
             for &(source, groups) in inputs {
                 for group in 0..3 {
                     if groups & (1 << group) != 0 {
-                        self.readers.entry(source).or_default()[group].push(index);
+                        edges.entry(source).or_default().readers[group].push(index);
                     }
                 }
             }
@@ -676,6 +680,7 @@ impl OutputRecords {
                 isolation,
                 isolation_inputs,
                 isolation_slots,
+                pending_bounds: Vec::new(),
             });
         }
         Some(ci)
@@ -691,74 +696,57 @@ impl OutputRecords {
             container = self.captures[capture].parent;
         }
     }
-    fn reach_slot(
-        &self,
-        ci: usize,
-        slot: usize,
-        dirty: &mut BTreeSet<usize>,
-        inputs: &mut HashMap<usize, BTreeMap<usize, Option<Rect>>>,
-    ) {
-        for &index in &self.containers[ci].users[slot] {
+    fn reach_slot(container: &OutputContainer, outputs: &mut [Composition], slot: usize, dirty: &mut BTreeSet<usize>) {
+        for &index in &container.users[slot] {
             dirty.insert(index);
-            if let Some(&input) = self.compositions[index].isolation_slots.get(&slot) {
-                inputs
-                    .entry(index)
-                    .or_default()
-                    .insert(input, self.containers[ci].bounds.items[slot]);
+            let output = &mut outputs[index];
+            if let Some(&input) = output.isolation_slots.get(&slot) {
+                output.pending_bounds.push((input, container.bounds.items[slot]));
             }
         }
     }
     pub(super) fn patch(
         &mut self,
         scene: &Scene,
-        changed: &[String],
+        changed: &[u32],
         plan: &mut Arc<CoveragePlan>,
         start: usize,
         seg: &mut crate::frame::CameraSegment,
         written: &mut PlanWritten,
         opts: &RenderOptions,
         caches: &mut PlanCaches,
-        hashes: &HashMap<String, NodeHashes>,
+        hashes: &dyn NodeHashSource,
     ) -> Option<i64> {
         use moda_scene::stamps::Group;
         if !self.valid {
             return None;
         }
-        let mut leaves: HashMap<usize, bool> = HashMap::default();
+        let mut leaves = Vec::new();
         let mut compositions = BTreeSet::new();
         let mut captures = BTreeSet::new();
-        for id in changed {
-            let row = scene.row_of(id)?;
-            if self.hidden.contains(&row) && !scene.hidden_from_paint_order(id) { return None; }
-            for group in [
-                Group::Placement,
-                Group::Paint,
-                Group::Content,
-                Group::Structure,
-            ] {
-                if scene.stamps().current(row, group, self.at) {
-                    continue;
-                }
-                if group == Group::Structure
-                    || self
-                        .held
-                        .get(&row)
-                        .is_some_and(|bits| bits & (1 << group as u8) != 0)
-                {
-                    return None;
-                }
-                if let Some(readers) = self
-                    .readers
-                    .get(&row)
-                    .and_then(|groups| groups.get(group as usize))
-                {
-                    for &index in readers {
-                        *leaves.entry(index).or_default() |= group != Group::Placement;
-                    }
-                }
-                if let Some(outputs) = self.composition_sources.get(&row) {
-                    compositions.extend(outputs.iter().copied());
-                }
+        if scene.stamps().latest(Group::Structure) > self.at &&
+            changed.iter().any(|&row| !scene.stamps().current(row, Group::Structure, self.at)) {
+            return None;
+        }
+        let mut visit = |row: u32, edges: &SourceEdges| -> Option<()> {
+            if edges.hidden && !scene.hidden_from_paint_order(scene.row(row)?.id()) { return None; }
+            for group in [Group::Placement, Group::Paint, Group::Content] {
+                if scene.stamps().current(row, group, self.at) { continue; }
+                if edges.held & (1 << group as u8) != 0 { return None; }
+                for &index in &edges.readers[group as usize] { leaves.push((index, group != Group::Placement)); }
+                compositions.extend(edges.compositions.iter().copied());
+            }
+            Some(())
+        };
+        // A page-wide fade may reach thousands of independent records. Intersect each record's
+        // inputs with the changed rows, starting with the shorter of the two ordered slices.
+        if changed.len() < self.inputs.len() {
+            for &row in changed {
+                if let Some(edges) = self.input(row) { visit(row, edges)?; }
+            }
+        } else {
+            for (row, edges) in &self.inputs {
+                if changed.binary_search(row).is_ok() { visit(*row, edges)?; }
             }
         }
         if leaves.is_empty() && compositions.is_empty() {
@@ -773,7 +761,12 @@ impl OutputRecords {
         let mut updates = Vec::new();
         let mut writes = Vec::new();
         let mut delta = 0i64;
-        let mut isolation_inputs = HashMap::default();
+        leaves.sort_unstable_by_key(|&(index, _)| index);
+        leaves.dedup_by(|later, earlier| {
+            if later.0 != earlier.0 { return false; }
+            earlier.1 |= later.1;
+            true
+        });
         let prepared = seg.prepared.as_ref()?;
         for (index, prepare) in leaves {
             let leaf = &self.leaves[index];
@@ -820,15 +813,12 @@ impl OutputRecords {
                 delta += items_bytes(std::slice::from_ref(&item)) as i64
                     - items_bytes(std::slice::from_ref(&old[slot])) as i64;
                 self.containers[ci].bounds.write(slot, &item);
-                self.reach_slot(ci, slot, &mut compositions, &mut isolation_inputs);
+                Self::reach_slot(&self.containers[ci], &mut self.compositions, slot, &mut compositions);
                 writes.push((ci, slot, item));
             }
             self.reach_captures(ci, &mut captures);
         }
-        let mut capture_updates: HashMap<
-            usize,
-            (Rect, Option<crate::layer_blur::plan::LayerBlurParams>),
-        > = HashMap::default();
+        let mut capture_updates = Vec::new();
         while let Some(index) = captures.pop_first() {
             let capture = &self.captures[index];
             let ci = capture.container;
@@ -861,11 +851,10 @@ impl OutputRecords {
                 self.containers[capture.parent]
                     .bounds
                     .capture_extent(capture.slot, params.extent_canvas);
-                self.reach_slot(
-                    capture.parent,
+                Self::reach_slot(
+                    &self.containers[capture.parent], &mut self.compositions,
                     capture.slot,
                     &mut compositions,
-                    &mut isolation_inputs,
                 );
                 // A capture's target rectangle is an input of every isolation output inside it.
                 compositions.extend(self.containers[ci].compositions.iter().copied());
@@ -874,7 +863,11 @@ impl OutputRecords {
                 None
             };
             self.reach_captures(capture.parent, &mut captures);
-            capture_updates.insert(index, (bounds, params));
+            // Captures are processed innermost first, in their recorded index order.
+            match capture_updates.binary_search_by_key(&index, |(key, _)| *key) {
+                Ok(at) => capture_updates[at] = (index, (bounds, params)),
+                Err(at) => capture_updates.insert(at, (index, (bounds, params))),
+            }
         }
         if !compositions.is_empty() && seg.backdrop.is_none() {
             return None;
@@ -900,22 +893,18 @@ impl OutputRecords {
                 .range(output.slots[0] + 1, output.slots[1]);
             let recipe = output.recipe.with_bounds(bounds);
             let mut items = recipe.emit(scene, &context)?;
+            let mut pending_parent_value = None;
             if let Some(isolation) = &mut output.isolation {
                 let old = rect_bits(isolation.value());
-                isolation.write(isolation_inputs.remove(&index).unwrap_or_default());
-                if rect_bits(isolation.value()) != old {
-                    for &(parent, input) in self.isolation_parents.get(&index).into_iter().flatten()
-                    {
-                        isolation_inputs
-                            .entry(parent)
-                            .or_default()
-                            .insert(input, isolation.value());
-                        compositions.insert(parent);
-                    }
+                isolation.write(output.pending_bounds.drain(..));
+                let value = isolation.value();
+                if rect_bits(value) != old {
+                    pending_parent_value = Some(value);
                 }
                 let capture_index = self.capture_owner[ci]?;
                 let capture = &self.captures[capture_index];
-                let target = if let Some((_, Some(params))) = capture_updates.get(&capture_index) {
+                let updated = capture_updates.binary_search_by_key(&capture_index, |(key, _)| *key).ok();
+                let target = if let Some((_, (_, Some(params)))) = updated.map(|at| &capture_updates[at]) {
                     (params.region_canvas, params.width_px, params.height_px)
                 } else {
                     let parent = container(
@@ -958,14 +947,18 @@ impl OutputRecords {
                 }
                 writes.push((ci, slot, item));
             }
+            if let Some(value) = pending_parent_value {
+                for &(parent, input) in self.isolation_parents.get(&index).into_iter().flatten() {
+                    self.compositions[parent].pending_bounds.push((input, value));
+                    compositions.insert(parent);
+                }
+            }
             recipes.push((index, recipe));
         }
         if !updates.is_empty() {
             let prepared = seg.prepared.as_mut()?;
             let before = prepared.bytes();
-            if !prepared.update(updates) {
-                return None;
-            }
+            prepared.update(updates);
             delta += prepared.bytes() as i64 - before as i64;
         }
         let dest = Arc::make_mut(plan);
@@ -1001,7 +994,6 @@ impl OutputRecords {
                 };
             }
             group.cache_key = None;
-            group.identity_key = None;
             capture.recipe.bounds = bounds;
             nested.insert(path.first().copied().unwrap_or(capture.slot));
         }
@@ -1021,56 +1013,27 @@ impl OutputRecords {
 
 impl OutputRecords {
     pub(super) fn bytes(&self) -> usize {
-        self.containers
-            .iter()
-            .map(|c| {
-                c.path.capacity() * 8
-                    + c.bounds.raw.tree.capacity()
-                        * std::mem::size_of::<Option<crate::layer_blur::shadow::ItemExtents>>()
-                    + c.bounds.items.capacity() * std::mem::size_of::<Option<Rect>>()
-                    + c.bounds.extra.len() * 64
-                    + c.users.iter().map(|v| v.capacity() * 8 + 24).sum::<usize>()
-            })
-            .sum::<usize>()
-            + self
-                .leaves
-                .iter()
-                .map(|r| std::mem::size_of::<Leaf>() + r.slots.capacity() * 8 + r.inputs.capacity() * 8)
-                .sum::<usize>()
-            + self
-                .compositions
-                .iter()
-                .map(|r| {
-                    128 + r.isolation_inputs.capacity() * 8
-                        + r.isolation_slots.capacity() * 24
-                        + r.isolation.as_ref().map_or(0, |b| {
-                            (b.inputs.capacity() + b.prefixes.capacity())
-                                * std::mem::size_of::<Option<Rect>>()
-                        })
-                })
-                .sum::<usize>()
-            + self.captures.iter().map(|c| std::mem::size_of::<Capture>()
-                + (c.recipe.strip_masks.capacity() + c.recipe.mask_table.capacity()) * 8
-                + c.recipe.isolations.capacity() * std::mem::size_of::<([usize; 2], Option<Rect>)>()).sum::<usize>()
-            + self.held.capacity() * 16
-            + self.hidden.capacity() * 8
-            + self.capture_owner.capacity() * 16
-            + self
-                .readers
-                .values()
-                .flat_map(|groups| groups.iter())
-                .map(|v| v.capacity() * 8 + 24)
-                .sum::<usize>()
-            + self
-                .composition_sources
-                .values()
-                .map(|v| v.capacity() * 8 + 32)
-                .sum::<usize>()
-            + self
-                .isolation_parents
-                .values()
-                .map(|v| v.capacity() * 16 + 32)
-                .sum::<usize>()
+        use super::weights::capacity;
+        use std::mem::size_of;
+        capacity(&self.containers) + self.containers.iter().map(|c| {
+            capacity(&c.path) + capacity(&c.bounds.raw.tree) + capacity(&c.bounds.items)
+                + c.bounds.extra.len() * (size_of::<(usize, Rect)>() + 3 * size_of::<usize>())
+                + capacity(&c.users) + c.users.iter().map(capacity).sum::<usize>() + capacity(&c.compositions)
+        }).sum::<usize>()
+            + capacity(&self.leaves) + self.leaves.iter().map(|r| capacity(&r.slots) + capacity(&r.inputs)).sum::<usize>()
+            + capacity(&self.compositions) + self.compositions.iter().map(|r| {
+                capacity(&r.isolation_inputs) + capacity(&r.pending_bounds)
+                    + r.isolation_slots.capacity() * (size_of::<(usize, usize)>() + 1)
+                    + r.isolation.as_ref().map_or(0, |b| capacity(&b.inputs) + capacity(&b.prefixes))
+            }).sum::<usize>()
+            + capacity(&self.captures) + self.captures.iter().map(|c| {
+                capacity(&c.recipe.strip_masks) + capacity(&c.recipe.mask_table) + capacity(&c.recipe.isolations)
+            }).sum::<usize>()
+            + capacity(&self.capture_owner) + capacity(&self.inputs)
+            + self.inputs.iter().map(|(_, edges)| capacity(&edges.compositions)
+                + edges.readers.iter().map(capacity).sum::<usize>()).sum::<usize>()
+            + self.isolation_parents.capacity() * (size_of::<(usize, Vec<(usize, usize)>)>() + 1)
+            + self.isolation_parents.values().map(capacity).sum::<usize>()
     }
 }
 
@@ -1086,12 +1049,12 @@ impl OutputRecords {
         use moda_scene::stamps::Group;
         self.valid = false;
         if scene.stamps().latest(Group::Structure) > self.at
-            || !unit.skipped.is_empty()
-            || !unit.dropped.is_empty()
+            || !unit.details().skipped.is_empty()
+            || !unit.details().dropped.is_empty()
             || unit.culled
             || unit.part_culled
             || unit.compositions.len() != self.compositions.len()
-            || unit.captures.len() != self.captures.len()
+            || unit.details().captures.len() != self.captures.len()
         {
             return false;
         }
@@ -1129,7 +1092,7 @@ impl OutputRecords {
             }
         }
         for capture in &mut self.captures {
-            let Some(recipe) = unit.captures.iter().find(|r| r.row == capture.recipe.row) else {
+            let Some(recipe) = unit.details().captures.iter().find(|r| r.row == capture.recipe.row) else {
                 return false;
             };
             let column = &self.containers[capture.container].bounds;
@@ -1190,6 +1153,7 @@ impl OutputRecords {
             };
             self.compositions[index].recipe = recipe.clone();
             self.compositions[index].isolation = isolation;
+            self.compositions[index].pending_bounds.clear();
         }
         self.at = scene.stamps().clock();
         self.valid = true;

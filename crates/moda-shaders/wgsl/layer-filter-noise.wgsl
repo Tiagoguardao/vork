@@ -77,8 +77,7 @@ fn cellAlpha(cell: vec2<i32>, salt: u32, t: f32) -> f32 {
   return clamp((cellHash(cell, salt) - t) / max(1.0 - t, 1e-6), 0.0, 1.0);
 }
 
-@fragment
-fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs(frag: vec4<f32>, noise: NoiseUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>, coverageTexture: texture_2d<f32>) -> vec4<f32> {
   let src = textureLoad(inputTexture, vec2<i32>(frag.xy), 0);
   let size = max(noise.params.x, 1e-3);
   let salt = u32(noise.params2.x) * 4u;
@@ -101,4 +100,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   // The shape's coverage: at least what the paint covers.
   let shape = max(textureLoad(coverageTexture, vec2<i32>(frag.xy), 0).a, src.a);
   return vec4<f32>(src.rgb * (1.0 - k) + colour * (k * shape), src.a + k * (shape - src.a));
+}
+
+@fragment
+fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs(frag, noise, inputSampler, inputTexture, coverageTexture);
 }

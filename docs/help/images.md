@@ -1,20 +1,19 @@
 IMAGES
 image.color_space overrides embedded colour tags; untagged HDR/EXR uses Linear Rec.709, other files sRGB.
-Use Non-Color for data. Tagged PQ/HLG inputs and footage tagged Rec.2020 or P3 refuse until decoded; the line names the color_space to set.
+Use Non-Color for data. On a canvas, PQ and HLG footage maps to SDR with 100-nit nominal white and FFmpeg's linear-light clip tone map before conversion to the working space. This needs FFmpeg with zscale and tonemap. Other tagged HDR images and unsupported wide-gamut footage require an explicit color_space.
 Nested camera textures inherit shot profile and timing. A canvas picture uses image.render.root and image.render.resolution;
 bind that image to a mesh material. Resolution is fixed, independent of camera distance.
 Worlds and canvases may nest.
 A canvas inside a canvas cannot set viewBox or preserveAspectRatio.
 Missing sampled image files, including environment images, use one magenta texel
 and emit a warning naming the file to restore. Corrupt images, IES profiles and
-colour-transform library data remain errors. Movie image inputs decode video only;
-attach audio: {file: ...} to a node to include the soundtrack.
+colour-transform library data remain errors. For movie sound and muting, see vork help render (SOUND).
 16-bit integer and floating-point image inputs avoid block compression but use half-float texture precision; exact source integer codes are not preserved.
 
 <!-- all -->
 ANIMATED TEXTURE REFERENCE
-image.file accepts .mov/.mp4/.mkv and %d/%04d frame patterns. Video requires
-user-installed ffmpeg and ffprobe. image.time is seconds into the clip; omitted
+image.file accepts .mov/.mp4/.mkv/.webm and %d/%04d frame patterns. Video requires
+user-installed ffmpeg and ffprobe. VP8/VP9 tracks with alpha use FFmpeg’s libvpx decoder. image.time is seconds into the clip; omitted
 follows its node's local clock, or scene time without one. Canvas path fills and
 strokes read movies and frame sequences through the same image binding. The ordinary animation path ["images",name,"time"] remaps it.
 Sequence time zero is the first on-disk frame. EXR sequences use framesPerSecond

@@ -219,8 +219,8 @@ pub(crate) fn flatten(cubics: &[Cubic], flat: f64) -> Vec<V2> {
         // Only collinear reversals need extra samples: keep the established
         // sampling of other curves unchanged.
         if c.is_chord(1e-9, f64::INFINITY) {
-            parameters.extend(c.extrema(|p| p.x));
-            parameters.extend(c.extrema(|p| p.y));
+            parameters.extend(super::bounds::AxisBezier::Cubic(c.0.map(|p| p.x)).extrema());
+            parameters.extend(super::bounds::AxisBezier::Cubic(c.0.map(|p| p.y)).extrema());
         }
         parameters.sort_by(f64::total_cmp);
         parameters.dedup();

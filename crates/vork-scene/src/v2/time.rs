@@ -207,10 +207,18 @@ impl Section {
     }
 }
 
+/// Route movie and playlist names to the media reader, which checks the held
+/// file's format and reports why a multi-file playlist cannot be pinned.
+pub fn is_movie_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext|
+        ["mov", "mp4", "mkv", "webm", "ffconcat", "m3u8", "m3u"]
+            .iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+}
+
 /// A movie or frame-sequence file: the content with a length of its own.
 pub fn is_media_file(path: &str) -> bool {
     let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("");
-    name.contains('%') || std::path::Path::new(path).extension().is_some_and(|e| ["mov", "mp4", "mkv"].iter().any(|v| e.eq_ignore_ascii_case(v)))
+    name.contains('%') || is_movie_path(std::path::Path::new(path))
 }
 
 /// A rational for messages: an integer, a decimal when exact, else `n/d`.

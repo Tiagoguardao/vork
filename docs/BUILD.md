@@ -275,7 +275,41 @@ existing installed-asset reader to validate and materialize only the entries
 used by that run. Export reads its fresh mutable store, so obsolete entries do
 not accumulate in the shipped bundle. The manifest is regenerated for the actual
 packaged binary. Neither store contains driver caches. Dist jobs restore/save
-these stores with Actions cache; Greenlight retains them across commit builds.
+these stores with Actions cache; the postmerge service retains them across commit builds.
 Each build-only store bounds completed shader payloads to 2 GiB, removing the
 oldest entries after a successful run; eviction only causes recompilation.
 Lock files and the fixed-compiler event log are separate metadata.
+
+### VideoToolbox canvas footage on macOS
+
+For a local source build with FFmpeg in a custom prefix, expose its
+`libavformat.pc` on `PKG_CONFIG_PATH` before building. The native reader
+looks for the matching ABI-qualified dylib in the reported library directory,
+then in the Homebrew locations. Distribution builds use pinned headers and
+search the Homebrew locations at runtime. The portable reader handles a missing
+native runtime.
+
+The macOS packaging workflow checks the Cargo build receipt for VideoToolbox.
+An explicit historical source-SHA build may omit it when that source predates
+the native reader.
+
+### NVIDIA footage on Linux
+
+To include the native CUDA footage reader, install the FFmpeg 6 development headers
+(libavformat 60, libavcodec 60 and libavutil 58), pkg-config and clang++ with its
+NVPTX backend before building. On Ubuntu 24.04 the packages are libavformat-dev,
+libavcodec-dev, libavutil-dev, pkg-config and clang. The build embeds the
+conversion kernel. At render time the reader loads the matching libav libraries
+for demux and bitstream filtering, plus libcuda and libnvcuvid for NVIDIA decode.
+Canvas and world movie textures share the decoder and the 4:2:0 conversion for
+8-bit footage and limited-range HEVC Main10 in BT.601/709. HDR canvases use
+their transfer-specific tone mapping. The world texture path retains
+16-bit components. Unsupported streams and builds without the native reader use
+FFmpeg software decoding. On opening an inactive CUDA primary context, the
+reader requests blocking synchronization. An active context keeps its owner’s
+scheduling mode, which the reader shares.
+
+The NVIDIA driver exposes per-picture decode status for H.264, HEVC and JPEG.
+Vork requires status for H.264. HEVC and JPEG can decode without status when
+the runtime reports that the query is unavailable. AV1, VP8, VP9, MPEG-1/2/4
+and VC-1 use the native decoder without a per-picture corruption check.

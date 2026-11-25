@@ -38,6 +38,31 @@ use crate::{
 const NAGA_LOCATION_SEMANTIC: &[u8] = c"LOC".to_bytes();
 
 impl super::Device {
+    fn texture_descriptor(&self, desc: &crate::TextureDescriptor) -> Direct3D12::D3D12_RESOURCE_DESC {
+        Direct3D12::D3D12_RESOURCE_DESC {
+            Dimension: conv::map_texture_dimension(desc.dimension),
+            Alignment: 0,
+            Width: desc.size.width as u64,
+            Height: desc.size.height,
+            DepthOrArraySize: desc.size.depth_or_array_layers as u16,
+            MipLevels: desc.mip_level_count as u16,
+            Format: auxil::dxgi::conv::map_texture_format_for_resource(
+                desc.format,
+                desc.usage,
+                !desc.view_formats.is_empty(),
+                self.shared
+                    .private_caps
+                    .casting_fully_typed_format_supported,
+            ),
+            SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: desc.sample_count,
+                Quality: 0,
+            },
+            Layout: Direct3D12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: conv::map_texture_usage_to_resource_flags(desc.usage),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         adapter: auxil::dxgi::factory::DxgiAdapter,
@@ -545,32 +570,17 @@ impl crate::Device for super::Device {
     unsafe fn flush_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
     unsafe fn invalidate_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
 
+    fn texture_binding_size(&self, desc: &crate::TextureDescriptor) -> Option<u64> {
+        let raw = self.texture_descriptor(desc);
+        let size = unsafe { self.raw.GetResourceAllocationInfo(0, core::slice::from_ref(&raw)) }.SizeInBytes;
+        (size != 0 && size != u64::MAX).then_some(size)
+    }
+
     unsafe fn create_texture(
         &self,
         desc: &crate::TextureDescriptor,
     ) -> Result<super::Texture, crate::DeviceError> {
-        let raw_desc = Direct3D12::D3D12_RESOURCE_DESC {
-            Dimension: conv::map_texture_dimension(desc.dimension),
-            Alignment: 0,
-            Width: desc.size.width as u64,
-            Height: desc.size.height,
-            DepthOrArraySize: desc.size.depth_or_array_layers as u16,
-            MipLevels: desc.mip_level_count as u16,
-            Format: auxil::dxgi::conv::map_texture_format_for_resource(
-                desc.format,
-                desc.usage,
-                !desc.view_formats.is_empty(),
-                self.shared
-                    .private_caps
-                    .casting_fully_typed_format_supported,
-            ),
-            SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
-                Count: desc.sample_count,
-                Quality: 0,
-            },
-            Layout: Direct3D12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
-            Flags: conv::map_texture_usage_to_resource_flags(desc.usage),
-        };
+        let raw_desc = self.texture_descriptor(desc);
 
         let (resource, allocation) =
             suballocation::DeviceAllocationContext::from(self).create_texture(desc, raw_desc)?;

@@ -1413,7 +1413,9 @@ impl RenderPassInfo {
             if mask_msb >= detected_mv {
                 return Err(RenderPassErrorInner::MultiViewMismatch);
             }
-            if mask.get() != (1 << detected_mv) - 1 {
+            // The highest set bit was checked above. Every attached view is
+            // selected exactly when the population equals the attachment count.
+            if mask.get().count_ones() != detected_mv {
                 device.require_features(wgt::Features::SELECTIVE_MULTIVIEW)?;
             }
         }
@@ -2279,49 +2281,41 @@ pub(super) fn encode_render_pass(
     };
 
     let encoder = &mut parent_state.raw_encoder;
+    debug_assert!(!encoder.is_open);
     let tracker = &mut parent_state.tracker;
 
-    {
-        let transit = encoder
-            .open_pass(hal_label(
-                Some("(wgpu internal) Pre Pass"),
-                device.instance_flags,
-            ))
+    fixup_discarded_surfaces(
+        pending_discard_init_fixups,
+        encoder,
+        &mut tracker.textures,
+        device,
+        parent_state.snatch_guard,
+    )
+    .map_pass_err(pass_scope)?;
+
+    pending_query_resets
+        .reset_queries(encoder)
+        .map_pass_err(pass_scope)?;
+
+    tracker.set_from_usage_scope(&scope);
+    CommandEncoder::drain_pre_pass_barriers(encoder, tracker, parent_state.snatch_guard)
+        .map_pass_err(pass_scope)?;
+
+    if let Some(ref indirect_validation) = device.indirect_validation {
+        indirect_validation
+            .draw
+            .inject_validation_pass(
+                device,
+                parent_state.snatch_guard,
+                parent_state.indirect_draw_validation_resources,
+                parent_state.temp_resources,
+                encoder,
+                indirect_draw_validation_batcher,
+            )
             .map_pass_err(pass_scope)?;
-
-        fixup_discarded_surfaces(
-            pending_discard_init_fixups.into_iter(),
-            transit,
-            &mut tracker.textures,
-            device,
-            parent_state.snatch_guard,
-        );
-
-        pending_query_resets.reset_queries(transit);
-
-        CommandEncoder::insert_barriers_from_scope(
-            transit,
-            tracker,
-            &scope,
-            parent_state.snatch_guard,
-        );
-
-        if let Some(ref indirect_validation) = device.indirect_validation {
-            indirect_validation
-                .draw
-                .inject_validation_pass(
-                    device,
-                    parent_state.snatch_guard,
-                    parent_state.indirect_draw_validation_resources,
-                    parent_state.temp_resources,
-                    transit,
-                    indirect_draw_validation_batcher,
-                )
-                .map_pass_err(pass_scope)?;
-        }
     }
 
-    encoder.close_and_swap().map_pass_err(pass_scope)?;
+    encoder.close_and_swap_if_open().map_pass_err(pass_scope)?;
 
     Ok(())
 }

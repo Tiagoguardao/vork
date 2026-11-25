@@ -29,6 +29,7 @@ mod command;
 pub mod conv;
 mod device;
 mod drm;
+pub mod fault;
 mod instance;
 mod native_backlog;
 mod sampler;
@@ -37,7 +38,7 @@ mod swapchain;
 
 pub use adapter::PhysicalDeviceFeatures;
 
-use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{
     borrow::Borrow,
     ffi::CStr,
@@ -505,6 +506,7 @@ struct DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
+        unsafe { fault::uninstall(self.raw.handle()) };
         for &raw in self.render_passes.lock().values() {
             unsafe { self.raw.destroy_render_pass(raw, None) };
         }
@@ -749,6 +751,14 @@ pub struct Texture {
 impl crate::DynTexture for Texture {}
 
 impl Texture {
+    /// Native space reserved for this image in its backing allocation.
+    pub fn binding_size(&self) -> Option<u64> {
+        match &self.memory {
+            TextureMemory::Allocation(allocation) => Some(allocation.size()),
+            _ => None,
+        }
+    }
+
     /// # Safety
     ///
     /// - The image handle must not be manually destroyed
@@ -1004,6 +1014,10 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 
     current_pipeline_is_multiview: bool,
+
+    /// The compute pass label and pipeline named by fault checkpoints.
+    fault_pass: String,
+    fault_pipeline: vk::Pipeline,
 }
 
 impl Drop for CommandEncoder {
@@ -1506,6 +1520,9 @@ fn map_pipeline_err(err: vk::Result) -> crate::DeviceError {
 /// Returns [`crate::DeviceError::Unexpected`] or panics if the `internal_error_panic`
 /// feature flag is enabled.
 fn get_unexpected_err(_err: vk::Result) -> crate::DeviceError {
+    // Preserve a driver's explicit loss even when a creation entry point did
+    // not list it among its normal failure modes.
+    if _err == vk::Result::ERROR_DEVICE_LOST { return get_lost_err(); }
     #[cfg(feature = "internal_error_panic")]
     panic!("Unexpected Vulkan error: {_err:?}");
 
@@ -1521,6 +1538,7 @@ fn get_oom_err(_err: vk::Result) -> crate::DeviceError {
 /// Returns [`crate::DeviceError::Lost`] or panics if the `device_lost_panic`
 /// feature flag is enabled.
 fn get_lost_err() -> crate::DeviceError {
+    fault::report();
     #[cfg(feature = "device_lost_panic")]
     panic!("Device lost");
 

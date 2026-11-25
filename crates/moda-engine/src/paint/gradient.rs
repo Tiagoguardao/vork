@@ -35,7 +35,7 @@ use moda_scene::paint::{
 use moda_scene::types::RawNode;
 use moda_scene::value::Value;
 
-use crate::color::{color_to_normalized_rgba, parse_color, Rgba};
+use crate::color::{color_to_normalized_rgba, Rgba};
 
 /// `MAX_GRADIENT_STOPS` (`WebGPUGradientSystem.ts:59`; manifest pinned).
 pub const MAX_GRADIENT_STOPS: usize = 8;
@@ -320,7 +320,7 @@ pub const NO_PAINT: Rgba = Rgba {
 /// The colour a solid fill paints; transparent for no fill or an unparseable
 /// colour.
 pub fn solid_fill_color(paint: Option<&Paint>) -> Rgba {
-    parse_color(paint.and_then(scene_paint::solid_color)).unwrap_or(NO_PAINT)
+    paint.and_then(Paint::solid_rgba).unwrap_or(NO_PAINT)
 }
 
 /// Whether the fill can contribute alpha. This is intentionally independent
@@ -331,7 +331,7 @@ pub fn solid_fill_color(paint: Option<&Paint>) -> Rgba {
 pub fn fill_paints(node: &RawNode) -> bool {
     match fill_paint(node) {
         Some(ref p) if is_gradient(p) => gradient_colors(p).iter().any(|c| c.a > 0.0),
-        Some(Paint::Image(_) | Paint::Video(_) | Paint::Shader(_)) => true,
+        Some(Paint::Image(_) | Paint::Video(_)) => true,
         p => solid_fill_color(p.as_ref()).a > 0.0,
     }
 }
@@ -790,7 +790,7 @@ pub fn stroke_gradient_paint(stroke: Option<&Stroke>) -> StrokeGradientPaint {
 /// stroke lanes don't draw yet (image, video, shader, conic), or an
 /// unparseable colour.
 pub fn solid_stroke_color(paint: Option<&Paint>) -> Rgba {
-    parse_color(paint.and_then(scene_paint::solid_color)).unwrap_or(NO_PAINT)
+    paint.and_then(Paint::solid_rgba).unwrap_or(NO_PAINT)
 }
 
 /// [`stroke_gradient_paint`] for the node's top stroke.

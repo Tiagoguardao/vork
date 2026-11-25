@@ -1,4 +1,6 @@
-use alloc::{borrow::ToOwned as _, collections::BTreeMap, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::ToOwned as _, collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec,
+};
 use core::{
     ffi::CStr,
     mem::{self, MaybeUninit},
@@ -33,7 +35,12 @@ impl super::DeviceShared {
     ///   this call.
     ///
     /// [`vkSetDebugUtilsObjectName`]: https://registry.khronos.org/vulkan/specs/latest/man/html/vkSetDebugUtilsObjectNameEXT.html
-    pub(super) unsafe fn set_object_name(&self, object: impl vk::Handle, name: &str) {
+    pub(super) unsafe fn set_object_name<H: vk::Handle>(&self, object: H, name: &str) {
+        let object = H::from_raw({
+            let raw = object.as_raw();
+            super::fault::name(H::TYPE, raw, name);
+            raw
+        });
         let Some(extension) = self.extension_fns.debug_utils.as_ref() else {
             return;
         };
@@ -955,6 +962,7 @@ impl crate::Device for super::Device {
             unsafe { self.shared.raw.destroy_buffer(raw, None) };
         })?;
 
+        super::fault::buffer(vk::Handle::as_raw(raw), desc.size, vk_info.usage);
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
         }
@@ -1061,6 +1069,13 @@ impl crate::Device for super::Device {
             }
             .unwrap();
         }
+    }
+
+    fn texture_binding_size(&self, desc: &crate::TextureDescriptor) -> Option<u64> {
+        let image = self.create_image_without_memory(desc, None).ok()?;
+        // SAFETY: the unbound image is private to this query.
+        unsafe { self.shared.raw.destroy_image(image.raw, None) };
+        Some(image.requirements.size)
     }
 
     unsafe fn create_texture(
@@ -1287,6 +1302,8 @@ impl crate::Device for super::Device {
             temp_texture_views: Default::default(),
             counters: Arc::clone(&self.counters),
             current_pipeline_is_multiview: false,
+            fault_pass: String::new(),
+            fault_pipeline: vk::Pipeline::null(),
         })
     }
 
@@ -2044,20 +2061,16 @@ impl crate::Device for super::Device {
             .map(|it| it.raw)
             .unwrap_or(vk::PipelineCache::null());
 
-        let mut raw_vec = {
+        let created = {
             profiling::scope!("vkCreateGraphicsPipelines");
             unsafe {
                 self.shared
                     .raw
                     .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
                     .map_err(|(_, e)| super::map_pipeline_err(e))
-            }?
+            }
         };
 
-        let raw = raw_vec.pop().unwrap();
-        if let Some(label) = desc.label {
-            unsafe { self.shared.set_object_name(raw, label) };
-        }
 
         if let Some(CompiledStage {
             temp_raw_module: Some(raw_module),
@@ -2086,6 +2099,11 @@ impl crate::Device for super::Device {
         }) = compiled_fs
         {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
+        }
+
+        let raw = created?.pop().unwrap();
+        if let Some(label) = desc.label {
+            unsafe { self.shared.set_object_name(raw, label) };
         }
 
         self.counters.render_pipelines.add(1);
@@ -2127,23 +2145,24 @@ impl crate::Device for super::Device {
             .map(|it| it.raw)
             .unwrap_or(vk::PipelineCache::null());
 
-        let mut raw_vec = {
+        let created = {
             profiling::scope!("vkCreateComputePipelines");
             unsafe {
                 self.shared
                     .raw
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
                     .map_err(|(_, e)| super::map_pipeline_err(e))
-            }?
+            }
         };
 
-        let raw = raw_vec.pop().unwrap();
-        if let Some(label) = desc.label {
-            unsafe { self.shared.set_object_name(raw, label) };
-        }
 
         if let Some(raw_module) = compiled.temp_raw_module {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
+        }
+
+        let raw = created?.pop().unwrap();
+        if let Some(label) = desc.label {
+            unsafe { self.shared.set_object_name(raw, label) };
         }
 
         self.counters.compute_pipelines.add(1);

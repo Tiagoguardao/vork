@@ -712,6 +712,15 @@ impl Device {
         DeviceError::from_hal(error)
     }
 
+    // A driver can reject a shader, layout or pipeline before it has any
+    // executable state. Only an explicit device loss invalidates other pipelines.
+    fn pipeline_creation_error(&self, error: hal::DeviceError) -> DeviceError {
+        match error {
+            hal::DeviceError::Unexpected => DeviceError::PipelineInternal,
+            error => self.handle_hal_error_with_nonfatal_oom(error),
+        }
+    }
+
     pub fn handle_hal_error_with_nonfatal_oom(&self, error: hal::DeviceError) -> DeviceError {
         match error {
             hal::DeviceError::OutOfMemory => DeviceError::from_hal(error),
@@ -1358,10 +1367,8 @@ impl Device {
         }
     }
 
-    pub fn create_texture(
-        self: &Arc<Self>,
-        desc: &resource::TextureDescriptor,
-    ) -> Result<Arc<Texture>, resource::CreateTextureError> {
+    fn texture_descriptor<'a>(&self, desc: &'a resource::TextureDescriptor)
+        -> Result<(hal::TextureDescriptor<'a>, wgt::TextureFormatFeatures), resource::CreateTextureError> {
         use resource::{CreateTextureError, TextureDimensionError};
 
         self.check_is_valid()?;
@@ -1627,6 +1634,20 @@ impl Device {
             view_formats: hal_view_formats,
         };
 
+        Ok((hal_desc, format_features))
+    }
+
+    pub(crate) fn texture_binding_size(&self, desc: &resource::TextureDescriptor) -> Option<u64> {
+        let (validated, _) = self.texture_descriptor(desc).ok()?;
+        self.raw().texture_binding_size(&validated)
+    }
+
+    pub fn create_texture(
+        self: &Arc<Self>,
+        desc: &resource::TextureDescriptor,
+    ) -> Result<Arc<Texture>, resource::CreateTextureError> {
+        let (hal_desc, format_features) = self.texture_descriptor(desc)?;
+        let hal_usage = hal_desc.usage;
         let raw_texture = unsafe { self.raw().create_texture(&hal_desc) }
             .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
 
@@ -2372,7 +2393,7 @@ impl Device {
             Err(error) => {
                 return Err(match error {
                     hal::ShaderError::Device(error) => {
-                        pipeline::CreateShaderModuleError::Device(self.handle_hal_error(error))
+                        pipeline::CreateShaderModuleError::Device(self.pipeline_creation_error(error))
                     }
                     hal::ShaderError::Compilation(ref msg) => {
                         log::error!("Shader error: {msg}");
@@ -2472,7 +2493,7 @@ impl Device {
             Err(error) => {
                 return Err(match error {
                     hal::ShaderError::Device(error) => {
-                        pipeline::CreateShaderModuleError::Device(self.handle_hal_error(error))
+                        pipeline::CreateShaderModuleError::Device(self.pipeline_creation_error(error))
                     }
                     hal::ShaderError::Compilation(ref msg) => {
                         log::error!("Shader error: {msg}");
@@ -2831,7 +2852,7 @@ impl Device {
         count_validator.validate_binding_arrays()?;
 
         let raw = unsafe { self.raw().create_bind_group_layout(&hal_desc) }
-            .map_err(|e| self.handle_hal_error(e))?;
+            .map_err(|e| self.pipeline_creation_error(e))?;
 
         let bgl = BindGroupLayout {
             raw: binding_model::RawBindGroupLayout::Owning(ManuallyDrop::new(raw)),
@@ -3769,7 +3790,7 @@ impl Device {
         };
 
         let raw = unsafe { self.raw().create_pipeline_layout(&hal_desc) }
-            .map_err(|e| self.handle_hal_error(e))?;
+            .map_err(|e| self.pipeline_creation_error(e))?;
 
         drop(raw_bind_group_layouts);
 
@@ -3921,7 +3942,7 @@ impl Device {
             unsafe { self.raw().create_compute_pipeline(&pipeline_desc) }.map_err(
                 |err| match err {
                     hal::PipelineError::Device(error) => {
-                        pipeline::CreateComputePipelineError::Device(self.handle_hal_error(error))
+                        pipeline::CreateComputePipelineError::Device(self.pipeline_creation_error(error))
                     }
                     hal::PipelineError::Linkage(_stages, msg) => {
                         pipeline::CreateComputePipelineError::Internal(msg)
@@ -4624,7 +4645,8 @@ impl Device {
         // Multiview is only supported if the feature is enabled
         if let Some(mv_mask) = desc.multiview_mask {
             self.require_features(wgt::Features::MULTIVIEW)?;
-            if !(mv_mask.get() + 1).is_power_of_two() {
+            // The fully populated 32-view mask is contiguous as well.
+            if mv_mask.get().trailing_ones() != mv_mask.get().count_ones() {
                 self.require_features(wgt::Features::SELECTIVE_MULTIVIEW)?;
             }
         }
@@ -4682,7 +4704,7 @@ impl Device {
             unsafe { self.raw().create_render_pipeline(&pipeline_desc) }.map_err(
                 |err| match err {
                     hal::PipelineError::Device(error) => {
-                        pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
+                        pipeline::CreateRenderPipelineError::Device(self.pipeline_creation_error(error))
                     }
                     hal::PipelineError::Linkage(stage, msg) => {
                         pipeline::CreateRenderPipelineError::Internal { stage, error: msg }

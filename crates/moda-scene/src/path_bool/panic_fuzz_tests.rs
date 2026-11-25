@@ -2,9 +2,9 @@
 //!
 //! `prop_tests.rs` fuzzes the editor's primitive vocabulary (rects, ellipses,
 //! rounded rects), which the solver handles. This module feeds it what people
-//! actually draw with the Pen, Pencil and Blob Brush: closed paths of random
+//! actually draw with the Pen, Pencil and uniform stroke: closed paths of random
 //! cubics (self-intersecting more often than not), smooth or spiky star-shaped
-//! blobs, Blob Brush stroke outlines, and a shape against a near copy of itself.
+//! blobs, uniform stroke stroke outlines, and a shape against a near copy of itself.
 //!
 //! Seeded xorshift, so every run sees the same cases. A panic is observed as a
 //! `solver_failed` envelope: on native the solver runs under `catch_unwind`,
@@ -107,11 +107,8 @@ pub(super) fn blob(rng: &mut Rng, cx: f64, cy: f64, r: f64, spiky: bool) -> Vec<
 pub(super) enum Family {
     RandomCurved,
     Blob,
-    /// Blob Brush strokes: a wobbly open curve outlined by the stroke
-    /// outliner (round caps and joins), exactly the operand `blobBrush.ts`
-    /// hands the solver. Wide strokes on tight curves give the outline cusps
-    /// and self-overlapping loops.
-    BrushStroke,
+    /// Wobbly open curves outlined as uniform strokes with round caps and joins.
+    UniformStroke,
     /// A random curved shape against a near copy of itself (identical, nudged
     /// by a hair, or turned by a fraction of a degree): the duplicate-and-
     /// combine case, all coincident or near-coincident edges.
@@ -121,7 +118,7 @@ pub(super) enum Family {
 pub(super) const FAMILIES: [Family; 4] = [
     Family::RandomCurved,
     Family::Blob,
-    Family::BrushStroke,
+    Family::UniformStroke,
     Family::NearCopy,
 ];
 
@@ -155,30 +152,26 @@ fn wobbly_centerline(rng: &mut Rng, cx: f64, cy: f64) -> Vec<PathPoint> {
     out
 }
 
-/// The stroke outliner's closed outline of a wobbly stroke, as Blob Brush
+/// The stroke outliner's closed outline of a wobbly stroke, as uniform stroke
 /// requests it. `None` when the outliner declines (it has its own fuzz).
-fn brush_stroke(rng: &mut Rng, cx: f64, cy: f64) -> Option<Vec<PathPoint>> {
+fn uniform_stroke(rng: &mut Rng, cx: f64, cy: f64) -> Option<Vec<PathPoint>> {
+    use i_overlay::mesh::float::stroke::offset::StrokeOffset;
+    use i_overlay::mesh::float::style::{LineCap, LineJoin, StrokeStyle};
     let centerline = wobbly_centerline(rng, cx, cy);
+    let line: Vec<[f64; 2]> = crate::blend::flatten_path_to_polyline(&centerline, false)
+        .into_iter().map(|(x, y)| [x, y]).collect();
     let width = rng.f(4.0, 60.0);
-    let request = crate::value::json!({
-        "points": centerline.iter().map(PathPoint::to_json).collect::<Vec<_>>(),
-        "closed": false,
-        "strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000000"}, "width": width,
-                     "cap": "round", "join": "round"}],
-        "tolerance": 0.25,
-    });
-    let reply: crate::value::Value = crate::value::from_str(
-        &crate::stroke_outline::stroke_outline_json(&request.to_string()),
-    )
-    .ok()?;
-    if reply["status"] != "ok" {
-        return None;
+    let style = StrokeStyle::new(width).start_cap(LineCap::Round(0.15))
+        .end_cap(LineCap::Round(0.15)).line_join(LineJoin::Round(0.15));
+    let shapes = line.stroke(style, false);
+    let mut points = Vec::new();
+    for polygon in shapes.into_iter().flatten() {
+        let first = *polygon.first()?;
+        points.push(PathPoint::Move { x: first[0], y: first[1] });
+        points.extend(polygon.into_iter().skip(1).map(|p| PathPoint::Line { x: p[0], y: p[1] }));
+        points.push(PathPoint::Line { x: first[0], y: first[1] });
     }
-    reply["points"]
-        .as_array()?
-        .iter()
-        .map(PathPoint::from_json)
-        .collect()
+    (!points.is_empty()).then_some(points)
 }
 
 fn near_copy(rng: &mut Rng, points: &[PathPoint]) -> Vec<PathPoint> {
@@ -219,13 +212,13 @@ pub(super) fn case_operands(rng: &mut Rng, family: Family, count: usize) -> Vec<
             let cx = rng.f(-15.0, 15.0);
             let cy = rng.f(-15.0, 15.0);
             let points = match family {
-                Family::BrushStroke => (0..100)
+                Family::UniformStroke => (0..100)
                     // The outliner answers every stroke it is given in practice;
                     // the retries only guard the fixture against an `empty` (and
                     // a request the outliner stops accepting fails loudly instead
                     // of spinning forever).
-                    .find_map(|_| brush_stroke(rng, cx, cy))
-                    .expect("the stroke outliner declined 100 Blob Brush strokes in a row"),
+                    .find_map(|_| uniform_stroke(rng, cx, cy))
+                    .expect("the uniform stroker declined 100 strokes in a row"),
                 Family::NearCopy => unreachable!("built above"),
                 Family::RandomCurved => {
                     let size = rng.f(40.0, 100.0);
@@ -445,8 +438,8 @@ fn measure_panic_rates() {
 #[test]
 fn curved_shapes_never_panic() {
     let cases: [(Family, u64, Ops); 6] = [
-        // Blob Brush outlines: every boolean op.
-        (Family::BrushStroke, 0xc0da_c9b8_7f4a_7c14, Ops::Boolean),
+        // uniform stroke outlines: every boolean op.
+        (Family::UniformStroke, 0xc0da_c9b8_7f4a_7c14, Ops::Boolean),
         // Near copies: booleans; divide / outline; trim; merge; minus back.
         (Family::NearCopy, 0xca77_73a4_a267_fad5, Ops::Boolean),
         (Family::NearCopy, 0xb37f_ab81_ac55_31af, Ops::Pathfinder),

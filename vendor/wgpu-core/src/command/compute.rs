@@ -755,34 +755,26 @@ pub(super) fn encode_compute_pass(
     // Stop the current command encoder.
     parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
 
-    // Create a new command encoder, which we will insert _before_ the body of the compute pass.
-    //
-    // Use that buffer to insert barriers and clear discarded images.
-    let transit = parent_state
-        .raw_encoder
-        .open_pass(hal_label(
-            Some("(wgpu internal) Pre Pass"),
-            device.instance_flags,
-        ))
-        .map_pass_err(pass_scope)?;
+    let encoder = &mut parent_state.raw_encoder;
+    debug_assert!(!encoder.is_open);
+    let tracker = &mut parent_state.tracker;
     fixup_discarded_surfaces(
-        pending_discard_init_fixups.into_iter(),
-        transit,
-        &mut parent_state.tracker.textures,
+        pending_discard_init_fixups,
+        encoder,
+        &mut tracker.textures,
         device,
         parent_state.snatch_guard,
-    );
-    CommandEncoder::insert_barriers_from_tracker(
-        transit,
-        parent_state.tracker,
-        &intermediate_trackers,
-        parent_state.snatch_guard,
-    );
-    // Close the command encoder, and swap it with the previous.
-    parent_state
-        .raw_encoder
-        .close_and_swap()
+    )
+    .map_pass_err(pass_scope)?;
+    tracker
+        .buffers
+        .set_from_tracker(&intermediate_trackers.buffers);
+    tracker
+        .textures
+        .set_from_tracker(&intermediate_trackers.textures);
+    CommandEncoder::drain_pre_pass_barriers(encoder, tracker, parent_state.snatch_guard)
         .map_pass_err(pass_scope)?;
+    encoder.close_and_swap_if_open().map_pass_err(pass_scope)?;
 
     Ok(())
 }

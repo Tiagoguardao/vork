@@ -1,7 +1,7 @@
 // #include "working-color.wgsl"
 
-struct VSOut { @builtin(position) pos: vec4f, @location(0) world: vec2f };
-@group(0) @binding(0) var<uniform> frame: mat4x4<f32>;
+struct VSOut { @builtin(position) pos: vec4f, @location(0) @interpolate(flat) clip: vec4f };
+// #include "rect-clip.wgsl"
 @group(0) @binding(1) var<uniform> model: mat4x4<f32>;
 @group(0) @binding(2) var<uniform> color: vec4f;
 @group(0) @binding(3) var<uniform> params: vec4f; // x=zDepth, y=nodeOpacity
@@ -10,15 +10,14 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) world: vec2f };
 @vertex fn vs(@location(0) pos: vec2f, @location(1) _uv: vec2f) -> VSOut {
   var o: VSOut;
   let world = model * vec4f(pos, 0.0, 1.0);
-  o.pos = frame * world;
+  o.pos = frameUniforms.viewProjection * world;
   o.pos.z = params.x; // enforce scene depth
-  o.world = world.xy;
+  o.clip = projectRectClip(pageClip);
   return o;
 }
 
 @fragment fn fsClip(in: VSOut) -> @location(0) vec4f {
-  let bounds = pageClip;
-  if (in.world.x < bounds.x || in.world.x > bounds.x + bounds.z || in.world.y < bounds.y || in.world.y > bounds.y + bounds.w) {
+  if (outsideRectClip(in.pos.xy, in.clip)) {
     discard;
   }
   // Straight alpha output, apply node opacity to alpha only (match MSDF pipeline semantics)

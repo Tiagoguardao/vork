@@ -1,9 +1,24 @@
 //! FFmpeg transports preserve ordered frame identity across their rate parsers.
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum Input {
+    Rgba,
+    Yuv420p,
+}
+
+impl Input {
+    pub(super) fn pixel_format(self) -> &'static str {
+        match self {
+            Self::Rgba => "rgba",
+            Self::Yuv420p => "yuv420p",
+        }
+    }
+}
+
 pub(super) fn readback_command(
     width: u32, height: u32, fps: Time, frames: u64, settings: EncodeSettings,
-    codec: &str, gop_frames: u32, path: &Path,
+    codec: &str, input: Input, gop_frames: u32, path: &Path,
 ) -> Result<Command> {
     let clock = Clock::query()?;
     clock.validate(fps, frames, path)?;
@@ -17,7 +32,7 @@ pub(super) fn readback_command(
         "-f",
         "rawvideo",
         "-pixel_format",
-        "rgba",
+        input.pixel_format(),
         "-video_size",
         &format!("{width}x{height}"),
         "-framerate",
@@ -55,7 +70,11 @@ pub(super) fn readback_command(
     // Set both frame and stream properties: encoders may prefer the
     // converted frame's colour tags over the output codec options.
     let primaries = settings.primaries.ffmpeg();
-    let filter = format!("scale=out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries={primaries}:color_trc=bt709:colorspace=bt709");
+    let scale = match input {
+        Input::Rgba => "scale=out_color_matrix=bt709:out_range=tv,",
+        Input::Yuv420p => "",
+    };
+    let filter = format!("{scale}setparams=range=limited:color_primaries={primaries}:color_trc=bt709:colorspace=bt709");
     command.args([
             "-vf",
             &filter,
@@ -177,9 +196,7 @@ impl Clock {
                 p <= 1_001_000 && q <= 1_001_000,
                 "ffmpeg lacks setts duration for exact fps {fps}; install FFmpeg 5.1+ on PATH"
             );
-            let mov = path
-                .extension()
-                .is_some_and(|s| s.eq_ignore_ascii_case("mov"));
+            let mov = crate::is_prores(&path);
             ensure!(
                 mov || 1_200_000 % p == 0,
                 "ffmpeg lacks setts duration for exact H.264 muxing at fps {fps}; install FFmpeg 5.1+ on PATH"

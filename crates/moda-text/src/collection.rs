@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,7 +44,7 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, String> {
     Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-fn read_at(file: &mut std::fs::File, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+fn read_at(file: &mut Cursor<&[u8]>, offset: u64, size: usize) -> Result<Vec<u8>, String> {
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| error.to_string())?;
     let mut bytes = vec![0; size];
@@ -61,7 +61,7 @@ fn checksum(bytes: &[u8]) -> u32 {
     })
 }
 
-fn extract(file: &mut std::fs::File, index: u32) -> Result<Vec<u8>, String> {
+fn extract(file: &mut Cursor<&[u8]>, index: u32) -> Result<Vec<u8>, String> {
     let header = read_at(file, 0, 12)?;
     if &header[..4] != b"ttcf" || index >= word(&header, 8)? {
         return Err("invalid collection face".into());
@@ -119,37 +119,16 @@ fn extract(file: &mut std::fs::File, index: u32) -> Result<Vec<u8>, String> {
 
 pub(crate) fn read(path: &Path) -> Result<Vec<u8>, String> {
     let face = descriptor(path)?;
-    let mut source = std::fs::File::open(&face.source).map_err(|error| error.to_string())?;
-    let stat = source.metadata().map_err(|error| error.to_string())?;
-    let modified = stat
-        .modified()
-        .map_err(|error| error.to_string())?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_nanos();
-    #[cfg(not(unix))]
-    let changed = String::new();
-    #[cfg(unix)]
-    let changed = {
-        use std::os::unix::fs::MetadataExt;
-        (i128::from(stat.ctime()) * 1_000_000_000 + i128::from(stat.ctime_nsec())).to_string()
-    };
-    let input = format!(
-        "sfnt-v1\n{}\n{}\n{}\n{}\n{}",
-        face.source.display(),
-        face.index,
-        stat.len(),
-        modified,
-        changed
-    );
-    let hash = input.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    let cached = face.cache_dir.join(format!("{hash:016x}.ttf"));
+    let source = std::fs::read(&face.source).map_err(|error| error.to_string())?;
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"sfnt-v2");
+    identity.update(&face.index.to_le_bytes());
+    identity.update(&source);
+    let cached = face.cache_dir.join(format!("{}.ttf", identity.finalize()));
     if let Ok(bytes) = std::fs::read(&cached) {
         return Ok(bytes);
     }
-    let bytes = extract(&mut source, face.index)?;
+    let bytes = extract(&mut Cursor::new(source.as_slice()), face.index)?;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     if std::fs::create_dir_all(&face.cache_dir).is_ok() {
         let temporary = cached.with_extension(format!(
@@ -243,10 +222,36 @@ mod tests {
             modified
         );
         let source = root.join("font.ttc");
-        let mut changed = std::fs::read(&source).unwrap();
-        changed.extend_from_slice(&[0; 4]);
-        std::fs::write(&source, changed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123))
+            .unwrap();
         assert_eq!(read(&descriptor).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 1);
+        let before = std::fs::metadata(&source).unwrap();
+        let mut changed = std::fs::read(&source).unwrap();
+        let tables = &changed[32..32 + count * 16];
+        let name = tables
+            .chunks_exact(16)
+            .find(|record| &record[..4] == b"name")
+            .unwrap();
+        let offset = word(name, 8).unwrap() as usize;
+        changed[offset + 1] ^= 1;
+        let replacement = root.join("replacement.ttc");
+        std::fs::write(&replacement, changed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        std::fs::rename(replacement, &source).unwrap();
+        let after = std::fs::metadata(&source).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(read(&descriptor).unwrap(), bytes);
         assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }

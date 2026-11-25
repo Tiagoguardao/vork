@@ -45,6 +45,10 @@ pub const PAINT_PROPERTY: &str = "--nf-paint";
 /// `InlineStyle` (`utils/richtext/types.ts:3-12`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineStyle {
+    /// Source run of a vector image slot. Travels with it through wrapping and visual reordering.
+    pub emoji_slot: Option<usize>,
+    /// The complete colour run selected for this inline cluster, in both layout lanes.
+    pub emoji: Option<std::sync::Arc<crate::degraded::ShapedEmoji>>,
     pub source: SourceIndices,
     pub font_family: String,
     /// px
@@ -183,6 +187,8 @@ pub fn round_line_height_px(px: f64) -> f64 {
 /// `DEFAULT_STYLE` (`utils/richtext/types.ts:30-39`).
 pub fn default_style() -> InlineStyle {
     InlineStyle {
+        emoji_slot: None,
+        emoji: None,
         source: Default::default(),
         font_family: "sans-serif".to_string(),
         font_size: 16.0,

@@ -615,21 +615,3 @@ mod tests {
         assert!(x[0].is_identity());
     }
 }
-
-/// Intrinsic wrapped cell height, independent of the row's current height/alignment.
-pub fn table_text_height(node: &RawNode) -> Option<f64> {
-    if moda_text::plain_text::parse_plain_text(node.str("htmlContent").unwrap_or("")).trim().is_empty() {
-        return Some(0.0);
-    }
-    let spec = RichTextNodeSpec {
-        node_id: node.id().to_string(),
-        html_content: node.str("htmlContent").unwrap_or("").to_string(),
-        width: node.f64("width"), height: Some(0.0),
-        paragraph_spacing: node.f64("paragraphSpacing").unwrap_or(0.0),
-        line_height_policy: Default::default(),
-        vertical_align: Some("top".into()), truncation: None, auto_width: false, area: None,
-    };
-    let dump = crate::text_draw::layout_rich_text_json(&spec).ok()?;
-    if !matches!(dump.get("engine")?.as_str()?, "vector" | "degraded") { return None; }
-    dump.get("totalHeightPx")?.as_f64()
-}

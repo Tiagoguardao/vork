@@ -82,19 +82,26 @@ fn joined<'scope>(jobs: impl IntoIterator<Item = Option<Job<'scope>>>) -> Result
 /// Owned pipeline-creation handle: background variant workers outlive the install
 /// call that started them, so they cannot borrow the Renderer.
 #[derive(Clone)]
-pub(crate) struct Compiler {
+pub(crate) struct Compiler(std::sync::Arc<CompilerState>);
+
+impl std::ops::Deref for Compiler {
+    type Target = CompilerState;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+pub(crate) struct CompilerState {
     #[cfg(test)]
-    pub(crate) hit_selections: std::sync::Arc<Mutex<Vec<(ProgramKernel, ProgramKernel)>>>,
+    pub(crate) hit_selections: Mutex<Vec<(ProgramKernel, ProgramKernel)>>,
     device: wgpu::Device,
     cache: Option<wgpu::PipelineCache>,
     /// Wall time per driver pipeline creation call; concurrent times overlap. On Metal a call
     /// includes its wait for the process's compile admission (wgpu-hal metal/compile_admission.rs).
-    pub(crate) timings: std::sync::Arc<Mutex<std::collections::BTreeMap<String, f64>>>,
-    known: std::sync::Arc<Mutex<Known>>,
+    pub(crate) timings: Mutex<std::collections::BTreeMap<String, f64>>,
+    known: Mutex<Known>,
     pending: std::sync::Arc<(Mutex<Pending>, std::sync::Condvar)>,
     schedule: std::sync::Arc<(Mutex<Schedule>, std::sync::Condvar)>,
     /// Driver creations so far; unchanged since the last save means nothing to persist.
-    created: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    created: std::sync::atomic::AtomicUsize,
     persistence: std::sync::Arc<Persistence>,
 }
 /// How many pipelines the device's driver cache has gained, where the backend counts them. A
@@ -136,7 +143,7 @@ struct Persistence {
     blob: Blob,
     /// Driver creations counted at the last save, and the blob content on disk. Held for a whole
     /// save, so saves never interleave.
-    saved: Mutex<(usize, Option<blake3::Hash>)>,
+    saved: Mutex<Option<(usize, Option<blake3::Hash>)>>, // None after renderer teardown.
     /// The driver cache's additions (`cache_additions`) covered by the last serialization.
     /// Written only while `saved` is held.
     serialized_additions: std::sync::atomic::AtomicUsize,
@@ -155,14 +162,16 @@ struct Pending {
 struct Schedule {
     critical: bool,
     foreground_preparations: usize,
-    active: usize,
+    foreground_creations: usize,
 }
 /// One admitted driver pipeline creation; frees its place when dropped.
-struct Permit<'a>(&'a (Mutex<Schedule>, std::sync::Condvar));
+struct Permit<'a> { schedule: &'a (Mutex<Schedule>, std::sync::Condvar), background: bool }
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        self.0.0.lock().unwrap().active -= 1;
-        self.0.1.notify_all();
+        if !self.background {
+            self.schedule.0.lock().unwrap().foreground_creations -= 1;
+            self.schedule.1.notify_all();
+        }
     }
 }
 /// Defer optional variants until every foreground preparation has finished.
@@ -179,10 +188,10 @@ impl<'a> Permit<'a> {
         let (state, signal) = schedule;
         let mut state = signal.wait_while(state.lock().unwrap(), |s| {
             (background && s.foreground_preparations != 0)
-                || s.critical && (background || s.active >= crate::constants::CRITICAL_PIPELINE_THREADS)
+                || s.critical && (background || s.foreground_creations >= crate::constants::CRITICAL_PIPELINE_THREADS)
         }).unwrap();
-        state.active += 1;
-        Self(schedule)
+        if !background { state.foreground_creations += 1; }
+        Self { schedule, background }
     }
 }
 impl Compiler {
@@ -193,24 +202,24 @@ impl Compiler {
         blob: Blob,
     ) -> Self {
         let persistence = std::sync::Arc::new(Persistence {
-            saved: Mutex::new((0, blob.loaded)),
+            saved: Mutex::new(Some((0, blob.loaded))),
             blob,
             // The loaded blob is the cache as it stands: only additions from here on are new.
             serialized_additions: cache_additions(device).unwrap_or(0).into(),
             queued: Default::default(),
         });
-        Self {
+        Self(std::sync::Arc::new(CompilerState {
             #[cfg(test)]
             hit_selections: Default::default(),
             device: device.clone(),
             cache: cache.cloned(),
             timings: Default::default(),
-            known: std::sync::Arc::new(Mutex::new(known)),
+            known: Mutex::new(known),
             pending: Default::default(),
             schedule: Default::default(),
             created: Default::default(),
             persistence,
-        }
+        }))
     }
     pub(crate) fn created(&self) -> usize {
         self.created.load(std::sync::atomic::Ordering::Acquire)
@@ -251,7 +260,15 @@ impl Compiler {
         // Serialize snapshot and publication together so an older save cannot
         // overwrite a newer ledger or acknowledge its dirty state.
         let mut saved = persistence.saved.lock().unwrap();
-        self.save_holding(&mut saved)
+        match saved.as_mut() {
+            Some(saved) => self.save_holding(saved),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for an active save to release its device and disarm queued saves.
+    pub(crate) fn close_saves(&self) {
+        *self.persistence.saved.lock().unwrap() = None;
     }
     fn save_holding(&self, saved: &mut (usize, Option<blake3::Hash>)) -> Result<()> {
         let persistence = &*self.persistence;
@@ -318,6 +335,7 @@ impl Compiler {
         }
         // A save in flight holds `saved`: work finished since it began needs the save queued behind it.
         if let Ok(saved) = persistence.saved.try_lock() {
+            let Some(saved) = saved.as_ref() else { return; };
             if saved.0 == self.created() && !self.known.lock().unwrap().added {
                 return;
             }
@@ -325,18 +343,21 @@ impl Compiler {
         if persistence.queued.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        let compiler = self.clone();
+        // A queued save owns only CPU state. Borrow the live compiler under the save
+        // lock, so close_saves can wait for exactly this device even on a shared worker.
+        let compiler = std::sync::Arc::downgrade(&self.0);
+        let persistence = self.persistence.clone();
         crate::disk_cache::persist(move || {
-            let persistence = &*compiler.persistence;
-            if !persistence.blob.save {
-                return;
-            }
             // Queued until this save holds `saved`: a request is always visible as one or the other
             // (`save_pending`), and one made from here on queues the save after this one.
             let mut saved = persistence.saved.lock().unwrap();
             persistence.queued.store(false, std::sync::atomic::Ordering::Release);
             // Cache availability never controls rendering; the save's receipts say what was written.
-            let _ = compiler.save_holding(&mut saved);
+            if let Some(saved) = saved.as_mut() {
+                if let Some(compiler) = compiler.upgrade() {
+                    let _ = Compiler(compiler).save_holding(saved);
+                }
+            }
         });
     }
     /// Leave on disk whatever this compiler has finished, on the calling thread: wait for a save
@@ -354,7 +375,7 @@ impl Compiler {
     /// Driver creations counted at the last save and the blob content on disk, once any save in
     /// flight has finished.
     pub(crate) fn saved(&self) -> (usize, Option<blake3::Hash>) {
-        *self.persistence.saved.lock().unwrap()
+        self.persistence.saved.lock().unwrap().expect("live compiler")
     }
     /// This compiler's place in the store, with what is on disk now: a replacement compiler on the
     /// same device keeps saving there.
@@ -395,7 +416,10 @@ impl Compiler {
                 Ok(Err(error)) => Some(format!("{error:#}")),
                 Err(_) => Some("worker panicked".into()),
             };
-            let (pending, done) = &*c.pending;
+            // A settling renderer may drop its last device reference as soon as the count hits zero.
+            let retirement = c.pending.clone();
+            drop(c);
+            let (pending, done) = &*retirement;
             let mut pending = pending.lock().unwrap();
             pending.workers -= 1;
             if pending.failure.is_none() { pending.failure = failure; }
@@ -510,6 +534,20 @@ impl Compiler {
 /// Moda's 2D pipelines are created like vork's own: through the persistent pipeline cache (a Metal binary archive
 /// on macOS), admitted, timed and counted, so a save after new canvas pipelines writes them to disk.
 impl moda_text_draw::device::PipelineHost for Compiler {
+    fn has_capture_hint(&self, hint: &str) -> bool { self.is_known(&blake3::hash(hint.as_bytes())) }
+    fn remember_capture_hint(&self, hint: &str) { self.remember(blake3::hash(hint.as_bytes())); }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn optional(&self, family: &'static str, build: moda_text_draw::device::OptionalBuild<'_>) -> Result<()> {
+        // The device host serializes canvas variants on its own worker. Scene preparation
+        // and required driver compiles can proceed throughout a canvas compile.
+        let start = std::time::Instant::now();
+        moda_text_draw::device::scoped_creation(&self.device, || build(self.cache.as_ref()))?;
+        self.created.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.time(Some(family), start);
+        self.save_soon();
+        Ok(())
+    }
     fn render_pipeline(&self, descriptor: &wgpu::RenderPipelineDescriptor<'_>) -> wgpu::RenderPipeline {
         self.render_cached(descriptor)
     }
@@ -746,6 +784,46 @@ mod known_persistence_tests {
         Ok(())
     }
 
+    #[test]
+    fn variant_worker_releases_compiler_before_retiring() {
+        let (device, _) = wgpu::Device::noop(&Default::default());
+        let compiler = Compiler::new(&device, None, Known::default(), Blob::ledger_only());
+        let live = std::sync::Arc::downgrade(&compiler.0);
+        let (finish, gate) = std::sync::mpsc::channel();
+        compiler.spawn_variant(VariantCompile::Background, move || Ok(gate.recv()?));
+
+        // Prevent the worker from publishing completion. It must already be able to give
+        // up its device reference before the settling thread can observe zero workers.
+        let pending = compiler.pending.0.lock().unwrap();
+        finish.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while live.strong_count() > 1 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let owners = live.strong_count();
+        drop(pending);
+        compiler.settle().unwrap();
+        assert_eq!(owners, 1, "worker retained the compiler while retiring");
+    }
+
+    #[test]
+    fn queued_save_releases_the_compiler_before_the_persistence_worker_runs() -> Result<()> {
+        let (device, _) = wgpu::Device::noop(&Default::default());
+        let compiler = Compiler::new(&device, None, Known::default(), Blob::ledger_only());
+        let live = std::sync::Arc::downgrade(&compiler.0);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        crate::disk_cache::persist(move || { let _ = gate.recv(); });
+
+        compiler.remember(blake3::hash(b"queued pipeline"));
+        compiler.save_soon();
+        assert!(compiler.save_pending());
+        compiler.close_saves();
+        drop(compiler);
+        assert!(live.upgrade().is_none());
+        drop(release);
+        crate::disk_cache::wait_persistence()
+    }
+
     /// A process about to exit must not take a save for finished while the worker is between
     /// taking it off the queue and running it.
     #[test]
@@ -803,6 +881,10 @@ pub(crate) enum VariantCompile {
     /// The path kernel behind its prebuilt engine is the exception: it compiles
     /// for the next render of the scene (Compiler::install_behind_engine).
     Fallback,
+    /// A path world inside a page: Fallback's choices, and nothing compiles behind the kernel it draws. A
+    /// page renders on many frame workers under one memory admission; a detached specializer would open a
+    /// second process and GPU device beside them.
+    Page,
     /// `vork setup`: Fallback's choices, and the hit kernels compile the superset
     /// key a later Fallback install draws with (CachedPipelines::drawn_kernel).
     Setup,
@@ -822,11 +904,11 @@ impl VariantCompile {
         match self {
             Self::Inline=>false,
             Self::Gated(_)=>true,
-            Self::Background|Self::Fallback|Self::Setup|Self::SetupPlain=>!warm && generic_ready,
+            Self::Background|Self::Fallback|Self::Page|Self::Setup|Self::SetupPlain=>!warm && generic_ready,
         }
     }
     /// One-frame choices: draw generics and compile no later variant.
-    pub(crate) fn fallback(&self)->bool {matches!(self,Self::Fallback|Self::Setup|Self::SetupPlain)}
+    pub(crate) fn fallback(&self)->bool {matches!(self,Self::Fallback|Self::Page|Self::Setup|Self::SetupPlain)}
 }
 /// A retained variant; the caller supplies a pipeline fallback or keeps its existing passes.
 #[derive(Clone)]
@@ -1583,11 +1665,11 @@ impl CachedPipelines {
             return match mode {
                 VariantCompile::Inline => kernel,
                 VariantCompile::Setup | VariantCompile::SetupPlain | VariantCompile::Gated(_) => engine.unwrap_or(kernel),
-                VariantCompile::Background | VariantCompile::Fallback =>
+                VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Page =>
                     ready_path_kernel(kernel, engine, warm, stored),
             };
         }
-        if matches!(mode, VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Gated(_))
+        if matches!(mode, VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Page | VariantCompile::Gated(_))
             && !compiler.is_known_input(self.kernel_content_key(kernel))
         {
             if let Some(plain) = kernel.plain_hit().filter(|plain| compiler.is_known_input(self.kernel_content_key(*plain))) {
@@ -1599,9 +1681,9 @@ impl CachedPipelines {
         match mode {
             VariantCompile::Setup => superset,
             VariantCompile::SetupPlain => kernel.plain_hit().unwrap_or(superset),
-            VariantCompile::Fallback if !compiler.is_known_input(self.kernel_content_key(kernel))
+            VariantCompile::Fallback | VariantCompile::Page if !compiler.is_known_input(self.kernel_content_key(kernel))
                 && compiler.is_known_input(self.kernel_content_key(superset)) => superset,
-            VariantCompile::Fallback if !stored(kernel) && stored(superset) => superset,
+            VariantCompile::Fallback | VariantCompile::Page if !stored(kernel) && stored(superset) => superset,
             _ => kernel,
         }
     }
@@ -1622,10 +1704,14 @@ impl CachedPipelines {
         mode: &VariantCompile, layout: wgpu::PipelineLayout, label: &'static str,
     ) -> Result<(Drawn<wgpu::ComputePipeline>, ProgramKernel)> {
         if crate::specialization::enabled() && r.cache.is_some()
-            && matches!(mode, VariantCompile::Background | VariantCompile::Fallback)
+            && matches!(mode, VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Page)
             && self.shader.path_engine(requested).is_ok()
+            && let Some(key) = (if matches!(mode, VariantCompile::Page) {
+                self.kernel_content_key(requested)
+            } else {
+                Some(self.compute_content_key(requested, false)?)
+            })
         {
-            let key = self.compute_content_key(requested, false)?;
             let path = r.disk_cache.path("specialization", 1, key);
             if let Some(cache) = crate::specialization::load(&r.device, &path) {
                 let (module, entry) = self.program_kernel(requested)?;
@@ -1636,7 +1722,7 @@ impl CachedPipelines {
                 return Ok((Drawn::inline(pipeline), requested));
             }
             let selected = self.drawn_kernel(requested, mode, &r.compiler);
-            if selected != requested {
+            if selected != requested && !matches!(mode, VariantCompile::Page) {
                 let ProgramKernel::Path {adaptive,..} = requested else {unreachable!()};
                 let ended = if let Some(ended) = crate::specialization::join(key, &path) {
                     Some(ended)
@@ -1692,8 +1778,8 @@ impl CachedPipelines {
         };
         // A render's kernel behind a ready path fallback always compiles, a still's
         // too: otherwise repeats of the scene would stay at the engine's speed.
-        // Setup keeps the engine alone; it has no scene to come back to.
-        let behind_engine = selected != requested && !matches!(mode, VariantCompile::Setup | VariantCompile::SetupPlain)
+        // Setup keeps the engine alone; it has no scene to come back to. A page keeps it too.
+        let behind_engine = selected != requested && !matches!(mode, VariantCompile::Page | VariantCompile::Setup | VariantCompile::SetupPlain)
             && matches!(requested, ProgramKernel::Path {..});
         let drawn = match fallback {
             Some(engine) if behind_engine => r.compiler.install_behind_engine(mode, self.camera_slot(requested), engine, own),

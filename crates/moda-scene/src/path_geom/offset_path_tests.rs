@@ -4,7 +4,7 @@
 use super::*;
 use crate::path_bool::Bounds;
 use crate::path_geom::vec2::{v2, V2};
-use crate::stroke_outline::raster::{polygons, Grid};
+use crate::path_geom::test_raster::{polygons, Grid};
 use std::f64::consts::PI;
 
 /// Every result is within the default tolerance of the exact offset.
@@ -650,7 +650,6 @@ fn small_offsets_are_accurate_relative_to_their_distance() {
     let big = offset_path(&OffsetRequest::new(circle(0.0, 0.0, 50_000.0), true, 0.01));
     assert!(matches!(big, Ok(BooleanOutcome::Shape { .. })), "{big:?}");
 }
-
 
 #[test]
 fn output_range_failure_refuses_the_whole_offset() {

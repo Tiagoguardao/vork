@@ -1,14 +1,6 @@
-//! M2 — faithful port of the arc-length / dash infrastructure from
-//! `utils/lineToPath.ts` (line citations are to that file):
-//!   - `scaleDashPattern` (:166, BASE_DASH_STROKE_WIDTH = 2)
-//!   - `PathSegment` + Gauss-Legendre arc lengths (:180-315)
-//!   - `findParameterAtArcLength{Quadratic,Cubic}` Newton iterations (:350-464)
-//!   - `walkPathByArcLength` (:623-699) + `getPointOnSegment` (:708-737)
-//!   - `buildElbowedPathSegments` (:501-610)
-//!
-//! All math in f64 like the JS engine. COPY THE BUGS — thresholds (0.001),
-//! iteration counts (8 / 10), and the 5-point Gauss-Legendre constants are
-//! part of the pixel contract.
+//! Stroke dashes and trims in local arc-length coordinates.
+use moda_scene::path_length::{distance_tolerance, elevated_controls};
+pub use moda_scene::path_length::{cubic_arc_length, find_t_at_arc_length_cubic, quadratic_arc_length};
 
 pub type Pt = [f64; 2];
 
@@ -46,62 +38,6 @@ pub fn normalize_dash_pattern(scaled: Vec<f64>) -> Vec<f64> {
     }
 }
 
-/// Gauss-Legendre 5-point abscissae/weights mapped to [0,1] (:212-229),
-/// written EXACTLY as the TS source expressions evaluate.
-const GL5_T: [f64; 5] = [
-    0.5 - 0.5 * 0.9061798459386639,
-    0.5 - 0.5 * 0.5384693101056831,
-    0.5,
-    0.5 + 0.5 * 0.5384693101056831,
-    0.5 + 0.5 * 0.9061798459386639,
-];
-const GL5_W: [f64; 5] = [
-    0.5 * 0.2369268850561891,
-    0.5 * 0.4786286704993665,
-    0.5 * 0.5688888888888889,
-    0.5 * 0.4786286704993665,
-    0.5 * 0.2369268850561891,
-];
-
-/// `computeQuadraticBezierArcLength` (:243-272).
-pub fn quadratic_arc_length(p0: Pt, cp: Pt, p1: Pt) -> f64 {
-    let ax = cp[0] - p0[0];
-    let ay = cp[1] - p0[1];
-    let bx = p1[0] - 2.0 * cp[0] + p0[0];
-    let by = p1[1] - 2.0 * cp[1] + p0[1];
-
-    let mut length = 0.0;
-    for i in 0..5 {
-        let t = GL5_T[i];
-        let w = GL5_W[i];
-        let dx = 2.0 * (ax + t * bx);
-        let dy = 2.0 * (ay + t * by);
-        length += w * (dx * dx + dy * dy).sqrt();
-    }
-    length
-}
-
-/// `computeCubicBezierArcLength` (:286-315).
-pub fn cubic_arc_length(p0: Pt, cp1: Pt, cp2: Pt, p1: Pt) -> f64 {
-    let ax = 3.0 * (cp1[0] - p0[0]);
-    let ay = 3.0 * (cp1[1] - p0[1]);
-    let bx = 3.0 * (cp2[0] - cp1[0]);
-    let by = 3.0 * (cp2[1] - cp1[1]);
-    let cx = 3.0 * (p1[0] - cp2[0]);
-    let cy = 3.0 * (p1[1] - cp2[1]);
-
-    let mut length = 0.0;
-    for i in 0..5 {
-        let t = GL5_T[i];
-        let w = GL5_W[i];
-        let mt = 1.0 - t;
-        let dx = mt * mt * ax + 2.0 * mt * t * bx + t * t * cx;
-        let dy = mt * mt * ay + 2.0 * mt * t * by + t * t * cy;
-        length += w * (dx * dx + dy * dy).sqrt();
-    }
-    length
-}
-
 /// `quadraticBezierAt` (:326-337).
 pub fn quadratic_at(p0: Pt, cp: Pt, p1: Pt, t: f64) -> Pt {
     let mt = 1.0 - t;
@@ -124,111 +60,10 @@ pub fn cubic_at(p0: Pt, cp1: Pt, cp2: Pt, p1: Pt, t: f64) -> Pt {
     ]
 }
 
-/// `findParameterAtArcLengthQuadratic` (:350-397) — Newton-Raphson, 8 iters.
-pub fn find_t_at_arc_length_quadratic(
-    p0: Pt,
-    cp: Pt,
-    p1: Pt,
-    target_length: f64,
-    total_length: f64,
-) -> f64 {
-    if target_length <= 0.0 {
-        return 0.0;
-    }
-    if target_length >= total_length {
-        return 1.0;
-    }
-
-    let mut t = target_length / total_length;
-
-    let ax = cp[0] - p0[0];
-    let ay = cp[1] - p0[1];
-    let bx = p1[0] - 2.0 * cp[0] + p0[0];
-    let by = p1[1] - 2.0 * cp[1] + p0[1];
-
-    for _ in 0..8 {
-        let mut current_length = 0.0;
-        for i in 0..5 {
-            let ti = t * GL5_T[i];
-            let wi = t * GL5_W[i];
-            let dx = 2.0 * (ax + ti * bx);
-            let dy = 2.0 * (ay + ti * by);
-            current_length += wi * (dx * dx + dy * dy).sqrt();
-        }
-
-        let error = current_length - target_length;
-        if error.abs() < 0.001 {
-            break;
-        }
-
-        let dx = 2.0 * (ax + t * bx);
-        let dy = 2.0 * (ay + t * by);
-        let speed = (dx * dx + dy * dy).sqrt();
-        if speed < 0.001 {
-            break;
-        }
-
-        t -= error / speed;
-        t = t.clamp(0.0, 1.0);
-    }
-
-    t
-}
-
-/// `findParameterAtArcLengthCubic` (:411-464) — Newton-Raphson, 10 iters.
-pub fn find_t_at_arc_length_cubic(
-    p0: Pt,
-    cp1: Pt,
-    cp2: Pt,
-    p1: Pt,
-    target_length: f64,
-    total_length: f64,
-) -> f64 {
-    if target_length <= 0.0 {
-        return 0.0;
-    }
-    if target_length >= total_length {
-        return 1.0;
-    }
-
-    let mut t = target_length / total_length;
-
-    let ax = 3.0 * (cp1[0] - p0[0]);
-    let ay = 3.0 * (cp1[1] - p0[1]);
-    let bx = 3.0 * (cp2[0] - cp1[0]);
-    let by = 3.0 * (cp2[1] - cp1[1]);
-    let cx = 3.0 * (p1[0] - cp2[0]);
-    let cy = 3.0 * (p1[1] - cp2[1]);
-
-    for _ in 0..10 {
-        let mut current_length = 0.0;
-        for i in 0..5 {
-            let ti = t * GL5_T[i];
-            let wi = t * GL5_W[i];
-            let mti = 1.0 - ti;
-            let dx = mti * mti * ax + 2.0 * mti * ti * bx + ti * ti * cx;
-            let dy = mti * mti * ay + 2.0 * mti * ti * by + ti * ti * cy;
-            current_length += wi * (dx * dx + dy * dy).sqrt();
-        }
-
-        let error = current_length - target_length;
-        if error.abs() < 0.001 {
-            break;
-        }
-
-        let mt = 1.0 - t;
-        let dx = mt * mt * ax + 2.0 * mt * t * bx + t * t * cx;
-        let dy = mt * mt * ay + 2.0 * mt * t * by + t * t * cy;
-        let speed = (dx * dx + dy * dy).sqrt();
-        if speed < 0.001 {
-            break;
-        }
-
-        t -= error / speed;
-        t = t.clamp(0.0, 1.0);
-    }
-
-    t
+pub fn find_t_at_arc_length_quadratic(p0: Pt, cp: Pt, p1: Pt, target: f64, total: f64) -> f64 {
+    let (cp, end) = (sub(cp, p0), sub(p1, p0));
+    let (c1, c2) = elevated_controls([0., 0.], cp, end);
+    find_t_at_arc_length_cubic([0., 0.], c1, c2, end, target, total)
 }
 
 /// `getPointOnSegment` (:708-737).
@@ -241,7 +76,7 @@ pub fn point_on_segment(segment: &PathSegment, distance: f64) -> Pt {
         Seg::Cubic { p0, p1, .. } => (*p0, *p1),
     };
 
-    if segment_length < 0.001 || distance <= 0.0 {
+    if distance <= 0.0 {
         return p0;
     }
     if distance >= segment_length {
@@ -274,109 +109,65 @@ pub enum WalkCmd {
 /// `walkPathByArcLength` (:623-699). `dash_pattern` must already be scaled
 /// and even-length-normalized.
 pub fn walk_path_by_arc_length(segments: &[PathSegment], dash_pattern: &[f64]) -> Vec<WalkCmd> {
-    let mut points: Vec<WalkCmd> = Vec::new();
+    walk_path_by_arc_length_phased(segments, dash_pattern, 0.0)
+}
 
-    if segments.is_empty() || dash_pattern.is_empty() {
-        return points;
+// SVG calibration can put two representations of a boundary on opposite
+// sides of a dash. Even a rounding sliver would receive a full stroke cap.
+fn snap_distance(distance: f64, boundary: f64) -> f64 {
+    if (distance - boundary).abs() <= distance_tolerance(distance.min(boundary)) {
+        boundary
+    } else {
+        distance
     }
+}
 
-    let pattern_length: f64 = dash_pattern.iter().sum();
-    if pattern_length == 0.0 {
-        return points;
+/// Intersect a distance window with one segment. Resolve a cut at a vertex
+/// in contour coordinates, before subtracting the segment origin. Only the
+/// emitted geometry snaps: the dash clock keeps its original phase.
+fn segment_window(start: f64, length: f64, from: f64, to: f64) -> Option<(f64, f64)> {
+    let end = start + length;
+    if from >= end || to <= start || from >= to || length <= 0. {
+        return None;
     }
-
-    let total_length: f64 = segments.iter().map(|s| s.arc_length).sum();
-    if total_length < 0.001 {
-        return points;
-    }
-
-    let mut pattern_index = 0usize;
-    let mut is_dash = true;
-    let mut remaining_in_pattern_segment = dash_pattern[0];
-
-    let mut current_segment_index = 0usize;
-    let mut distance_into_current_segment = 0.0f64;
-
-    let mut in_dash = false;
-
-    while current_segment_index < segments.len() {
-        let segment = &segments[current_segment_index];
-        let segment_length = segment.arc_length;
-        let remaining_in_segment = segment_length - distance_into_current_segment;
-
-        if remaining_in_segment < 0.001 {
-            current_segment_index += 1;
-            distance_into_current_segment = 0.0;
-            continue;
-        }
-
-        let step_length = remaining_in_pattern_segment.min(remaining_in_segment);
-
-        if is_dash && step_length > 0.001 {
-            let start_dist = distance_into_current_segment;
-            let end_dist = distance_into_current_segment + step_length;
-
-            let start_point = point_on_segment(segment, start_dist);
-            let end_point = point_on_segment(segment, end_dist);
-
-            if !in_dash {
-                points.push(WalkCmd::Move(start_point));
-                in_dash = true;
+    let local = |cut: f64| {
+        if cut <= start {
+            0.
+        } else if cut >= end {
+            length
+        } else {
+            let vertex = if cut - start < end - cut { start } else { end };
+            // Two cuts of the same short run must never snap together.
+            if snap_distance(cut, vertex) == vertex && (cut - vertex).abs() < (to - from) * 0.5 {
+                if vertex == start { 0. } else { length }
+            } else {
+                cut - start
             }
-            points.push(WalkCmd::Line(end_point));
         }
-
-        distance_into_current_segment += step_length;
-        remaining_in_pattern_segment -= step_length;
-
-        if remaining_in_pattern_segment < 0.001 {
-            pattern_index = (pattern_index + 1) % dash_pattern.len();
-            remaining_in_pattern_segment = dash_pattern[pattern_index];
-            if is_dash {
-                in_dash = false;
-            }
-            is_dash = !is_dash;
-        }
-    }
-
-    points
+    };
+    let (a, b) = (local(from), local(to));
+    (a < b).then_some((a, b))
 }
 
 /// Seed the dash walk's phase from an offset DISTANCE into an
 /// already-scaled+normalized dash pattern (marching-ants / `stroke-dashoffset`).
-/// Returns `(pattern_index, is_dash, remaining_in_pattern_segment)`. Offset wraps
-/// modulo the pattern length and may be negative (flow direction). At `offset == 0`
-/// this returns `(0, true, pattern[0])` — the un-phased walk's init. (For a
-/// degenerate leading `0.0` element the two could differ at the first step, but
-/// `offset == 0` never routes through the phased walk — callers use the un-phased
-/// walk there — so the phased path is only taken for `offset != 0`.)
-pub(crate) fn seed_dash_phase(dash_pattern: &[f64], offset: f64) -> (usize, bool, f64) {
-    let pattern_length: f64 = dash_pattern.iter().sum();
-    if pattern_length <= 0.0 {
-        return (0, true, dash_pattern.first().copied().unwrap_or(0.0));
-    }
-    let mut o = offset.rem_euclid(pattern_length); // normalized into [0, pattern_length)
-    let mut index = 0usize;
-    let mut is_dash = true;
-    // The offset lands within one element after at most `len` steps (the elements
-    // sum to pattern_length and o < pattern_length).
-    for _ in 0..dash_pattern.len() {
-        let seg = dash_pattern[index];
-        if o < seg {
-            return (index, is_dash, seg - o);
+/// Returns the index, on/off state and remaining distance. Offset wraps
+/// modulo the pattern length and may be negative.
+fn seed_dash_phase(dash_pattern: &[f64], offset: f64) -> Option<(usize, bool, f64)> {
+    let period: f64 = dash_pattern.iter().sum();
+    if period <= 0. { return None; }
+    let mut phase = offset.rem_euclid(period);
+    for (index, &length) in dash_pattern.iter().enumerate() {
+        phase = snap_distance(phase, length);
+        if phase < length {
+            return Some((index, index % 2 == 0, length - phase));
         }
-        o -= seg;
-        index = (index + 1) % dash_pattern.len();
-        is_dash = !is_dash;
+        phase -= length;
     }
-    // Rounding put `o` exactly at the wrap — treat as phase 0.
-    (0, true, dash_pattern[0])
+    Some((0, true, dash_pattern[0])) // Rounded to the end of the period.
 }
 
-/// Phased variant of [`walk_path_by_arc_length`] — starts the dash pattern at an
-/// arc-length `offset` into the pattern (`dashOffset`, marching ants). Byte-identical
-/// to the un-phased walk at `offset == 0`; callers use the un-phased walk for the
-/// no-offset case so oracle-pinned output is untouched.
+/// Walk the path starting at the given distance into the dash pattern.
 pub fn walk_path_by_arc_length_phased(
     segments: &[PathSegment],
     dash_pattern: &[f64],
@@ -384,63 +175,40 @@ pub fn walk_path_by_arc_length_phased(
 ) -> Vec<WalkCmd> {
     let mut points: Vec<WalkCmd> = Vec::new();
 
-    if segments.is_empty() || dash_pattern.is_empty() {
+    let Some((mut index, mut is_dash, first_end)) = seed_dash_phase(dash_pattern, offset) else {
         return points;
-    }
-    let pattern_length: f64 = dash_pattern.iter().sum();
-    if pattern_length == 0.0 {
-        return points;
-    }
-    let total_length: f64 = segments.iter().map(|s| s.arc_length).sum();
-    if total_length < 0.001 {
-        return points;
-    }
-
-    let (mut pattern_index, mut is_dash, mut remaining_in_pattern_segment) =
-        seed_dash_phase(dash_pattern, offset);
-
-    let mut current_segment_index = 0usize;
-    let mut distance_into_current_segment = 0.0f64;
+    };
+    // The contour end truncates the pattern itself, unlike interior cuts.
+    let total = segments.iter().map(|s| s.arc_length).sum();
+    let mut dash_start = 0.;
+    let mut dash_end = snap_distance(first_end, total);
+    let mut start = 0.;
     let mut in_dash = false;
-
-    while current_segment_index < segments.len() {
-        let segment = &segments[current_segment_index];
-        let segment_length = segment.arc_length;
-        let remaining_in_segment = segment_length - distance_into_current_segment;
-
-        if remaining_in_segment < 0.001 {
-            current_segment_index += 1;
-            distance_into_current_segment = 0.0;
-            continue;
-        }
-
-        let step_length = remaining_in_pattern_segment.min(remaining_in_segment);
-
-        if is_dash && step_length > 0.001 {
-            let start_dist = distance_into_current_segment;
-            let end_dist = distance_into_current_segment + step_length;
-            let start_point = point_on_segment(segment, start_dist);
-            let end_point = point_on_segment(segment, end_dist);
-            if !in_dash {
-                points.push(WalkCmd::Move(start_point));
-                in_dash = true;
-            }
-            points.push(WalkCmd::Line(end_point));
-        }
-
-        distance_into_current_segment += step_length;
-        remaining_in_pattern_segment -= step_length;
-
-        if remaining_in_pattern_segment < 0.001 {
-            pattern_index = (pattern_index + 1) % dash_pattern.len();
-            remaining_in_pattern_segment = dash_pattern[pattern_index];
+    for segment in segments {
+        let segment_end = start + segment.arc_length;
+        let mut position = start;
+        while position < segment_end {
+            let end = dash_end.min(segment_end);
             if is_dash {
+                if let Some((a, b)) = segment_window(start, segment.arc_length, dash_start, dash_end) {
+                    if !in_dash {
+                        points.push(WalkCmd::Move(point_on_segment(segment, a)));
+                        in_dash = true;
+                    }
+                    points.push(WalkCmd::Line(point_on_segment(segment, b)));
+                }
+            }
+            if end == dash_end {
+                index = (index + 1) % dash_pattern.len();
+                dash_start = end;
+                dash_end = snap_distance(end + dash_pattern[index], total);
+                is_dash = !is_dash;
                 in_dash = false;
             }
-            is_dash = !is_dash;
+            position = end;
         }
+        start = segment_end;
     }
-
     points
 }
 
@@ -834,18 +602,14 @@ pub fn extract_sub_segment(
     local_end_dist: f64,
 ) -> Option<PathSegment> {
     let seg_len = segment.arc_length;
-    if seg_len <= 0.001 {
-        return None;
-    }
-
     let clamped_start = local_start_dist.clamp(0.0, seg_len);
     let clamped_end = local_end_dist.clamp(0.0, seg_len);
-    if clamped_end - clamped_start <= 0.001 {
+    if clamped_end <= clamped_start {
         return None;
     }
 
     // Fast path: fully covers the original segment.
-    if clamped_start <= 0.001 && clamped_end >= seg_len - 0.001 {
+    if clamped_start == 0. && clamped_end == seg_len {
         return Some(segment.clone());
     }
 
@@ -863,7 +627,7 @@ pub fn extract_sub_segment(
         Seg::Quadratic { p0, p1, cp } => {
             let t_start = find_t_at_arc_length_quadratic(*p0, *cp, *p1, clamped_start, seg_len);
             let t_end = find_t_at_arc_length_quadratic(*p0, *cp, *p1, clamped_end, seg_len);
-            if t_end - t_start <= 1e-6 {
+            if t_end <= t_start {
                 return None;
             }
             let (sp0, scp, sp1) = subdivide_quadratic(*p0, *cp, *p1, t_start, t_end);
@@ -879,7 +643,7 @@ pub fn extract_sub_segment(
         Seg::Cubic { p0, p1, cp1, cp2 } => {
             let t_start = find_t_at_arc_length_cubic(*p0, *cp1, *cp2, *p1, clamped_start, seg_len);
             let t_end = find_t_at_arc_length_cubic(*p0, *cp1, *cp2, *p1, clamped_end, seg_len);
-            if t_end - t_start <= 1e-6 {
+            if t_end <= t_start {
                 return None;
             }
             let (sp0, scp1, scp2, sp1) = subdivide_cubic(*p0, *cp1, *cp2, *p1, t_start, t_end);
@@ -904,7 +668,7 @@ pub fn extract_path_segments_by_arc_length(
     end_dist: f64,
 ) -> Vec<PathSegment> {
     let mut result: Vec<PathSegment> = Vec::new();
-    if end_dist - start_dist <= 0.001 {
+    if end_dist <= start_dist {
         return result;
     }
 
@@ -915,17 +679,12 @@ pub fn extract_path_segments_by_arc_length(
         let seg_end = current_dist + seg_len;
         current_dist = seg_end;
 
-        if seg_end <= start_dist + 0.001 {
-            continue;
-        }
-        if seg_start >= end_dist - 0.001 {
+        if seg_start >= end_dist {
             break;
         }
-
-        let local_start = (start_dist - seg_start).max(0.0);
-        let local_end = (end_dist - seg_start).min(seg_len);
-
-        if let Some(sub) = extract_sub_segment(segment, local_start, local_end) {
+        if let Some(sub) = segment_window(seg_start, seg_len, start_dist, end_dist)
+            .and_then(|(a, b)| extract_sub_segment(segment, a, b))
+        {
             result.push(sub);
         }
     }
@@ -944,14 +703,6 @@ pub fn extract_path_segments_by_arc_length(
 pub struct DashPiece {
     pub points: Vec<Pt>,
     pub closed: bool,
-}
-
-/// The walk reaches a segment end through `d + (len - d)`, which is not always exactly
-/// `len`, so the seam vertex is matched within the walk's own 0.001 resolution.
-const SEAM_EPS: f64 = 1e-3;
-
-fn same_point(a: Pt, b: Pt) -> bool {
-    (a[0] - b[0]).abs() < SEAM_EPS && (a[1] - b[1]).abs() < SEAM_EPS
 }
 
 /// Group one sub-path's walk output into [`DashPiece`]s. `start` / `end` are the
@@ -979,12 +730,9 @@ pub fn dash_pieces(cmds: &[WalkCmd], closed: bool, start: Pt, end: Pt) -> Vec<Da
     if !closed || pieces.is_empty() {
         return pieces;
     }
-    let first_on = same_point(pieces[0].points[0], start);
-    let last_on = pieces
-        .last()
-        .and_then(|p| p.points.last().copied())
-        .map(|p| same_point(p, end))
-        .unwrap_or(false);
+    // The walk emits authored endpoints exactly when a run reaches the seam.
+    let first_on = pieces[0].points.first() == Some(&start);
+    let last_on = pieces.last().and_then(|p| p.points.last()) == Some(&end);
     if !(first_on && last_on) {
         return pieces;
     }
@@ -1005,6 +753,40 @@ pub fn dash_pieces(cmds: &[WalkCmd], closed: bool, start: Pt, end: Pt) -> Vec<Da
 #[cfg(test)]
 mod dash_piece_tests {
     use super::*;
+
+    #[test]
+    fn a_large_non_dyadic_turn_resolves_its_out_and_back_distance() {
+        // The quadratic turns at t=4/7. At a fixed depth its unresolved
+        // reversal leaves a macroscopic phase error on a straight continuation.
+        let length = quadratic_arc_length([0., 0.], [1e8, 0.], [2.5e7, 0.]);
+        let exact = 2. * (1e8 * 4. / 7.) - 2.5e7;
+        assert!((length - exact).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_small_bend_has_the_same_length_and_inverse_far_from_the_origin() {
+        let bend = [[2., 2.], [0., 2.], [0., 0.], [0., 0.]];
+        let shifted = bend.map(|[x, y]| [1e16 + x, 1e16 + y]);
+        let measure = |[a, b, c, d]: [Pt; 4]| {
+            let length = cubic_arc_length(a, b, c, d);
+            (length, find_t_at_arc_length_cubic(a, b, c, d, length * 0.4, length))
+        };
+        assert_eq!(measure(bend), measure(shifted));
+    }
+
+    #[test]
+    fn inverse_length_follows_both_turns_of_a_collinear_cubic() {
+        // x(t) = 300t(1-t)(1-2t) turns at x = ±50/√3.
+        let (a, b, c, d) = ([0., 0.], [100., 0.], [-100., 0.], [0., 0.]);
+        let peak = 50. / 3f64.sqrt();
+        let total = cubic_arc_length(a, b, c, d);
+        assert!((total - 4. * peak).abs() <= 0.01);
+        for (distance, x) in [(peak + 10., peak - 10.), (3. * peak + 10., 10. - peak)] {
+            let t = find_t_at_arc_length_cubic(a, b, c, d, distance, total);
+            assert!((cubic_at(a, b, c, d, t)[0] - x).abs() <= 2. * 0.01);
+        }
+    }
+
     use crate::tess::moda_engine_path_types::{FillRule, LineCap, LineJoin, PathCmd, StrokeAlign};
     use crate::tess::tessellate_combined_oracle;
 
@@ -1250,27 +1032,27 @@ mod dash_offset_tests {
     #[test]
     fn seed_phase_at_zero_matches_unphased_init() {
         // Offset 0 → start of first dash, full remaining.
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], 0.0), (0, true, 10.0));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], 0.0), Some((0, true, 10.0)));
     }
 
     #[test]
     fn seed_phase_within_first_dash() {
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], 4.0), (0, true, 6.0));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], 4.0), Some((0, true, 6.0)));
     }
 
     #[test]
     fn seed_phase_into_gap() {
         // Offset 10 lands exactly at the gap start (element 1, not a dash).
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], 10.0), (1, false, 10.0));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], 10.0), Some((1, false, 10.0)));
         // Offset 15 → 5 into the gap.
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], 15.0), (1, false, 5.0));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], 15.0), Some((1, false, 5.0)));
     }
 
     #[test]
     fn seed_phase_wraps_modulo_pattern_length() {
         // 25 mod 20 == 5 (into first dash); -5 mod 20 == 15 (into gap).
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], 25.0), (0, true, 5.0));
-        assert_eq!(seed_dash_phase(&[10.0, 10.0], -5.0), (1, false, 5.0));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], 25.0), Some((0, true, 5.0)));
+        assert_eq!(seed_dash_phase(&[10.0, 10.0], -5.0), Some((1, false, 5.0)));
     }
 
     #[test]

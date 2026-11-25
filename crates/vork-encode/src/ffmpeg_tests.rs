@@ -62,7 +62,7 @@ fn encode(path: &Path, fps: Time, frames: usize) {
     };
     let gop = (fps.numerator() as u64 * 2).div_ceil(fps.denominator() as u64) as u32;
     finish(
-        readback_command(64, 32, fps, frames as u64, EncodeSettings::default(), codec, gop, path).unwrap(),
+        readback_command(64, 32, fps, frames as u64, EncodeSettings::default(), codec, Input::Rgba, gop, path).unwrap(),
         &pixels(frames),
     );
     check(path, fps, frames);
@@ -278,6 +278,7 @@ fn readback_preflight_refuses_inexact_movie_clock() {
                 } else {
                     "libx264"
                 },
+                Input::Rgba,
                 48,
                 &path,
             )
@@ -301,6 +302,7 @@ fn readback_preflight_refuses_inexact_movie_clock() {
                 } else {
                     "libx264"
                 },
+                Input::Rgba,
                 48,
                 &path,
             )
@@ -367,6 +369,7 @@ fn software_h264_targets_quality_and_names_its_primaries() {
         1,
         EncodeSettings { hardware_bitrate: 7_000_000, ..EncodeSettings::default() },
         "libx264",
+        Input::Rgba,
         60,
         Path::new("out.mp4"),
     )
@@ -391,6 +394,7 @@ fn software_h264_targets_quality_and_names_its_primaries() {
         1,
         EncodeSettings { primaries: Primaries::DisplayP3, ..EncodeSettings::default() },
         "libx264",
+        Input::Yuv420p,
         48,
         Path::new("out.mp4"),
     )
@@ -399,6 +403,7 @@ fn software_h264_targets_quality_and_names_its_primaries() {
     let value = |key| args[args.iter().position(|s| *s == key).unwrap() + 1];
     assert_eq!(value("-color_primaries"), "smpte432");
     assert_eq!((value("-color_trc"), value("-colorspace"), value("-color_range")), ("bt709", "bt709", "tv"));
-    assert!(value("-vf").contains("out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries=smpte432:color_trc=bt709:colorspace=bt709"));
+    assert_eq!(value("-pixel_format"), "yuv420p");
+    assert_eq!(value("-vf"), "setparams=range=limited:color_primaries=smpte432:color_trc=bt709:colorspace=bt709");
     assert_eq!((Primaries::Bt709.h273(), Primaries::DisplayP3.h273()), (1, 12));
 }

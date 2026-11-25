@@ -17,6 +17,73 @@ use crate::value::{Map, Number, Value};
 use std::borrow::Cow;
 use std::cell::Cell;
 
+/// Closure in contour order. A Boolean applies to every contour.
+#[derive(Debug, Clone, Copy)]
+pub enum PathClosure<'a> {
+    Uniform(bool),
+    PerContour(&'a [Value]),
+}
+
+impl From<bool> for PathClosure<'_> {
+    fn from(closed: bool) -> Self {
+        Self::Uniform(closed)
+    }
+}
+
+impl<'a> PathClosure<'a> {
+    pub fn from_field(field: &'a Value) -> Self {
+        if let Some(flags) = field.as_array() {
+            Self::PerContour(flags)
+        } else {
+            Self::Uniform(field.as_bool().unwrap_or(false))
+        }
+    }
+
+    pub fn at(self, index: usize) -> bool {
+        match self {
+            Self::Uniform(closed) => closed,
+            Self::PerContour(flags) => flags.get(index).and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+
+    /// A move starts a contour. Keep the index even for a contour with no segments.
+    pub fn contours<T>(
+        self,
+        points: &'a [T],
+        is_move: impl Fn(&T) -> bool + Clone + 'a,
+    ) -> impl Iterator<Item = (&'a [T], bool)> + Clone {
+        points
+            .chunk_by(move |_, next| !is_move(next))
+            .enumerate()
+            .map(move |(index, points)| (points, self.at(index)))
+    }
+
+    pub fn to_field(flags: Vec<bool>) -> Value {
+        match flags.first() {
+            Some(&first) if flags.iter().all(|&flag| flag == first) => Value::Bool(first),
+            Some(_) => Value::Array(flags.into_iter().map(Value::Bool).collect()),
+            None => Value::Bool(false),
+        }
+    }
+}
+
+impl crate::types::RawNode {
+    pub fn path_closure(&self) -> PathClosure<'_> {
+        self.json_field("closed")
+            .map_or(PathClosure::Uniform(false), PathClosure::from_field)
+    }
+
+    pub fn path_has_open_contours(&self) -> bool {
+        let closure = self.path_closure();
+        if let PathClosure::Uniform(closed) = closure {
+            return !closed;
+        }
+        let Some(points) = self.points() else { return false };
+        let moves = points.iter().skip(1).filter(|p| p.kind() == Some("move")).count();
+        !points.is_empty() && (0..=moves).any(|index| !closure.at(index))
+    }
+}
+
 thread_local! {
     static COMPACT_ON_LOAD: Cell<bool> = const { Cell::new(true) };
 }
@@ -71,6 +138,50 @@ impl<'a> PathPoints<'a> {
 
     pub fn iter(&self) -> PathPointsIter<'a> {
         PathPointsIter { points: *self, at: 0 }
+    }
+
+    /// Commands consumed by the renderer, including its defaults for incomplete JSON points.
+    pub fn draw_commands(self) -> impl Iterator<Item = crate::blend::BlendPathPoint> + 'a {
+        use crate::blend::BlendPathPoint as PathCmd;
+        let pt = |p: &PathPointRef<'_>, k: &str| -> (f64, f64) {
+            match p.xy(k) {
+                Some((x, y)) => (x.unwrap_or(0.0), y.unwrap_or(0.0)),
+                None => (0.0, 0.0),
+            }
+        };
+        self.iter()
+            .filter_map(move |p| {
+                if !p.is_object() {
+                    return None;
+                }
+                let x = p.f64("x").unwrap_or(0.0);
+                let y = p.f64("y").unwrap_or(0.0);
+                match p.kind()? {
+                    "move" => Some(PathCmd::Move { x, y }),
+                    "line" => Some(PathCmd::Line { x, y }),
+                    "curve" => Some(PathCmd::Curve {
+                        x,
+                        y,
+                        cp1: pt(&p, "cp1"),
+                        cp2: pt(&p, "cp2"),
+                    }),
+                    "quadratic" => Some(PathCmd::Quadratic {
+                        x,
+                        y,
+                        cp: pt(&p, "cp"),
+                    }),
+                    "arc" => Some(PathCmd::Arc {
+                        x,
+                        y,
+                        rx: p.f64("rx").unwrap_or(0.0),
+                        ry: p.f64("ry").unwrap_or(0.0),
+                        x_axis_rotation: p.f64("xAxisRotation").unwrap_or(0.0),
+                        large_arc: p.bool("largeArc").unwrap_or(false),
+                        sweep: p.bool("sweep").unwrap_or(false),
+                    }),
+                    _ => None,
+                }
+            })
     }
 
     /// The points as JSON values, as the node's JSON has them (borrowed when stored as JSON).

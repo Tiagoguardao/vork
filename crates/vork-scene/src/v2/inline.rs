@@ -125,6 +125,8 @@ macro_rules! resource_files {
             fn files(nodes: &mut [super::Node]) -> Vec<&mut String> {
                 let mut result = Vec::new();
                 for node in nodes {
+                    result.extend(node.audio.iter_mut().filter_map(|audio| audio.file.as_mut()));
+                    result.extend(node.animation.iter_mut().filter_map(|layer| layer.clip.as_mut()).filter_map(|clip| clip.file.as_mut()));
                     match &mut node.kind {
                         super::NodeKind::Asset { file, .. } => result.push(file),
                         super::NodeKind::Text { font, content, .. } => {

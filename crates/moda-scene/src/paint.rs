@@ -54,8 +54,24 @@ pub struct GradientStop {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SolidColor")]
 pub struct SolidPaint {
     pub color: Value,
+    #[serde(skip)]
+    pub rgba: Option<crate::color::Rgba>,
+}
+
+#[derive(Deserialize)]
+struct SolidColor { color: Value }
+
+impl From<SolidColor> for SolidPaint {
+    fn from(value: SolidColor) -> Self { Self::new(value.color) }
+}
+
+impl SolidPaint {
+    pub fn new(color: Value) -> Self {
+        Self { rgba: crate::color::parse_color(color.as_str()), color }
+    }
 }
 
 /// The colour space a gradient's stops blend in (CSS Color 4's `in <space>`). Absent = `srgb`.
@@ -502,104 +518,6 @@ pub struct VideoPaint {
     pub adjust: Option<ImageAdjust>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShaderPaint {
-    pub shader_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Map>,
-}
-
-/// Where a vector pattern's tile space sits in the node (E8.5, `moda_scene::pattern`): node-local =
-/// `T(x, y) · R(rotation) · S(scale)` · pattern space, or any affine as `matrix` (`patterns.ts`
-/// `PatternTransform`), which takes precedence when it is usable (six finite numbers, a non-zero determinant). It is
-/// the paint's own transform, independent of the node's (Illustrator's "transform patterns only"): the tiles move
-/// with the node, and this moves them inside it.
-#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PatternTransform {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub x: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub y: Option<f64>,
-    /// Uniform; absent, zero or not finite = 1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scale: Option<f64>,
-    /// Degrees, clockwise (the node rotation's sense).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rotation: Option<f64>,
-    /// Any affine `[a, b, c, d, e, f]` (x' = a·x + c·y + e, y' = b·x + d·y + f): a non-uniform scale, shear or
-    /// reflection of the tiles. Used in place of the fields above when usable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matrix: Option<[f64; 6]>,
-}
-
-// Debug as before `matrix` existed when it is absent: plan digests print paints (existing_documents_unchanged).
-impl std::fmt::Debug for PatternTransform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut d = f.debug_struct("PatternTransform");
-        d.field("x", &self.x)
-            .field("y", &self.y)
-            .field("scale", &self.scale)
-            .field("rotation", &self.rotation);
-        if let Some(m) = &self.matrix {
-            d.field("matrix", m);
-        }
-        d.finish()
-    }
-}
-
-impl PatternTransform {
-    /// The `matrix` when it is usable: six finite numbers and a non-zero determinant (`isUsablePatternMatrix`).
-    pub fn usable_matrix(&self) -> Option<crate::types::Affine> {
-        let m = self.matrix?;
-        if !m.iter().all(|v| v.is_finite()) || m[0] * m[3] - m[1] * m[2] == 0.0 {
-            return None;
-        }
-        Some(crate::types::Affine {
-            a: m[0],
-            b: m[1],
-            c: m[2],
-            d: m[3],
-            e: m[4],
-            f: m[5],
-        })
-    }
-
-    /// Pattern space → node-local.
-    pub fn affine(&self) -> crate::types::Affine {
-        if let Some(m) = self.usable_matrix() {
-            return m;
-        }
-        let fin = |v: Option<f64>, d: f64| v.filter(|v| v.is_finite()).unwrap_or(d);
-        let scale = self.scale.filter(|s| s.is_finite() && *s != 0.0).unwrap_or(1.0);
-        crate::transform::from_trs(crate::types::Transform2D {
-            x: fin(self.x, 0.0),
-            y: fin(self.y, 0.0),
-            rotation: fin(self.rotation, 0.0),
-            scale_x: scale,
-            scale_y: scale,
-        })
-    }
-}
-
-/// A vector pattern (Illustrator's pattern swatch, E8.5): the document pattern `patternId` names
-/// (`canvas.patterns`, `moda_scene::pattern`), tiled over the layer's region and clipped to it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PatternPaint {
-    pub pattern_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transform: Option<PatternTransform>,
-}
-
-impl PatternPaint {
-    /// Pattern space → node-local (identity without a transform).
-    pub fn affine(&self) -> crate::types::Affine {
-        self.transform.unwrap_or_default().affine()
-    }
-}
-
 /// What one fill or stroke layer paints. Tagged by `type`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -615,14 +533,14 @@ pub enum Paint {
     Freeform(FreeformGradientPaint),
     Image(ImagePaint),
     Video(VideoPaint),
-    Shader(ShaderPaint),
-    /// A vector pattern from the document's pattern table (E8.5).
-    Pattern(PatternPaint),
-    /// Illustrator's gradient mesh (fills only; `crate::mesh_gradient`).
-    Mesh(crate::mesh_gradient::MeshGradientPaint),
+
 }
 
 impl Paint {
+    pub fn solid_rgba(&self) -> Option<crate::color::Rgba> {
+        match self { Self::Solid(solid) => solid.rgba, _ => None }
+    }
+
     /// A stop gradient's interpolation space and dither (default for any other paint).
     pub fn gradient_options(&self) -> GradientOptions {
         match self {
@@ -656,9 +574,7 @@ pub struct Fill {
 }
 
 /// One stroke layer, with its own weight, alignment, caps, joins, dashes,
-/// width/brush objects and arrowheads (Illustrator's model). The brush and
-/// width objects are kept as stored JSON; `stroke_model` parses and
-/// normalises them.
+/// and arrowheads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
@@ -691,16 +607,7 @@ pub struct Stroke {
     /// dashes to corners and path ends, adjusting lengths to fit".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dash_alignment: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub taper: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wave: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dynamic: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brush: Option<Value>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_arrow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,7 +675,7 @@ impl Stroke {
             opacity: None,
             blend_mode: None,
             overprint: None,
-            paint: Paint::Solid(SolidPaint { color }),
+            paint: Paint::Solid(SolidPaint::new(color)),
             width,
             align: None,
             cap: None,
@@ -777,11 +684,7 @@ impl Stroke {
             dash: None,
             dash_offset: None,
             dash_alignment: None,
-            profile: None,
-            taper: None,
-            wave: None,
-            dynamic: None,
-            brush: None,
+
             start_arrow: None,
             end_arrow: None,
             arrow_scale: None,
@@ -802,11 +705,7 @@ impl Stroke {
             dash: zero_dashes_as_dots(self.dash.as_deref(), self.cap.as_deref(), self.width),
             dash_offset: self.dash_offset,
             dash_alignment: self.dash_alignment.clone(),
-            profile: self.profile.clone().filter(|v| !v.is_null()),
-            taper: self.taper.clone().filter(|v| !v.is_null()),
-            wave: self.wave.clone().filter(|v| !v.is_null()),
-            dynamic: self.dynamic.clone().filter(|v| !v.is_null()),
-            brush: self.brush.clone().filter(|v| !v.is_null()),
+
             start_arrow: self.start_arrow.clone(),
             end_arrow: self.end_arrow.clone(),
             arrow_scale: self.arrow_scale,
@@ -854,7 +753,7 @@ impl Fill {
             opacity: None,
             blend_mode: None,
             overprint: None,
-            paint: Paint::Solid(SolidPaint { color }),
+            paint: Paint::Solid(SolidPaint::new(color)),
             effects: None,
         }
     }
@@ -889,8 +788,6 @@ pub const STROKE_NODE_TYPES: &[&str] = &[
     "polygon",
     "richtext",
     "line",
-    "table",
-    "generated",
 ];
 
 /// Parse a stored layer list, skipping any entry that is not a well-formed
@@ -910,6 +807,21 @@ pub fn parse_fills(v: Option<&Value>) -> Vec<Fill> {
 /// A stroke stack from its JSON value (`strokes`).
 pub fn parse_strokes(v: Option<&Value>) -> Vec<Stroke> {
     parse_layers(v)
+}
+
+/// True when the ordered layers have the same rendering inputs apart from solid RGB.
+pub(crate) fn recoloured(old: &[Fill], new: &[Fill]) -> bool {
+    old.len() == new.len() && old.iter().zip(new).all(|(a, b)| {
+        let Fill { id, visible, opacity, blend_mode, overprint, effects, paint } = a;
+        id == &b.id && visible == &b.visible && opacity == &b.opacity && blend_mode == &b.blend_mode
+            && overprint == &b.overprint && effects == &b.effects && match (paint, &b.paint) {
+                (Paint::Solid(left), Paint::Solid(right)) => match (left.rgba, right.rgba) {
+                    (Some(a), Some(b)) => a.a == b.a,
+                    _ => left == right,
+                },
+                (left, right) => left == right,
+            }
+    })
 }
 
 /// A node's fill stack, bottom to top (`[]` for node types without fills).
@@ -978,6 +890,11 @@ pub fn top_fill(node: &RawNode) -> Option<Fill> {
     node_fills_shared(node).iter().rev().find(|f| shown(f.visible, f.opacity)).cloned()
 }
 
+/// Whether any visible stroke has a positive width.
+pub fn strokes_visibly(node: &RawNode) -> bool {
+    node_strokes_shared(node).iter().any(|s| shown(s.visible, s.opacity) && s.width > 0.0)
+}
+
 /// The node's top visible stroke.
 pub fn top_stroke(node: &RawNode) -> Option<Stroke> {
     with_top_stroke(node, |s| s.cloned())
@@ -1009,30 +926,6 @@ pub fn top_fill_paint_json(node: &RawNode) -> Option<&Map> {
         })
         .and_then(|f| f.get("paint"))
         .and_then(Value::as_object)
-}
-
-/// The stroke that carries the node's width model and brush: the top-most
-/// visible stroke with a width profile or a brush, else the top visible
-/// stroke (the Width tool and the brush tools act on the same one; TS twin in
-/// the editor's stroke helpers).
-pub fn model_stroke(node: &RawNode) -> Option<Stroke> {
-    with_model_stroke(node, |s| s.cloned())
-}
-
-/// `f` of the node's model stroke ([`model_stroke`], by reference: no copy of it).
-pub fn with_model_stroke<T>(node: &RawNode, f: impl FnOnce(Option<&Stroke>) -> T) -> T {
-    let all = node_strokes_shared(node);
-    let has = |v: &Option<Value>| v.as_ref().is_some_and(|v| !v.is_null());
-    let mut shown_strokes = all.iter().filter(|s| shown(s.visible, s.opacity));
-    let mut last = None;
-    let mut model = None;
-    for s in shown_strokes.by_ref() {
-        if has(&s.profile) || has(&s.brush) {
-            model = Some(s);
-        }
-        last = Some(s);
-    }
-    f(model.or(last))
 }
 
 /// The top visible stroke of a node-shaped JSON object (a line spec, a
@@ -1119,12 +1012,7 @@ pub fn paint_sources(fills: &[Fill]) -> Vec<&str> {
     let mut out = Vec::new();
     for f in fills {
         match &f.paint {
-            // A paint layer's surface is not an asset (the engine's surface registry fills it).
-            Paint::Image(p) => out.extend(
-                p.src
-                    .as_deref()
-                    .filter(|s| !s.starts_with(crate::normalize::PAINT_SURFACE_SRC_PREFIX)),
-            ),
+            Paint::Image(p) => out.extend(p.src.as_deref()),
             Paint::Video(p) => {
                 out.extend(p.src.as_deref());
                 out.extend(p.poster_src.as_deref());
@@ -1141,7 +1029,7 @@ pub fn paint_sources(fills: &[Fill]) -> Vec<&str> {
 
 /// The top stroke's GEOMETRY, owned (the paint and layer props left out). A
 /// node without a stroke has the default (every field `None`): no stroke band.
-/// `dash` and the brush objects stay as stored so every lane keeps its own
+/// `dash` stays as stored so every lane keeps its own
 /// parse.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StrokeStyle {
@@ -1154,11 +1042,7 @@ pub struct StrokeStyle {
     pub dash_offset: Option<f64>,
     /// [`Stroke::dash_alignment`].
     pub dash_alignment: Option<String>,
-    pub profile: Option<Value>,
-    pub taper: Option<Value>,
-    pub wave: Option<Value>,
-    pub dynamic: Option<Value>,
-    pub brush: Option<Value>,
+
     pub start_arrow: Option<String>,
     pub end_arrow: Option<String>,
     pub arrow_scale: Option<f64>,
@@ -1187,12 +1071,6 @@ impl StrokeStyle {
 /// The node's top stroke geometry (default without a stroke).
 pub fn node_stroke_style(node: &RawNode) -> StrokeStyle {
     with_top_stroke(node, |s| s.map(Stroke::style).unwrap_or_default())
-}
-
-/// The MODEL stroke's geometry ([`model_stroke`]: the stroke that carries the
-/// width model and brush), default without a stroke.
-pub fn model_stroke_style(node: &RawNode) -> StrokeStyle {
-    with_model_stroke(node, |s| s.map(Stroke::style).unwrap_or_default())
 }
 
 /// The top stroke geometry of a node-shaped JSON object.
@@ -1269,26 +1147,6 @@ pub fn set_solid_stroke(
     set_strokes(node, vec![s]);
 }
 
-/// A transient path's stroke: `stroke`'s paint and layer props at `width`,
-/// its width model (profile / taper / wave) and caps/joins (a line body
-/// outlined as a path).
-pub fn set_width_model(node: &mut Map, stroke: &Stroke, width: f64) {
-    let mut s = stroke.clone();
-    s.width = width;
-    s.align = None;
-    s.miter_limit = None;
-    s.dash = None;
-    s.dash_offset = None;
-    s.dash_alignment = None;
-    s.dynamic = None;
-    s.brush = None;
-    s.start_arrow = None;
-    s.end_arrow = None;
-    s.arrow_scale = None;
-    s.sides = None;
-    set_strokes(node, vec![s]);
-}
-
 /// A no-repeat image fill at `scale` over its `natural` size, at the origin
 /// (a generated graphic's cached asset).
 pub fn set_image_fill(
@@ -1324,22 +1182,9 @@ pub fn set_image_fill(
     );
 }
 
-/// Remove every stroke (a placed brush's own body: the artwork replaces the
-/// stroke band).
+/// Remove every stroke from a node-shaped JSON object.
 pub fn clear_strokes(node: &mut Map) {
     node.remove("strokes");
-}
-
-/// Remove the brush from every stroke (a refused placement draws the plain
-/// stroke).
-pub fn clear_stroke_brush(node: &mut Map) {
-    if let Some(Value::Array(strokes)) = node.get_mut("strokes") {
-        for s in strokes.iter_mut() {
-            if let Some(o) = s.as_object_mut() {
-                o.remove("brush");
-            }
-        }
-    }
 }
 
 /// Whether a node-shaped JSON object strokes: a visible stroke with a positive
@@ -1350,29 +1195,13 @@ pub fn map_strokes_visibly(map: &Map) -> bool {
     })
 }
 
-/// Multiply every stroke width of a node-shaped JSON object by `k` (a placed
-/// brush copy at a scale); a non-finite result becomes 0.
+/// Multiply every stroke width of a node-shaped JSON object by `k`; a non-finite result becomes 0.
 pub fn scale_stroke_widths(map: &mut Map, k: f64) {
     if let Some(Value::Array(strokes)) = map.get_mut("strokes") {
         for s in strokes.iter_mut() {
             if let Some(o) = s.as_object_mut() {
                 let w = o.get("width").and_then(Value::as_f64).unwrap_or(0.0) * k;
                 o.insert("width".into(), json!(if w.is_finite() { w } else { 0.0 }));
-            }
-        }
-    }
-}
-
-/// Remove the width model and brush (`profile`, `taper`, `wave`, `dynamic`,
-/// `brush`) from every stroke of a node-shaped JSON object: a placed copy of
-/// brush artwork strokes plainly.
-pub fn strip_stroke_models(map: &mut Map) {
-    if let Some(Value::Array(strokes)) = map.get_mut("strokes") {
-        for s in strokes.iter_mut() {
-            if let Some(o) = s.as_object_mut() {
-                for k in ["profile", "taper", "wave", "dynamic", "brush"] {
-                    o.remove(k);
-                }
             }
         }
     }
@@ -1389,7 +1218,7 @@ pub fn page_background_fields(page: &RawPage) -> Map {
 }
 
 // ---------------------------------------------------------------------------
-// Colour walking (variable resolution, brush colourisation)
+// Paint colour walking
 // ---------------------------------------------------------------------------
 
 /// Which colour of a node's paint a [`map_paint_colors`] /
@@ -1573,6 +1402,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recolour_uses_parsed_alpha_and_preserves_each_layer() {
+        let stack = |a: &str, b: &str| parse_fills(Some(&json!([
+            {"id":"a","opacity":0.6,"paint":{"type":"solid","color":a}},
+            {"id":"b","blendMode":"multiply","paint":{"type":"solid","color":b}},
+            {"id":"image","paint":{"type":"image","src":"unchanged.png"}}
+        ])));
+        let old = stack("#abc8", "rgba(2,3,4,0.4)");
+        let new = stack("#ffffff88", "rgba(200,5,1,0.4)");
+        assert_eq!(old.len(), 3);
+        assert!(recoloured(&old, &new));
+        assert!(!recoloured(&old, &stack("#eee9", "rgba(2,3,4,0.4)")));
+        let mut changed = new.clone();
+        changed[1].blend_mode = None;
+        assert!(!recoloured(&old, &changed));
+        assert!(!recoloured(&old, &new[..2]));
+    }
+
+    #[test]
     fn fill_mode_stretches_the_image_onto_the_box() {
         // CSS `object-fit: fill`: a 100 × 50 image in a 300 × 300 box, each axis scaled to the box.
         let placement: ImagePlacement = crate::value::from_value(json!({"fit": "fill", "naturalSize": {"width": 100, "height": 50}})).unwrap();
@@ -1604,65 +1451,6 @@ mod tests {
 
     fn raw(v: Value) -> RawNode {
         RawNode::from_value(v).unwrap()
-    }
-
-    /// Numbers as f64 (serde writes a parsed `0` back as `0.0`).
-    fn as_floats(v: &Value) -> Value {
-        match v {
-            Value::Number(n) => json!(n.as_f64().unwrap()),
-            Value::Array(items) => Value::Array(items.iter().map(as_floats).collect()),
-            // A shader's params and the width-model objects are kept verbatim (untyped bags).
-            Value::Object(map) => Value::Object(
-                map.iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            if k == "params" || k == "taper" {
-                                v.clone()
-                            } else {
-                                as_floats(v)
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    #[test]
-    fn stacks_round_trip_through_serde() {
-        let fills = json!([
-            {"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}},
-            {"id": "fill-1", "visible": false, "opacity": 0.5, "blendMode": "multiply",
-             "paint": {"type": "linear", "start": {"x": 0, "y": 0}, "end": {"x": 100, "y": 0},
-                       "stops": [{"offset": 0, "color": "#fff"}, {"offset": 1, "color": {"type": "variable", "variableId": "v"}}]}},
-            {"id": "fill-2", "paint": {"type": "image", "src": "a.png",
-             "placement": {"fit": "cover", "offset": {"x": 1, "y": 2}, "repeat": "no-repeat"},
-             "adjust": {"exposure": 0.2, "overlay": {"enabled": true, "color": "#000", "opacity": 0.3}}}},
-            {"id": "fill-3", "paint": {"type": "video", "src": "v.mp4", "posterSrc": "p.png",
-             "playback": {"loop": true, "rate": 2}, "placement": {}}},
-            {"id": "fill-4", "paint": {"type": "shader", "shaderId": "mesh", "params": {"a": 1}}},
-            {"id": "fill-5", "paint": {"type": "diamond", "center": {"x": 50, "y": 50}, "radiusX": 10,
-             "radiusY": 20, "rotation": 0, "stops": []}},
-            {"id": "fill-6", "paint": {"type": "conic", "center": {"x": 50, "y": 50}, "angle": 90, "stops": []}},
-            {"id": "fill-7", "paint": {"type": "freeform", "points": [
-                {"x": 10, "y": 20, "color": "#f00", "spread": 30},
-                {"x": 40, "y": 50, "color": {"type": "variable", "variableId": "v"}, "line": 1},
-                {"x": 80, "y": 50, "color": "#00f", "line": 1}]}}
-        ]);
-        let parsed = parse_fills(Some(&fills));
-        assert_eq!(parsed.len(), 8);
-        assert_eq!(crate::value::to_value(&parsed).unwrap(), as_floats(&fills));
-        let strokes = json!([{"id": "stroke-0", "paint": {"type": "solid", "color": "#000"}, "width": 2,
-            "cap": "round", "dash": [4, 2], "taper": {"startLength": 10}, "startArrow": "triangle",
-            "arrowScale": 1.5, "gradientMode": "along"}]);
-        let parsed = parse_strokes(Some(&strokes));
-        assert_eq!(crate::value::to_value(&parsed).unwrap(), as_floats(&strokes));
-        assert_eq!(parsed[0].gradient_mode(), StrokeGradientMode::Along);
-        let mut s = parsed[0].clone();
-        s.gradient_mode = Some("sideways".into());
-        assert_eq!(s.gradient_mode(), StrokeGradientMode::Within, "unknown modes read as within");
     }
 
     #[test]
@@ -1818,31 +1606,6 @@ mod tests {
         assert_eq!(n["strokes"][0]["paint"]["color"], "red");
     }
 
-
-    /// `matrix` takes precedence over x / y / scale / rotation when usable (`patterns.ts` `patternMatrix`); a
-    /// singular or non-finite one falls back to them; and a transform without one prints as before it existed.
-    #[test]
-    fn a_pattern_transform_matrix_takes_precedence() {
-        let t: PatternTransform = crate::value::from_value(json!({"x": 5, "scale": 3, "matrix": [2, 0, 0.5, 1, 7, -3]})).unwrap();
-        let a = t.affine();
-        assert_eq!((a.a, a.b, a.c, a.d, a.e, a.f), (2.0, 0.0, 0.5, 1.0, 7.0, -3.0));
-        // A reflection is usable (negative determinant).
-        let r: PatternTransform = crate::value::from_value(json!({"matrix": [-1, 0, 0, 1, 10, 0]})).unwrap();
-        assert_eq!(r.affine().a, -1.0);
-        // Singular: the plain fields.
-        let s: PatternTransform = crate::value::from_value(json!({"x": 5, "scale": 3, "matrix": [1, 2, 2, 4, 0, 0]})).unwrap();
-        let a = s.affine();
-        assert_eq!((a.a, a.d, a.e), (3.0, 3.0, 5.0));
-        assert!(s.usable_matrix().is_none());
-        // Round trip, and the Debug form of a matrix-free transform is unchanged.
-        let back = crate::value::to_value(t).unwrap();
-        assert_eq!(back["matrix"], json!([2.0, 0.0, 0.5, 1.0, 7.0, -3.0]));
-        let plain: PatternTransform = crate::value::from_value(json!({"scale": 2})).unwrap();
-        assert!(crate::value::to_value(plain).unwrap().get("matrix").is_none());
-        assert_eq!(format!("{plain:?}"), "PatternTransform { x: None, y: None, scale: Some(2.0), rotation: None }");
-        let paint: PatternPaint = crate::value::from_value(json!({"patternId": "p", "transform": {"matrix": [1, 0, -1, 1, 0, 0]}})).unwrap();
-        assert_eq!(paint.affine().c, -1.0);
-    }
 }
 
 #[cfg(test)]
@@ -1879,5 +1642,52 @@ mod gradient_options_tests {
             .unwrap();
             assert_eq!(c.gradient_options().shader_flags(), code, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+    fn as_floats(v: &Value) -> Value {
+        match v {
+            Value::Number(n) => json!(n.as_f64().unwrap()),
+            Value::Array(items) => Value::Array(items.iter().map(as_floats).collect()),
+            Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), as_floats(v))).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn stacks_round_trip_through_serde() {
+        let fills = json!([
+            {"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}},
+            {"id": "fill-1", "visible": false, "opacity": 0.5, "blendMode": "multiply",
+             "paint": {"type": "linear", "start": {"x": 0, "y": 0}, "end": {"x": 100, "y": 0},
+                       "stops": [{"offset": 0, "color": "#fff"}, {"offset": 1, "color": "#00f"}]}},
+            {"id": "fill-2", "paint": {"type": "image", "src": "a.png",
+             "placement": {"fit": "cover", "offset": {"x": 1, "y": 2}, "repeat": "no-repeat"},
+             "adjust": {"exposure": 0.2, "overlay": {"enabled": true, "color": "#000", "opacity": 0.3}}}},
+            {"id": "fill-3", "paint": {"type": "video", "src": "v.mp4", "posterSrc": "p.png",
+             "playback": {"loop": true, "rate": 2}, "placement": {}}},
+            {"id": "fill-5", "paint": {"type": "diamond", "center": {"x": 50, "y": 50}, "radiusX": 10,
+             "radiusY": 20, "rotation": 0, "stops": []}},
+            {"id": "fill-6", "paint": {"type": "conic", "center": {"x": 50, "y": 50}, "angle": 90, "stops": []}},
+            {"id": "fill-7", "paint": {"type": "freeform", "points": [
+                {"x": 10, "y": 20, "color": "#f00", "spread": 30},
+                {"x": 40, "y": 50, "color": "#00f", "line": 1},
+                {"x": 80, "y": 50, "color": "#00f", "line": 1}]}}
+        ]);
+        let parsed = parse_fills(Some(&fills));
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(crate::value::to_value(&parsed).unwrap(), as_floats(&fills));
+        let strokes = json!([{"id": "stroke-0", "paint": {"type": "solid", "color": "#000"}, "width": 2,
+            "cap": "round", "dash": [4, 2], "startArrow": "triangle",
+            "arrowScale": 1.5, "gradientMode": "along"}]);
+        let parsed = parse_strokes(Some(&strokes));
+        assert_eq!(crate::value::to_value(&parsed).unwrap(), as_floats(&strokes));
+        assert_eq!(parsed[0].gradient_mode(), StrokeGradientMode::Along);
+        let mut s = parsed[0].clone();
+        s.gradient_mode = Some("sideways".into());
+        assert_eq!(s.gradient_mode(), StrokeGradientMode::Within, "unknown modes read as within");
     }
 }

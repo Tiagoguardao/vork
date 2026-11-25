@@ -163,9 +163,7 @@ fn is_gradient(p: &Paint) -> bool {
 /// Interpolate one paint (see the module docs).
 pub fn lerp_paint(a: &Paint, b: &Paint, t: f64) -> Paint {
     match (a, b) {
-        (Paint::Solid(x), Paint::Solid(y)) => Paint::Solid(SolidPaint {
-            color: lerp_color(&x.color, &y.color, t),
-        }),
+        (Paint::Solid(x), Paint::Solid(y)) => Paint::Solid(SolidPaint::new(lerp_color(&x.color, &y.color, t))),
         (Paint::Solid(x), g) if is_gradient(g) => {
             lerp_paint(&with_stops(g, flat_stops(&x.color)), g, t)
         }

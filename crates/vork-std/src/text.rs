@@ -292,8 +292,7 @@ fn validate_options(o: &Options) -> Result<()> {
     );
     ensure!(
         !matches!(o.align_x.as_str(), "justify" | "flush"),
-        "std/text.align_x {} was removed; std/text does not wrap: write left, center or right, or use wrapped canvas text for justification; see vork help upgrade",
-        o.align_x
+        "{}", vork_scene::migration::message("std/text.align_x", &[("align_x", &o.align_x)])
     );
     ensure!(ALIGN_X.contains(&o.align_x.as_str()), "invalid align_x");
     ensure!(ALIGN_Y.contains(&o.align_y.as_str()), "invalid align_y");
@@ -516,8 +515,7 @@ fn geometry(o: Options, label: &str, bytes: &[u8]) -> Result<Value> {
     for ch in o.body.chars() {
         ensure!(ch == '\n' || !ch.is_control(), "unsupported text control character {ch:?}");
     }
-    let face = ttf_parser::Face::parse(bytes, 0)
-        .map_err(|error| anyhow::anyhow!("font {label}: not a TrueType or OpenType font ({error})"))?;
+    let face = moda::parse_face(label, bytes)?;
     for ch in o.body.chars().filter(|c| !c.is_whitespace()) {
         ensure!(face.glyph_index(ch).is_some_and(|g| g.0 != 0), "font has no glyph for {ch:?}");
     }

@@ -630,17 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn repeat_mode_encoding() {
-        assert_eq!(encode_pattern_repeat_mode(Some("repeat"), false), 0.0);
-        assert_eq!(encode_pattern_repeat_mode(Some("repeat-x"), false), 0.25);
-        assert_eq!(encode_pattern_repeat_mode(Some("repeat-y"), false), 0.5);
-        assert_eq!(encode_pattern_repeat_mode(Some("no-repeat"), false), 0.75);
-        assert_eq!(encode_pattern_repeat_mode(None, false), 0.0);
-        // Placeholder force-tiles even no-repeat.
-        assert_eq!(encode_pattern_repeat_mode(Some("no-repeat"), true), 0.0);
-    }
-
-    #[test]
     fn image_adjustments_pack_clamped_and_placeholders_drop_them() {
         let node = raw(json!({"id": "n", "type": "rectangle",
             "fills": [{"id": "fill-0", "paint": {"type": "image", "placement": {}, "adjust": {
@@ -923,4 +912,15 @@ mod tests {
             "distort": {"type": "matrix", "matrix": [1, 0, 0, 0, 1, 0, 1e-6, 0, 1]}}));
         assert!(node_distort(&lean).is_some());
     }
+    #[test]
+    fn repeat_mode_encoding() {
+        assert_eq!(encode_pattern_repeat_mode(Some("repeat"), false), 0.0);
+        assert_eq!(encode_pattern_repeat_mode(Some("repeat-x"), false), 0.25);
+        assert_eq!(encode_pattern_repeat_mode(Some("repeat-y"), false), 0.5);
+        assert_eq!(encode_pattern_repeat_mode(Some("no-repeat"), false), 0.75);
+        assert_eq!(encode_pattern_repeat_mode(None, false), 0.0);
+        // Placeholder force-tiles even no-repeat.
+        assert_eq!(encode_pattern_repeat_mode(Some("no-repeat"), true), 0.0);
+    }
+
 }

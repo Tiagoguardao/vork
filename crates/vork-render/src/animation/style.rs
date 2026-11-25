@@ -301,18 +301,13 @@ impl StyleValue {
             ),
             Self::Filter(f) => {
                 let mut s = Vec::new();
-                if let Some((xy, r, c)) = f.drop_shadow {
-                    s.push(format!(
-                        "drop-shadow({}px {}px {}px {})",
-                        xy[0],
-                        xy[1],
-                        r,
-                        color_css(c)
-                    ));
-                }
-                if let Some(r) = f.blur {
-                    s.push(format!("blur({r}px)"));
-                }
+                use crate::canvas_draw::{ColorFunction, FilterOp::*};
+                for op in &f.0 { s.push(match *op {
+                    Shadow(xy,r,c) => format!("drop-shadow({}px {}px {r}px {})", xy[0],xy[1],color_css(c)),
+                    Blur(r) => format!("blur({r}px)"),
+                    Color(ColorFunction::HueRotate, v) => format!("hue-rotate({v}deg)"),
+                    Color(fun, v) => format!("{}({v})",fun.name()),
+                }); }
                 json!(if s.is_empty() {
                     "none".into()
                 } else {
@@ -344,16 +339,7 @@ impl StyleValue {
                 a.len() != b.len() || !a.iter().zip(b).all(|(a, b)| a.0 == b.0)
             }
             (Self::Filter(a), Self::Filter(b)) => {
-                let kinds = |f: &crate::canvas_draw::Filter| {
-                    [
-                        f.drop_shadow.is_some().then_some(0),
-                        f.blur.is_some().then_some(1),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                };
-                !kinds(a).iter().zip(kinds(b)).all(|(a, b)| *a == b)
+                !a.0.iter().zip(&b.0).all(|(a,b)| a.same_kind(b))
             }
             (Self::Json(a), Self::Json(b)) if matches!(kind, I::Number | I::FontWeight) => {
                 !(a.is_number() && b.is_number())
@@ -397,32 +383,17 @@ impl StyleValue {
                 )
             }
             (Self::Filter(a), Self::Filter(b)) => {
-                let kinds = |f: &crate::canvas_draw::Filter| {
-                    [
-                        f.drop_shadow.is_some().then_some(0),
-                        f.blur.is_some().then_some(1),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                };
-                if !kinds(a).iter().zip(kinds(b)).all(|(a, b)| *a == b) {
-                    return discrete();
-                }
+                use crate::canvas_draw::FilterOp::*;
                 let mut out = crate::canvas_draw::Filter::default();
-                if a.blur.is_some() || b.blur.is_some() {
-                    out.blur = Some(mix(a.blur.unwrap_or(0.), b.blur.unwrap_or(0.)));
-                }
-                if a.drop_shadow.is_some() || b.drop_shadow.is_some() {
-                    let (a, b) = (
-                        a.drop_shadow.unwrap_or(([0.; 2], 0., [0.; 4])),
-                        b.drop_shadow.unwrap_or(([0.; 2], 0., [0.; 4])),
-                    );
-                    out.drop_shadow = Some((
-                        [mix(a.0[0], b.0[0]), mix(a.0[1], b.0[1])],
-                        mix(a.1, b.1),
-                        color_mix(a.2, b.2, t),
-                    ));
+                for i in 0..a.0.len().max(b.0.len()) {
+                    let left = a.0.get(i).copied().unwrap_or_else(|| b.0[i].identity());
+                    let right = b.0.get(i).copied().unwrap_or_else(|| left.identity());
+                    out.0.push(match (left,right) {
+                        (Blur(a), Blur(b)) => Blur(mix(a,b)),
+                        (Shadow(p,r,c), Shadow(q,s,d)) => Shadow([mix(p[0],q[0]),mix(p[1],q[1])],mix(r,s),color_mix(c,d,t)),
+                        (Color(f,a), Color(g,b)) if f == g => Color(f,mix(a,b)),
+                        _ => return discrete(),
+                    });
                 }
                 Self::Filter(out)
             }
@@ -481,26 +452,32 @@ impl StyleTrack {
         time: f32,
         upper: Option<usize>,
         exact: Option<&vork_time::exact::Germ>,
-    ) -> Arc<StyleValue> {
+    ) -> Result<Arc<StyleValue>> {
         let upper = upper.unwrap_or_else(|| self.times.partition_point(|t| *t <= time));
         let lo = upper.saturating_sub(1);
         if self.step || upper == 0 || upper >= self.times.len() {
-            return self.values[lo].clone();
+            return Ok(self.values[lo].clone());
         }
         if self.values[lo].discrete_with(&self.values[upper], self.kind) {
             if let (Some(clocks), Some(exact)) = (&self.clocks, exact) {
                 let midpoint = (clocks[lo].exact() + clocks[upper].exact())
                     / vork_time::exact::Rational::from_integer(2.into());
-                return self.values[if exact.compare_point(&midpoint).is_lt() {
+                return Ok(self.values[if exact.compare_point(&midpoint).is_lt() {
                     lo
                 } else {
                     upper
                 }]
-                .clone();
+                .clone());
             }
         }
         let t = (time - self.times[lo]) / (self.times[upper] - self.times[lo]);
-        Arc::new(self.values[lo].mix(&self.values[upper], t, self.kind))
+        // A path morph, for example, creates another command/coordinate table
+        // before the canvas can compare the sampled values. Only interpolate a
+        // fixed-size pair on a speculative renderer.
+        let fixed = |v: &StyleValue| matches!(v, StyleValue::Origin(_) | StyleValue::Paint(Paint::Color(_))
+            | StyleValue::Json(Value::Number(_) | Value::Bool(_) | Value::Null));
+        if !fixed(&self.values[lo]) || !fixed(&self.values[upper]) { crate::canvas_host_memory::require_serial_growth()?; }
+        Ok(Arc::new(self.values[lo].mix(&self.values[upper], t, self.kind)))
     }
 }
 
@@ -513,6 +490,19 @@ mod tests {
             .mix(&StyleValue::parse(kind, &b).unwrap(), t, kind)
             .json()
     }
+    #[test]
+    fn replica_refuses_variable_size_interpolation_before_building_it() {
+        let path = |x| Arc::new(StyleValue::Path(vec![('M', vec![0., 0.]), ('H', vec![x])]));
+        let track = StyleTrack {
+            times: vec![0., 2.], values: vec![path(1.), path(20.)], kind: I::Path, step: false, clocks: None,
+        };
+        crate::canvas_host_memory::with_workers(|| {
+            assert!(Arc::ptr_eq(&track.sample(0., Some(0), None).unwrap(), &track.values[0]));
+            assert!(track.sample(1., None, None).unwrap_err().is::<wgpu::optional_allocations::Refused>());
+        });
+        assert!(track.sample(1., None, None).is_ok());
+    }
+
     #[test]
     fn paths_keep_commands_and_interpolate_parameters() {
         let path = sample(
@@ -559,8 +549,8 @@ mod tests {
         let StyleValue::Filter(f) = a.mix(&b, 0.5, I::Filter) else {
             panic!()
         };
-        assert_eq!(f.blur, Some(2.));
-        assert_eq!(f.drop_shadow, Some(([4., 6.], 8., [0.5, 0., 0.5, 1.])));
+        assert_eq!(f.0[1], crate::canvas_draw::FilterOp::Blur(2.));
+        assert_eq!(f.0[0], crate::canvas_draw::FilterOp::Shadow([4., 6.], 8., [0.5, 0., 0.5, 1.]));
         let a = json!("blur(4px)");
         let b = json!("drop-shadow(0 0 2px red)");
         assert_eq!(sample(I::Filter, a.clone(), b.clone(), 0.49), a);
@@ -647,13 +637,13 @@ mod tests {
                     Some(1),
                     Some(&vork_time::exact::Germ::left(one.clone()))
                 )
-                .json(),
+                .unwrap().json(),
             json!("left")
         );
         assert_eq!(
             track
                 .sample(1., Some(1), Some(&vork_time::exact::Germ::point(one)))
-                .json(),
+                .unwrap().json(),
             json!("right")
         );
     }
@@ -669,13 +659,13 @@ mod tests {
             step: false,
             clocks: None,
         };
-        assert_eq!(track.sample(0.9, None, None).json(), json!("left"));
-        assert_eq!(track.sample(1., None, None).json(), json!("right"));
+        assert_eq!(track.sample(0.9, None, None).unwrap().json(), json!("left"));
+        assert_eq!(track.sample(1., None, None).unwrap().json(), json!("right"));
         let track = StyleTrack {
             step: true,
             ..track
         };
-        assert_eq!(track.sample(1.9, None, None).json(), json!("left"));
-        assert_eq!(track.sample(2., None, None).json(), json!("right"));
+        assert_eq!(track.sample(1.9, None, None).unwrap().json(), json!("left"));
+        assert_eq!(track.sample(2., None, None).unwrap().json(), json!("right"));
     }
 }

@@ -58,9 +58,6 @@ pub(crate) enum Kind { Deform, Compute, Displace }
 impl Kind {
     pub(crate) const DEFAULT: [Self;3] = [Self::from_scene(v2::GeometryStage::DEFAULT[0]),Self::from_scene(v2::GeometryStage::DEFAULT[1]),Self::from_scene(v2::GeometryStage::DEFAULT[2])];
     pub(crate) const fn from_scene(stage:v2::GeometryStage)->Self {match stage {v2::GeometryStage::Deform=>Self::Deform,v2::GeometryStage::Compute=>Self::Compute,v2::GeometryStage::Displace=>Self::Displace}}
-    pub(crate) fn deformation_before_compute(list: &[Self]) -> bool {
-        Self::before(list,Self::Deform,Self::Compute)
-    }
     pub(crate) fn before(list:&[Self],a:Self,b:Self) -> bool {
         list.iter().position(|kind|*kind==a).zip(list.iter().position(|kind|*kind==b))
             .is_some_and(|(deform,compute)|deform<compute)
@@ -84,6 +81,7 @@ trait Stage: Send + Sync {
     fn subdivision_morphs(&self) -> &[Option<wgpu::Buffer>] {
         &[]
     }
+    #[cfg(test)]
     fn displacements(&self) -> &[Option<displacement::Frame>] {
         &[]
     }
@@ -362,6 +360,7 @@ impl Stage for Displace {
     fn append_draw_inputs(&self,draw:usize,changes:&values::ChangeTracker,inputs:&mut Vec<u8>) {
         if let Some(frame)=self.0.get(draw).and_then(Option::as_ref) {frame.append_inputs(changes,inputs);}
     }
+    #[cfg(test)]
     fn displacements(&self) -> &[Option<displacement::Frame>] {
         &self.0
     }
@@ -453,6 +452,7 @@ impl Frame {
             .find(|morphs| !morphs.is_empty())
             .unwrap_or(&[])
     }
+    #[cfg(test)]
     pub(crate) fn displacements(&self) -> &[Option<displacement::Frame>] {
         self.stages
             .iter()

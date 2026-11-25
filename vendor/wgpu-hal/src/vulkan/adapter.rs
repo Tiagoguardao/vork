@@ -2404,6 +2404,7 @@ impl super::Adapter {
             .phd_capabilities
             .get_required_extensions(features)
             .iter()
+            .chain(super::fault::device_extensions().iter().filter(|_| super::fault::requested()))
             .partition::<Vec<&CStr>, _>(|&&extension| {
                 self.phd_capabilities.supports_extension(extension)
             });
@@ -2794,6 +2795,16 @@ impl super::Adapter {
             empty_descriptor_set_layout,
         });
 
+        unsafe {
+            super::fault::install(
+                &self.instance.entry,
+                &self.instance.raw,
+                &self.instance.extensions,
+                &shared.raw,
+                raw_queue,
+                enabled_extensions,
+            )
+        };
         let relay_semaphores = super::RelaySemaphores::new(&shared)?;
 
         let queue = super::Queue {
@@ -2866,6 +2877,7 @@ impl super::Adapter {
             .queue_priorities(&[1.0]);
         let mut family_infos = Vec::from([family_info]);
 
+        let mut fault_chain;
         let mut pre_info = vk::DeviceCreateInfo::default();
 
         if let Some(callback) = callback {
@@ -2890,6 +2902,10 @@ impl super::Adapter {
             .queue_create_infos(&family_infos)
             .enabled_extension_names(&str_pointers);
         let info = enabled_phd_features.add_to_device_create(pre_info);
+        fault_chain = unsafe {
+            super::fault::CreateChain::new(&self.instance.raw, self.raw, &enabled_extensions)
+        };
+        let info = fault_chain.add_to_device_create(info);
         let raw_device = {
             profiling::scope!("vkCreateDevice");
             unsafe {

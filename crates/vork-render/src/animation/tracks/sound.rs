@@ -25,6 +25,10 @@ pub(crate) struct SoundPlan {
     layers: Vec<SoundLayer>,
     /// The audible nodes a gain track keys, ascending.
     keyed: Vec<usize>,
+    gain_slots: Vec<Option<usize>>,
+    /// Scratch row for a layer whose weight is keyed.
+    weight_slots: Vec<Option<usize>>,
+    driven: usize,
     /// Every keyed existence in `nodes` reads the scene or its parent, so a block can span samples.
     spans: bool,
 }
@@ -39,6 +43,10 @@ pub(crate) struct SoundScratch {
     /// until then each sample is one exact evaluation and nothing else, as without blocks.
     refused_until: i64,
 }
+impl SoundScratch {
+    pub(crate) fn rate_bound(&self, owner: usize) -> Rational { self.motions[owner].rate() }
+}
+
 /// How a present node's local time moves until a block's horizon: toward lower or higher
 /// values, no faster than `bound` local seconds per scene second. Its value is a polynomial
 /// of at most `degree` in scene time and its germ's rate one of at most `rate_degree`, from
@@ -103,6 +111,7 @@ pub(crate) struct SoundClock {
     speed: Carried<f64>,
     /// Under a keyed speed: zero at the samples where a clock above stands for an instant.
     gate: Option<Progression>,
+    selected: Option<Vec<std::ops::Range<i64>>>,
 }
 impl SoundClock {
     /// Local seconds at output sample `sample` of the block.
@@ -118,7 +127,23 @@ impl SoundClock {
     /// Whether sound travels to the node at output sample `sample` of the block. Sound is
     /// absent at an instant where the node's clock or one above it has no speed, even where
     /// the node's own rate is not zero.
-    pub(crate) fn sounds(&self, sample: i64) -> bool { self.gate.as_ref().is_none_or(|gate| !gate.is_zero(sample - self.first)) }
+    pub(crate) fn sounds(&self, sample: i64) -> bool {
+        self.gate.as_ref().is_none_or(|gate| !gate.is_zero(sample - self.first)) &&
+            self.selected.as_ref().is_none_or(|runs| runs.get(runs.partition_point(|r| r.end <= sample))
+                .is_some_and(|r| r.start <= sample))
+    }
+
+    /// The first source frame if the entire block advances on the output sample grid.
+    pub(crate) fn aligned_start(&self) -> Option<i64> {
+        match (&self.line, &self.speed, &self.selected) {
+            (Carried::Along(line), Carried::One(1.), None) => line.unit_step_start(SAMPLE_RATE),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn windows(&self, whole: std::ops::Range<i64>) -> impl Iterator<Item = std::ops::Range<i64>> + '_ {
+        self.selected.is_none().then_some(whole).into_iter().chain(self.selected.iter().flatten().cloned())
+    }
 }
 /// A quantity along a block: the one value its evaluation read, which is all a one-sample
 /// block or a constant needs and exactly what an evaluation per sample reads; or the exact
@@ -148,6 +173,11 @@ struct Horizon<'a> {
     at: Option<Rational>,
 }
 impl Horizon<'_> {
+    fn end(&self, first: i64, last: i64) -> i64 {
+        self.at.as_ref().and_then(|at| i64::try_from((at * Rational::from_integer(SAMPLE_RATE.into()))
+            .ceil().to_integer()).ok()).unwrap_or(last).clamp(first + 1, last)
+    }
+
     /// `value`, moving at `rate` per scene second, reaches `threshold`. At or before `now` the
     /// exact evaluation has already decided it.
     fn reach(&mut self, value: &Rational, rate: &Rational, threshold: &Rational) {
@@ -158,6 +188,10 @@ impl Horizon<'_> {
 }
 
 impl Plan {
+    pub(crate) fn keys_image_time(&self, name: &str) -> bool {
+        self.layers.iter().flat_map(|l| &l.tracks).any(|t| matches!(&t.target, Some(v2::TrackTarget::ImageTime {image}) if image == name))
+    }
+
     /// The sound slice for `audible` nodes (ascending: the nodes with a file and their
     /// ancestors). `node` resolves a gain track's node name to its installed index.
     pub(crate) fn sound_plan(&self, audible: &[usize], node: impl Fn(&str) -> Result<usize>) -> Result<SoundPlan> {
@@ -194,9 +228,28 @@ impl Plan {
             }
             flat += layer.tracks.len();
         }
-        let mut needed = vec![false; self.clocks.len()];
         let mut stack = audible.to_vec();
         stack.extend(layers.iter().filter_map(|layer| self.layers[layer.layer].owner_node));
+        let (nodes, spans) = self.sound_nodes(stack);
+        let mut keyed: Vec<usize> = gains.into_iter().flatten().collect();
+        keyed.sort_unstable();
+        keyed.dedup();
+        let mut gain_slots = vec![None; self.clocks.len()];
+        for (slot, &node) in keyed.iter().enumerate() { gain_slots[node] = Some(slot); }
+        let mut weight_slots = vec![None; self.layers.len()];
+        let mut driven = 0;
+        for target in layers.iter().flat_map(|layer| &layer.tracks)
+            .filter_map(|track| self.track_at(track.flat).weight_target)
+        {
+            if weight_slots[target].is_none() {
+                weight_slots[target] = Some(driven);
+                driven += 1;
+            }
+        }
+        Ok(SoundPlan { nodes, layers, keyed, gain_slots, weight_slots, driven, spans })
+    }
+    fn sound_nodes(&self, mut stack: Vec<usize>) -> (Vec<usize>, bool) {
+        let mut needed = vec![false; self.clocks.len()];
         let mut spans = true;
         while let Some(node) = stack.pop() {
             if std::mem::replace(&mut needed[node], true) { continue; }
@@ -209,33 +262,32 @@ impl Plan {
             }
         }
         let nodes = (0..needed.len()).filter(|&node| needed[node]).collect();
-        let mut keyed: Vec<usize> = gains.into_iter().flatten().collect();
-        keyed.sort_unstable();
-        keyed.dedup();
-        Ok(SoundPlan { nodes, layers, keyed, spans })
+        (nodes, spans)
     }
+
+    pub(crate) fn sound_ancestors(&self, owner: usize) -> Vec<usize> {
+        self.sound_nodes(vec![owner]).0
+    }
+
+    pub(crate) fn sound_local(&self, owner: usize, nodes: &[usize], scene: &Germ, scratch: &mut SoundScratch) -> Result<Germ> {
+        self.sound_states(nodes, scene, &mut scratch.states, false)?;
+        scratch.states[owner].local.clone().context("sounding movie's composition has no clock")
+    }
+
     pub(crate) fn sound_scratch(&self) -> SoundScratch {
         SoundScratch { states: vec![State::absent(); self.clocks.len()], motions: vec![Motion::still(); self.clocks.len()], samples: self.samples(), refused_until: i64::MIN }
     }
 
-    /// The block that starts at output sample `first` and ends at or before `last`
-    /// (`first < last`). `voices` are the nodes whose clocks the mixer reads.
-    pub(crate) fn sound_block(&self, sound: &SoundPlan, voices: &[usize], first: i64, last: i64, scratch: &mut SoundScratch) -> Result<SoundBlock> {
-        let hz = Rational::from_integer(SAMPLE_RATE.into());
-        let now = Rational::new(first.into(), SAMPLE_RATE.into());
-        let scene = Germ::right(now.clone());
-        // Whether this block may span samples: then it needs every clock's motion and the
-        // horizon. A one-sample block needs neither: its evaluation is the whole answer.
-        let mut spans = sound.spans && first >= scratch.refused_until;
-        self.sound_states(&sound.nodes, &scene, &mut scratch.states, spans)?;
+    fn sound_horizon(&self, nodes: &[usize], scene: &Germ, scratch: &mut SoundScratch,
+        mut spans: bool, scene_motion: &Motion, horizon: &mut Horizon<'_>) -> Result<bool> {
+        self.sound_states(nodes, scene, &mut scratch.states, spans)?;
         let (states, motions) = (&scratch.states, &mut scratch.motions);
-        let mut horizon = Horizon { now: &now, at: None };
         // How each clock moves, parents first, and where its decisions can next change.
-        for &node in if spans { &sound.nodes[..] } else { &[] } {
+        for &node in if spans { nodes } else { &[] } {
             let spec = &self.clocks[node];
             // Under an absent parent nothing of this node is decided before the parent returns.
             let (parent, along) = match spec.parent {
-                None => (&scene, Motion::scene()),
+                None => (scene, scene_motion.clone()),
                 Some(parent) => match &states[parent].local {
                     Some(local) => (local, motions[parent].clone()),
                     None => { motions[node] = Motion::still(); continue }
@@ -245,7 +297,7 @@ impl Plan {
             match (&spec.active, spec.active_track) {
                 (_, Some(track)) => {
                     // A spanning plan keys existence from the scene or from the parent.
-                    let (owner, rate) = if self.layers[self.layer_of(track)].owner_node.is_none() { (&scene, one()) } else { (parent, rate.clone()) };
+                    let (owner, rate) = if self.layers[self.layer_of(track)].owner_node.is_none() { (scene, scene_motion.rate()) } else { (parent, rate.clone()) };
                     if let Some(keys) = &self.track_at(track).discrete_keys {
                         if let Some(key) = keys.next(owner, rate > zero()) { horizon.reach(owner.value(), &rate, key); }
                     }
@@ -289,6 +341,22 @@ impl Plan {
                 }
             };
         }
+        Ok(spans)
+    }
+
+    /// The block that starts at output sample `first` and ends at or before `last`
+    /// (`first < last`). `voices` are the nodes whose clocks the mixer reads.
+    pub(crate) fn sound_block<'a>(&self, sound: &SoundPlan, voices: &[usize], remaps: &[Option<(String, Option<vork_time::Clock>)>], paints: &crate::audio::PaintSelection, first: i64, last: i64, scratch: &mut SoundScratch, movie: impl Fn(usize) -> Option<&'a str>) -> Result<SoundBlock> {
+        let hz = Rational::from_integer(SAMPLE_RATE.into());
+        let now = Rational::new(first.into(), SAMPLE_RATE.into());
+        let scene = Germ::right(now.clone());
+        // Whether this block may span samples: then it needs every clock's motion and the
+        // horizon. A one-sample block needs neither: its evaluation is the whole answer.
+        let remapped = remaps.iter().any(Option::is_some);
+        let mut horizon = Horizon { now: &now, at: None };
+        let mut spans = self.sound_horizon(&sound.nodes, &scene, scratch,
+            !remapped && sound.spans && first >= scratch.refused_until, &Motion::scene(), &mut horizon)?;
+        let states = &scratch.states;
         let motions = &scratch.motions;
         let mut curved = Vec::new();
         let mut clocks = Vec::with_capacity(voices.len());
@@ -303,7 +371,7 @@ impl Plan {
                     // A straight clock is its germ: value and rate.
                     spans = spans && *local == Germ::point(local.value().clone()).add(&Germ::right(zero()).scale(&rate));
                     let line = if spans { Carried::Along(Progression::new(local.value().clone(), &rate / &hz)) } else { Carried::One(local.seconds()?) };
-                    Some(SoundClock { first, line, speed: Carried::One(Germ::point(rate).seconds()?), gate: None })
+                    Some(SoundClock { first, line, speed: Carried::One(Germ::point(rate).seconds()?), gate: None, selected: None })
                 }
                 // Under a keyed speed no clock above is held along the block, and each sample
                 // asks whether one stands at its instant.
@@ -320,7 +388,7 @@ impl Plan {
                     }
                     let gate = self.sound_gate(&chain, states)?;
                     curved.push(Curved::Voice { index, node: voice, chain, degree });
-                    Some(SoundClock { first, line: Carried::One(local.seconds()?), speed: Carried::One(Germ::point(local.rate()).seconds()?), gate: Some(Progression::through(&[gate])) })
+                    Some(SoundClock { first, line: Carried::One(local.seconds()?), speed: Carried::One(Germ::point(local.rate()).seconds()?), gate: Some(Progression::through(&[gate])), selected: None })
                 }
                 _ => None,
             };
@@ -362,11 +430,7 @@ impl Plan {
             layers.push(BlockLayer { layer: wanted.layer, owner, tracks });
         }
         // A decision that changes at instant `at` changes for the first sample at or after it.
-        let mut end = match horizon.at {
-            _ if !spans => first + 1,
-            Some(at) => i64::try_from((at * &hz).ceil().to_integer()).map_or(last, |end| end.clamp(first + 1, last)),
-            None => last,
-        };
+        let mut end = if spans { horizon.end(first, last) } else { first + 1 };
         // A curved quantity of degree d is the polynomial through its d + 1 first values in the
         // block. Carrying it pays only while reading it is cheaper than evaluating the clock:
         // - finding it takes those evaluations and about d * d exact operations, and saves one
@@ -437,6 +501,24 @@ impl Plan {
                 end = first + 1;
             }
         }
+        if remapped {
+            self.sample_where_request(scene.numeric()?, Some(&vork_time::Request::Exact(scene.clone())), &mut scratch.samples,
+                |track| matches!(track.target, Some(v2::TrackTarget::ImageTime {..})))?;
+            for (clock, remap) in clocks.iter_mut().zip(remaps) {
+                if let (true, Some((name, time))) = (clock.is_some(), remap) {
+                    let local = self.footage_time(&scratch.samples, &scene, name, time.as_ref())?
+                        .context("present sound has no picture clock")?;
+                    *clock = if local.rate() == zero() { None } else {
+                        Some(SoundClock { first, line: Carried::One(local.seconds()?), speed: Carried::One(Germ::point(local.rate()).seconds()?), gate: None, selected: None })
+                    };
+                }
+            }
+        }
+        for (voice, clock) in clocks.iter_mut().enumerate() {
+            if let (Some(clock), Some(movie)) = (clock, movie(voice)) {
+                clock.selected = paints.windows(voice, movie, self, first, end, scratch)?;
+            }
+        }
         Ok(SoundBlock { first, end, clocks, layers })
     }
     /// The product of the raw rates of the clocks in `chain`: zero exactly where `clock_state`
@@ -455,33 +537,115 @@ impl SoundBlock {
     pub(crate) fn end(&self) -> i64 { self.end }
     /// The clock of `voices[voice]` while it sounds: `None` while it is absent, held or standing.
     pub(crate) fn clock(&self, voice: usize) -> Option<&SoundClock> { self.clocks[voice].as_ref() }
-    /// Node gains at output sample `sample` of the block: every keyed gain blended over `base`,
-    /// layer by layer, each track sampled as a picture samples it. `scratch` carries each
-    /// track's last value from sample to sample, as a picture's samples do.
-    pub(crate) fn gains(&self, plan: &Plan, sound: &SoundPlan, sample: i64, scratch: &mut SoundScratch, base: &[f32], gains: &mut [f32]) -> Result<()> {
-        if self.layers.is_empty() { return Ok(()); }
-        let samples = &mut scratch.samples;
-        let time = (sample as f64 / SAMPLE_RATE as f64) as f32;
-        plan.start_sample(samples, self.layers.iter().map(|block| block.layer));
-        for block in &self.layers {
-            let owner_local = match &block.owner {
-                Some(Carried::One(local)) => Some(*local),
-                Some(Carried::Along(line)) => Some(line.numeric(sample - self.first)?),
-                None => None,
-            };
-            // The block decided each track's presence and key interval; the layer does the rest.
-            plan.sample_layer(block.layer, plan.layer_starts[block.layer], time, owner_local, block.tracks.iter().map(|track| (track.flat, track)),
-                |_, _, _, track| Ok((!track.absent).then(|| TrackRead { upper: track.upper, exact_local: None })), samples, None)?;
-        }
-        for &node in &sound.keyed { gains[node] = base[node]; }
-        for block in &self.layers {
-            let additive = matches!(plan.layers[block.layer].source.blend, v2::Blend::Add);
-            for track in &block.tracks {
-                if let (Some(node), Sample::Numeric(value)) = (track.gain, &samples.values[track.flat]) {
-                    blend(std::slice::from_mut(&mut gains[node]), value, samples.weights[track.flat], additive, Combine::Add);
+}
+
+mod gain;
+pub(crate) use gain::{Gain, GainTile};
+
+/// The picture's content tracks for one item, the weights that drive them, and
+/// the clocks those reads depend on. Each item advances on its own horizon.
+pub(crate) struct BindingPlan {
+    layers: Vec<(usize, Vec<(usize, bool)>)>,
+    nodes: Vec<usize>,
+    spans: bool,
+}
+
+impl BindingPlan {
+    pub(crate) fn is_empty(&self) -> bool { self.layers.is_empty() }
+}
+
+impl Plan {
+    pub(crate) fn binding_plan(&self, item: usize, tracks: impl Iterator<Item = u32>) -> BindingPlan {
+        let mut selected: std::collections::BTreeSet<_> = tracks.map(|i| i as usize).collect();
+        let mut wanted: std::collections::BTreeSet<_> = selected.iter().map(|&i| self.layer_of(i)).collect();
+        // Weight controllers precede the layers they drive in evaluation order.
+        for (i, layer) in self.layers.iter().enumerate().rev() {
+            for (offset, track) in layer.tracks.iter().enumerate() {
+                if track.weight_target.is_some_and(|target| wanted.contains(&target)) {
+                    selected.insert(self.layer_starts[i] + offset);
+                    wanted.insert(i);
                 }
             }
         }
-        Ok(())
+        let mut nodes = vec![item];
+        let layers = wanted.into_iter().map(|index| {
+            let layer = &self.layers[index];
+            nodes.extend(layer.owner_node);
+            let start = self.layer_starts[index];
+            let tracks = selected.range(start..start + layer.tracks.len()).map(|&flat| {
+                nodes.extend(self.subjects[flat]);
+                let constant = match &self.track_at(flat).channel {
+                    Channel::Numeric(c) => c.times.len() == 1
+                        || (c.interpolation == Interpolation::Step && c.values.chunks_exact(c.width).all(|v| v == &c.values[..c.width]))
+                        || (c.interpolation == Interpolation::Linear && c.values.iter().all(|&v| v == 0.)),
+                    Channel::Style(s) => s.values.windows(2).all(|p| p[0] == p[1]),
+                    Channel::Discrete { values, .. } => values.windows(2).all(|p| p[0] == p[1]),
+                };
+                (flat, constant)
+            }).collect();
+            (index, tracks)
+        }).collect();
+        let (nodes, spans) = self.sound_nodes(nodes);
+        BindingPlan { layers, nodes, spans }
+    }
+
+    pub(crate) fn sample_binding(&self, binding: &BindingPlan, scene: &Germ, first: i64, last: i64,
+        scope_rate: Option<&Rational>, scratch: &mut SoundScratch, samples: &mut Samples) -> Result<i64> {
+        self.start_sample(samples, binding.layers.iter().map(|(layer, _)| *layer));
+        if binding.is_empty() { return Ok(last); }
+        let now = Rational::new(first.into(), SAMPLE_RATE.into());
+        let mut horizon = Horizon { now: &now, at: None };
+        // An enclosing sound block bounds the composition clock until its own next decision.
+        let motion = scope_rate.map_or_else(Motion::scene, |rate| Motion {
+            falling: rate < &zero(), bound: if rate < &zero() { -rate } else { rate.clone() },
+            ..Motion::scene()
+        });
+        let mut spans = self.sound_horizon(&binding.nodes, scene, scratch, last > first + 1 && binding.spans, &motion, &mut horizon)?;
+        let time = scene.numeric()?;
+        for (index, tracks) in &binding.layers {
+            let layer = &self.layers[*index];
+            let owner = match layer.owner_node {
+                None => Some(scene),
+                Some(node) => scratch.states[node].local.as_ref(),
+            };
+            let local = owner.map(|t| layer.exact_local(t)).transpose()?;
+            let owner_local = local.as_ref().map(Germ::numeric).transpose()?;
+            let rate = layer.owner_node.map_or_else(|| motion.rate(), |node| scratch.motions[node].rate()) * ieee(layer.source.speed)?;
+            if let (Some(local), Some((a,b))) = (&local, layer.loop_span()) {
+                horizon.reach(local.value(), &rate, a);
+                horizon.reach(local.value(), &rate, b);
+            }
+            self.sample_layer(*index, self.layer_starts[*index], time, owner_local, tracks.iter().copied(),
+                |_, flat, track, constant| {
+                    if self.subjects[flat].is_some_and(|node| scratch.states[node].local.is_none()) { return Ok(None); }
+                    let local = local.as_ref().expect("a sampled layer has a clock");
+                    let upper = track.discrete_keys.as_ref().map(|keys| keys.upper(local));
+                    if spans && rate != zero() && !constant {
+                        if let Some(keys) = &track.discrete_keys {
+                            if let Some(next) = keys.next(local, rate > zero()) { horizon.reach(local.value(), &rate, next); }
+                            let i = upper.unwrap();
+                            if let Channel::Style(style) = &track.channel
+                                && !track.channel.constant_at(i) && style.values[i-1] != style.values[i]
+                            {
+                                if let Some(times) = &style.clocks
+                                    && style.values[i-1].discrete_with(&style.values[i], style.kind)
+                                {
+                                    let middle = (times[i-1].exact() + times[i].exact()) / Rational::from_integer(2.into());
+                                    horizon.reach(local.value(), &rate, &middle);
+                                } else { spans = false; }
+                            }
+                        } else {
+                            // Numeric interpolation uses the writer's f32 clock. After its
+                            // final key in the travel direction it holds until a clock decision.
+                            let t = layer.looped(if layer.owner_node.is_some() { owner_local.unwrap() }
+                                else { layer.source.offset + time * layer.source.speed });
+                            let times = track.channel.times();
+                            spans = !layer.source.looping && if rate > zero() { t >= *times.last().unwrap() } else { t <= times[0] };
+                        }
+                    }
+                    Ok(Some(TrackRead { upper, exact_local: Some(local.clone()) }))
+                }, samples)?;
+        }
+        Ok(if spans { horizon.end(first, last) } else { first + 1 })
     }
 }

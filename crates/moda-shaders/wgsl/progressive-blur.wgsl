@@ -38,7 +38,7 @@ fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 }
 
 // The blur radius at `p` (texture px).
-fn radiusAt(p: vec2<f32>) -> f32 {
+fn radiusAt(p: vec2<f32>, blur: ProgressiveBlurUniforms) -> f32 {
   let d = blur.line.zw - blur.line.xy;
   let len2 = dot(d, d);
   var t = 1.0;
@@ -48,12 +48,11 @@ fn radiusAt(p: vec2<f32>) -> f32 {
   return max(mix(blur.radii.x, blur.radii.y, t), 0.0);
 }
 
-@fragment
-fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs(frag: vec4<f32>, blur: ProgressiveBlurUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>) -> vec4<f32> {
   let size = blur.params.zw;
   let p = frag.xy;
   let uv = p / size;
-  let sigma = radiusAt(p) / 3.0;
+  let sigma = radiusAt(p, blur) / 3.0;
   if (sigma < 0.2) {
     return textureSampleLevel(inputTexture, inputSampler, uv, 0.0);
   }
@@ -75,4 +74,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     wsum += w;
   }
   return acc / wsum;
+}
+
+@fragment
+fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs(frag, blur, inputSampler, inputTexture);
 }

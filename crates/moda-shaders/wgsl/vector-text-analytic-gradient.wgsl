@@ -27,7 +27,7 @@ fn vectorWarpLocal(local: vec2<f32>) -> vec3<f32> {
   let p = vec3<f32>(local, 1.0);
   return vec3<f32>(dot(draw.distort0.xyz, p), dot(draw.distort1.xyz, p), dot(draw.distort2.xyz, p));
 }
-@group(0) @binding(0) var<uniform> frame: mat4x4<f32>;
+// #include "rect-clip.wgsl"
 @group(0) @binding(1) var<uniform> draw: DrawUniforms;
 // Quadratic outline segments: 3 control points per curve, em units (y-down, pen origin).
 @group(0) @binding(2) var<storage, read> curvePoints: array<vec2<f32>>;
@@ -35,10 +35,7 @@ fn vectorWarpLocal(local: vec2<f32>) -> vec3<f32> {
 
 struct VSOut {
   @builtin(position) pos: vec4<f32>,
-  // True world position: affine in screen space, so linear (non-perspective)
-  // interpolation is exact on warped quads; em/local are affine in LOCAL
-  // space and need the default perspective-correct interpolation.
-  @location(0) @interpolate(linear) world: vec2<f32>,
+  @location(0) @interpolate(flat) clip: vec4<f32>,
   @location(1) em: vec2<f32>,
   @location(2) @interpolate(flat) curveRange: vec2<u32>, // firstCurve, curveCount
   @location(3) local: vec2<f32>,
@@ -46,22 +43,7 @@ struct VSOut {
 };
 
 
-fn kineticGlyphLocal(
-  pen: vec2<f32>, em: vec2<f32>, emBox: vec4<f32>, fontSizePx: f32,
-  glyphLin: vec4<f32>, glyphOff: vec2<f32>,
-) -> vec2<f32> {
-  let baseLocal = pen + em * fontSizePx;
-  if (glyphLin.x == 1.0 && glyphLin.y == 0.0 && glyphLin.z == 0.0 && glyphLin.w == 1.0 &&
-      glyphOff.x == 0.0 && glyphOff.y == 0.0) {
-    return baseLocal;
-  }
-  let center = pen + (emBox.xy + emBox.zw) * 0.5 * fontSizePx;
-  let rel = baseLocal - center;
-  return vec2<f32>(
-    glyphLin.x * rel.x + glyphLin.y * rel.y + glyphOff.x,
-    glyphLin.z * rel.x + glyphLin.w * rel.y + glyphOff.y,
-  ) + center;
-}
+// #include "vector-text-quad.wgsl"
 
 @vertex fn vs(
   @location(0) corner: vec2<f32>,      // unit quad corner (0..1)
@@ -72,18 +54,17 @@ fn kineticGlyphLocal(
   @location(5) glyphLin: vec4<f32>,    // KineticText per-glyph 2×2 [a,c,b,d]
   @location(6) glyphOff: vec2<f32>,    // KineticText per-glyph px offset
   @location(7) glyphOpacity: f32,      // KineticText per-glyph opacity
+  @location(8) localAaPx: f32,
 ) -> VSOut {
-  let em = mix(emBox.xy, emBox.zw, corner);
-  // KineticText: per-glyph transform about the glyph em-box
-  // center; identity instances fast-path to the original math (byte-exact static).
-  let local = kineticGlyphLocal(pen, em, emBox, fontSizePx, glyphLin, glyphOff);
+  let vertex = glyphVertex(corner, pen, emBox, fontSizePx, glyphLin, glyphOff, localAaPx);
+  let local = vertex.local;
   let h = vectorWarpLocal(local);
   let world = draw.model * vec4<f32>(h.xy, 0.0, h.z);
   var o: VSOut;
-  o.pos = frame * world;
+  o.pos = frameUniforms.viewProjection * world;
   o.pos.z = draw.params.x * h.z; // hardware divide restores params.x
-  o.world = world.xy / h.z;
-  o.em = em;
+  o.clip = projectRectClip(draw.pageClip);
+  o.em = vertex.em;
   o.curveRange = curveRange;
   o.local = local;
   o.glyphOpacity = glyphOpacity;
@@ -177,9 +158,7 @@ fn vectorGradientFillColor(localPos: vec2<f32>, fallback: vec4<f32>) -> vec4<f32
   let footprint = max(fwidth(in.em), vec2<f32>(1e-6));
   let invDiameter = 1.0 / footprint;
 
-  let clip = draw.pageClip;
-  if (in.world.x < clip.x || in.world.x > clip.x + clip.z ||
-      in.world.y < clip.y || in.world.y > clip.y + clip.w) {
+  if (outsideRectClip(in.pos.xy, in.clip)) {
     discard;
   }
 

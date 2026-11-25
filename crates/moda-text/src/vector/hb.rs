@@ -450,26 +450,6 @@ mod tests {
         assert_eq!(both[1], both[0]);
     }
 
-    /// F7.3: `ss01` swaps Montserrat's two-storey a for the single-storey
-    /// one; `frac` turns "1/2" into numerator, fraction slash and denominator
-    /// glyphs (none of them the cmap's own).
-    #[test]
-    #[ignore = "needs unported Moda fixture montserrat/Montserrat-Regular.ttf"]
-    fn ss01_and_frac_substitute_glyphs() {
-        let (font, hb) = load_from(&crate::test_fixtures::oracle_fonts_root().join("montserrat/Montserrat-Regular.ttf"));
-        let a = font.char_to_glyph_index('a');
-        let ss01 = gids(&shape_features_hb(&hb, &font, "a", &[feat("ss01", 1)]).unwrap());
-        assert_ne!(ss01, vec![a]);
-        let cmap: Vec<u32> = "1/2".chars().map(|c| font.char_to_glyph_index(c)).collect();
-        let plain = gids(&shape_features_hb(&hb, &font, "1/2", &[]).unwrap());
-        assert_eq!(plain, cmap);
-        let frac = gids(&shape_features_hb(&hb, &font, "1/2", &[feat("frac", 1)]).unwrap());
-        assert!(
-            frac.iter().all(|g| !cmap.contains(g)),
-            "frac must replace every glyph: {frac:?} vs {cmap:?}"
-        );
-    }
-
     /// UAX #9 with the LTR base level (one Chromium `fillText` of the same
     /// string): RTL content forms a level-1 run; mixed strings keep their
     /// LTR anchors in place; neutrals between same-direction RTL words join

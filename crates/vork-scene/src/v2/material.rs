@@ -2,7 +2,7 @@ use super::*;
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Image {
-    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "image.file", "x-help" = "file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C"))]
+    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "image.file", "x-help" = "file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv webm or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C"))]
     pub file: Option<String>,
     /// Seconds into media; omitted follows scene time. EXR sequences honor
     /// framesPerSecond metadata; other sequences use render.fps.
@@ -498,12 +498,3 @@ mod image_tokens {
 }
 
 fn material_double_sided() -> bool { true }
-
-#[cfg(test)]
-mod retired_medium_bound_tests {
-    #[test]
-    fn authored_medium_majorant_is_unknown() {
-        let error=serde_json::from_value::<super::Material>(serde_json::json!({"medium_majorant":1.})).unwrap_err();
-        assert!(error.to_string().contains("unknown field `medium_majorant`"));
-    }
-}

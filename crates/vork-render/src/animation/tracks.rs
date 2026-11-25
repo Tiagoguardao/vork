@@ -7,8 +7,8 @@ mod weights;
 mod clocks;
 mod sound;
 use clocks::ClockSpec;
-pub(crate) use clocks::{ClockNode, FootageClock};
-pub(crate) use sound::SoundPlan;
+pub(crate) use clocks::ClockNode;
+pub(crate) use sound::{BindingPlan, Gain, GainTile, SoundClock, SoundPlan, SoundScratch};
 use vork_time::exact::Germ;
 
 /// A clock-valued track: its keys are exact seconds or rates, not IEEE numbers.
@@ -81,11 +81,7 @@ impl Curve {
         let a = upper.saturating_sub(1);
         let b = upper.min(self.times.len() - 1);
         let dt = self.times[b] - self.times[a];
-        let u = if dt > 0. {
-            ((time - self.times[a]) / dt).clamp(0., 1.)
-        } else {
-            0.
-        };
+        let u = key_fraction(time, self.times[a], dt);
         let cubic = self.interpolation == Interpolation::Cubic;
         let stride = if self.euler { 3 } else { self.width };
         let value = |key: usize, part: usize, k: usize| {
@@ -99,7 +95,7 @@ impl Curve {
             } else if self.interpolation == Interpolation::Step {
                 value(a, 0, k)
             } else {
-                value(a, 0, k) * (1. - u) + value(b, 0, k) * u
+                linear_key(value(a, 0, k), value(b, 0, k), u)
             };
             let euler = v2::Rotation::Euler { euler: [angle(0), angle(1), angle(2)] };
             out.copy_from_slice(&euler.quaternion());
@@ -122,7 +118,7 @@ impl Curve {
             } else if self.interpolation == Interpolation::Step {
                 value(a, 0, k)
             } else {
-                value(a, 0, k) * (1. - u) + value(b, 0, k) * u
+                linear_key(value(a, 0, k), value(b, 0, k), u)
             };
             changed |= COMPARE && out.to_bits() != next.to_bits();
             *out = next;
@@ -235,6 +231,26 @@ fn components(value: &serde_json::Value) -> Result<Vec<f32>> {
     Ok(values.into_iter().map(|v| v as f32).collect())
 }
 
+fn key_fraction(time: f32, start: f32, duration: f32) -> f32 {
+    if duration > 0. {
+        ((time - start) / duration).clamp(0., 1.)
+    } else {
+        0.
+    }
+}
+
+fn linear_key(a: f32, b: f32, u: f32) -> f32 {
+    a * (1. - u) + b * u
+}
+
+fn blend_scalar(base: f32, sample: f32, weight: f32, additive: bool) -> f32 {
+    if additive {
+        base + weight * sample
+    } else {
+        base + weight * (sample - base)
+    }
+}
+
 /// How an additive layer combines with the value below it (Blender NLA Combine).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Combine {
@@ -261,9 +277,8 @@ pub(crate) fn blend(base: &mut [f32], sample: &[f32], weight: f32, additive: boo
     }
     for (base, sample) in base.iter_mut().zip(sample) {
         *base = match (additive, kind) {
-            (false, _) => *base + weight * (sample - *base),
             (true, Combine::Multiply) => *base * sample.signum() * sample.abs().powf(weight),
-            (true, _) => *base + weight * sample,
+            _ => blend_scalar(*base, *sample, weight, additive),
         };
     }
 }
@@ -502,15 +517,8 @@ struct AssetBindings {
     transforms: Vec<(usize, AssetTarget, bool)>,
     visibility: Vec<(usize, usize)>,
 }
-struct LiveValues {
-    generation: u64,
-    values: std::collections::BTreeMap<usize, Vec<f32>>,
-}
 #[derive(Clone, Default)]
 pub(crate) struct Plan {
-    // Absent in offline plans. Clones retained by imported animation share the
-    // publication, while each frame still samples into its own storage.
-    live: std::sync::Arc<std::sync::OnceLock<std::sync::RwLock<LiveValues>>>,
     pub layers: Vec<CompiledLayer>,
     reset_bindings: Vec<NodeBinding>,
     asset_bindings: Vec<AssetBindings>,
@@ -536,41 +544,6 @@ pub(crate) struct Plan {
     source_lengths: std::collections::BTreeMap<Vec<usize>, vork_time::exact::Rational>,
 }
 impl Plan {
-    /// Resolve host inputs after all imported channels and material bindings
-    /// have finalized. Targets were declared as varying before installation.
-    pub(crate) fn bind_live(&self, targets: &[v2::TrackTarget], initial: &[Vec<f32>]) -> Result<Vec<usize>> {
-        let mut indices = Vec::new();
-        for target in targets {
-            let matching: Vec<_> = self.layers.iter().flat_map(|l| &l.tracks).enumerate()
-                .filter(|(_, track)| track.target.as_ref() == Some(target)).collect();
-            ensure!(matching.len() == 1, "live input must have exactly one prepared binding; remove other tracks for {target:?}");
-            let (index, track) = matching[0];
-            ensure!(matches!(track.channel, Channel::Numeric(_)), "live input must be numeric: {target:?}");
-            indices.push(index);
-        }
-        self.live.set(std::sync::RwLock::new(LiveValues {
-            generation: 0,
-            values: indices.iter().copied().zip(initial.iter().cloned()).collect(),
-        }))
-            .map_err(|_| anyhow::anyhow!("live inputs already bound"))?;
-        Ok(indices)
-    }
-
-    pub(crate) fn publish_live<'a>(&self, updates: impl Iterator<Item = (usize, &'a [f32])>) {
-        let mut values = self.live.get().expect("prepared live inputs").write().expect("live values lock poisoned");
-        let mut changed = false;
-        for (index, value) in updates {
-            values.values.get_mut(&index).expect("prepared live binding").copy_from_slice(value);
-            changed = true;
-        }
-        if changed { values.generation += 1; }
-    }
-
-    /// Time alone does not identify a pose when the host can publish values.
-    pub(crate) fn live_generation(&self) -> u64 {
-        self.live.get().map_or(0, |values| values.read().expect("live values lock poisoned").generation)
-    }
-
     #[cfg(test)]
     pub fn compile(scene: &v2::Scene, base: &std::path::Path) -> Result<Self> {
         Self::compile_with_buffers(scene, base, None)
@@ -747,7 +720,7 @@ impl Plan {
                     clock_endpoints.extend([times.first().unwrap().clone(),times.last().unwrap().clone()]);
                 }
                 let time_curve = if matches!(target, TrackTarget::ImageTime {..}) || target.is_speed() {
-                    let Channel::Numeric(curve) = &channel else { anyhow::bail!("image time needs a scalar track") };
+                    let Channel::Numeric(curve) = &channel else { anyhow::bail!("{} needs a numeric scalar track", track.path.join(".")) };
                     Some(std::sync::Arc::new(exact::DeferredTimeCurve::new(track,std::sync::Arc::new(curve.clone()))))
                 } else { None };
                 let discrete_keys = (!matches!(target, TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) && !target.is_speed() && match &channel {
@@ -810,7 +783,6 @@ impl Plan {
         let mut layers = layers;
         Self::gather_keys(&mut layers);
         Ok(Self {
-            live: Default::default(),
             layers,
             camera_tracks,
             discrete_tracks,
@@ -1282,7 +1254,6 @@ impl Plan {
         samples: &mut Samples,
         wanted: impl Fn(&PropertyTrack) -> bool,
     ) -> Result<()> {
-        let live = self.live.get().map(|values| values.read().expect("live values lock poisoned"));
         for (value, binding) in samples
             .material_values
             .iter_mut()
@@ -1324,7 +1295,7 @@ impl Plan {
                 // Only a style channel reads the exact instant itself.
                 let exact_local = if matches!(track.channel, Channel::Style(_)) { exact_local.clone() } else { None };
                 Ok(Some(TrackRead { upper, exact_local }))
-            }, samples, live.as_deref())?;
+            }, samples)?;
             index += count;
         }
         Ok(())
@@ -1352,7 +1323,6 @@ impl Plan {
         tracks: impl IntoIterator<Item = (usize, T)>,
         mut read: impl FnMut(&Samples, usize, &PropertyTrack, T) -> Result<Option<TrackRead>>,
         samples: &mut Samples,
-        live: Option<&LiveValues>,
     ) -> Result<()> {
         let layer = &self.layers[layer_index];
         let weight = samples.layer_weights[layer_index];
@@ -1368,7 +1338,7 @@ impl Plan {
                 _ => None,
             };
             match (local, read) {
-                (Some(local), Some(read)) => self.sample_track(index, track, local, read.upper, read.exact_local.as_ref(), weight, additive, samples, live),
+                (Some(local), Some(read)) => self.sample_track(index, track, local, read.upper, read.exact_local.as_ref(), weight, additive, samples)?,
                 _ => {
                     // A track that is no longer consumed changed: its weight went to zero.
                     if samples.weights[index].to_bits() != 0f32.to_bits() {
@@ -1400,13 +1370,12 @@ impl Plan {
         weight: f32,
         additive: bool,
         samples: &mut Samples,
-        live: Option<&LiveValues>,
-    ) {
+    ) -> Result<()> {
         let mut changed = samples.weights[index].to_bits() != weight.to_bits();
         samples.weights[index] = weight;
         if weight == 0. {
             if changed { if let Some(named) = &mut samples.changed { named.push(index as u32); } }
-            return;
+            return Ok(());
         }
         // An image's time and a clock's speed are read from their curves by the clocks, and a camera cut from
         // its exact keys: no value is written here for them.
@@ -1415,16 +1384,7 @@ impl Plan {
             Channel::Discrete { .. } => track.camera_keys.is_none(),
             Channel::Style(_) => true,
         };
-        if let Some(value) = live.and_then(|values| values.values.get(&index)) {
-            // A published live value stands in for the track's keys.
-            let Sample::Numeric(sample) = &mut samples.values[index] else { unreachable!() };
-            if sample.len() != value.len() || sample.iter().zip(value).any(|(a, b)| a.to_bits() != b.to_bits()) {
-                sample.clear();
-                sample.extend_from_slice(value);
-                changed = true;
-            }
-            samples.held[index] = Held::No;
-        } else if keyed {
+        if keyed {
             // The value stands when the weight does and the time is still where the keys said the value is
             // constant.
             let stands = !changed && match (samples.held[index], upper) {
@@ -1438,7 +1398,7 @@ impl Plan {
                 let upper = upper.unwrap_or_else(|| times.partition_point(|t| *t <= local));
                 match &track.channel {
                     Channel::Style(style) => {
-                        let value = style.sample(local, Some(upper), exact_local);
+                        let value = style.sample(local, Some(upper), exact_local)?;
                         let Sample::Style(held) = &mut samples.values[index] else { unreachable!() };
                         if samples.changed.is_some() && !std::sync::Arc::ptr_eq(held, &value) && **held != *value { changed = true; }
                         *held = value;
@@ -1506,6 +1466,7 @@ impl Plan {
             }
         }
         if changed { if let Some(named) = &mut samples.changed { named.push(index as u32); } }
+        Ok(())
     }
     pub fn apply_asset_visibility(&self, asset: usize, samples: &Samples, visibility: &mut [v2::Visibility]) {
         let Some(bindings) = self.asset_bindings.get(asset) else { return; };
@@ -1629,54 +1590,8 @@ impl Plan {
             }
         }
     }
-    fn apply_filtered(
-        &self,
-        samples: &Samples,
-        wanted: impl Fn(&PropertyTrack) -> bool,
-        mut apply: impl FnMut(&PropertyTrack, &Sample, f32, bool),
-    ) {
-        let mut index = 0;
-        for layer in &self.layers {
-            let additive = matches!(layer.source.blend, v2::Blend::Add);
-            for track in &layer.tracks {
-                if track.weight_target.is_none() && samples.weights[index] != 0. && wanted(track) {
-                    apply(
-                        track,
-                        &samples.values[index],
-                        samples.weights[index],
-                        additive,
-                    );
-                }
-                index += 1;
-            }
-        }
-    }
 }
 
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-    #[test]
-    fn live_publication_replaces_sampling_in_cloned_plans_without_rebinding() -> Result<()> {
-        let scene = v2::Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera","name":"camera"}],
-            "animation":[{"tracks":[{"path":["nodes","camera","translation"],"keys":[[0,[-10,-10,-10]],[1,[10,10,10]]]}]}]}"#)?;
-        let plan = Plan::compile(&scene, std::path::Path::new("."))?;
-        let imported_copy = plan.clone();
-        let target = scene.track_targets()?.remove(0);
-        let binding = plan.bind_live(&target, &[vec![1.,2.,3.]])?[0];
-        assert_eq!(imported_copy.live_generation(), 0);
-        let mut samples = imported_copy.samples();
-        imported_copy.sample_into(0.75, &mut samples);
-        assert_eq!(samples.values[0], Sample::numeric(vec![1.,2.,3.]));
-        plan.publish_live([(binding, &[4.,5.,6.][..])].into_iter());
-        assert_eq!(imported_copy.live_generation(), 1);
-        plan.publish_live(std::iter::empty());
-        assert_eq!(imported_copy.live_generation(), 1);
-        imported_copy.sample_into(0.25, &mut samples);
-        assert_eq!(samples.values[0], Sample::numeric(vec![4.,5.,6.]));
-        Ok(())
-    }
-}
 #[cfg(test)]
 mod held_tests {
     use super::*;

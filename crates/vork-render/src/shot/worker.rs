@@ -12,8 +12,10 @@
 //! patch a shader specialization fact: when in doubt, reinstall.
 //!
 //! A 2D canvas's installation is its document and GPU side (`canvas::Kept`): the
-//! same document renders again without device, pipeline or document setup; any
-//! change to it or to its files builds both again on the retained device.
+//! same document renders again without setup, and compatible edits update its rows.
+mod published_files;
+use crate::asset_revision::{FileVersion, file_versions};
+use published_files::PublishedFiles;
 use super::{Retained, Shot};
 use crate::{InstalledScene, Renderer};
 use anyhow::{Context, Result};
@@ -78,6 +80,7 @@ pub struct Worker {
 }
 struct Open {
     reader: std::cell::OnceCell<crate::ask::Reader>,
+    media: crate::footage::Opened,
     path: PathBuf,
     base: PathBuf,
     /// The authored document as last opened.
@@ -85,9 +88,19 @@ struct Open {
     /// The document decoded (std-expanded) for comparison and dependency tracking.
     scene: Scene,
     /// Content hashes of the tracked external files at open, when enumerable.
-    files: Option<Vec<(PathBuf, blake3::Hash)>>,
+    files: Option<Vec<(PathBuf, FileVersion)>>,
     revision: u64,
+    // Before the first render there is no delivery identity to keep on the GPU.
+    // The admitted CPU inputs still belong to a published revision.
+    unrendered: Option<RevisionSources>,
+    rejected_inputs: Option<(RevisionSources, blake3::Hash, Scene)>,
     installed: Option<Installed>,
+}
+#[derive(Clone)]
+struct RevisionSources {
+    compiler: Option<crate::programs::session_inputs::Capture>,
+    files: Vec<(PathBuf, FileVersion)>,
+    published: PublishedFiles,
 }
 /// What an installation holds on the device.
 enum Kept {
@@ -100,7 +113,8 @@ struct Installed {
     kept: Kept,
     /// The decoded document this installation was built from.
     snapshot: Scene,
-    files: Vec<(PathBuf, blake3::Hash)>,
+    files: Vec<(PathBuf, FileVersion)>,
+    published: PublishedFiles,
     pending: Reuse,
     /// Whether `installs` has counted it (a render drew from it).
     counted: bool,
@@ -119,7 +133,7 @@ impl Worker {
     pub fn ask(&self, questions: &serde_json::Value) -> Result<serde_json::Value> {
         let open = self.open.as_ref().context("ask requires an open scene; open a scene first").context(crate::failure::FailureKind::Usage)?;
         if open.reader.get().is_none() {
-            let reader = crate::ask::Reader::new(open.scene.clone(), &open.base).map_err(crate::failure::scene)?;
+            let reader = crate::ask::Reader::new(open.scene.clone(), &open.base, open.media.clone()).map_err(crate::failure::scene)?;
             let _ = open.reader.set(reader);
         }
         open.reader.get().unwrap().ask(questions).map_err(crate::failure::scene)
@@ -130,6 +144,22 @@ impl Worker {
     /// installed facts, the candidate installed on the renderer's device before anything
     /// is published, so a failure keeps the previous revision and installation.
     pub fn open(&mut self, source: Source) -> Result<Opened> {
+        let result = self.open_candidate(source);
+        if result.is_err() && let Some(open) = &mut self.open {
+            let previous = open.installed.as_ref().map(|installed| (installed.sources(), &installed.snapshot))
+                .or_else(|| open.unrendered.clone().map(|sources| (sources, &open.scene)));
+            // Repeated refusals after a delivery change still refer to the
+            // inputs of the original publication.
+            if let Some((sources, scene)) = previous {
+                if open.rejected_inputs.as_ref().is_none_or(|(old, stamp, _)| old.live_stamp() != *stamp) {
+                    open.rejected_inputs = sources.rejected_stamp().map(|stamp| (sources, stamp, scene.clone()));
+                }
+            }
+        }
+        result
+    }
+
+    fn open_candidate(&mut self, source: Source) -> Result<Opened> {
         let (path, base, document) = match source {
             Source::File(path) => {
                 let bytes = std::fs::read(path).with_context(|| format!("load scene {}", path.display()))?;
@@ -141,13 +171,15 @@ impl Worker {
             Source::Document { document, base } => (base.join("(document)"), base.to_path_buf(), document),
         };
         let scene = decode(&document, &path)?;
+        let _compiler_scope = compiler_scope(&scene);
         // The one-shot loader's source admission, before any file is read for
         // hashing or any device work: the same errors, in the same words.
         let profile = self.template.as_ref().and_then(|template| template.profile.as_ref())
             .map_or(vork_scene::DEFAULT_PROFILE, |profile| profile.name.as_str()).to_owned();
-        let paths = crate::validate_inputs(&scene, &base)
+        let media = crate::footage::Opened::default();
+        let paths = crate::validate_inputs_for(&scene, &base, crate::InputIdentity::Reuse, &media)
             .with_context(|| format!("load scene {} with profile {profile}", path.display()))?;
-        let files = tracked_files(paths);
+        let files = paths.and_then(|paths| file_versions(paths, &media));
         let mut changed = Vec::new();
         let mut reuse = Reuse::Reinstalled;
         let mut updates = None;
@@ -170,7 +202,7 @@ impl Worker {
             // `reused` means a retained installation is kept as it is; with none
             // retained an identical document is still prepared and reinstalled.
             let same_installed_files = matches!((&open.installed, &files),
-                (Some(installed), Some(files)) if installed.files == *files);
+                (Some(installed), Some(files)) if open.base == base && installed.files == *files && installed.compiler_inputs_current());
             reuse = match &open.installed {
                 Some(installed) if same_installed_files && same_scene(&installed.snapshot, &scene)? => Reuse::Reused,
                 Some(installed) if same_installed_files && !recompile => match installed.plan(&scene)? {
@@ -186,14 +218,26 @@ impl Worker {
         // that does not compile, a missing asset, a geometry stage that fails) keeps
         // the previous revision and installation, and a success is the installation
         // the next render draws from. Two installations are alive until publication.
+        let previous = self.open.as_ref().and_then(|open| open.installed.as_ref().map(|i| &i.published)
+            .or_else(|| open.unrendered.as_ref().map(|sources| &sources.published))).cloned().unwrap_or_default();
+        let published = if matches!(reuse, Reuse::Reused | Reuse::Updated) { previous }
+            else { files.as_ref().map(|files| PublishedFiles::capture(files, &previous, &media)).transpose()?.unwrap_or_default() };
+        let unrendered = if self.template.is_none() {
+            files.as_ref().map(|files| -> Result<_> { Ok(RevisionSources {
+                compiler: crate::programs::session_inputs::current(),
+                files: files.clone(),
+                published: published.clone(),
+            }) }).transpose()?
+        } else { None };
         let prepared = if matches!(reuse, Reuse::Reused | Reuse::Updated) { None }
-            else { self.prepare(&scene, &document, &base, &path, files.as_deref(), reuse)? };
+            else { self.prepare(&scene, &document, &base, &path, files.as_deref(), reuse, &published, &media)? };
+        if prepared.as_ref().is_some_and(|i| i.pending == Reuse::Updated) { reuse = Reuse::Updated; }
         // Publish. The previous installation is dropped here, after the candidate's.
         let (revision, installed) = match self.open.take() {
             Some(previous) => (previous.revision + 1, match (reuse, previous.installed) {
                 (Reuse::Reused, installed) => installed,
                 (Reuse::Updated, Some(mut installed)) => {
-                    installed.write(updates.take().unwrap_or_default(), &scene);
+                    installed.write(updates.take().expect("planned update"), &scene, &self.renderer.as_ref().expect("installed device").queue);
                     installed.pending = Reuse::Updated;
                     Some(installed)
                 }
@@ -201,7 +245,7 @@ impl Worker {
             }),
             None => (1, prepared),
         };
-        self.open = Some(Open { path, base, document, scene, files, revision, installed, reader: Default::default() });
+        self.open = Some(Open { path, base, document, scene, files, revision, unrendered, rejected_inputs: None, installed, media: media.pins(), reader: Default::default() });
         Ok(Opened { revision, reuse, changed })
     }
 
@@ -213,25 +257,36 @@ impl Worker {
     /// render has opened it yet. None when the install emitted warnings: a render
     /// that reused it could not reproduce them, so the render installs instead.
     fn prepare(&mut self, decoded: &Scene, document: &serde_json::Value, base: &Path, path: &Path,
-        files: Option<&[(PathBuf, blake3::Hash)]>, pending: Reuse) -> Result<Option<Installed>> {
+        files: Option<&[(PathBuf, FileVersion)]>, pending: Reuse, published: &PublishedFiles, media: &crate::footage::Opened) -> Result<Option<Installed>> {
         // A candidate reads its canvases' image files again, as a fresh process would: Moda's image store is
         // the process's and is keyed by path, and a file may have changed since it was read. Any installation
         // can hold a canvas (the document itself, or a canvas picture in a 3D world), so every candidate
         // starts from an empty store. The previous installation stays, and when the candidate fails the
         // store it drew from is put back, so the previous revision renders on from what it had.
-        let images = crate::canvas_draw::forget_images();
-        let prepared = self.prepare_candidate(decoded, document, base, path, files, pending);
+        let canvas_update = decoded.is_canvas() && self.template.as_ref().is_some_and(|t| t.edit.is_none())
+            && self.open.as_ref().is_some_and(|open| open.base == base && open.installed.as_ref().is_some_and(|i|
+                matches!(i.kept, Kept::Canvas(_)) && files.is_some_and(|files| {
+                    // Snapshots give unchanged static assets the same private paths. Movie revisions are
+                    // bound by their own handles and can be replaced independently of the canvas.
+                    let static_file = |entry: &&(PathBuf, FileVersion)| !crate::footage::is_media(&entry.0);
+                    i.files.iter().filter(static_file).eq(files.iter().filter(static_file))
+                })));
+        let images = if canvas_update { moda_assets::engine_seam::installed() } else { crate::canvas_draw::forget_images() };
+        let prepared = self.prepare_candidate(decoded, document, base, path, files, pending, published, media, canvas_update)
+            .map_err(|error| published.name_decode_source(error));
         if prepared.is_err() { crate::canvas_draw::restore_images(images); }
         prepared
     }
 
     fn prepare_candidate(&mut self, decoded: &Scene, document: &serde_json::Value, base: &Path, path: &Path,
-        files: Option<&[(PathBuf, blake3::Hash)]>, pending: Reuse) -> Result<Option<Installed>> {
+        files: Option<&[(PathBuf, FileVersion)]>, pending: Reuse, published: &PublishedFiles, media: &crate::footage::Opened, canvas_update: bool) -> Result<Option<Installed>> {
         let usage = |error: anyhow::Error| error.context(crate::failure::FailureKind::Usage);
         // Before any render there is no identity to prepare under: validate as a
         // one-shot install would, under the scene's own defaults, and keep nothing.
         // Preparing under a guessed profile would pay that profile's first install
         // (std/final on a CPU device is minutes) for a render that may never match.
+        let mut captured_scene = decoded.clone();
+        published.relocate(&mut captured_scene, base)?;
         let Some(template) = self.template.clone() else {
             let warnings = crate::warnings::Collector::default();
             let promoted = self.candidate_device(decoded)?;
@@ -240,11 +295,11 @@ impl Worker {
                 let _scope = warnings.enter();
                 // A canvas: its fonts load, its images decode, its first frame plans and its worlds install.
                 if decoded.is_canvas() {
-                    crate::canvas::check(decoded, base, renderer).with_context(|| format!("install scene {}", path.display()))?;
+                    crate::canvas::check(&captured_scene, base, renderer, media).with_context(|| format!("install scene {}", path.display()))?;
                     return renderer.wait(None);
                 }
-                let installed = renderer.install_with_options(decoded.clone(), base,
-                        crate::InstallOptions { variants: crate::pipelines::VariantCompile::Fallback, ..Default::default() })
+                let installed = renderer.install_with_options(captured_scene, base,
+                        crate::InstallOptions { opened: media.clone(), variants: crate::pipelines::VariantCompile::Fallback, ..Default::default() })
                     .with_context(|| format!("install scene {}", path.display()))?;
                 super::check_timeline(&installed)?;
                 drop(installed);
@@ -261,10 +316,12 @@ impl Worker {
         let profile = match &template.profile { Some(profile) => profile.clone(), None => vork_scene::Profile::load(vork_scene::DEFAULT_PROFILE)? };
         let overrides = vork_scene::CallOverrides::resolve(template.settings.clone()).map_err(usage)?;
         let settings = profile.resolve(&overrides.settings).map_err(usage)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let settings = vork_scene::test_settings(&settings, &template.test_techniques)?;
         let default_denoise = (vork_scene::libraries::profile(&profile.name).is_some() && profile.level <= 1 && !overrides.settings.contains_key("denoise"))
             .then(|| (profile.name.clone(), profile.level, overrides.settings.contains_key("samples")));
         let bytes = serde_json::to_vec(document)?;
-        let mut scene = super::load_document_with_settings(&bytes, path, settings, &profile.name, template.edit, Some(decoded.clone())).map_err(crate::failure::scene)?;
+        let (mut scene, _) = super::admit_document_with_settings(&bytes, path, settings, &profile.name, template.edit, Some(captured_scene), crate::InputIdentity::Reuse, media).map_err(crate::failure::scene)?;
         if let Some(resolution) = overrides.resolution { scene.render.resolution = resolution; }
         if let Some(fps) = overrides.fps { scene.render.fps = fps; }
         scene.validate().map_err(crate::failure::scene)?;
@@ -293,16 +350,35 @@ impl Worker {
             let _scope = warnings.enter();
             // A canvas: the document and GPU side a render builds before its first frame.
             if scene.is_canvas() {
-                let kept = crate::canvas::Kept::prepare(renderer, &scene, base, target)
+                if canvas_update && promoted.is_none() {
+                    let previous = &mut self.open.as_mut().expect("retained canvas").installed;
+                    let installed = previous.as_mut().expect("retained canvas");
+                    let Kept::Canvas(canvas) = &mut installed.kept else { unreachable!() };
+                    let files = files.expect("proved canvas files");
+                    let unchanged = files.iter().filter(|(p, version)| installed.files.binary_search_by(|(f, _)| f.cmp(p))
+                        .is_ok_and(|index| installed.files[index].1 == *version)).map(|(p, _)| p.as_path()).collect();
+                    if canvas.revise(renderer, &scene, base, media, &unchanged)
+                        .map_err(crate::failure::scene).with_context(|| format!("update scene {}", path.display()))? {
+                        installed.snapshot = decoded.clone();
+                        installed.files = files.to_vec();
+                        installed.published = published.clone();
+                        installed.pending = Reuse::Updated;
+                        return Ok(previous.take());
+                    }
+                }
+                if canvas_update { crate::canvas_draw::forget_images(); }
+                let kept = crate::canvas::Kept::prepare(renderer, &scene, base, target, media)
                     .with_context(|| format!("install scene {}", path.display()))?;
                 let Some(files) = files.filter(|_| template.edit.is_none()) else {
                     drop(kept);
                     renderer.wait(None)?;
                     return Ok(None);
                 };
-                return Ok(Some(Installed { kept: Kept::Canvas(kept), snapshot: decoded.clone(), files: files.to_vec(), pending, counted: false }));
+                return Ok(Some(Installed { kept: Kept::Canvas(kept), snapshot: decoded.clone(), published: published.clone(), files: files.to_vec(), pending, counted: false }));
             }
-            let plan = super::install_plan(renderer, &mut scene, default_denoise.as_ref(), install_readback, frames == 1, video || template.gpu_only, &outputs.0, initial_time, target)?;
+            let mut plan = super::install_plan(renderer, &mut scene, default_denoise.as_ref(), install_readback, frames == 1, video || template.gpu_only, &outputs.0, initial_time, target)?;
+            plan.options.opened = media.clone();
+            plan.options.previous_resources = Some(self.open.as_ref().and_then(|open| open.installed.as_ref()).and_then(Installed::static_resources).unwrap_or_default());
             let installed = renderer.install_with_options(scene, base, plan.options)
                 .with_context(|| format!("install scene {}", path.display()))?;
             super::check_timeline(&installed)?;
@@ -314,7 +390,7 @@ impl Worker {
                 renderer.wait(None)?;
                 return Ok(None);
             };
-            Ok(Some(Installed { kept: Kept::World(installed, plan.delivery), snapshot: decoded.clone(), files: files.to_vec(), pending, counted: false }))
+            Ok(Some(Installed { kept: Kept::World(installed, plan.delivery), snapshot: decoded.clone(), published: published.clone(), files: files.to_vec(), pending, counted: false }))
         })();
         // A device failure (lost device, out of memory), in the install or the
         // wait that drops a candidate, leaves no renderer to trust, as after a
@@ -364,8 +440,7 @@ impl Worker {
         let open = self.open.as_mut().context("no scene is open; send open first").context(crate::failure::FailureKind::Usage)?;
         shot.scene = open.path.clone();
         shot.document = Some({
-            #[cfg(feature = "frame-profile")]
-            let _profile = crate::frame_profile::span("request_serialize");
+            profile_span!(_profile, "request_serialize");
             serde_json::to_vec(&open.document)?
         });
         // Ordinary source admission can refuse before touching the device. Cache
@@ -375,20 +450,36 @@ impl Worker {
         // A caller's rewrite runs later and may change the scene, as it may change its sources below: the
         // shot then admits the rewritten scene itself, where its errors are every rewritten scene's.
         let target = crate::output_device::target(&shot.out)?;
+        // Refusing a candidate preserves the last published compiler inputs.
+        // Once the files change again, ordinary admission sees the new edit.
+        if open.rejected_inputs.as_ref().is_some_and(|(source, stamp, _)| source.live_stamp() != *stamp) {
+            open.rejected_inputs = None;
+        }
+        let rollback = open.rejected_inputs.as_ref();
+        let replay = rollback.and_then(|(sources, _, _)| sources.compiler.as_ref())
+            .map(|inputs| inputs.lock().unwrap().revision());
+        let _revision = replay.as_ref().map(vork_slang::RevisionFiles::enter);
         let decoded = {
-            #[cfg(feature = "frame-profile")]
-            let _profile = crate::frame_profile::span("request_decode_validate");
-            decode(&open.document, &open.path)?
+            profile_span!(_profile, "request_decode_validate");
+            match rollback {
+                Some((_, _, scene)) => scene.clone(),
+                None => decode(&open.document, &open.path)?,
+            }
         };
+        let _compiler_scope = compiler_scope(&decoded);
+        let mut render_scene = decoded.clone();
+        if let Some((sources, _, _)) = rollback { sources.published.relocate(&mut render_scene, &open.base)?; }
         if shot.edit.is_none() { crate::output_device::admit(&decoded, &shot.out, target).map_err(crate::failure::scene)?; }
-        let paths = crate::validate_files(&decoded, &open.base)?;
+        let media = rollback.map(|(sources, _, _)| sources.published.media.pins()).unwrap_or_default();
+        let paths = crate::inspect_files(&render_scene, &open.base, crate::InputIdentity::Reuse, &media)?;
         // A caller's rewrite runs later and may introduce different sources.
-        let files = tracked_files(paths).filter(|_| shot.edit.is_none());
+        let files = if let Some((sources, _, _)) = rollback {
+            Some(sources.files.clone())
+        } else { paths.and_then(|paths| file_versions(paths, &media)) }.filter(|_| shot.edit.is_none());
         let same_install = {
-            #[cfg(feature = "frame-profile")]
-            let _profile = crate::frame_profile::span("request_identity");
+            profile_span!(_profile, "request_identity");
             match (&open.installed, &files) {
-            (Some(installed), Some(files)) => installed.files == *files && same_scene(&installed.snapshot, &decoded)?,
+            (Some(installed), Some(files)) => installed.files == *files && installed.compiler_inputs_current() && same_scene(&installed.snapshot, &decoded)?,
             _ => false,
             }
         };
@@ -397,7 +488,14 @@ impl Worker {
         // than the one that made it. The shot opens the device when none is
         // retained, or when the retained one lacks what the resolved scene
         // needs; its receipt then reports that device as this request's.
+        let previous_files = rollback.map(|(sources, _, _)| sources.published.clone())
+            .or_else(|| open.installed.as_ref().map(|i| i.published.clone()))
+            .or_else(|| open.unrendered.as_ref().map(|sources| sources.published.clone())).unwrap_or_default();
+        let published = if same_install || rollback.is_some() { previous_files }
+            else { files.as_ref().map(|files| PublishedFiles::capture(files, &previous_files, &media)).transpose()?.unwrap_or_default() };
+        if rollback.is_none() { published.relocate(&mut render_scene, &open.base)?; }
         let renderer = self.renderer.take();
+        let pages = open.installed.as_ref().and_then(Installed::static_resources).unwrap_or_default();
         let installed = open.installed.take().filter(|_| renderer.is_some());
         let previous = installed.filter(|_| same_install);
         let (pending, counted) = previous.as_ref().map_or((None, true), |installed| (Some(installed.pending), installed.counted));
@@ -417,9 +515,9 @@ impl Worker {
         // under: refused options would make every later open fail on them.
         let mut template = shot.clone();
         let rendered = {
-            #[cfg(feature = "frame-profile")]
-            let _profile = crate::frame_profile::span("request_render_inclusive");
-            shot.render_retained_decoded(retained, decoded.clone())?
+            profile_span!(_profile, "request_render_inclusive");
+            shot.render_retained_decoded(retained, render_scene, pages, media)
+                .map_err(|error| published.name_decode_source(error))?
         };
         template.document = None;
         self.template = Some(template);
@@ -442,7 +540,8 @@ impl Worker {
                 (None, None) => None,
             };
             if let (Some(kept), Some(files), true) = (kept, files, clean) {
-                open.installed = Some(Installed { kept, snapshot: decoded, files, pending: Reuse::Reused, counted: true });
+                open.installed = Some(Installed { kept, snapshot: decoded, published, files, pending: Reuse::Reused, counted: true });
+                open.unrendered = None;
             }
         }
         Ok((report, reuse))
@@ -515,12 +614,19 @@ fn diff(before: &serde_json::Value, after: &serde_json::Value, path: &mut Vec<se
         }
         (Value::Array(a), Value::Array(b)) => {
             let name = |item: &Value| item.get("name").and_then(|n| n.as_str()).filter(|n| !n.is_empty()).map(str::to_owned);
+            // Pop from the end to match duplicate names in their original order.
+            let mut positions = std::collections::HashMap::<&str, Vec<usize>>::new();
+            for (j, item) in b.iter().enumerate().rev() {
+                if let Some(key) = item.get("name").and_then(Value::as_str).filter(|key| !key.is_empty()) {
+                    positions.entry(key).or_default().push(j);
+                }
+            }
             let mut taken = vec![false; b.len()];
             let mut pairs = Vec::new();
             let mut unnamed = Vec::new();
             for (i, item) in a.iter().enumerate() {
                 match name(item) {
-                    Some(n) => match b.iter().enumerate().position(|(j, other)| !taken[j] && name(other).as_deref() == Some(&n)) {
+                    Some(n) => match positions.get_mut(n.as_str()).and_then(Vec::pop) {
                         Some(j) => { taken[j] = true; pairs.push((i, j)); }
                         None => { path.push(n.into()); out.push(path.clone().into()); path.pop(); }
                     },
@@ -555,38 +661,106 @@ fn diff(before: &serde_json::Value, after: &serde_json::Value, path: &mut Vec<se
 
 /// Hash only the sources enumerated by ordinary admission. Failure to identify
 /// an installation disables retention; only the ordinary loader may refuse it.
-fn tracked_files(paths: Option<std::collections::BTreeSet<PathBuf>>) -> Option<Vec<(PathBuf, blake3::Hash)>> {
-    paths?.into_iter().map(|path| {
+#[cfg(test)]
+fn tracked_files(paths: Option<std::collections::BTreeSet<PathBuf>>) -> Option<Vec<(PathBuf, FileVersion)>> {
+    file_versions(paths?, &Default::default())
+}
+
+fn compiler_scope(scene: &Scene) -> crate::programs::session_inputs::Scope {
+    let capture = (!scene.programs.is_empty()).then(Default::default);
+    crate::programs::session_inputs::enter(capture)
+}
+
+struct Updates {
+    nodes: Vec<(usize, serde_json::Value)>,
+    bindings: Vec<(String, usize, Vec<u32>)>,
+}
+
+impl RevisionSources {
+    fn live_stamp(&self) -> blake3::Hash {
         let mut hash = blake3::Hasher::new();
-        hash.update_reader(crate::source_file(&path).ok()?).ok()?;
-        Some((path, hash.finalize()))
-    }).collect()
+        if let Some(inputs) = self.compiler.as_ref() { hash.update(inputs.lock().unwrap().live_stamp().as_bytes()); }
+        for (path, _) in &self.files {
+            match FileVersion::read(path) {
+                Ok(version) => {
+                    let target = version.target.as_os_str().as_encoded_bytes();
+                    hash.update(&(target.len() as u64).to_le_bytes());
+                    hash.update(target);
+                    hash.update(version.content.as_bytes());
+                }
+                Err(_) => { hash.update(&u64::MAX.to_le_bytes()); }
+            }
+        }
+        hash.finalize()
+    }
+    fn rejected_stamp(&self) -> Option<blake3::Hash> {
+        (self.compiler.as_ref().is_some_and(|inputs| !inputs.lock().unwrap().valid()) || self.files.iter().any(|(p, v)| FileVersion::read(p).as_ref().ok() != Some(v)))
+            .then(|| self.live_stamp())
+    }
 }
 
 impl Installed {
+    fn static_resources(&self) -> Option<crate::install::StaticResources> {
+        match &self.kept {
+            Kept::World(scene, _) => Some(scene.static_resources.clone()),
+            Kept::Canvas(_) => None,
+        }
+    }
+    fn compiler_inputs(&self) -> Option<&crate::programs::session_inputs::Capture> {
+        match &self.kept {
+            Kept::World(world, _) => world.compiler_inputs.as_ref(),
+            Kept::Canvas(_) => None,
+        }
+    }
+    fn sources(&self) -> RevisionSources {
+        RevisionSources { compiler: self.compiler_inputs().cloned(), files: self.files.clone(), published: self.published.clone() }
+    }
+    fn compiler_inputs_current(&self) -> bool {
+        if self.snapshot.programs.is_empty() { return true; }
+        self.compiler_inputs().is_some_and(|inputs| inputs.lock().unwrap().valid())
+    }
+
     /// The value-only changes between the installed document and `next`, or None
     /// when the change touches anything the installation proved or specialized.
-    fn plan(&self, next: &Scene) -> Result<Option<Vec<(usize, serde_json::Value)>>> {
-        // A changed canvas builds its document again: no value is written into a kept one.
+    fn plan(&self, next: &Scene) -> Result<Option<Updates>> {
+        // Canvas updates compare evaluated rows after delivery and file resolution in prepare_candidate.
         let Kept::World(installed, _) = &self.kept else { return Ok(None) };
         if !installed.footage.is_empty() || installed.compute.is_some() { return Ok(None); }
         let camera_updates = installed.displacement.is_none()
             && installed.probes.is_none()
             && installed.fibre.is_none()
+            && !installed.materials.iter().any(|material| material.solid_transmission)
             && self.snapshot.geometry.values().all(|g| matches!(g.topology, vork_scene::v2::Topology::Triangles));
         let cameras: Vec<bool> = (0..installed.nodes.len())
             .map(|id| camera_updates && static_camera_placement(&installed.nodes, &installed.animation, id))
             .collect();
-        changes(&self.snapshot, next, &cameras, &installed.animation)
+        let mut bindings = Vec::new();
+        if installed.probes.is_none() && installed.displacement.is_none() && !installed.has_media {
+            let animated = crate::materials::animated_inputs(&self.snapshot)?;
+            for (name, (offset, layout)) in &installed.editable_bindings {
+                let (Some(before), Some(after)) = (self.snapshot.materials.get(name), next.materials.get(name)) else { continue; };
+                if animated.contains_key(name) || before.inputs == after.inputs { continue; }
+                let inputs = after.inputs.iter().map(|(name, value)| Ok((name.clone(), serde_json::to_value(value)?)))
+                    .collect::<Result<std::collections::BTreeMap<_,_>>>()?;
+                let words = layout.pack(&inputs, |_, _| anyhow::bail!("expected numeric material input"))?;
+                bindings.push((name.clone(), *offset, words));
+            }
+        }
+        let nodes = changes_with_bindings(&self.snapshot, next, &cameras, &installed.animation, &bindings)?;
+        Ok(nodes.map(|nodes| Updates { nodes, bindings }))
     }
 
     /// Write planned value changes into the installation (`plan` proved them).
-    fn write(&mut self, updates: Vec<(usize, serde_json::Value)>, next: &Scene) {
+    fn write(&mut self, updates: Updates, next: &Scene, queue: &wgpu::Queue) {
         let Kept::World(installed, _) = &mut self.kept else { unreachable!("plan offers updates for 3D installations only") };
         fn field<T: serde::de::DeserializeOwned>(fields: &serde_json::Value, name: &str) -> T {
             serde_json::from_value(fields[name].clone()).expect("planned update values come from a decoded scene")
         }
-        for (index, fields) in updates {
+        for (name, offset, words) in updates.bindings {
+            installed.material_table.write_words(queue, offset, &words);
+            installed.scene.materials.get_mut(&name).expect("installed material").inputs = next.materials[&name].inputs.clone();
+        }
+        for (index, fields) in updates.nodes {
             if let NodeKind::Light { energy, color, .. } = &mut installed.nodes[index].node.kind {
                 *energy = field(&fields, "energy");
                 *color = field(&fields, "color");
@@ -638,9 +812,17 @@ fn static_camera_placement(nodes: &[crate::install::EvalNode], animation: &crate
 /// The value changes between two decoded documents, or None when anything else
 /// differs. Every unmasked byte is part of the installation identity, so a new
 /// scene field fails closed without extending this classifier.
+#[cfg(test)]
 fn changes(before_scene: &Scene, after_scene: &Scene, cameras: &[bool], animation: &crate::animation::Plan) -> Result<Option<Vec<(usize, serde_json::Value)>>> {
+    changes_with_bindings(before_scene, after_scene, cameras, animation, &[])
+}
+fn changes_with_bindings(before_scene: &Scene, after_scene: &Scene, cameras: &[bool], animation: &crate::animation::Plan, bindings: &[(String, usize, Vec<u32>)] ) -> Result<Option<Vec<(usize, serde_json::Value)>>> {
     let mut before = serde_json::to_value(before_scene)?;
     let mut after = serde_json::to_value(after_scene)?;
+    for (name, _, _) in bindings {
+        before["materials"][name.as_str()]["inputs"] = serde_json::Value::Null;
+        after["materials"][name.as_str()]["inputs"] = serde_json::Value::Null;
+    }
     let mut updates = Vec::new();
     // Only radiometric local-light values are independent of install-time
     // topology, acceleration, shader proofs and projection specialization.
@@ -677,10 +859,14 @@ fn changes(before_scene: &Scene, after_scene: &Scene, cameras: &[bool], animatio
             strip(&mut node["children"], animated_lights, cameras, updates, index);
         }
     }
-    strip(&mut before["nodes"], &animated_lights, cameras, &mut Vec::new(), &mut 0);
+    let mut previous = Vec::new();
+    strip(&mut before["nodes"], &animated_lights, cameras, &mut previous, &mut 0);
     strip(&mut after["nodes"], &animated_lights, cameras, &mut updates, &mut 0);
     if before != after { return Ok(None); }
-    Ok(Some(updates))
+    // Equal masked documents have the same node order, types and eligibility.
+    let changed = updates.into_iter().zip(previous)
+        .filter_map(|(new, old)| (new != old).then_some(new)).collect();
+    Ok(Some(changed))
 }
 
 #[cfg(test)]
@@ -698,10 +884,10 @@ mod tests {
         assert!(worker.ask(&questions).is_err());
         let source = scene();
         worker.open = Some(Open {
-            reader: Default::default(),
+            reader: Default::default(), media: Default::default(),
             path: PathBuf::from("does-not-exist.json"), base: PathBuf::from("."),
             document: serde_json::to_value(&source)?, scene: source, files: None,
-            revision: 7, installed: None,
+            revision: 7, unrendered: None, rejected_inputs: None, installed: None,
         });
         let expected = serde_json::to_value(&worker.open.as_ref().unwrap().scene.nodes[0])?["energy"].clone();
         assert_eq!(worker.ask(&questions)?, json!([expected]));
@@ -780,7 +966,8 @@ mod tests {
             *energy = Some(20.);
             *color = Some([0.2, 0.4, 0.8]);
         }
-        assert!(changes(&before, &after, &[false, true])?.is_some());
+        let planned = changes(&before, &after, &[false, true])?.unwrap();
+        assert_eq!(planned.iter().map(|(index, _)| *index).collect::<Vec<_>>(), [0]);
         after.nodes[1].transform.translation[0] = 2.;
         assert!(changes(&before, &after, &[false, true])?.is_some());
         assert!(changes(&before, &after, &[false, false])?.is_none());
@@ -864,6 +1051,23 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tracked_files_detect_a_retargeted_link_with_identical_bytes() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("vork-worker-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&base)?;
+        let link = base.join("asset");
+        let paths = Some(std::collections::BTreeSet::from([link.clone()]));
+        for name in ["first", "second"] { std::fs::write(base.join(name), b"same")?; }
+        std::os::unix::fs::symlink("first", &link)?;
+        let before = tracked_files(paths.clone()).unwrap();
+        std::fs::remove_file(&link)?;
+        std::os::unix::fs::symlink("second", &link)?;
+        assert_ne!(before, tracked_files(paths).unwrap());
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
     #[test]
     fn untracked_dependencies_and_changed_files_fail_closed() -> Result<()> {
         let base = std::env::temp_dir().join(format!("vork-worker-files-{}", std::process::id()));
@@ -902,6 +1106,22 @@ mod tests {
         let scene = image_scene("plate.tif")?;
         let files = tracked_files(crate::validate_files(&scene, &base)?).unwrap();
         assert_eq!(files[0].0, base.join("plate.tif"));
+        // The source changes after its receipt, then changes back after the
+        // decoder's read. Only the private copy can establish which bytes it read.
+        let published = PublishedFiles::capture(&files, &Default::default(), &Default::default())?;
+        std::fs::write(base.join("plate.tif"), b"temporary replacement")?;
+        let mut install = scene.clone();
+        published.relocate(&mut install, &base)?;
+        let private_path = base.join(install.images["plate"].file.as_ref().unwrap());
+        let consumed = std::fs::read(&private_path)?;
+        let decode = crate::texture_source::decode_context(anyhow::anyhow!("invalid image"), "decode image", &private_path);
+        let diagnostic = published.name_decode_source(crate::failure::scene(decode).context("install scene"));
+        let message = format!("{diagnostic:#}");
+        assert!(message.contains("plate.tif") && message.contains("invalid image"), "{message}");
+        assert!(!message.contains("vork-revision-"), "{message}");
+        std::fs::write(base.join("plate.tif"), b"source bytes")?;
+        assert_eq!(consumed, b"source bytes");
+        assert_eq!(FileVersion::read(&files[0].0).as_ref().ok(), Some(&files[0].1));
         // Every composition's compositor supplies its sources, a world's inside a canvas included (source
         // admission reads bindings; it compiles no program).
         let nested = Scene::from_json(&serde_json::to_vec(&json!({
@@ -934,6 +1154,84 @@ mod tests {
         std::fs::remove_dir_all(base)?;
         Ok(())
     }
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang"]
+    fn installation_consumes_the_receipted_image_after_a_concurrent_replacement() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let base = directory.path();
+        let path = base.join("scene.json");
+        let texture = base.join("world.png");
+        let write = |color| image::RgbImage::from_pixel(16, 16, image::Rgb(color)).save(&texture);
+        let mut document = json!({"version":2,"render":{"resolution":[32,24]},
+            "images":{"plate":{"file":"world.png"}},
+            "materials":{"world":{"program":"std/environment_image","inputs":{"image":{"image":"plate"}}}},
+            "nodes":[{"type":"light","shape":"environment","material":"world"},{"type":"camera"}]});
+        let fresh = base.join("fresh.png");
+        let shot = Shot {scene:path.clone(),out:vec![fresh.clone().into()],
+            profile:Some(vork_scene::Profile::load("std/draft")?),settings:serde_json::from_value(json!({"denoise":false,"samples":1}))?,
+            ..Default::default()};
+        write([0,255,0])?;
+        let mut worker = Worker::new();
+        worker.open(Source::Document {document:document.clone(), base})?;
+        worker.render(shot.clone())?;
+        // Force a new world on the retained device. Pause between identity collection
+        // and candidate installation so the decoder would see B through a live path.
+        document["nodes"][1]["name"] = json!("replacement");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        drop(shot.clone().render()?);
+        let green = std::fs::read(&fresh)?;
+        let decoded = decode(&document, &path)?;
+        let files = tracked_files(crate::validate_inputs(&decoded,base)?).unwrap();
+        let previous = worker.open.as_ref().unwrap().installed.as_ref().unwrap();
+        let published = PublishedFiles::capture(&files,&previous.published, &Default::default())?;
+        write([255,0,255])?;
+        drop(shot.clone().render()?);
+        assert_ne!(std::fs::read(&fresh)?,green);
+        let installed = worker.prepare(&decoded,&document,base,&path,Some(&files),Reuse::Reinstalled,&published, &Default::default())?;
+        assert!(installed.is_some());
+        write([0,255,0])?;
+        let open = worker.open.as_mut().unwrap();
+        open.document = document;
+        open.scene = decoded;
+        open.installed = installed;
+        let (report,_) = worker.render(shot)?;
+        assert_eq!(report["install_reused"],true);
+        assert_eq!(std::fs::read(fresh)?,green);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang"]
+    fn camera_cut_refits_the_automatic_probe_volume() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let base = directory.path();
+        let path = base.join("cut.json");
+        let document = json!({"version":2,"render":{"resolution":[64,48],"duration":1},
+            "nodes":[{"type":"mesh","name":"floor","geometry":{"std":"grid","size":[12,12]}},
+            {"type":"mesh","name":"ball","translation":[0,0.5,0],"geometry":{"std":"sphere","radius":0.5}},
+            {"type":"light","shape":"point","translation":[1,3,2],"energy":180},
+            {"type":"camera","name":"near","translation":[0,1,3]},
+            {"type":"camera","name":"wide","translation":[1.25,1,4],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":4}}}],
+            "animation":[{"tracks":[{"path":["render","camera"],"keys":[[0,"near"],[0.5,"wide"]]}]}]});
+        std::fs::write(&path,serde_json::to_vec(&document)?)?;
+        let mut worker = Worker::new();
+        worker.open(Source::File(&path))?;
+        let mut shot = Shot {scene:path.clone(),out:vec![base.join("kept.png").into()],
+            profile:Some(vork_scene::Profile::load("std/draft")?),settings:serde_json::from_value(json!({"denoise":false,"samples":1}))?,
+            test_techniques:serde_json::from_value(json!({"probes":{}}))?,at:Some("0".parse()?),
+            ..Default::default()};
+        worker.render(shot.clone())?;
+        let installed = worker.open.as_ref().unwrap().installed.as_ref().expect("first look retained");
+        assert!(matches!(&installed.kept,Kept::World(scene,_) if scene.probes.is_some()));
+        shot.at = Some("0.75".parse()?);
+        let (result,_) = worker.render(shot.clone())?;
+        shot.out = vec![base.join("fresh.png").into()];
+        drop(shot.render()?);
+        assert_eq!(std::fs::read(base.join("fresh.png"))?,std::fs::read(base.join("kept.png"))?);
+        assert_eq!(result["install_reused"],false);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn reopen_compares_and_prepares_on_the_device() -> Result<()> {
@@ -1002,7 +1300,7 @@ mod tests {
         let shot = |name: &str| -> Result<Shot> {
             Ok(Shot { out: vec![base.join(name).into()], profile: Some(vork_scene::Profile::load("std/path")?), ..Default::default() })
         };
-        let rays = |worker: &Worker| worker.renderer.as_ref().is_some_and(|renderer| renderer.provides(crate::DeviceNeeds::ALL));
+        let rays = |worker: &Worker| worker.renderer.as_ref().is_some_and(|renderer| renderer.needs.ray_queries);
         let mut worker = Worker::new();
         // A canvas opens and renders on a device without ray queries.
         worker.open(Source::Document { document: canvas.clone(), base: &base })?;

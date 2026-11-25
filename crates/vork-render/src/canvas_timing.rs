@@ -48,7 +48,7 @@ pub(crate) fn total(samples: &[Value], setup: &HostTimings, start: f64, finish: 
         "gpu_busy_ms": "sum of pass timestamp intervals plus nested-world pass intervals; overlaps host and completion waits; excludes queue idle gaps",
         "gpu_span_ms": "first to last canvas pass, including queue idle gaps; overlaps GPU busy and host; do not add",
         "completion_wait_ms": "host acceptance/readback and output credit waits; overlaps GPU busy and other frames",
-        "encoder_handoff_ms": "host encoder release/push and writer handoff including backpressure; asynchronous encode runs outside this span",
+        "encoder_handoff_ms": "host encoder release/push and writer handoff including bounded ring backpressure; completion-driven push precedes acceptance/readback; asynchronous GPU/encode/mux work runs outside this span",
         "encoder_start_ms": "prepare plus open; prepare overlaps document/device setup; render-level only, per-frame zero",
         "frame_wall_ms": "frame-start-to-delivery latency; frames overlap; never sum as render wall time",
         "host_spans_inclusive_ms": "nested detail, not additive; $ entries are exclusive categories",

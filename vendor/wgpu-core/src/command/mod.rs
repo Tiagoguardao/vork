@@ -20,6 +20,8 @@ mod encoder_command;
 pub mod ffi;
 mod memory_init;
 mod pass;
+#[cfg(all(test, feature = "std", any(vulkan, metal)))]
+mod pre_pass_tests;
 mod query;
 mod ray_tracing;
 mod render;
@@ -583,7 +585,7 @@ impl EncodingApi {
 /// commands into the middle of a recorded stream. However, hal queue submission
 /// accepts a series of command buffers at once, so we can simply break the
 /// stream up into multiple buffers, and then reorder the buffers. See
-/// [`InnerCommandEncoder::close_and_swap`] for a specific example of this.
+/// [`InnerCommandEncoder::close_and_swap_if_open`] for a specific example of this.
 ///
 /// [rce]: hal::Api::CommandEncoder
 /// [rcb]: hal::Api::CommandBuffer
@@ -631,6 +633,14 @@ pub(crate) struct InnerCommandEncoder {
 }
 
 impl InnerCommandEncoder {
+    /// Return the current pre-pass buffer, opening it on the first command.
+    pub(crate) fn open_pre_pass(&mut self) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+        if self.is_open {
+            return Ok(self.raw.as_mut());
+        }
+        self.open_pass(Some("(wgpu internal) Pre Pass"))
+    }
+
     /// Finish the current command buffer and insert it just before
     /// the last element in [`self.list`][l].
     ///
@@ -649,15 +659,15 @@ impl InnerCommandEncoder {
     /// in just before the pass's. This is the function that jams in the
     /// transitions' command buffer.
     ///
-    /// # Panics
-    ///
-    /// - If the encoder is not open.
+    /// An empty pre-pass never opened a buffer.
     ///
     /// [l]: InnerCommandEncoder::list
     /// [`transition_buffers`]: hal::CommandEncoder::transition_buffers
     /// [`transition_textures`]: hal::CommandEncoder::transition_textures
-    fn close_and_swap(&mut self) -> Result<(), DeviceError> {
-        assert!(self.is_open);
+    fn close_and_swap_if_open(&mut self) -> Result<(), DeviceError> {
+        if !self.is_open {
+            return Ok(());
+        }
         self.is_open = false;
 
         let new =
@@ -704,6 +714,8 @@ impl InnerCommandEncoder {
 
         let cmd_buf =
             unsafe { self.raw.end_encoding() }.map_err(|e| self.device.handle_hal_error(e))?;
+        #[cfg(all(test, feature = "std", any(vulkan, metal)))]
+        pre_pass_tests::record_body(&*cmd_buf);
         self.list.push(cmd_buf);
 
         Ok(())
@@ -928,20 +940,6 @@ impl CommandEncoder {
         }
     }
 
-    pub(crate) fn insert_barriers_from_tracker(
-        raw: &mut dyn hal::DynCommandEncoder,
-        base: &mut Tracker,
-        head: &Tracker,
-        snatch_guard: &SnatchGuard,
-    ) {
-        profiling::scope!("insert_barriers");
-
-        base.buffers.set_from_tracker(&head.buffers);
-        base.textures.set_from_tracker(&head.textures);
-
-        Self::drain_barriers(raw, base, snatch_guard);
-    }
-
     pub(crate) fn insert_barriers_from_scope(
         raw: &mut dyn hal::DynCommandEncoder,
         base: &mut Tracker,
@@ -950,8 +948,7 @@ impl CommandEncoder {
     ) {
         profiling::scope!("insert_barriers");
 
-        base.buffers.set_from_usage_scope(&head.buffers);
-        base.textures.set_from_usage_scope(&head.textures);
+        base.set_from_usage_scope(head);
 
         Self::drain_barriers(raw, base, snatch_guard);
     }
@@ -963,6 +960,21 @@ impl CommandEncoder {
     ) {
         profiling::scope!("drain_barriers");
 
+        let (buffer_barriers, texture_barriers) = Self::collect_barriers(base, snatch_guard);
+
+        unsafe {
+            raw.transition_buffers(&buffer_barriers);
+            raw.transition_textures(&texture_barriers);
+        }
+    }
+
+    fn collect_barriers<'a>(
+        base: &'a mut Tracker,
+        snatch_guard: &'a SnatchGuard<'a>,
+    ) -> (
+        Vec<hal::BufferBarrier<'a, dyn hal::DynBuffer>>,
+        Vec<hal::TextureBarrier<'a, dyn hal::DynTexture>>,
+    ) {
         let buffer_barriers = base
             .buffers
             .drain_transitions(snatch_guard)
@@ -973,11 +985,24 @@ impl CommandEncoder {
             .enumerate()
             .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
             .collect::<Vec<_>>();
+        (buffer_barriers, texture_barriers)
+    }
 
-        unsafe {
-            raw.transition_buffers(&buffer_barriers);
-            raw.transition_textures(&texture_barriers);
+    fn drain_pre_pass_barriers(
+        encoder: &mut InnerCommandEncoder,
+        base: &mut Tracker,
+        snatch_guard: &SnatchGuard,
+    ) -> Result<(), DeviceError> {
+        let (buffers, textures) = Self::collect_barriers(base, snatch_guard);
+        if (!buffers.is_empty() || !textures.is_empty()) && encoder.raw.records_resource_transitions()
+        {
+            let raw = encoder.open_pre_pass()?;
+            unsafe {
+                raw.transition_buffers(&buffers);
+                raw.transition_textures(&textures);
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn insert_barriers_from_device_tracker(

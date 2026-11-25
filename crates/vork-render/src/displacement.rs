@@ -205,7 +205,7 @@ impl Pipeline {
             let receipt_path = crate::programs::native_input_receipt_path(
                 &|key| r.disk_cache.path("material-displacement", 1, key), &compiler,
                 &modules, "displacement", &[(entry, "compute")], &args, &native_programs.identities, &native_programs.inputs)?;
-            let code = crate::programs::native_code(&identity, prepared, &native_programs.inputs, &receipt_path, |identity| {
+            let (code, identity) = crate::programs::native_code(identity, prepared, &native_programs.inputs, &receipt_path, |identity| {
                 let mut key = prefix.clone();
                 key.update(identity);
                 r.disk_cache.path("material-displacement", 1, key.finalize())
@@ -215,6 +215,7 @@ impl Pipeline {
                 crate::timing::creation(&r.device,entry,"Slang",start.elapsed().as_secs_f64()*1000.,0.);
                 Ok(code)
             })?;
+            crate::programs::session_inputs::record(&identity)?;
             let threads = if entry == "initialize" {
                 (1, 1, 1)
             } else {

@@ -524,19 +524,44 @@ pub(crate) fn automatic_reflections_requested(scene: &Scene) -> bool {
         && surface_transport_required(scene)
 }
 
+/// Compute trace effects become known when Slang compiles the programs at install. Until then a compute program
+/// that can reach `trace` (by name, or through a file or import not read here) reserves ray queries.
+fn may_trace(program: &vork_scene::v2::Program) -> bool {
+    program.is_compute() && program.source.as_ref().is_none_or(|source| source.contains("trace")
+        || source.contains('#')
+        || source.match_indices("import").any(|(at, word)| {
+            let name = source[at + word.len()..].split(';').next().unwrap_or("").trim();
+            name != "vork"
+        }))
+}
+
 /// What drawing `scene` needs from the device: what its own space needs, and what each of its parts needs (a
 /// world inside a canvas, a canvas pictured in a world, and theirs in turn), since every part is drawn on the
 /// document's one device. A canvas's own drawing traces nothing. A world is judged before its assets and
 /// programs are installed, so a technique it may resolve to counts as needed: installation then chooses among
 /// techniques this device provides and never asks for more.
 pub(crate) fn device_needs(scene: &Scene) -> Result<crate::DeviceNeeds> {
-    let mut needs = if scene.is_canvas() { crate::DeviceNeeds::default() } else {
-        crate::DeviceNeeds {
-            ray_queries: uses_rays(scene) || possible_transport_queries(scene) || automatic_refraction(scene)
-                || automatic_reflections_requested(scene) || automatic_indirect_requested(scene),
-        }
+    fn capture_track(track: &vork_scene::v2::Track) -> bool {
+        track.path.last().is_some_and(|field| matches!(field.as_str(),
+            "filter" | "mask" | "clip-path" | "opacity" | "isolation" | "mix-blend-mode"))
+    }
+    let canvas = scene.is_canvas();
+    let mut needs = crate::DeviceNeeds {
+        ray_queries: !canvas && (scene.programs.values().any(may_trace) || uses_rays(scene) || possible_transport_queries(scene) || automatic_refraction(scene)
+            || automatic_reflections_requested(scene) || automatic_indirect_requested(scene)),
+        prefer_layered_captures: canvas && scene.animation.iter().flat_map(|layer| layer.tracks.iter().flatten()).any(capture_track),
     };
-    for part in scene.composition_parts() {
+    let mut parts = Vec::new();
+    scene.visit_space_nodes(|node, part| {
+        if part { parts.push(node); }
+        if canvas && !needs.prefer_layered_captures {
+            needs.prefer_layered_captures = node.filter.is_some() || node.mask.is_some() || node.clip_path.is_some()
+                || node.opacity != 1.0 || node.isolation == vork_scene::v2::Isolation::Isolate
+                || node.mix_blend_mode != vork_scene::v2::MixBlendMode::Normal
+                || node.animation.iter().flat_map(|layer| layer.tracks.iter().flatten()).any(capture_track);
+        }
+    });
+    for part in parts {
         if needs == crate::DeviceNeeds::ALL { break; }
         // A part's needs follow from its nodes and the document's settings, not from the size it is drawn at.
         let part = scene.composition_scene(&part.name, scene.render.resolution).with_context(|| format!("node {:?}", part.name))?;
@@ -710,7 +735,7 @@ pub(crate) struct Rays {
     /// Ray topology; opacity headers use this same CandidateInstanceIndex order.
     pub(crate) instances: Vec<(usize,u32)>,
     /// Every frame slot uses the installed topology and descriptor ABI.
-    placement_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    placement_pipeline: crate::gpu_tlas::Pipelines,
     /// Per draw: candidates are alpha-tested (non-opaque BLAS geometry).
     alpha_tested: Vec<bool>,
     shadow_solids: Vec<bool>,
@@ -757,7 +782,7 @@ impl ComputeSnapshot {
                 }
             }
         }
-        let rays=Rays::new(r,draws,&selected,objects,&[],true,materials,integrator,&[],&[],&[],&[],false)?;
+        let rays=Rays::new(r,draws,&selected,objects,&[],true,materials,integrator,&[],&[],&[],&[],false,None)?;
         let packed=gpu_objects(objects);
         let object_buffer=init(&r.device,"compute query objects",bytemuck::cast_slice(&packed),wgpu::BufferUsages::STORAGE);
         let tlas=r.device.create_tlas(&wgpu::CreateTlasDescriptor {label:Some("compute query snapshot"),max_instances:rays.instances.len().max(1) as u32,flags:BUILD_FLAGS,update_mode:wgpu::AccelerationStructureUpdateMode::Build});
@@ -1050,7 +1075,10 @@ fn alpha_table(
 }
 // Intern geometry sets independently of their instance transforms. Repeated
 // opaque assemblies retain shared BLAS instead of duplicating geometry per instance.
-fn geometry_key(draw: &install::Draw) -> (wgpu::Buffer,wgpu::Buffer,u64,u64,u32,u32,u64,bool) {
+type GeometryKey = (wgpu::Buffer,wgpu::Buffer,u64,u64,u32,u32,u64,bool);
+pub(crate) type StaticBlas = std::collections::HashMap<Vec<GeometryKey>, wgpu::Blas>;
+
+fn geometry_key(draw: &install::Draw) -> GeometryKey {
     (draw.vertices.clone(),draw.indices.clone(),draw.vertex_offset,draw.index_offset,
         draw.count,draw.vertex_count,draw.layout.vertex_stride(),draw.ray_corners.is_some())
 }
@@ -1080,7 +1108,8 @@ impl Rays {
         solid_owners: &[u32],
         subsurface_ids: &[u32],
         solids: &[crate::passes::path::PathSolid],
-        medium_sources: bool,
+        shared_emitter_sources: bool,
+        mut retained: Option<(&StaticBlas, &mut std::sync::Arc<StaticBlas>)>,
     ) -> Result<Self> {
         let path=integrator.is_path();
         ensure!(
@@ -1090,7 +1119,9 @@ impl Rays {
         let d = &r.device;
         let points=point_shapes(r,draws)?;
         let mut pending: Vec<(Vec<(usize,wgpu::BlasTriangleGeometrySizeDescriptor)>,wgpu::Blas)> = Vec::new();
-        let mut unique = std::collections::HashMap::new();
+        // Only the buffers and ranges consumed by a static BLAS determine its
+        // shape. Placement and all per-instance hit records belong to this install.
+        let mut unique = StaticBlas::new();
         let mut visibility_groups = Vec::new();
         let mut grouped_instances = vec![false;instances.len()];
         if !hits && integrator.subsurface_method().is_none() {
@@ -1120,7 +1151,10 @@ impl Rays {
                         (draw,triangles_size(&draws[draw]))
                     }).collect();
                     let key:Vec<_>=records.iter().map(|(draw,_)|geometry_key(&draws[*draw])).collect();
-                    let built=unique.entry(key).or_insert_with(|| {
+                    let built=unique.entry(key).or_insert_with_key(|key| {
+                        if let Some(blas) = retained.as_ref().and_then(|(old, _)| old.get(key)) {
+                            return blas.clone();
+                        }
                         let sizes:Vec<_>=records.iter().map(|(_,size)|size.clone()).collect();
                         let built=blas_geometries(d,"static opaque visibility BLAS",&sizes);
                         pending.push((records,built.clone()));built
@@ -1137,12 +1171,16 @@ impl Rays {
             if let Some(shape)=&points[index] {return Some(shape.blas.clone());}
             if draw.evaluated() || !primitive_needed[index] {return None;}
             let key=vec![geometry_key(draw)];
-            Some(unique.entry(key).or_insert_with(|| {
+            Some(unique.entry(key).or_insert_with_key(|key| {
+                if let Some(blas) = retained.as_ref().and_then(|(old, _)| old.get(key)) {
+                    return blas.clone();
+                }
                 let size=triangles_size(draw);
                 let built=blas(d,"static primitive BLAS",&size);
                 pending.push((vec![(index,size)],built.clone()));built
             }).clone())
         }).collect();
+        if let Some((_, next)) = retained.take() { *next = std::sync::Arc::new(unique); }
         // Bounded submissions keep build scratch small (the M5 forest spike OOM):
         // each batch's scratch is released before the next batch allocates its own.
         let mut start = 0;
@@ -1201,7 +1239,7 @@ impl Rays {
             && crate::emitters::has_sources(draws,instances,materials,true);
         let gi_emitters=integrator.raster().is_some_and(|r|r.fast_gi.as_ref().is_some_and(|g|g.method==vork_scene::FastGiMethod::Ray))
             && crate::emitters::has_sources(draws,instances,materials,true);
-        let topology = if path || probe_emitters || gi_emitters || medium_sources || integrator.reflections()==Some(vork_scene::Reflections::Ray) {
+        let topology = if path || probe_emitters || gi_emitters || shared_emitter_sources || integrator.reflections()==Some(vork_scene::Reflections::Ray) {
             crate::emitters::emitter_topology_counts(draws, &ray_instances, materials, !path, |slot,draw|points[draw].as_ref().filter(|_|point_rows[slot].is_some()).map_or(draws[draw].count,|p|p.indices)/3)?
         } else { vec![0, 0, 0] };
         let absorbing=ray_instances.iter().filter_map(|&(draw,object)| {
@@ -1229,7 +1267,7 @@ impl Rays {
             opaque: draws.iter().all(|draw| draw.ray_corners.is_none() && draw.splats.is_none()),
             emitters,
             probe_emitters,
-            emitter_weights:if path || probe_emitters || gi_emitters || medium_sources {crate::emitter_weights::Plan::new(r,emitters,topology[1])?} else {None},
+            emitter_weights:if path || probe_emitters || gi_emitters || shared_emitter_sources {crate::emitter_weights::Plan::new(r,emitters,topology[1])?} else {None},
             boundaries,
             object_boundaries,
             subsurface,
@@ -1262,6 +1300,10 @@ pub(crate) struct FrameRays {
     rebuilt_exposure: bool,
     #[cfg(test)]
     pub(crate) builds: u32,
+    #[cfg(test)]
+    pub(crate) refits: u32,
+    #[cfg(test)]
+    pub(crate) rebuilds: u32,
     /// This slot's hit buffer array (Rays::hit_buffers with deformed ranges
     /// resolved to its deform pool), as (buffer, offset, size).
     pub(crate) hit_buffers: Vec<(wgpu::Buffer, u64, u64)>,
@@ -1269,6 +1311,7 @@ pub(crate) struct FrameRays {
     deformed: Vec<Option<(wgpu::BlasTriangleGeometrySizeDescriptor, wgpu::Blas)>>,
 }
 impl Rays {
+    pub(crate) fn has_point_shapes(&self) -> bool { self.points.iter().any(Option::is_some) }
     pub(crate) fn dynamic_shadow_bounds(&self)->bool {self.shadow_bounds.as_ref().is_some_and(|p|p.dynamic())}
 }
 impl FrameRays {
@@ -1335,7 +1378,7 @@ impl FrameRays {
                 crate::gpu_tlas::Placement::with_points(r,objects,&instances,&installed.placement_pipeline,&point_poses,&installed.triangle_sides)
             }).transpose()?;
         let shadow_bounds=installed.shadow_bounds.as_ref().map(|plan|crate::shadow_containment::Slot::new(r,plan,objects)).transpose()?;
-        Ok(Some(Self { shadow_bounds, tlas, placement, placement_revision:0, motion_bytes:0, rebuilt_exposure:false, #[cfg(test)] builds:0, hit_buffers: Vec::new(), deformed, emitter_weights:installed.emitter_weights.as_ref().map(|p|crate::emitter_weights::Slot::new(p,d)) }))
+        Ok(Some(Self { shadow_bounds, tlas, placement, placement_revision:0, motion_bytes:0, rebuilt_exposure:false, #[cfg(test)] builds:0, #[cfg(test)] refits:0, #[cfg(test)] rebuilds:0, hit_buffers: Vec::new(), deformed, emitter_weights:installed.emitter_weights.as_ref().map(|p|crate::emitter_weights::Slot::new(p,d)) }))
     }
 }
 
@@ -1411,6 +1454,7 @@ pub(crate) fn encode(encoder: &mut wgpu::CommandEncoder, s: &InstalledScene, f: 
         .collect();
     #[cfg(test)] {rays.builds+=1;}
     if let Some(placement)=&rays.placement {
+        #[cfg(test)] { if force_rebuild { rays.rebuilds += 1; } else { rays.refits += 1; } }
         encoder.build_acceleration_structures(entries.iter(), std::iter::empty());
         placement.encode(encoder,&rays.tlas, force_rebuild);
     } else {
@@ -1588,10 +1632,22 @@ mod transport_owner_tests {
         // A world in the canvas is drawn on the canvas's device.
         let with_world = scene(serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"resolution":[64,64]},"nodes":[
             shape, world("shot", serde_json::json!([{"type":"camera","name":"cam"}]))]}))?;
-        assert_eq!(device_needs(&with_world)?, crate::DeviceNeeds::ALL);
+        let rays = crate::DeviceNeeds { ray_queries: true, prefer_layered_captures: false };
+        assert_eq!(device_needs(&with_world)?, rays);
         // A 3D document is judged as before.
         let three = scene(serde_json::json!({"version":2,"nodes":[{"type":"camera","name":"cam"}]}))?;
-        assert_eq!(device_needs(&three)?, crate::DeviceNeeds::ALL);
+        assert_eq!(device_needs(&three)?, rays);
+        let mut masked = canvas;
+        masked.nodes[0].filter = Some("blur(4px)".into());
+        assert_eq!(device_needs(&masked)?, crate::DeviceNeeds { ray_queries: false, prefer_layered_captures: true });
+        masked.nodes[0].filter = None;
+        let track = serde_json::from_value(serde_json::json!({"tracks":[{"path":["nodes","shape","filter"],
+            "keys":[[0,"none"],[1,"blur(4px)"]]}]}))?;
+        masked.animation.push(track);
+        let animated = device_needs(&masked)?;
+        assert!(animated.prefer_layered_captures);
+        assert!(crate::DeviceNeeds::default().covers(animated));
+        assert!(!animated.covers(rays));
         Ok(())
     }
 
@@ -1604,6 +1660,40 @@ mod transport_owner_tests {
             assert!(message.contains(name), "{message}");
         }
         assert!(message.contains(adapter_help()));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_trace_reserves_queries_before_effect_reflection() -> Result<()> {
+        let scene = Scene::from_json(br#"{
+            "version":2, "nodes":[{"type":"camera"}],
+            "buffers":{"distance":{"type":"f32","data":[0]}},
+            "programs":{"probe":{"schedule":"frame","dispatch":1,"bindings":{"distance":"distance"},
+                "source":"struct Inputs {}; void compute(ComputeContext c, Inputs i) { distance_store(0u, trace(float3(0,1,0),float3(0,-1,0),0.,2.,255u,7u).distance); }"}}
+        }"#)?;
+        assert!(device_needs(&scene)?.ray_queries);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_compute_with_textual_dependencies_reserves_queries() -> Result<()> {
+        let program = serde_json::from_value(serde_json::json!({
+            "schedule": "frame", "dispatch": 1,
+            "source": "import vork;\n#include \"collider.slang\"\nstruct Inputs {}; void compute(ComputeContext c, Inputs i) { collide(c); }"
+        }))?;
+        assert!(may_trace(&program));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_without_trace_needs_no_queries() -> Result<()> {
+        let scene = Scene::from_json(br#"{
+            "version":2, "nodes":[{"type":"camera"}],
+            "buffers":{"distance":{"type":"f32","data":[0]}},
+            "programs":{"fill":{"schedule":"frame","dispatch":1,"bindings":{"distance":"distance"},
+                "source":"import vork; struct Inputs {}; void compute(ComputeContext c, Inputs i) { distance_store(0u, 1.); }"}}
+        }"#)?;
+        assert!(!device_needs(&scene)?.ray_queries);
         Ok(())
     }
 

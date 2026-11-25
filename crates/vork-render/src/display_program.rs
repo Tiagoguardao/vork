@@ -207,7 +207,7 @@ pub(crate) fn prepare(
                 vork_scene::libraries::ProgramImage::File(_) => Some(std::env::current_exe()?.canonicalize()?),
                 _ => None,
             };
-            library_image(*image, executable.as_deref())?
+            library_image_from(*image, executable.as_deref(), &scene.library_files)?
         } else {
             let v2::Input::Texture(binding) = serde_json::from_value::<v2::Input>(value.clone())
                 .with_context(|| format!("input {input}: expected {{\"image\": name}}"))? else {
@@ -268,13 +268,17 @@ impl Prepared {
 }
 
 /// Follow the companion-tool layout: resolve data beside the canonical executable.
+#[cfg(test)]
 fn library_image(image: vork_scene::libraries::ProgramImage, executable: Option<&Path>) -> Result<ImageSource> {
+    library_image_from(image, executable, &Default::default())
+}
+fn library_image_from(image: vork_scene::libraries::ProgramImage, executable: Option<&Path>, files: &std::collections::BTreeMap<PathBuf, PathBuf>) -> Result<ImageSource> {
     match image {
         vork_scene::libraries::ProgramImage::Embedded(bytes) => Ok(ImageSource::Library(bytes)),
         vork_scene::libraries::ProgramImage::File(relative) => {
             let path = executable.context("locate executable for library image")?
                 .parent().context("locate executable directory for library image")?.join(relative);
-            let bytes = std::fs::read(&path)
+            let bytes = std::fs::read(files.get(&path).unwrap_or(&path))
                 .with_context(|| format!("read library image {}", path.display()))?;
             Ok(ImageSource::File { image: None, path, bytes, srgb: false, color_space: Some(v2::ColorSpace::NonColor) })
         }
@@ -922,7 +926,7 @@ impl ErrorWord {
 /// in the canvas carries it. A canvas whose view is the identity (`Prepared::identity`) compiles and runs no
 /// program: the stage finishes the picture as it is, with the one clamp and rounding every view's result takes.
 pub(crate) struct PictureStage {
-    stage: Stage,
+    stage: std::sync::Arc<Stage>,
     floating: bool,
     /// A result that cannot be used is zeroed and recorded here, unless the picture is drawn for a frame that
     /// collects its own diagnostics (`encode`).
@@ -933,13 +937,20 @@ pub(crate) struct PictureStage {
 impl PictureStage {
     /// `target` is the display the stage encodes for: a render's `output.display`, or sRGB for a reader
     /// (`floating`: a world that reads the canvas, an EXR).
-    pub(crate) fn new(r: &Renderer, scene: &v2::Scene, base: &Path, target: crate::output_device::Target, floating: bool) -> Result<Self> {
+    pub(crate) fn new(r: &Renderer, scene: &v2::Scene, base: &Path, target: crate::output_device::Target, floating: bool, opened: &crate::footage::Opened) -> Result<Self> {
         let mut prepared = if Prepared::identity(scene, target) { Prepared::new(scene, target, floating, None, Vec::new(), None, Vec::new()) }
-            else { prepare(r, scene, base, target, &crate::footage::Opened::default(), floating)? };
+            else { prepare(r, scene, base, target, opened, floating)? };
         prepared.picture = true;
         let stage = prepared.install(r)?;
-        Ok(Self { stage, floating, errors: ErrorWord::new(r, "canvas view errors"), size: scene.render.resolution, seed: scene.render.settings.seed })
+        Ok(Self { stage: std::sync::Arc::new(stage), floating, errors: ErrorWord::new(r, "canvas view errors"), size: scene.render.resolution, seed: scene.render.settings.seed })
     }
+    /// Keep the installed pipeline, image views and animation, with an error
+    /// word owned by this frame lane until its readback is recorded.
+    pub(crate) fn replica(&self, r: &Renderer) -> Self {
+        Self { stage: self.stage.clone(), floating: self.floating, size: self.size, seed: self.seed,
+            errors: ErrorWord::new(r, "canvas view errors") }
+    }
+
     /// The format `encode` writes: the picture a world reads, or the renderer's 8-bit frame.
     pub(crate) fn format(&self, r: &Renderer) -> wgpu::TextureFormat {
         if self.floating { wgpu::TextureFormat::Rgba16Float } else { r.output_format() }

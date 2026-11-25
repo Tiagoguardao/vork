@@ -56,9 +56,7 @@ pub const DEGENERATE_EPSILON_SQ: f64 = 1e-12;
 /// 3 control points × 2 floats per quadratic segment (GlyphCurveStore.ts:21).
 pub const FLOATS_PER_CURVE: usize = 6;
 
-/// `GlyphQuadratics` (glyphCurves.ts:21-31). Values are f32 — the browser
-/// stores a Float32Array and computes bounds over the CONVERTED values, so
-/// bounds here are min/max of the f32-rounded control points.
+/// Drawn quadratics and their tight bounds, both in em units.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlyphQuadratics {
     /// Flat control points [p0x, p0y, cx, cy, p1x, p1y, ...].
@@ -181,33 +179,16 @@ pub fn quadratics_from_commands(commands: &[PathCommand]) -> GlyphQuadratics {
     }
     close_contour!();
 
-    // `new Float32Array(pts)` — convert FIRST, then bounds over f32 values.
+    // Bound the outline at the precision the GPU receives.
     let points: Vec<f32> = pts.iter().map(|v| *v as f32).collect();
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    if !points.is_empty() {
-        min_x = f32::INFINITY;
-        min_y = f32::INFINITY;
-        max_x = f32::NEG_INFINITY;
-        max_y = f32::NEG_INFINITY;
-        let mut i = 0;
-        while i < points.len() {
-            let x = points[i];
-            let y = points[i + 1];
-            if x < min_x {
-                min_x = x;
-            }
-            if x > max_x {
-                max_x = x;
-            }
-            if y < min_y {
-                min_y = y;
-            }
-            if y > max_y {
-                max_y = y;
-            }
-            i += 2;
-        }
-    }
+    let bounds = moda_scene::path_geom::bounds::path_bounds(points.chunks_exact(6).flat_map(|q| {
+        use moda_scene::blend::BlendPathPoint::{Move, Quadratic};
+        [Move { x: q[0].into(), y: q[1].into() },
+         Quadratic { cp: (q[2].into(), q[3].into()), x: q[4].into(), y: q[5].into() }]
+    }));
+    let [min_x, min_y, max_x, max_y] = bounds.map_or([0.0; 4], |b| {
+        [b.min_x as f32, b.min_y as f32, b.max_x as f32, b.max_y as f32]
+    });
     let curve_count = (points.len() / FLOATS_PER_CURVE) as u32;
     GlyphQuadratics {
         points,
@@ -737,6 +718,15 @@ pub(crate) fn outline_error(e: String) -> ShapeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyph_ink_bounds_stop_at_the_quadratic_turn() {
+        let q = quadratics_from_commands(&[
+            PathCommand::M { x: 0.0, y: 0.0 },
+            PathCommand::Q { x1: 0.5, y1: 2.0, x: 1.0, y: 0.0 },
+        ]);
+        assert_eq!([q.min_x, q.min_y, q.max_x, q.max_y], [0.0, 0.0, 1.0, 1.0]);
+    }
 
     #[test]
     fn lines_become_degenerate_quadratics_and_z_closes() {

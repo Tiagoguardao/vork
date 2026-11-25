@@ -1,8 +1,7 @@
 //! Spatial source selection; path transport consumes evaluated analytic sources.
 //! Bounds/powers are proposal guides, never radiance or visibility certificates.
-#![allow(dead_code)] // Combined mesh/field/environment membership remains standalone groundwork.
 use super::Light;
-use crate::{Material, Vec3, install::Draw};
+use crate::Vec3;
 use anyhow::{Result, ensure};
 use bytemuck::{Pod, Zeroable};
 
@@ -10,9 +9,10 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Kind {
     Analytic,
+    #[cfg(test)]
     Mesh,
-    Implicit,
-    Environment,
+    #[cfg(test)]
+    Environment = 3,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct Source {
@@ -68,90 +68,6 @@ pub(crate) fn analytic_sources(lights: &[Light]) -> Vec<Source> {
     out
 }
 
-/// Derive membership from exactly the installed source topology. Caller supplies
-/// current world bounds per ray instance (including GPU deformation/placement),
-/// and optional current power guides. Unknown program powers must stay supported.
-/// The environment is one composite installed source, not one leaf per texel.
-pub(crate) fn installed_sources(
-    lights: &[Light],
-    draws: &[Draw],
-    instances: &[(usize, u32)],
-    materials: &[Material],
-    world_bounds: &[(Vec3, Vec3)],
-    mesh_powers: &[f64],
-    environment_power: Option<f64>,
-) -> Result<Vec<Source>> {
-    ensure!(
-        instances.len() == world_bounds.len(),
-        "light tree needs current bounds for every ray instance"
-    );
-    ensure!(
-        mesh_powers.is_empty() || mesh_powers.len() == instances.len(),
-        "light tree power guide length mismatch"
-    );
-    let mut out = analytic_sources(lights);
-    let topology = crate::emitters::emitter_topology(draws, instances, materials, false)?;
-    for entry in topology[3 + instances.len()..].chunks_exact(3) {
-        let i = entry[0] as usize;
-        out.push(Source {
-            kind: Kind::Mesh,
-            identity: entry[0],
-            bounds: world_bounds[i],
-            power: mesh_powers.get(i).copied().unwrap_or(1.),
-            infinite: false,
-        });
-    }
-    let implicit = crate::emitters::implicit_sources(draws, instances, materials);
-    for (field, (i, _)) in instances
-        .iter()
-        .enumerate()
-        .filter(|(_, (draw, _))| draws[*draw].implicit.is_some())
-        .enumerate()
-    {
-        if implicit.binary_search(&(field as u32)).is_ok() {
-            out.push(Source {
-                kind: Kind::Implicit,
-                identity: field as u32,
-                bounds: world_bounds[i],
-                power: mesh_powers.get(i).copied().unwrap_or(1.),
-                infinite: false,
-            });
-        }
-    }
-    if let Some(power) = environment_power {
-        out.push(Source {
-            kind: Kind::Environment,
-            identity: 0,
-            bounds: (Vec3::ZERO, Vec3::ZERO),
-            power,
-            infinite: true,
-        });
-    }
-    Ok(out)
-}
-/// Build from an installed scene and this frame's already evaluated lights and
-/// bounds. Installation order is the source identity; camera culling is irrelevant.
-pub(crate) fn from_scene(
-    scene: &crate::InstalledScene,
-    lights: &[Light],
-    world_bounds: &[(Vec3, Vec3)],
-    powers: &[f64],
-    environment_power: f64,
-) -> Result<Tree> {
-    let instances = scene
-        .rays
-        .as_ref()
-        .map_or(&[][..], |r| r.instances.as_slice());
-    Tree::build(&installed_sources(
-        lights,
-        &scene.draws,
-        instances,
-        &scene.materials,
-        world_bounds,
-        powers,
-        Some(environment_power),
-    )?)
-}
 impl Tree {
     pub(crate) fn build(sources: &[Source]) -> Result<Self> {
         ensure!(

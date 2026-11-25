@@ -63,7 +63,7 @@ fn region_at(sources: &[Value], p: (f64, f64), gap: f64) -> Option<FilledRegion>
 /// Area of a region's points: its largest ring less the others (the holes
 /// in these tests nest one deep).
 fn area_of(r: &FilledRegion) -> f64 {
-    let areas: Vec<f64> = crate::stroke_outline::raster::polygons(&r.points)
+    let areas: Vec<f64> = crate::path_geom::test_raster::polygons(&r.points)
         .iter()
         .map(|p| {
             let n = p.len();
@@ -119,7 +119,7 @@ fn overlap_reaches_under_the_ink_but_never_past_it() {
     let RegionAt::Region(r) = arr.at((50.0, 50.0)) else { panic!("a region") };
     // Where the region's outline crosses y = 50.
     let mut side: Vec<f64> = Vec::new();
-    for poly in crate::stroke_outline::raster::polygons(&r.points) {
+    for poly in crate::path_geom::test_raster::polygons(&r.points) {
         for k in 0..poly.len() {
             let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
             if (a.y - 50.0) * (b.y - 50.0) < 0.0 {
@@ -430,22 +430,4 @@ fn a_500_path_drawing_fills_a_region_in_under_200_ms() {
         assert!(worst < 200.0, "{worst:.1} ms per region (budget 200 ms)");
         assert!(all_ms / (n as f64) < 200.0);
     }
-}
-
-#[test]
-#[ignore]
-fn profile_500() {
-    let sources = drawing_500();
-    let t = Instant::now();
-    let d = drawing(&sources, 3.0, 0.5);
-    eprintln!("parse {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
-    let t = Instant::now();
-    let _ = d.at((50.0, 50.0), None).unwrap();
-    eprintln!("at (cold) {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
-    let t = Instant::now();
-    let a = d.arrange(None).unwrap();
-    eprintln!("arrange everything {:.1} ms, {} faces", t.elapsed().as_secs_f64() * 1000.0, a.region_count());
-    let t = Instant::now();
-    let r = a.regions();
-    eprintln!("refit every region {:.1} ms ({})", t.elapsed().as_secs_f64() * 1000.0, r.len());
 }

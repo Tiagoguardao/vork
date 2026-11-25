@@ -32,6 +32,7 @@ pub(crate) const SRGB_DECODE_CURVE: [f32; 5] = [0.04045, 12.92, 0.055, 1.055, 2.
 pub(crate) const TEXTURE_COMPRESSION_QUALITY: i32 = 100;
 pub(crate) const TEXTURE_COMPRESSION_EFFORT: i32 = 1;
 /// Amortize scoped-thread startup over at least 64K output texels; tiny mips stay serial.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const TEXTURE_MIP_TEXELS_PER_WORKER: usize = 64 * 1024;
 /// BC7 and ASTC 4x4 both encode sixteen texels into sixteen bytes.
 pub(crate) const TEXTURE_BLOCK_EDGE: u32 = 4;
@@ -42,6 +43,7 @@ pub(crate) const TEXTURE_BC7_GROUP_SIZE: u32 = 64;
 /// ring sharing one GPU mip/search workspace.
 pub(crate) const TEXTURE_PREPARATION_IN_FLIGHT: usize = 2;
 /// Keep SIMD alpha refinement parallel through small edge-heavy mip levels.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const TEXTURE_BC7_ALPHA_BLOCKS_PER_WORKER: usize = 256;
 /// derived: maximum finite IEEE-754 binary16 value (2-2^-10)*2^15.
 pub(crate) const HALF_FLOAT_MAX: f32 = 65504.;

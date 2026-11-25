@@ -217,8 +217,6 @@ pub(crate) struct Field {
     positions: Vec<Grid>,
     indices: Vec<Grid>,
     frame: Option<Grid>,
-    #[cfg(test)]
-    pub(crate) placement_ms: f64,
 }
 impl Field {
     pub(crate) fn in_frame(
@@ -242,10 +240,9 @@ impl Field {
             })
             .collect::<Vec<_>>();
         let eyes=eyes.iter().map(|&p|normalized.transform_point3(p)).collect::<Vec<_>>();
-        let started = Instant::now();
         let (bricks, nodes) = finest_fit(|opening, range| Self::enumerate(volume, draws, &objects, &eyes,
             opening, demand, frame.clip, Some(device), range))?;
-        let field = Self::pack_admitted(volume, bricks, nodes, started)?;
+        let field = Self::pack_admitted(volume, bricks, nodes)?;
         let mut field = field.in_world(frame);
         field.demand = frame.relative || demand;
         Ok(field)
@@ -286,9 +283,8 @@ impl Field {
     #[cfg(test)]
     fn place(volume: &vork_scene::ProbeVolume, draws: &[install::Draw], objects: &[Object], eyes: &[Vec3],
         opening: f32, demand: bool, clip: Option<[Vec3;8]>, device: Option<&wgpu::Device>) -> Result<Self> {
-        let started=Instant::now();
         let (bricks,nodes)=Self::enumerate(volume,draws,objects,eyes,opening,demand,clip,device,&mut OpeningRange::default())?;
-        Self::pack(volume,bricks,nodes,started)
+        Self::pack(volume,bricks,nodes)
     }
     fn enumerate(
         volume: &vork_scene::ProbeVolume,
@@ -381,7 +377,6 @@ impl Field {
     fn from_cells(
         volume: &vork_scene::ProbeVolume,
         cells: BTreeSet<[i32; 3]>,
-        started: Instant,
     ) -> Result<Self> {
         let res = volume.resolution();
         let mut bricks = Bricks::new();
@@ -398,18 +393,17 @@ impl Field {
                 }
             }
         }
-        Self::pack(volume, bricks, nodes, started)
+        Self::pack(volume, bricks, nodes)
     }
     fn pack(
         volume: &vork_scene::ProbeVolume,
         cells: Bricks,
         keys: BTreeSet<[i64; 4]>,
-        _started: Instant,
     ) -> Result<Self> {
         let res = volume.resolution();
         cells.check_field(keys.len() as u64,cells.len() as u64,res)?;
         cells.check_native(resident_bytes(keys.len(), cells.len(), res))?;
-        Self::pack_admitted(volume, cells, keys, _started)
+        Self::pack_admitted(volume, cells, keys)
     }
     /// Encode only after admission has selected the final spatial support.
     /// Telemetry checks belong to admission, where pressure can retry the search.
@@ -417,7 +411,6 @@ impl Field {
         volume: &vork_scene::ProbeVolume,
         cells: Bricks,
         keys: BTreeSet<[i64; 4]>,
-        _started: Instant,
     ) -> Result<Self> {
         #[cfg(test)]
         FIELD_PACK_COUNT.with(|count| count.set(count.get()+1));
@@ -487,8 +480,6 @@ impl Field {
             positions,
             indices,
             frame: None,
-            #[cfg(test)]
-            placement_ms: _started.elapsed().as_secs_f64() * 1000.,
         })
     }
     pub(crate) fn coarsen(&self) -> Result<Self> {
@@ -551,7 +542,7 @@ impl Field {
                 }}}
             }
         }
-        let mut field = Self::pack(&volume, cells, nodes, Instant::now())?.in_world(self.reference);
+        let mut field = Self::pack(&volume, cells, nodes)?.in_world(self.reference);
         field.header.visibility_policy[0] = self.header.visibility_policy[0];
         field.header.visibility_policy[3] = self.header.visibility_policy[3];
         field.demand = self.demand;
@@ -835,7 +826,7 @@ mod tests {
             result?;
             Ok((bricks,nodes))
         })?;
-        let field=Field::pack(&volume,bricks,nodes,started)?;
+        let field=Field::pack(&volume,bricks,nodes)?;
         assert!(enumerations<20,"pressure enumeration count: {enumerations}");
         assert!(bindings_fit(field.positions.len(),field.bricks.len(),volume.resolution(),1<<20));
         let packs=FIELD_PACK_COUNT.with(|count| count.get());
@@ -895,7 +886,7 @@ mod tests {
     }
     #[test]
     fn demand_growth_streams_and_retries_with_the_original_binding_limit() -> Result<()> {
-        let mut initial=Field::from_cells(&vork_scene::ProbeVolume::default(),BTreeSet::from([[0,0,0]]),Instant::now())?;
+        let mut initial=Field::from_cells(&vork_scene::ProbeVolume::default(),BTreeSet::from([[0,0,0]]))?;
         initial.binding_limit=Some(1<<20);
         let requests=(1..256).map(|x|[x*1000,0,0]).collect();
         let grown=initial.grow_bricks(&requests,0)?;
@@ -975,7 +966,7 @@ mod tests {
     fn demand_adds_only_complete_requested_stencils_and_preserves_the_frame() -> Result<()> {
         let volume=vork_scene::ProbeVolume::default();
         let frame=Frame {origin:Vec3::new(10.,20.,30.),rotation:glam::Quat::from_rotation_y(0.7),scale:0.25,relative:true,clip:None};
-        let initial=Field::from_cells(&volume,BTreeSet::from([[0,0,0]]),Instant::now())?.in_world(frame);
+        let initial=Field::from_cells(&volume,BTreeSet::from([[0,0,0]]))?.in_world(frame);
         let requests=BTreeSet::from([[-2000,3000,4000]]);
         let grown=initial.grow(&requests,0)?;
         assert_eq!(grown.header.count(),initial.header.count()+8);
@@ -994,7 +985,7 @@ mod tests {
         for x in 0..8192 {
             mark_cell([4;3], glam::IVec3::new(x*6,0,0), &mut bricks, &mut nodes)?;
         }
-        let field = Field::pack(&vork_scene::ProbeVolume::default(),bricks,nodes,Instant::now())?;
+        let field = Field::pack(&vork_scene::ProbeVolume::default(),bricks,nodes)?;
         assert!(resident_bytes(field.positions.len(),field.bricks.len(),[4;3])>64<<20);
         assert_eq!(field.header.field[3],0,"capacity must not coarsen the lattice");
         assert_eq!(field.header.spacing[..3],[constants::PROBE_SPACING;3]);
@@ -1020,7 +1011,6 @@ mod tests {
             &vork_scene::ProbeVolume::default(),
             bricks,
             nodes,
-            Instant::now(),
         )?;
         assert_eq!(field.header.spacing[..3], [constants::PROBE_SPACING; 3]);
         let metadata = field.metadata();
@@ -1081,11 +1071,10 @@ mod tests {
     #[test]
     fn canonical_support_does_not_stretch_with_distant_geometry() -> Result<()> {
         let volume = vork_scene::ProbeVolume::default();
-        let local = Field::from_cells(&volume, BTreeSet::from([[0, 0, 0]]), Instant::now())?;
+        let local = Field::from_cells(&volume, BTreeSet::from([[0, 0, 0]]))?;
         let distant = Field::from_cells(
             &volume,
             BTreeSet::from([[0, 0, 0], [1000, 0, 1000]]),
-            Instant::now(),
         )?;
         assert_eq!(local.bricks[0].origin, distant.bricks[0].origin);
         assert_eq!(local.bricks[0].spacing, distant.bricks[0].spacing);
@@ -1100,13 +1089,11 @@ mod tests {
         let low = Field::from_cells(
             &volume,
             BTreeSet::from([[0, 0, 0], [1, 0, 0]]),
-            Instant::now(),
         )?;
         volume.rays_per_probe = 65536;
         let mut high = Field::from_cells(
             &volume,
             BTreeSet::from([[0, 0, 0], [1, 0, 0]]),
-            Instant::now(),
         )?;
         high.header.visibility_policy[3] = 1;
         assert_eq!(low.positions, high.positions);
@@ -1133,7 +1120,6 @@ mod tests {
             &vork_scene::ProbeVolume::default(),
             bricks,
             nodes,
-            Instant::now(),
         )?;
         assert_eq!(
             field.header.count(),
@@ -1161,7 +1147,6 @@ mod tests {
         let field = Field::from_cells(
             &vork_scene::ProbeVolume::default(),
             BTreeSet::from([[0, 0, 0], [1, 0, 0]]),
-            Instant::now(),
         )?;
         assert_eq!(field.header.count(), 2 * 64 - 16);
         let metadata = field.metadata();

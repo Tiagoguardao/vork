@@ -314,7 +314,7 @@ fn applyColorChange(
 
         
         // Frame-level uniforms
-        @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>; // viewProjection
+// #include "rect-clip.wgsl"
         // Mask sampling (optional)
         struct MaskUniforms {
           maskActive: u32,
@@ -377,8 +377,9 @@ fn applyColorChange(
           @location(1) uv: vec2<f32>,
           @location(2) @interpolate(flat) isStroke: f32,
           @location(3) localPos: vec2<f32>,
-          @location(4) worldPos: vec2<f32>, // Add world position for clipping
+          @location(4) worldPos: vec2<f32>, // World position for mask sampling
           @location(5) @interpolate(flat) clip: vec4<f32>,
+          @location(6) @interpolate(flat) imageEdges: vec4<f32>,
         }
         
         @vertex
@@ -395,7 +396,7 @@ fn applyColorChange(
           // Transform to world space
           let worldPos = path.model * vec4<f32>(localPos.x, localPos.y, 0.0, 1.0);
           output.worldPos = worldPos.xy; // Pass world position to fragment shader
-          output.position = frameUniforms * worldPos;
+          output.position = frameUniforms.viewProjection * worldPos;
           
           // Use pre-calculated depth value (stored in pathInfo.w)
           let depthOffset = select(0.0, STROKE_DEPTH_OFFSET, vertex.vertexType > 0.5);
@@ -404,8 +405,18 @@ fn applyColorChange(
           output.instanceId = instanceIndex;
           output.isStroke = vertex.vertexType;
           output.localPos = localPos;
-          output.clip = path.pageClipBounds;
+          output.clip = projectRectClip(path.pageClipBounds);
           
+          output.imageEdges = vec4<f32>(0.0); // no framebuffer pixel centre is zero
+          if (path.patternData.x > 0.6 && path.model[0].y == 0.0 && path.model[1].x == 0.0 &&
+              abs(path.patternData.w) <= 0.001 && path.perspectiveRow0.w == 0.0) {
+            let axis = vec2<f32>(path.model[0].x, path.model[1].y);
+            let end = fma(path.textureDims, path.patternData.yz, path.patternOffset);
+            let a = fma(path.patternOffset, axis, path.model[3].xy);
+            let b = fma(end, axis, path.model[3].xy);
+            output.imageEdges = projectRectClip(vec4<f32>(min(a, b), abs(b - a)));
+          }
+
           // Calculate UV coordinates with offset
           // Get texture dimensions
           let textureDims = path.textureDims;
@@ -534,10 +545,10 @@ fn applyColorChange(
             // texture is in that encoding already (the pattern cache uploads a decoded image in it).
             color = vec4<f32>(workingRgb(path.strokeColor.rgb), path.strokeColor.a);
           } else {
-            // For fills, check if we should show the pattern
-            // For no-repeat mode, check against the transformed UV coordinates
-            if (repeatMode > 0.6 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)) {
-              // no-repeat mode and outside bounds
+            let outside = (uv < vec2<f32>(0.0)) | (uv > vec2<f32>(1.0));
+            // The top-left rule on pixel-rounded bounds excludes a centre tied with the leading image edge and includes one tied with the trailing edge.
+            let tiedOutside = (outside & (input.position.xy != input.imageEdges.zw)) | (input.position.xy == input.imageEdges.xy);
+            if (repeatMode > 0.6 && any(tiedOutside)) {
               color = vec4<f32>(0.0);
             } else {
               // Use the texture color with opacity
@@ -551,12 +562,7 @@ fn applyColorChange(
             discard;
           }
           
-          // Check page clip bounds
-          let bounds = input.clip;
-          if (input.worldPos.x < bounds.x || 
-              input.worldPos.x > bounds.x + bounds.z ||
-              input.worldPos.y < bounds.y || 
-              input.worldPos.y > bounds.y + bounds.w) {
+          if (outsideRectClip(input.position.xy, input.clip)) {
             discard;
           }
           

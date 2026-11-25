@@ -8,13 +8,8 @@
 //! operands' own membership is the same a little way off in every direction, so no sample sits on a boundary),
 //! the result must contain exactly the points the op's definition says it does. On subsets small enough for
 //! the exact lane, they also check the exact answer against the polygon lane's.
-//!
-//! `bench_large_inputs` is `#[ignore]`d and prints timings for docs/qa/perf.md:
-//!
-//!   cargo test --release -p moda-scene bench_large_inputs -- --ignored --nocapture
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use super::convert::{flatten_subpath, points_to_subpaths};
 use super::solve::{solve_on, Lane};
@@ -178,83 +173,6 @@ fn describe_boolean(r: &Result<BooleanOutcome, BooleanError>) -> String {
         }) => format!("ok {} pts {} subpaths", points.len(), subpath_count),
         Ok(BooleanOutcome::Empty) => "empty".into(),
         Err(e) => format!("error {} ({})", e.code, e.message),
-    }
-}
-
-fn describe_pathfinder(r: &Result<PathfinderOutcome, BooleanError>) -> String {
-    match r {
-        Ok(PathfinderOutcome::Pieces(p)) => format!(
-            "ok {} pieces {} pts",
-            p.len(),
-            p.iter().map(|p| p.points.len()).sum::<usize>()
-        ),
-        Ok(PathfinderOutcome::Empty) => "empty".into(),
-        Err(e) => format!("error {} ({})", e.code, e.message),
-    }
-}
-
-#[test]
-#[ignore]
-fn bench_large_inputs() {
-    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
-    // `MODA_BENCH_MAX=<n>` skips the larger sizes (an uncapped run of the old solver takes minutes past 500).
-    let max: usize = std::env::var("MODA_BENCH_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(usize::MAX);
-    for (anchors, sizes) in [
-        (20, &[16, 64, 200, 500, 1000][..]),
-        (8, &[500, 1000, 1500][..]),
-    ] {
-        for &n in sizes.iter().filter(|&&n| n <= max) {
-            for op in [
-                BooleanOp::Union,
-                BooleanOp::Subtract,
-                BooleanOp::Exclude,
-                BooleanOp::Intersect,
-            ] {
-                let operands = grid_operands(n, anchors);
-                let t = Instant::now();
-                let r = boolean(op, operands);
-                println!(
-                    "grid {n:>5} x {anchors:>2} anchors {op:?}: {:.1} ms, {}",
-                    ms(t),
-                    describe_boolean(&r)
-                );
-            }
-        }
-    }
-    for n in [64, 500, 1000].into_iter().filter(|&n| n <= max) {
-        let operands: Vec<BooleanOperand> = clusters(&vec![5; n / 5], 20)
-            .into_iter()
-            .flatten()
-            .collect();
-        let t = Instant::now();
-        let r = boolean(BooleanOp::Union, operands);
-        println!(
-            "clusters-of-5 {n:>5} Union: {:.1} ms, {}",
-            ms(t),
-            describe_boolean(&r)
-        );
-    }
-    for n in [16, 64, 200, 300, 500].into_iter().filter(|&n| n <= max) {
-        for op in [
-            PathfinderOp::Divide,
-            PathfinderOp::Trim,
-            PathfinderOp::Merge,
-            PathfinderOp::Crop,
-            PathfinderOp::Outline,
-            PathfinderOp::MinusBack,
-        ] {
-            let operands = grid_operands(n, 20);
-            let t = Instant::now();
-            let r = pathfinder(op, operands);
-            println!(
-                "grid {n:>5} x 20 anchors {op:?}: {:.1} ms, {}",
-                ms(t),
-                describe_pathfinder(&r)
-            );
-        }
     }
 }
 

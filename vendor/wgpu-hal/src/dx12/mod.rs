@@ -987,6 +987,9 @@ pub struct Texture {
 }
 
 impl Texture {
+    /// Native bytes reserved for this resource.
+    pub fn binding_size(&self) -> u64 { self.allocation.size() }
+
     pub unsafe fn raw_resource(&self) -> &Direct3D12::ID3D12Resource {
         &self.resource
     }

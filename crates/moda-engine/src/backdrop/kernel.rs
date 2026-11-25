@@ -103,6 +103,21 @@ pub const SIGMA_DIRECT_MAX: f64 = 5.0;
 /// sampled at ±offset).
 pub type BlurPass = BlurKernel;
 
+/// Pack one direction of the separable Gaussian for `backdrop-blur.wgsl`.
+pub(crate) fn blur_pass_uniform(kernel: &BlurPass, direction: u32, size: [f32; 2]) -> Vec<f32> {
+    let kernel_size = kernel.size.min(MAX_BLUR_KERNEL_SIZE);
+    let mut uniform = vec![0f32; 4 + MAX_BLUR_KERNEL_SIZE * 4];
+    uniform[0] = direction as f32;
+    uniform[1] = kernel_size as f32;
+    uniform[2] = size[0];
+    uniform[3] = size[1];
+    for i in 0..kernel_size {
+        uniform[4 + i * 4] = kernel.weights.get(i).copied().unwrap_or(0.0);
+        uniform[4 + i * 4 + 1] = kernel.offsets.get(i).copied().unwrap_or(0.0);
+    }
+    uniform
+}
+
 /// The passes (per direction) that blur by σ = max(radius / 3, 0.5).
 ///
 /// Up to σ = 5 this is the single production kernel, unchanged. Beyond it the

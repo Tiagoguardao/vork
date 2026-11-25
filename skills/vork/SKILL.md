@@ -6,7 +6,8 @@ description: Make 3D stills, animation and video with vork. Use for rendering, a
 # vork
 
 Start with `vork help`; use `vork init` for a new scene. Look up commands,
-fields and defaults there.
+fields and defaults there. For parallel MP4 export, follow `vork help render`
+and use the bundled [stitch script](scripts/chunk-export.py).
 
 Primitive-only stills are technical renders: do not open either reference. This
 exception overrides the table. Otherwise read matching references before the first

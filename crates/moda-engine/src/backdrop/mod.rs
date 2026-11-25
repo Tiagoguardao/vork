@@ -37,12 +37,13 @@
 //! stack.
 
 pub mod blend;
+pub(crate) mod isolation;
 pub mod exec;
 pub mod kernel;
 pub mod plan;
 
 pub use blend::{
-    canvas_root_has_split_blend, canvas_root_has_split_blend_over, compute_blend_splits, compute_group_splits, compute_stack_splits, page_has_split_blend,
+    canvas_root_has_split_blend, canvas_root_has_split_blend_over, page_has_split_blend,
     page_has_split_blend_over, page_splits_are_stacks_only,
 };
 pub use exec::BackdropRenderer;

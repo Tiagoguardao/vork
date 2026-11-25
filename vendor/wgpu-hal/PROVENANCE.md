@@ -213,3 +213,28 @@ copy's completion signal. The ordinary queue-wide signal API is unchanged.
 Regression: `vulkan::semaphore_list::thread_signal_tests` checks concurrent
 producers without a GPU. Remove when upstream supports producer-scoped external
 completion signals.
+
+Local patch (diagnostic, opt-in): `src/vulkan/fault.rs`, with hooks in
+`src/vulkan/adapter.rs` (extension list, `open_with_callback`, `device_from_raw`),
+`src/vulkan/command.rs` (a checkpoint before each compute dispatch),
+`src/vulkan/device.rs` (object names, buffer sizes), `src/vulkan/instance.rs`
+(`VK_EXT_debug_utils` for address-range reports) and `src/vulkan/mod.rs`
+(`get_lost_err`). With `VORK_DEVICE_FAULT=1`, the device is created with whichever of
+`VK_EXT_device_fault` (and `deviceFaultVendorBinary` where offered),
+`VK_EXT_device_address_binding_report`, `VK_NV_device_diagnostic_checkpoints` and
+`VK_NV_device_diagnostics_config` the driver has. The first `VK_ERROR_DEVICE_LOST`
+prints, with the prefix `vork gpu fault:`, the last compute dispatch each pipeline
+stage reached (pass label, pipeline label, dispatch arguments), the driver's fault
+description, address records (each mapped to the labelled buffer or image whose
+address range holds it) and vendor codes, and writes any vendor binary to
+`VORK_DEVICE_FAULT_DUMP` (default `vork-device-fault.bin`) and the full report beside
+it as `.txt`. `VORK_DEVICE_FAULT=2` also asks the NVIDIA driver to keep shader debug
+information. Without the variable nothing changes. Remove when upstream reports device
+faults and checkpoint data.
+
+Vulkan, Metal and D3D12 expose native texture allocation requirements and backing sizes for capture scheduling. Vulkan releases temporary pipeline shader modules after a failed driver creation and propagates explicit device loss.
+
+Local patch: command encoders expose whether buffer or texture transitions can
+record commands. Metal opts out alongside its two empty transition methods.
+Other backends default to explicit transitions. Used by wgpu-core's lazy
+pre-pass recording. Remove with the corresponding upstream pre-pass change.

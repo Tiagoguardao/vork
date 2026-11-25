@@ -20,6 +20,8 @@ use std::{
 /// compile at install too), and the shared mesh-medium transport.
 #[derive(Clone, Default)]
 pub(crate) struct SlangScene {
+    pub(crate) revision_files: vork_slang::RevisionFiles,
+    pub(crate) installed_inputs: Option<Arc<Mutex<vork_slang::InstalledInputs>>>,
     pub(crate) program_trace: bool,
     pub(crate) propagation: Option<crate::propagation::Native>,
     pub(crate) camera: Option<Arc<crate::camera_program::Native>>,
@@ -112,6 +114,7 @@ impl SlangScene {
         kernel:Option<crate::pipelines::ProgramKernel>, program:Option<u32>,
         consume:impl FnOnce(&[(&str,&str)],&[&str],&std::collections::BTreeMap<String,Vec<u8>>,&[vork_slang::InputIdentity],EntryTransforms)->T,
     )->T {
+        let _revision = self.revision_files.enter();
         use crate::pipelines::{ProgramKernel, ShadeStage};
         let (_, target, flags) = if metal {
             METAL_TARGET
@@ -250,12 +253,11 @@ impl SlangScene {
                 }
             }
         }
-        if matches!(kernel,Some(ProgramKernel::Path {..}|ProgramKernel::PathEnvironment {..})) {
-            if let Some(camera)=&self.camera {
-                kernel_defines.push("-DVORK_LIGHT_PATHS".into());
-                for module in &camera.modules {
-                    if !program_modules.iter().any(|(name,_)|name==&module.0) {program_modules.push(module.clone());}
-                }
+        let camera = self.camera.as_ref().filter(|_| matches!(kernel, Some(ProgramKernel::Path {..}|ProgramKernel::PathEnvironment {..})));
+        if let Some(camera) = camera {
+            kernel_defines.push("-DVORK_LIGHT_PATHS".into());
+            for module in &camera.modules {
+                if !program_modules.iter().any(|(name,_)|name==&module.0) {program_modules.push(module.clone());}
             }
         }
 
@@ -358,6 +360,11 @@ impl SlangScene {
             .collect();
         let identities=(if secondary {all_programs} else {programs}).map(|p|p.identities.clone()).unwrap_or_default();
         let inputs=(if secondary {all_programs} else {programs}).map(|p|p.inputs.as_slice()).unwrap_or(&[]);
+        let combined;
+        let inputs = if let Some(camera) = camera.filter(|camera| !camera.inputs.is_empty()) {
+            combined = [inputs, camera.inputs.as_slice()].concat();
+            combined.as_slice()
+        } else { inputs };
         consume(&modules,&args,&identities,inputs,EntryTransforms {
             localize_blends:transport_outlining && !metal,
             // Keep the native optimizer from re-expanding large authored path graphs.
@@ -402,6 +409,9 @@ impl SlangScene {
                 }
                 identity
             };
+            if !lookup_only && let Some(inputs) = &self.installed_inputs {
+                inputs.lock().unwrap().record(&identity)?;
+            }
             let mut hash=transforms.prefix(if metal {request.threads} else {(0,0,0)});
             hash.update(&identity.identity);
             Ok(hash.finalize())
@@ -621,7 +631,8 @@ impl SlangForward {
         } else {
             programs::native_input_identity(self.cache.as_ref(),&compiler,&modules,main,&[entry],&args,&identities,inputs)?
         };
-        let code = programs::native_code(&identity, prepared, inputs, &receipt_path, |identity| {
+        let expected = self.scene.installed_inputs.as_ref().map(|_| identity.identity.clone());
+        let (code, installed_identity) = programs::native_code(identity, prepared, inputs, &receipt_path, |identity| {
             let mut hash = prefix.clone();
             hash.update(identity);
             (self.cache)(hash.finalize())
@@ -640,6 +651,11 @@ impl SlangForward {
             }
             Ok(code)
         })?;
+        if let Some(inputs) = &self.scene.installed_inputs {
+            anyhow::ensure!(expected.as_deref() == Some(&installed_identity.identity),
+                "native inputs for {label} changed after pipeline lookup; retry the command");
+            inputs.lock().unwrap().record(&installed_identity)?;
+        }
         Ok(Lookup::Built(if self.metal {
             let source=String::from_utf8(code)?;
             vork_slang::metal_source::validate(&source)?;
@@ -943,7 +959,6 @@ impl VariantShader for SlangForward {
         anyhow::ensure!(self.path_engine(kernel).is_ok(), "only engine-backed path kernels detach");
         let request = self.hit_entry(kernel);
         self.scene.with_entry_inputs(self.metal,self.ray_shadows,self.msaa,&request.main,request.text.as_deref(),request.entry,request.kernel,request.program,|modules,args,identities,inputs,transforms| {
-            anyhow::ensure!(inputs.is_empty(), "engine kernel has no authored input proofs");
             let compiler = vork_slang::Compiler::discover();
             let (identity, _) = programs::native_input_identity(self.cache.as_ref(), &compiler, modules, &request.main, &[request.entry], args, identities, inputs)?;
             // This process will not generate the kernel. Release the install's
@@ -1281,7 +1296,7 @@ mod tests {
             std::fs::remove_file(&receipt)?;
             let snapshot=take_prepared(&prepared,&receipt,inputs).expect("identity capture survives receipt eviction and transfers to compilation");
             let artifact=|identity:&[u8]| {let mut hash=transforms.prefix((0,0,0));hash.update(identity);cache(hash.finalize())};
-            let code=programs::native_code(&identity,Some(snapshot),inputs,&receipt,artifact,
+            let (code, _)=programs::native_code(identity,Some(snapshot),inputs,&receipt,artifact,
                 ||anyhow::bail!("registry preparation must not run twice"),|snapshot|snapshot.compile())?;
             let fresh=compiler.prepare_identified_modules(modules,&entry.main,&[entry.entry],args,identities)?.compile()?;
             assert_eq!(code,fresh,"transferring the snapshot must preserve executable bytes");

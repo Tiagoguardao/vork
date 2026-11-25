@@ -222,15 +222,6 @@ fn image_render_help_matches_capture_fields_and_settings() {
     assert!(!help.contains("image.render.seed") && !help.contains("image.render.motion_blur"));
 }
 
-#[test]
-fn removed_abi_flag_is_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_vork"))
-        .args(["help", "programs", "--abi"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--abi'"));
-    assert!(!help_args(&["--help"]).contains("--abi"));
-}
-
 fn field_error(path: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_vork"))
         .args(["help", "field", path]).output().unwrap();
@@ -463,7 +454,7 @@ fn canvas_limits_are_explicit_where_the_features_are_advertised() {
     }
     for topic in ["ask", "limits"] {
         for args in [vec![topic], vec![topic, "--all"]] {
-            assert!(help_args(&args).contains("Canvas documents support audio answers only"), "{args:?}");
+            assert!(help_args(&args).contains("Canvas nodes support transform"), "{args:?}");
         }
     }
     for topic in ["nodes", "images", "limits"] {

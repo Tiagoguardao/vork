@@ -4,12 +4,21 @@ use crate::*;
 use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttributeDomain { Vertex, Primitive, Corner, Instance, Constant }
+pub(crate) enum AttributeDomain {
+    Vertex,
+    #[cfg(test)]
+    Primitive,
+    #[cfg(test)]
+    Corner,
+    #[cfg(test)]
+    Instance,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Connectivity<'a> {
     Triangles(&'a [u32]),
     Polygons { indices: &'a [u32], counts: &'a [u32] },
+    #[cfg(test)]
     Points,
 }
 #[derive(Clone, Copy)]
@@ -22,12 +31,14 @@ impl Topology<'_> {
         match self.connectivity {
             Connectivity::Triangles(indices) => indices.len()/3,
             Connectivity::Polygons {counts,..} => counts.len(),
+            #[cfg(test)]
             Connectivity::Points => self.vertices,
         }
     }
     fn corners(&self) -> usize {
         match self.connectivity {
             Connectivity::Triangles(indices) | Connectivity::Polygons {indices,..} => indices.len(),
+            #[cfg(test)]
             Connectivity::Points => self.vertices,
         }
     }
@@ -45,6 +56,7 @@ impl Topology<'_> {
                 ensure!(corners==indices.len() as u64,"polygon corner counts do not cover connectivity");
                 indices
             }
+            #[cfg(test)]
             Connectivity::Points => return Ok(()),
         };
         u32::try_from(indices.len()).context("geometry connectivity exceeds u32 addressing")?;
@@ -55,15 +67,19 @@ impl Topology<'_> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RowMap<'a> {
+    #[cfg(test)]
     Identity,
     Indexed(&'a [u32]),
     Stencils(&'a vork_mesh::Plan),
+    #[cfg(test)]
     Repeated { rows_per_input: usize },
 }
+#[cfg(test)]
 enum Contributions<'a> {
     Single(Option<(u32,f32)>),
     Weighted(std::slice::Iter<'a,(u32,f32)>),
 }
+#[cfg(test)]
 impl Iterator for Contributions<'_> {
     type Item=(u32,f32);
     fn next(&mut self) -> Option<Self::Item> {
@@ -71,16 +87,20 @@ impl Iterator for Contributions<'_> {
     }
 }
 impl RowMap<'_> {
+    #[cfg(test)]
     fn sources(&self,row:usize) -> Contributions<'_> {
         match *self {
+            #[cfg(test)]
             Self::Identity => Contributions::Single(Some((row as u32,1.))),
             Self::Indexed(rows) => Contributions::Single(Some((rows[row],1.))),
             Self::Stencils(plan) => Contributions::Weighted(plan.stencils[row].iter()),
+            #[cfg(test)]
             Self::Repeated {rows_per_input} => Contributions::Single(Some(((row/rows_per_input) as u32,1.))),
         }
     }
     fn validate(&self,input:usize,output:usize) -> Result<()> {
         match *self {
+            #[cfg(test)]
             Self::Identity => ensure!(input==output,"identity correspondence changes row count"),
             Self::Indexed(rows) => {
                 ensure!(rows.len()==output,"indexed correspondence does not cover output rows");
@@ -97,15 +117,18 @@ impl RowMap<'_> {
                     ensure!((mass-1.).abs()<1e-4,"vertex correspondence does not preserve constants");
                 }
             }
+            #[cfg(test)]
             Self::Repeated {rows_per_input} => ensure!(rows_per_input>0 && input.checked_mul(rows_per_input)==Some(output),"repeated correspondence has inconsistent capacity"),
         }
         Ok(())
     }
     fn apply<'a,const N:usize>(&self,values:&'a [[f32;N]]) -> Cow<'a,[[f32;N]]> {
         match *self {
+            #[cfg(test)]
             Self::Identity => Cow::Borrowed(values),
             Self::Indexed(rows) => Cow::Owned(rows.iter().map(|&row|values[row as usize]).collect()),
             Self::Stencils(plan) => Cow::Owned(plan.evaluate(values)),
+            #[cfg(test)]
             Self::Repeated {rows_per_input} => Cow::Owned(values.iter().flat_map(|value|std::iter::repeat_n(*value,rows_per_input)).collect()),
         }
     }
@@ -134,6 +157,7 @@ impl Transition<'_> {
         if let Some(map)=self.corners {map.validate(self.input.corners(),self.output.corners())?;}
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn vertex_sources(&self,row:usize) -> impl Iterator<Item=(u64,f32)> + '_ {
         assert!(row<self.output.vertices,"vertex outside topology contract");
         self.vertices.sources(row).map(|(source,weight)|
@@ -142,9 +166,11 @@ impl Transition<'_> {
     pub(crate) fn remap<'a,const N:usize>(&self,domain:AttributeDomain,values:&'a [[f32;N]]) -> Result<Cow<'a,[[f32;N]]>> {
         let (count,map)=match domain {
             AttributeDomain::Vertex => (self.input.vertices,self.vertices),
+            #[cfg(test)]
             AttributeDomain::Primitive => (self.input.primitives(),self.primitives),
+            #[cfg(test)]
             AttributeDomain::Corner => (self.input.corners(),self.corners.context("topology stage requires vertex-indexed attributes; split seams in the source")?),
-            AttributeDomain::Constant => {ensure!(values.len()==1,"constant attribute needs one row");return Ok(Cow::Borrowed(values));}
+            #[cfg(test)]
             AttributeDomain::Instance => return Ok(Cow::Borrowed(values)),
         };
         ensure!(values.len()==count,"{domain:?} attribute has {} rows; predecessor domain has {count}",values.len());

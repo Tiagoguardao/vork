@@ -48,6 +48,7 @@ impl State {
 
 pub(crate) struct Instance {
     pub standard_camera: bool,
+    pub install_identity: vork_slang::InputIdentity,
     pub node: usize,
     pub material: String,
     pub id: u32,
@@ -93,7 +94,9 @@ pub(crate) fn install(r: &Renderer, scene: &v2::Scene, nodes: &mut [EvalNode], b
         let mut hash=blake3::Hasher::new();
         hash.update(b"camera-optics-v3");hash.update(abi.cache_identity()?.as_bytes());hash.update(source.as_bytes());hash.update(origin.to_string_lossy().as_bytes());
         let key=hash.finalize();let tag=key.to_hex();
-        let program=programs::cached(r,key,&vork_slang::Compiler::discover(),
+        let compiler = vork_slang::Compiler::discover();
+        let install_identity = programs::program_identity(&r.disk_cache, &compiler, &abi, &source, &origin)?;
+        let program=programs::cached(r,key,&compiler.with_identity(&install_identity),
         &abi, &source, &origin,
             |compiler|compiler.compile_camera(&abi,&source,&origin,&tag[..12]))?;
         let values=material.inputs.iter().map(|(k,v)|Ok((k.clone(),serde_json::to_value(v)?))).collect::<Result<BTreeMap<_,_>>>()?;
@@ -109,8 +112,9 @@ pub(crate) fn install(r: &Renderer, scene: &v2::Scene, nodes: &mut [EvalNode], b
         for &[w,h] in &views[&n.node.name] {
             n.camera.as_ref().unwrap().calibration(w as f32/h as f32)?;
         }
-        result.push(Instance {standard_camera:material.program=="std/camera",node,material:name.clone(),id:result.len() as u32+1,offset:0,spectral,unit_weight,uses_time,words,program});
+        result.push(Instance {install_identity,standard_camera:material.program=="std/camera",node,material:name.clone(),id:result.len() as u32+1,offset:0,spectral,unit_weight,uses_time,words,program});
     }
+    vork_slang::InputIdentity::verify_all(result.iter().map(|camera| &camera.install_identity))?;
     Ok(result)
 }
 
@@ -162,6 +166,7 @@ pub(crate) fn origin_balls(instances: &[Instance], nodes: &[EvalNode], animated:
 
 pub(crate) fn native(instances: &[Instance]) -> Native {
     let mut native=crate::camera_dispatch_native::generate(&programs::abi(),instances.iter().map(|i|(i.id,i.program.as_ref())));
+    native.inputs = instances.iter().map(|camera| camera.install_identity.clone()).collect();
     native.standard_camera=instances.len()==1 && instances[0].id==1 && instances[0].standard_camera;
     native
 }

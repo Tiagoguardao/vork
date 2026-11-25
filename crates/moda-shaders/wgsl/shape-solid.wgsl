@@ -12,7 +12,7 @@ const MIN_GRADIENT_STOP_DIFF: f32 = 0.0001;
 
 // Main shader code
 
-      @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>; // viewProjection
+// #include "rect-clip.wgsl"
 
       struct RectData {
         model: mat4x4<f32>,     // 16 floats
@@ -31,7 +31,6 @@ const MIN_GRADIENT_STOP_DIFF: f32 = 0.0001;
       struct VSOut {
         @builtin(position) position: vec4<f32>,
         @location(0) color: vec4<f32>,
-        @location(1) worldPos: vec2<f32>,
         @location(2) @interpolate(flat) clip: vec4<f32>,
         @location(3) localPos: vec2<f32>,
         @location(4) @interpolate(flat) size: vec2<f32>,
@@ -279,12 +278,11 @@ fn applyInnerShadow(
 
         let local = vec4<f32>(anchored, 0.0, 1.0);
         let world = r.model * local;
-        var clip = frameUniforms * world;
+        var clip = frameUniforms.viewProjection * world;
         clip.z = r.dimensions.z; // use precomputed linear depth
         out.position = clip;
         out.color = r.color;
-        out.worldPos = world.xy;
-        out.clip = r.pageClipBounds;
+        out.clip = projectRectClip(r.pageClipBounds);
 
         // Pass local position for SDF calculation
         out.localPos = localPos;
@@ -308,11 +306,7 @@ fn applyInnerShadow(
       @fragment
       fn fragmentMainPremul(inp: VSOut) -> @location(0) vec4<f32> {
         // Check page clip bounds first
-        let bounds = inp.clip;
-        if (inp.worldPos.x < bounds.x ||
-            inp.worldPos.x > bounds.x + bounds.z ||
-            inp.worldPos.y < bounds.y ||
-            inp.worldPos.y > bounds.y + bounds.w) {
+        if (outsideRectClip(inp.position.xy, inp.clip)) {
           discard;
         }
 
@@ -360,11 +354,7 @@ fn applyInnerShadow(
       @fragment
       fn fragmentMainA2C(inp: VSOut) -> @location(0) vec4<f32> {
         // Check page clip bounds first
-        let bounds = inp.clip;
-        if (inp.worldPos.x < bounds.x ||
-            inp.worldPos.x > bounds.x + bounds.z ||
-            inp.worldPos.y < bounds.y ||
-            inp.worldPos.y > bounds.y + bounds.w) {
+        if (outsideRectClip(inp.position.xy, inp.clip)) {
           discard;
         }
 

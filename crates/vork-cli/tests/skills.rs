@@ -27,7 +27,12 @@ impl Drop for Project {
     }
 }
 
-const FILES: &[&str] = &["SKILL.md", "references/shot.md", "references/assets.md"];
+const FILES: &[&str] = &[
+    "SKILL.md",
+    "references/shot.md",
+    "references/assets.md",
+    "scripts/chunk-export.py",
+];
 const DESTINATIONS: &[&str] = &[".agents/skills/vork", ".claude/skills/vork"];
 
 #[test]

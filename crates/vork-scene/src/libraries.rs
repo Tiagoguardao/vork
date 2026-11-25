@@ -177,23 +177,13 @@ pub fn material_programs<'a>() -> impl Iterator<Item = &'a str> {
 
 /// Error-only guidance for removed module names; these never resolve to source.
 pub fn removed_module(name: &str) -> Option<String> {
-    let replacement = match name {
-        // std.white_balance is a library, not a program: the stage is the author's own.
-        "post/white_balance" | "post.white_balance" =>
-            "std.white_balance is a library, not a program: write a composite program that imports it and returns white_balance(color, inputs)",
-        "std/particles" | "std.particles" => "use fluid.particles",
-        "std/display" | "std.display" => "use std.view: finish_view(srgb, ctx, gamma)",
+    let key = match name {
+        "post/white_balance" | "post.white_balance" => "post/white_balance",
+        "std/particles" | "std.particles" => "std/particles",
+        "std/display" | "std.display" => "std/display",
         _ => return None,
     };
-    Some(format!("{name} was removed; {replacement}; see `vork help upgrade`"))
-}
-
-#[cfg(test)]
-#[test]
-fn compatibility_expires_in_06() {
-    for name in ["post/white_balance", "std/particles"] {
-        assert!(module_source(name).is_none(), "removed module {name} still registered");
-    }
+    Some(crate::migration::message(key, &[("name", name)]))
 }
 
 #[test]

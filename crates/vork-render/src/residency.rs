@@ -7,13 +7,26 @@ use std::sync::{
 
 trait Entry: Send + Sync {
     fn age(&self) -> u64;
-    fn evict(&self) -> u64;
+    fn evict(&self) -> Option<u64>;
     fn bytes(&self) -> u64;
 }
 #[derive(Default)]
 pub(crate) struct Ledger {
     clock: AtomicU64,
     entries: Mutex<Vec<Weak<dyn Entry>>>,
+}
+/// Keeps an external cache's participation alive without retaining its values.
+pub(crate) struct Registration { entry: Arc<External>, ledger: Arc<Ledger> }
+impl Registration {
+    pub(crate) fn touch(&self) {
+        self.entry.touched.fetch_max(self.ledger.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+struct External { reclaim: Box<dyn Fn() -> bool + Send + Sync>, touched: AtomicU64 }
+impl Entry for External {
+    fn age(&self) -> u64 { self.touched.load(Ordering::Relaxed) }
+    fn bytes(&self) -> u64 { 0 }
+    fn evict(&self) -> Option<u64> { (self.reclaim)().then_some(0) }
 }
 struct State<T> {
     value: Option<Arc<T>>,
@@ -30,9 +43,9 @@ impl<T: Send + Sync> Entry for Inner<T> {
     fn bytes(&self) -> u64 {
         self.state.lock().unwrap().bytes
     }
-    fn evict(&self) -> u64 {
+    fn evict(&self) -> Option<u64> {
         let Ok(mut state) = self.state.try_lock() else {
-            return 0;
+            return None;
         };
         if state
             .value
@@ -40,9 +53,9 @@ impl<T: Send + Sync> Entry for Inner<T> {
             .is_some_and(|v| Arc::strong_count(v) == 1)
         {
             state.value.take();
-            std::mem::take(&mut state.bytes)
+            Some(std::mem::take(&mut state.bytes))
         } else {
-            0
+            None
         }
     }
 }
@@ -119,6 +132,15 @@ impl<T: Send + Sync + 'static> Cache<T> {
     }
 }
 impl Ledger {
+    /// Native allocation remains authoritative for caches whose handle drops
+    /// can merely unpin a shared allocation. Each successful call is progress.
+    pub(crate) fn register(self: &Arc<Self>, reclaim: impl Fn() -> bool + Send + Sync + 'static) -> Registration {
+        let entry = Arc::new(External { reclaim: Box::new(reclaim), touched: AtomicU64::new(0) });
+        let erased: Arc<dyn Entry> = entry.clone();
+        self.entries.lock().unwrap().push(Arc::downgrade(&erased));
+        Registration { entry, ledger: self.clone() }
+    }
+
     /// Native allocation is authoritative. Retire consumers only after pressure,
     /// then release one LRU entry per retry; never flush a roomy device's caches.
     pub(crate) fn retry<T, E>(
@@ -133,7 +155,7 @@ impl Ledger {
                 Err(error) => {
                     if !pressure(&error) { return Err(error); }
                     retire()?;
-                    if self.evict(1) == 0 { return Err(error); }
+                    if !self.reclaim() { return Err(error); }
                 }
             }
         }
@@ -151,24 +173,32 @@ impl Ledger {
     }
     /// Release least recently useful entries until demand is covered. Pinned
     /// entries are skipped, and revisited after dependent cache entries drop.
-    pub(crate) fn evict(&self, needed: u64) -> u64 {
+    pub(crate) fn evict(&self, needed: u64) -> u64 { self.evict_up_to(needed, false).0 }
+
+    /// A zero-byte owner can pin a separate backing cache. Its removal is
+    /// progress even before any accounted GPU bytes become reclaimable.
+    pub(crate) fn reclaim(&self) -> bool { self.evict_up_to(1, true).1 }
+
+    fn evict_up_to(&self, needed: u64, one: bool) -> (u64, bool) {
         let mut registry = self.entries.lock().unwrap();
         registry.retain(|e| e.strong_count() > 0);
         let mut entries: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
         drop(registry);
         entries.sort_by_key(|e| e.age());
         let mut freed: u64 = 0;
+        let mut reclaimed = false;
         loop {
-            let before = freed;
+            let mut changed = false;
             for entry in &entries {
-                if freed >= needed {
-                    return freed;
+                if freed >= needed { return (freed, reclaimed); }
+                if let Some(bytes) = entry.evict() {
+                    freed = freed.saturating_add(bytes);
+                    changed = true;
+                    reclaimed = true;
+                    if one { return (freed, reclaimed); }
                 }
-                freed = freed.saturating_add(entry.evict());
             }
-            if before == freed {
-                return freed;
-            }
+            if !changed { return (freed, reclaimed); }
         }
     }
 }
@@ -176,6 +206,38 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_cache_use_shares_the_ledgers_eviction_order() {
+        let ledger = Arc::new(Ledger::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = calls.clone();
+        let external = ledger.register(move || { count.fetch_add(1, Ordering::Relaxed); false });
+        let old = Cache::new(&ledger);
+        drop(old.insert(7, 64));
+        external.touch();
+        assert!(ledger.reclaim());
+        assert!(!old.is_resident());
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "recent external cache was asked before older backing");
+        assert!(!ledger.reclaim());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn external_cache_progress_and_registration_lifetime() {
+        let ledger = Arc::new(Ledger::default());
+        let remaining = Arc::new(AtomicU64::new(2));
+        let cache = remaining.clone();
+        let registration = ledger.register(move || cache.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |n| n.checked_sub(1)).is_ok());
+        assert!(ledger.reclaim());
+        assert_eq!(remaining.load(Ordering::Relaxed), 1);
+        assert!(ledger.reclaim());
+        assert_eq!(remaining.load(Ordering::Relaxed), 0);
+        assert!(!ledger.reclaim());
+        remaining.store(1, Ordering::Relaxed);
+        drop(registration);
+        assert!(!ledger.reclaim());
+        assert_eq!(remaining.load(Ordering::Relaxed), 1);
+    }
     #[test]
     fn camera_headroom_ignores_staging_but_not_local_pressure() {
         assert_eq!(local_headroom::<u64>([(true, 4<<30), (false, 32<<30)]), Some(4<<30));
@@ -248,6 +310,27 @@ mod tests {
         assert_eq!(ledger.retained_bytes(), 0);
     }
     #[test]
+    fn an_unaccounted_owner_unpins_its_backing_cache() {
+        let ledger = Arc::new(Ledger::default());
+        let backing = Cache::new(&ledger);
+        let owner = Cache::new(&ledger);
+        let lease = backing.insert((), 64);
+        drop(owner.insert(lease, 0));
+        assert_eq!(ledger.evict(1), 64);
+        assert!(!owner.is_resident());
+        assert!(!backing.is_resident());
+    }
+    #[test]
+    fn native_retry_observes_zero_byte_reclamation() {
+        let ledger = Arc::new(Ledger::default());
+        let owner = Cache::new(&ledger);
+        drop(owner.insert((), 0));
+        let mut attempts = 0;
+        assert_eq!(ledger.retry(|| { attempts += 1; if attempts == 1 { Err(true) } else { Ok(()) } },
+            |pressure| *pressure, || Ok(())), Ok(()));
+        assert_eq!(attempts, 2);
+    }
+    #[test]
     fn registry_does_not_retain_abandoned_caches() {
         let ledger = Arc::new(Ledger::default());
         {
@@ -262,6 +345,7 @@ mod tests {
 /// Only a single shared Vulkan heap has resource-independent headroom. wgpu's
 /// selected memory type is not exposed here: multiple heaps (including staging
 /// heaps) are unknown, never a minimum/maximum admission budget.
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
 fn common_headroom<T>(heaps: impl IntoIterator<Item = T>) -> Option<T> {
     let mut heaps = heaps.into_iter();
     let first = heaps.next()?;
@@ -305,6 +389,7 @@ pub(crate) fn camera_usage_headroom(device: &wgpu::Device) -> Option<(u64, u64)>
     }
     None
 }
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
 fn local_headroom<T>(heaps: impl IntoIterator<Item = (bool, T)>) -> Option<T> {
     common_headroom(heaps.into_iter().filter_map(|(local, free)| local.then_some(free)))
 }

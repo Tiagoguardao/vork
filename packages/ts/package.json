@@ -1,6 +1,6 @@
 {
   "name": "@voyager-so/vork",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Rust-generated scene types, JSON Schema and serialization for vork",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -25,7 +25,7 @@
     "check": "tsc --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
     "generate": "node generate.mjs",
-    "check:generated": "node generate.mjs --check && node generate-std.mjs --check"
+    "check:generated": "node generate.mjs --check"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

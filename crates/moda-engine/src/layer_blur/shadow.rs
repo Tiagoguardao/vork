@@ -339,25 +339,8 @@ pub fn silhouette_node(node: &RawNode) -> RawNode {
     let mut m = node.fields().clone();
     m.insert("opacity".into(), moda_scene::value::Value::from(1.0));
     m.remove("blendMode");
-    let geometry: Vec<moda_scene::value::Value> = node
-        .array("effects")
-        .map(|effects| {
-            effects
-                .iter()
-                .filter(|e| {
-                    e.get("type")
-                        .and_then(moda_scene::value::Value::as_str)
-                        .is_some_and(|t| moda_scene::effect::GEOMETRY_EFFECT_TYPES.contains(&t))
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    if geometry.is_empty() {
-        m.remove("effects");
-    } else {
-        m.insert("effects".into(), moda_scene::value::Value::Array(geometry));
-    }
+
+    m.remove("effects");
     let has_fill = sp::node_fills_shared(node)
         .iter()
         .any(|f| sp::shown(f.visible, f.opacity));
@@ -381,7 +364,7 @@ pub fn silhouette_node(node: &RawNode) -> RawNode {
         },
     );
     let stroke = crate::paint::layers::widest_stroke(node).map(|mut s| {
-        s.paint = sp::Paint::Solid(sp::SolidPaint { color: black() });
+        s.paint = sp::Paint::Solid(sp::SolidPaint::new(black()));
         s.opacity = None;
         s.visible = None;
         s.blend_mode = None;
@@ -412,7 +395,7 @@ pub fn noise_coverage_node(node: &RawNode) -> Option<RawNode> {
             && f.opacity.unwrap_or(1.0) >= 1.0
             && f.blend_mode.as_deref().is_none_or(|b| b == "normal")
             && matches!(&f.paint, sp::Paint::Solid(s)
-                if crate::color::parse_color(s.color.as_str()).is_some_and(|c| c.a >= 1.0))
+                if s.rgba.is_some_and(|c| c.a >= 1.0))
     });
     if covered {
         return None;
@@ -700,9 +683,8 @@ pub(crate) fn plan_shadow_group(
             ..Default::default()
         },
         cache_key: None,
-        identity_key: None,
         coverage: Vec::new(),
-        masks: Vec::new(),
+        masks: Default::default(),
     })
 }
 
@@ -726,6 +708,35 @@ pub(crate) fn items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Re
     item_extents(items).map(ItemExtents::rect)
 }
 pub(crate) fn item_extents(items: &[crate::seams::DrawItem]) -> Option<ItemExtents> {
+    geometry_extents(items, false)
+}
+
+/// Canvas-space geometry used by host read-back. Transform each drawn body vertex
+/// before taking its extrema so a rotated nonrectangular path stays tight.
+pub fn draw_bounds(item: &crate::seams::DrawItem) -> Option<[f64; 4]> {
+    let items = std::slice::from_ref(item);
+    if let Some(e) = geometry_extents(items, true) {
+        return Some([e.min.0, e.min.1, e.max.0, e.max.1]);
+    }
+    if matches!(item, crate::seams::DrawItem::Text(_) | crate::seams::DrawItem::Body { .. }) { return None; }
+    all_items_canvas_bounds(items).map(|r| [r.x, r.y, r.x + r.w, r.y + r.h])
+}
+
+/// Endpoints of each nonempty alpha row. Their four pixel corners suffice for
+/// the extrema under any affine placement, including a rotated colour glyph.
+fn alpha_row_corners(rgba: &[u8], width: u32, mut point: impl FnMut(f32, f32)) {
+    for (y, row) in rgba.chunks_exact(width as usize * 4).enumerate() {
+        let mut ink = row.chunks_exact(4).enumerate().filter(|(_, p)| p[3] > 0);
+        if let Some((left, _)) = ink.next() {
+            let right = ink.next_back().map_or(left, |(x, _)| x) + 1;
+            for x in [left, right] {
+                for y in [y, y + 1] { point(x as f32, y as f32); }
+            }
+        }
+    }
+}
+
+fn geometry_extents(items: &[crate::seams::DrawItem], vertices: bool) -> Option<ItemExtents> {
     use crate::seams::DrawItem;
     let mut min = (f64::INFINITY, f64::INFINITY);
     let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -740,6 +751,11 @@ pub(crate) fn item_extents(items: &[crate::seams::DrawItem]) -> Option<ItemExten
     };
     for item in items {
         match item {
+            DrawItem::Body { geometry, instance, .. } if vertices => {
+                for p in geometry.positions.chunks_exact(2) {
+                    add(&instance.model_matrix, p[0], p[1]);
+                }
+            }
             DrawItem::Body { instance, .. } => {
                 let m = &instance.model_matrix;
                 let [x, y, w, h] = instance.bounds;
@@ -747,9 +763,56 @@ pub(crate) fn item_extents(items: &[crate::seams::DrawItem]) -> Option<ItemExten
                     add(m, px, py);
                 }
             }
+            DrawItem::Text(batch) if batch.distort.is_some() && batch.vector.is_some() => {
+                use moda_text_draw::seams::TextBounds;
+                match batch.painted_local_bounds() {
+                    TextBounds::Finite([l, t, r, b]) => {
+                        for (x, y) in [(l, t), (l, b), (r, t), (r, b)] {
+                            add(&batch.model_matrix, x as f32, y as f32);
+                        }
+                    }
+                    TextBounds::CrossesHorizon => {
+                        // Glyphs can overflow the node's box, where the homography
+                        // can cross the horizon. The shader's canvas clip still holds.
+                        // Host read-back asks for finite geometry. An unclipped
+                        // horizon has no finite bounds in canvas space.
+                        if vertices && batch.page_clip_bounds == crate::seams::INFINITE_CLIP {
+                            return None;
+                        }
+                        let [x, y, w, h] = batch.page_clip_bounds;
+                        let identity = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];
+                        add(&identity, x, y);
+                        add(&identity, x + w, y + h);
+                    }
+                    TextBounds::Empty => {}
+                }
+            }
             DrawItem::Text(batch) => {
                 let m = &batch.model_matrix;
                 for op in &batch.ops {
+                    if vertices {
+                        if let moda_text::ops::TextOpPipeline::Emoji { emoji } = op.pipeline {
+                            let glyph = batch.vector.as_ref().and_then(|v| v.emojis.get(emoji as usize));
+                            if let (Some(glyph), Some(engine)) = (glyph, &batch.emoji_engine) {
+                                if let Some(img) = glyph.image(engine).filter(|_| op.opacity > 0.) {
+                                    // Use the two triangles' collected f32 corners. Round the projected
+                                    // texel edge once, as for CPU-collected glyph bounds.
+                                    let [x0, y0, x1, y1, x2, y2, x3, y3] = glyph.corners.map(f64::from);
+                                    alpha_row_corners(&img.rgba, img.width, |x, y| {
+                                        let u = f64::from(x) / f64::from(img.width);
+                                        let v = f64::from(y) / f64::from(img.height);
+                                        let (x, y) = if u >= v {
+                                            ((1. - u) * x0 + (u - v) * x1 + v * x2, (1. - u) * y0 + (u - v) * y1 + v * y2)
+                                        } else {
+                                            ((1. - v) * x0 + u * x2 + (v - u) * x3, (1. - v) * y0 + u * y2 + (v - u) * y3)
+                                        };
+                                        add(m, x as f32, y as f32);
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     for v in op.verts.chunks_exact(4) {
                         add(m, v[0], v[1]);
                     }
@@ -761,34 +824,66 @@ pub(crate) fn item_extents(items: &[crate::seams::DrawItem]) -> Option<ItemExten
                         x0 + dq.raster.logical_w as f32,
                         y0 + dq.raster.logical_h as f32,
                     );
+                    if vertices {
+                        // The fallback draw has already rasterized its glyphs. Its quad
+                        // includes transparent padding, which is outside the ink.
+                        let raster = &dq.raster;
+                        let sx = raster.logical_w as f32 / raster.width as f32;
+                        let sy = raster.logical_h as f32 / raster.height as f32;
+                        alpha_row_corners(&raster.rgba, raster.width, |x, y| add(m, x0 + x*sx, y0 + y*sy));
+                        continue;
+                    }
                     for (px, py) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
                         add(m, px, py);
                     }
                 }
                 // The vector lane: tessellated triangles, and analytic glyph
                 // boxes placed as `kineticGlyphLocal` places them.
+                let pad = batch.quad_padding();
                 for op in batch.vector.iter().flat_map(|v| &v.ops) {
                     for v in op.tris.chunks_exact(2) {
                         add(m, v[0], v[1]);
                     }
                     for r in op.records.iter() {
-                        let [x0, y0, x1, y1] = r.em_box;
+                        let [x0, y0, x1, y1] = crate::seams::TextQuadBatch::padded_box(r.em_box, pad);
                         let s = r.font_size_px;
                         let center = (
                             r.pen_x + (x0 + x1) * 0.5 * s,
                             r.baseline_y + (y0 + y1) * 0.5 * s,
                         );
                         let [a, c, b, d] = r.glyph_lin;
-                        for (ex, ey) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-                            let rel = (
-                                r.pen_x + ex * s - center.0,
-                                r.baseline_y + ey * s - center.1,
-                            );
-                            add(
-                                m,
-                                center.0 + a * rel.0 + c * rel.1 + r.glyph_off[0],
-                                center.1 + b * rel.0 + d * rel.1 + r.glyph_off[1],
-                            );
+                        if vertices {
+                            if r.glyph_opacity <= 0. { continue; }
+                            // Measure the curves the analytic shader consumes, after its
+                            // glyph and node transforms. em_box includes shader AA padding.
+                            let place = |ex: f32, ey: f32| {
+                                let dx = r.pen_x + ex * s - center.0;
+                                let dy = r.baseline_y + ey * s - center.1;
+                                let x = center.0 + a * dx + c * dy + r.glyph_off[0];
+                                let y = center.1 + b * dx + d * dy + r.glyph_off[1];
+                                (f64::from(m[0]*x + m[4]*y + m[12]), f64::from(m[1]*x + m[5]*y + m[13]))
+                            };
+                            let radius = op.stroke_px * 0.5;
+                            let rx = radius * (m[0]*a+m[4]*b).hypot(m[0]*c+m[4]*d);
+                            let ry = radius * (m[1]*a+m[5]*b).hypot(m[1]*c+m[5]*d);
+                            let first = r.first_curve as usize * 6;
+                            let end = first + r.curve_count as usize * 6;
+                            let vector = batch.vector.as_ref().unwrap();
+                            use crate::tess::moda_engine_path_types::PathCmd;
+                            for q in vector.curve_points[first..end].chunks_exact(6) {
+                                let (x0,y0) = place(q[0],q[1]);
+                                let (x,y) = place(q[4],q[5]);
+                                let cmds = [PathCmd::Move{x:x0,y:y0}, PathCmd::Quadratic{x,y,cp:place(q[2],q[3])}];
+                                if let Some([l,t,r,b]) = crate::tess::path_bounds(&cmds) {
+                                    const ID: [f32;16] = [1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.];
+                                    add(&ID,l as f32-rx,t as f32-ry);
+                                    add(&ID,r as f32+rx,b as f32+ry);
+                                }
+                            }
+                            continue;
+                        }
+                        for [x, y] in r.quad_corners([x0, y0, x1, y1]) {
+                            add(m, x, y);
                         }
                     }
                 }
@@ -812,98 +907,84 @@ pub(crate) fn union_canvas_bounds(a: Option<Rect>, b: Option<Rect>) -> Option<Re
     }
 }
 
-/// The canvas AABB every one of `items` paints (a subtree layer capture's
-/// content): tessellated bodies and text as [`items_canvas_bounds`], SDF
-/// shapes by their box grown by the stroke, SDF shadows by their silhouette
-/// grown by the blur and moved by the offset (a conservative reach), nested
-/// captures by their region. `None` when nothing measurable draws.
-pub(crate) fn all_items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Rect> {
+/// Quad emitted by the analytic shape and shadow vertex shaders. Coordinates are
+/// local endpoints; a drop shadow applies its canvas-space offset after the affine.
+pub(crate) struct PaintedQuad<'a> {
+    pub model: &'a [f32; 16],
+    pub edges: [f32; 4],
+    pub offset: [f32; 2],
+}
+
+impl PaintedQuad<'_> {
+    pub fn corners(&self) -> [f32; 8] {
+        let [l, t, r, b] = self.edges;
+        [l, t, r, t, l, b, r, b]
+    }
+
+    fn canvas_bounds(&self) -> Rect {
+        let m = self.model;
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for xy in self.corners().chunks_exact(2) {
+            for axis in 0..2 {
+                let v = f64::from(m[axis]) * f64::from(xy[0])
+                    + f64::from(m[4 + axis]) * f64::from(xy[1])
+                    + f64::from(m[12 + axis]) + f64::from(self.offset[axis]);
+                lo[axis] = lo[axis].min(v);
+                hi[axis] = hi[axis].max(v);
+            }
+        }
+        Rect { x: lo[0], y: lo[1], w: hi[0] - lo[0], h: hi[1] - lo[1] }
+    }
+}
+
+/// The capture, native Gaussian tiles and fade scheduler must agree on the quad
+/// before projecting it to their respective pixel grids.
+pub(crate) fn painted_quad(item: &crate::seams::DrawItem) -> Option<PaintedQuad<'_>> {
     use crate::seams::DrawItem;
+    let (model, dimensions, stroke) = match item {
+        DrawItem::Shadow { instance, .. } => {
+            let [w, h, blur, _] = instance.shape_data;
+            let inner = instance.inner_params[0] > 0.5;
+            let spread = if inner { 0. } else { instance.inner_params[1].max(0.) };
+            // path-shadow.wgsl: three sigmas per side, positive spread, and one AA pixel.
+            let expansion = blur * 3. + 2. * spread + 2.;
+            let (width, height) = (w + expansion, h + expansion);
+            let edges = if instance.corner_radii[3] < 0. {
+                [-width * 0.5, -height * 0.5, width * 0.5, height * 0.5]
+            } else {
+                let pad = expansion * 0.5;
+                [-pad, -pad, width - pad, height - pad]
+            };
+            let offset = if inner { [0.; 2] } else { [instance.shadow_offset[0], instance.shadow_offset[1]] };
+            return Some(PaintedQuad { model: &instance.model_matrix, edges, offset });
+        }
+        DrawItem::SolidShapeSdf { instance, .. } => (&instance.model_matrix, instance.dimensions, instance.stroke_params),
+        DrawItem::GradientShapeSdf { instance, .. } => (&instance.model_matrix, instance.dimensions, instance.stroke_params),
+        _ => return None,
+    };
+    // The full stroke width covers every alignment, including an outside stroke.
+    let (x, y) = (dimensions[0] * 0.5, dimensions[1] * 0.5);
+    let grow = stroke[0].abs();
+    let (rx, ry) = (x.abs() + grow, y.abs() + grow);
+    Some(PaintedQuad { model, edges: [x - rx, y - ry, x + rx, y + ry], offset: [0.; 2] })
+}
+
+/// Canvas extent of a painted subtree. Preserve the ordered reduction of the
+/// ordinary body/text bounds followed by analytic quads and nested captures.
+pub(crate) fn all_items_canvas_bounds(items: &[crate::seams::DrawItem]) -> Option<Rect> {
     let mut acc = items_canvas_bounds(items);
-    let mut add = |r: Rect| {
-        if r.finite() { acc = union_canvas_bounds(acc, Some(r)); }
-    };
-    // The canvas AABB of a local box through a column-major model matrix.
-    let boxed = |m: &[f32; 16], x0: f64, y0: f64, x1: f64, y1: f64| {
-        let mut min = (f64::INFINITY, f64::INFINITY);
-        let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-            let cx = m[0] as f64 * x + m[4] as f64 * y + m[12] as f64;
-            let cy = m[1] as f64 * x + m[5] as f64 * y + m[13] as f64;
-            min = (min.0.min(cx), min.1.min(cy));
-            max = (max.0.max(cx), max.1.max(cy));
-        }
-        Rect {
-            x: min.0,
-            y: min.1,
-            w: max.0 - min.0,
-            h: max.1 - min.1,
-        }
-    };
     for item in items {
-        match item {
-            DrawItem::SolidShapeSdf { instance, .. } => {
-                let [w, h, ..] = instance.dimensions;
-                let sw = instance.stroke_params[0].max(0.0) as f64;
-                add(boxed(
-                    &instance.model_matrix,
-                    -sw,
-                    -sw,
-                    w as f64 + sw,
-                    h as f64 + sw,
-                ));
-            }
-            DrawItem::GradientShapeSdf { instance, .. } => {
-                let [w, h, ..] = instance.dimensions;
-                let sw = instance.stroke_params[0].max(0.0) as f64;
-                add(boxed(
-                    &instance.model_matrix,
-                    -sw,
-                    -sw,
-                    w as f64 + sw,
-                    h as f64 + sw,
-                ));
-            }
-            DrawItem::Shadow {
-                instance, inner, ..
-            } => {
-                // A rect's quad spans [0, w], an ellipse's is centred: cover both.
-                let [w, h, blur, _] = instance.shape_data;
-                let (w, h) = (w as f64, h as f64);
-                let pad = if *inner {
-                    0.0
-                } else {
-                    2.0 * blur.max(0.0) as f64
-                };
-                let r = boxed(
-                    &instance.model_matrix,
-                    -0.5 * w - pad,
-                    -0.5 * h - pad,
-                    w + pad,
-                    h + pad,
-                );
-                let (ox, oy) = if *inner {
-                    (0.0, 0.0)
-                } else {
-                    (
-                        instance.shadow_offset[0] as f64,
-                        instance.shadow_offset[1] as f64,
-                    )
-                };
-                add(Rect {
-                    x: r.x + ox,
-                    y: r.y + oy,
-                    ..r
-                });
-            }
-            DrawItem::LayerBlurComposite { group, .. } => {
-                // The picture's extent, not the stored region: a capture cut to what can be read still
-                // occupies its whole bounds for whatever encloses it.
-                let [x, y, w, h] = group.extent_canvas;
-                add(Rect { x, y, w, h });
-            }
-            _ => {}
-        }
+        let r = if let Some(quad) = painted_quad(item) {
+            quad.canvas_bounds()
+        } else if let crate::seams::DrawItem::LayerBlurComposite { group, .. } = item {
+            // Clipping storage to its readers leaves the nested picture's extent intact.
+            let [x, y, w, h] = group.extent_canvas;
+            Rect { x, y, w, h }
+        } else {
+            continue;
+        };
+        if r.finite() { acc = union_canvas_bounds(acc, Some(r)); }
     }
     acc
 }
@@ -1026,7 +1107,6 @@ mod tests {
             ],
             "effects": [
                 {"id": "d", "type": "drop-shadow", "color": "#000", "blur": 8},
-                {"id": "r", "type": "roughen", "size": 3, "detail": 5}
             ]
         }));
         let sil = silhouette_node(&n);
@@ -1043,9 +1123,7 @@ mod tests {
         assert_eq!(strokes[0].width, 6.0);
         assert_eq!(strokes[0].align.as_deref(), Some("outside"));
         assert_eq!(strokes[0].opacity, None);
-        // Only the geometry effect survives.
-        let effects = sil.array("effects").unwrap();
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0]["type"], "roughen");
+        assert!(sil.json_field("effects").is_none());
     }
+
 }

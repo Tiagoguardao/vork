@@ -686,7 +686,8 @@ impl Export {
                 false,
             );
         }
-        let mut plan = animation::Plan::compile_with_buffers(&scene, base, Some(&buffers.data))?;
+        let opened = crate::footage::Opened::default();
+        let mut plan = animation::Plan::compile_in(&scene, base, Some(&buffers.data), &opened)?;
         let material_keys = plan.material_inputs();
         for (slot, (material, input)) in material_keys.iter().enumerate() {
             let default = match scene.materials[material].inputs.get(input) {
@@ -826,6 +827,7 @@ impl Export {
         let mut material_ids = BTreeMap::new();
         let mut mesh_ids = BTreeMap::new();
         let mut skins = Vec::new();
+        let media = scene.media_readers();
         for &i in &selected {
             let n = &nodes[i].node;
             let address = if n.name.is_empty() {
@@ -833,7 +835,17 @@ impl Export {
             } else {
                 n.name.clone()
             };
-            if payload.contains(&i) && n.audio.is_some() {
+            let mut has_sound = n.audio.is_some();
+            let mut movie_material = false;
+            if payload.contains(&i) {
+                for name in media.node_media(n) {
+                    let path = base.join(scene.images[&name].file.as_ref().unwrap());
+                    if crate::footage::is_sequence(&path) { continue; }
+                    movie_material = true;
+                    has_sound = has_sound || opened.optional_audio(&path)?.is_some();
+                }
+            }
+            if payload.contains(&i) && has_sound {
                 w.issue("audio", &address, "node sound", "omitted; glTF sound export is not built yet",
                     "export a picture-only subtree or acknowledge audio", false);
             }
@@ -910,7 +922,10 @@ impl Export {
                             .is_some_and(|s| s.render_levels > 0)
                         || source.face_vertex_counts.is_some()
                         || computed_geometry::dynamic(&scene, source);
-                    if unsupported {
+                    if movie_material {
+                        w.issue("material_parameter", &address, "movie texture", "refused; glTF needs a still texture",
+                            "freeze the movie to a still PNG before exporting", true);
+                    } else if unsupported {
                         w.issue("geometry_stage",&address,"final evaluated surface","refused; this stage needs a qualified final snapshot","supply static triangle buffers; skin, morph, subdivision, compute-written streams, polygons and nontriangles are not admitted yet",true);
                     } else {
                         let mut slots = Vec::new();
@@ -1609,7 +1624,7 @@ impl Export {
             .issues
             .iter()
             .any(|i| i["severity"] == "error" || i["acknowledged"] != true);
-        let mut report = json!({"version":1,"status":if failed{"failed"}else{"complete"},"vork_version":if self.vork_version.is_empty(){env!("CARGO_PKG_VERSION")}else{self.vork_version.as_str()},"source":self.scene,"source_hash":w.input_hash.finalize().to_hex().to_string(),"selection":{"root":self.root},"time":time,"source_clock":self.at,"fps":scene.render.fps,"target":{"specification":"glTF 2.0","extensions_used":w.extensions,"extensions_required":w.extensions},"animation_range":if animated {json!({"frame_start":start,"frame_end":end,"clip_time_origin":0})} else {Value::Null},"counts":{"skins":skin_output.len(),"animations":animations.len(),"cameras":w.cameras.len(),"lights":w.lights.len(),"joints":skin_output.iter().map(|s| s["joints"].as_array().unwrap().len()).sum::<usize>(),"nodes":output.len(),"meshes":w.meshes.len(),"materials":w.materials.len(),"images":w.images.len(),"vertices":w.vertex_count,"triangles":w.triangle_count,"buffer_bytes":w.bin.len()},"issues":w.issues,"dispositions":w.dispositions,"dependency_scope":"selected subtree; full scene transform dependencies evaluated","bake":null});
+        let report = json!({"version":1,"status":if failed{"failed"}else{"complete"},"vork_version":if self.vork_version.is_empty(){env!("CARGO_PKG_VERSION")}else{self.vork_version.as_str()},"source":self.scene,"source_hash":w.input_hash.finalize().to_hex().to_string(),"selection":{"root":self.root},"time":time,"source_clock":self.at,"fps":scene.render.fps,"target":{"specification":"glTF 2.0","extensions_used":w.extensions,"extensions_required":w.extensions},"animation_range":if animated {json!({"frame_start":start,"frame_end":end,"clip_time_origin":0})} else {Value::Null},"counts":{"skins":skin_output.len(),"animations":animations.len(),"cameras":w.cameras.len(),"lights":w.lights.len(),"joints":skin_output.iter().map(|s| s["joints"].as_array().unwrap().len()).sum::<usize>(),"nodes":output.len(),"meshes":w.meshes.len(),"materials":w.materials.len(),"images":w.images.len(),"vertices":w.vertex_count,"triangles":w.triangle_count,"buffer_bytes":w.bin.len()},"issues":w.issues,"dispositions":w.dispositions,"dependency_scope":"selected subtree; full scene transform dependencies evaluated","bake":null});
         let report_path = self.out.with_extension("export.json");
         if failed {
             publish(&report_path, &serde_json::to_vec_pretty(&report)?)?;
@@ -1649,54 +1664,65 @@ impl Export {
         if !w.lights.is_empty() {
             document["extensions"] = json!({"KHR_lights_punctual":{"lights":w.lights}});
         }
-        let image_bytes = if extension == "gltf" {
-            externalize_images(&mut document, &mut w.bin, &self.out)?
+        publish_export(&self.out, &report_path, extension, document, w.bin, report)
+    }
+}
+
+fn publish_export(
+    out: &Path,
+    report_path: &Path,
+    extension: &str,
+    mut document: Value,
+    mut bin: Vec<u8>,
+    mut report: Value,
+) -> Result<Value> {
+    let image_bytes = if extension == "gltf" {
+        externalize_images(&mut document, &mut bin, out)?
+    } else {
+        0
+    };
+    let asset = if extension == "glb" {
+        if !bin.is_empty() {
+            document["buffers"] = json!([{"byteLength":bin.len()}]);
+        }
+        glb(&document, &bin)?
+    } else {
+        // Content-addressed sidecars keep an old asset valid until the new JSON is published.
+        if !bin.is_empty() {
+            let name = format!("{}.bin", blake3::hash(&bin).to_hex());
+            publish(&out.with_file_name(&name), &bin)?;
+            document["buffers"] = json!([{"byteLength":bin.len(),"uri":name}]);
+        }
+        serde_json::to_vec_pretty(&document)?
+    };
+    // Structural validation before publication; external qualification also runs Khronos Validator.
+    let checked = if extension == "glb" {
+        asset.clone()
+    } else {
+        glb(
+            &{
+                let mut d = document.clone();
+                if !bin.is_empty() {
+                    d["buffers"][0].as_object_mut().unwrap().remove("uri");
+                }
+                d
+            },
+            &bin,
+        )?
+    };
+    import::from_slice(&checked).context("export generated invalid glTF")?;
+    report["asset_bytes"] = asset.len().into();
+    report["bytes"] = (asset.len()
+        + if extension == "gltf" {
+            bin.len() + image_bytes
         } else {
             0
-        };
-        let asset = if extension == "glb" {
-            if !w.bin.is_empty() {
-                document["buffers"] = json!([{"byteLength":w.bin.len()}]);
-            }
-            glb(&document, &w.bin)?
-        } else {
-            // Content-addressed sidecars keep an old asset valid until the new JSON is published.
-            if !w.bin.is_empty() {
-                let name = format!("{}.bin", blake3::hash(&w.bin).to_hex());
-                publish(&self.out.with_file_name(&name), &w.bin)?;
-                document["buffers"] = json!([{"byteLength":w.bin.len(),"uri":name}]);
-            }
-            serde_json::to_vec_pretty(&document)?
-        };
-        // Structural validation before publication; external qualification also runs Khronos Validator.
-        let checked = if extension == "glb" {
-            asset.clone()
-        } else {
-            glb(
-                &{
-                    let mut d = document.clone();
-                    if !w.bin.is_empty() {
-                        d["buffers"][0].as_object_mut().unwrap().remove("uri");
-                    }
-                    d
-                },
-                &w.bin,
-            )?
-        };
-        import::from_slice(&checked).context("export generated invalid glTF")?;
-        report["asset_bytes"] = asset.len().into();
-        report["bytes"] = (asset.len()
-            + if extension == "gltf" {
-                w.bin.len() + image_bytes
-            } else {
-                0
-            })
-        .into();
-        report["counts"]["buffer_bytes"] = w.bin.len().into();
-        publish(&report_path, &serde_json::to_vec_pretty(&report)?)?;
-        publish(&self.out, &asset)?;
-        Ok(report)
-    }
+        })
+    .into();
+    report["counts"]["buffer_bytes"] = bin.len().into();
+    publish(report_path, &serde_json::to_vec_pretty(&report)?)?;
+    publish(out, &asset)?;
+    Ok(report)
 }
 /// glTF uses ordinary relative PNGs; GLB retains the same images in bufferViews.
 fn externalize_images(document: &mut Value, bin: &mut Vec<u8>, out: &Path) -> Result<usize> {

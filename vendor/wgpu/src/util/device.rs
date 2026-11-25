@@ -66,6 +66,9 @@ impl DeviceExt for crate::Device {
             };
 
             let buffer = self.create_buffer(&wgt_descriptor);
+            // A loss during creation returns an invalid handle. Mapping that
+            // handle would panic and mask the device-lost callback at frame completion.
+            if self.is_lost() { return buffer; }
 
             buffer
                 .get_mapped_range_mut(..)

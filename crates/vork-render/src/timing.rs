@@ -260,18 +260,33 @@ fn take_finished(log: &mut Vec<CacheSave>, device: u64) -> Vec<CacheSave> {
 /// Host intervals spent encoding and writing delivered frames: image-file
 /// compression and writes, and handing frames to or finishing video encoders.
 /// Bounded like the Slang pass timeline; renders read their own wall interval.
-struct EncodeLog { intervals: Vec<(std::time::Instant, std::time::Instant)>, dropped_before: Option<std::time::Instant> }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStage {
+    ImageEncode,
+    ImageWrite,
+    Other,
+}
+struct OutputInterval {
+    start: std::time::Instant,
+    end: std::time::Instant,
+    stage: OutputStage,
+}
+struct EncodeLog { intervals: Vec<OutputInterval>, dropped_before: Option<std::time::Instant> }
 static ENCODE: std::sync::Mutex<EncodeLog> = std::sync::Mutex::new(EncodeLog { intervals: Vec::new(), dropped_before: None });
 const ENCODE_CAPACITY: usize = 1 << 16;
 
 pub(crate) fn encoded(start: std::time::Instant) {
+    output_interval(OutputStage::Other, start);
+}
+
+pub(crate) fn output_interval(stage: OutputStage, start: std::time::Instant) {
     let end = std::time::Instant::now();
     let mut log = ENCODE.lock().unwrap_or_else(|poison| poison.into_inner());
     if log.intervals.len() >= ENCODE_CAPACITY {
-        let last = log.intervals.drain(..ENCODE_CAPACITY / 2).map(|(_, end)| end).max();
+        let last = log.intervals.drain(..ENCODE_CAPACITY / 2).map(|interval| interval.end).max();
         log.dropped_before = log.dropped_before.max(last);
     }
-    log.intervals.push((start, end));
+    log.intervals.push(OutputInterval { start, end, stage });
 }
 
 /// Wall time covered by the union of intervals clipped to `[start, end]`, the
@@ -325,9 +340,16 @@ pub(crate) fn stages(device: &wgpu::Device, start: std::time::Instant, end: std:
         let (serialize, publish) = (step("serialize"), step("publish"));
         (serialize, publish, take_finished(&mut log, id))
     };
-    let (encode, encode_truncated) = {
+    let (encode, image_encode, image_write, encode_truncated) = {
         let log = ENCODE.lock().unwrap_or_else(|poison| poison.into_inner());
-        (log.intervals.clone(), log.dropped_before.is_some_and(|dropped| dropped > start))
+        let spans = |stage: Option<OutputStage>| {
+            log.intervals.iter()
+                .filter(|interval| stage.is_none_or(|stage| interval.stage == stage))
+                .map(|interval| (interval.start, interval.end))
+                .collect()
+        };
+        (spans(None), spans(Some(OutputStage::ImageEncode)), spans(Some(OutputStage::ImageWrite)),
+            log.dropped_before.is_some_and(|dropped| dropped > start))
     };
     let gpu_pass_ms: serde_json::Map<_, _> = totals.gpu_spans_ms.iter()
         .filter(|(_, ms)| *ms > 0.).map(|(name, ms)| ((*name).to_owned(), (*ms).into())).collect();
@@ -346,6 +368,8 @@ pub(crate) fn stages(device: &wgpu::Device, start: std::time::Instant, end: std:
         "gpu_pass_ms": gpu_pass_ms,
         "denoise": {"busy_ms": totals.denoise_busy_ms, "wait_ms": totals.denoise_wait_ms},
         "encode": coverage(encode, start, end),
+        "image_encode": coverage(image_encode, start, end),
+        "image_write": coverage(image_write, start, end),
         "truncated": slang_truncated || encode_truncated,
     }), saves)
 }

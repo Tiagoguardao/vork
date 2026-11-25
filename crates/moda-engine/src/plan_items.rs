@@ -33,6 +33,7 @@ impl ItemOrder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PlanItems<'a> {
     plan: &'a CoveragePlan,
     range: usize,

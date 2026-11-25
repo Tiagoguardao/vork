@@ -121,7 +121,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 // Main shader code
 
         // Frame-level uniforms
-        @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>; // viewProjection
+// #include "rect-clip.wgsl"
         // Mask sampling (optional)
         struct MaskUniforms {
           maskActive: u32,
@@ -181,7 +181,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
           @location(0) @interpolate(flat) instanceId: u32,
           @location(1) localPos: vec2<f32>, // Local position for gradient calculation
           @location(2) @interpolate(flat) isStroke: f32,
-          @location(3) worldPos: vec2<f32>, // World position for gradient calculation and clipping
+          @location(3) worldPos: vec2<f32>, // World position for mask sampling
           @location(4) @interpolate(flat) clip: vec4<f32>,
           @location(5) strokeUV: vec2<f32>,
         }
@@ -199,7 +199,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
           
           // Transform to world space
           let worldPos = path.model * vec4<f32>(localPos.x, localPos.y, 0.0, 1.0);
-          output.position = frameUniforms * worldPos;
+          output.position = frameUniforms.viewProjection * worldPos;
           output.worldPos = worldPos.xy;
           
           // Use pre-calculated depth value
@@ -211,7 +211,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
           output.instanceId = instanceIndex;
           output.isStroke = vertex.vertexType;
           output.localPos = localPos;
-          output.clip = path.pageClipBounds;
+          output.clip = projectRectClip(path.pageClipBounds);
           output.strokeUV = vertex.strokeUV;
           
           return output;
@@ -666,12 +666,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
         fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
           let path = paths[input.instanceId];
           
-          // Early page clip check
-          let bounds = input.clip;
-          if (input.worldPos.x < bounds.x ||
-              input.worldPos.x > bounds.x + bounds.z ||
-              input.worldPos.y < bounds.y ||
-              input.worldPos.y > bounds.y + bounds.w) {
+          if (outsideRectClip(input.position.xy, input.clip)) {
             discard;
           }
 

@@ -148,6 +148,7 @@ struct Writer final : ISlangWriter {
 struct Library {
 #ifdef _WIN32
   HMODULE handle;
+  DWORD error = 0;
   Library(const char *path) : handle(nullptr) {
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
                                 nullptr, 0);
@@ -159,6 +160,11 @@ struct Library {
                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     }
+    if (!handle)
+      error = GetLastError();
+  }
+  std::string failure() const {
+    return " (Windows error " + std::to_string(error) + ")";
   }
   ~Library() {
     if (handle)
@@ -169,12 +175,19 @@ struct Library {
   }
 #else
   void *handle;
-  Library(const char *path) : handle(dlopen(path, RTLD_NOW | RTLD_LOCAL)) {}
+  std::string load_error;
+  Library(const char *path) : handle(dlopen(path, RTLD_NOW | RTLD_LOCAL)) {
+    if (!handle) {
+      if (const char *message = dlerror())
+        load_error = std::string(" (") + message + ")";
+    }
+  }
   ~Library() {
     if (handle)
       dlclose(handle);
   }
   void *symbol(const char *name) { return dlsym(handle, name); }
+  const std::string &failure() const { return load_error; }
 #endif
   template <typename T> T get(const char *name) {
     auto p = symbol(name);
@@ -192,7 +205,7 @@ extern "C" int vork_slang_compile(const char *library,
     static Library lib(library);
     if (!lib.handle)
       throw std::runtime_error(std::string("cannot load Slang library: ") +
-                               library);
+                               library + lib.failure());
     auto create = lib.get<decltype(&spCreateSession)>("spCreateSession");
     auto destroy = lib.get<decltype(&spDestroySession)>("spDestroySession");
     auto requestCreate =

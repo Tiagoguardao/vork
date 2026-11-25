@@ -7,7 +7,7 @@ mod tracks;
 pub(crate) mod style;
 use tracks::Combine;
 use tracks::{Curve, Interpolation};
-pub(crate) use tracks::{blend, fold_material_inputs,ClockNode,FootageClock,MaterialBinding, Plan, Sample, Samples, SoundPlan};
+pub(crate) use tracks::{blend, fold_material_inputs,ClockNode,MaterialBinding, Plan, Sample, Samples, BindingPlan, Gain, GainTile, SoundClock, SoundScratch, SoundPlan};
 pub(crate) use tracks::Combine as BlendKind;
 
 type BindNodes = Vec<(Option<usize>, vork_scene::Transform, Vec<f32>)>;

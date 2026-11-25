@@ -63,12 +63,8 @@ impl CpuScene {
             .get(name)
             .with_context(|| format!("ask: unknown image {name:?}"))?;
         let time = request.exact()?;
-        let base = image.time.as_ref().map_or_else(
-            || time.clone(),
-            |t| vork_time::exact::Germ::point(t.exact()),
-        );
-        self.animation
-            .image_time_exact(&pose.samples, &time, name, base)
+        self.animation.footage_time(&pose.samples, &time, name, image.time.as_ref())?
+            .with_context(|| format!("ask: image {name:?} is absent at this time"))
     }
 
     pub fn image_info(
@@ -82,63 +78,34 @@ impl CpuScene {
             .images
             .get(name)
             .with_context(|| format!("ask: unknown image {name:?}"))?;
-        if let Some(render) = &image.render {
-            return Ok(json!({"width":render.resolution[0],"height":render.resolution[1]}));
-        }
-        let mut path = self
-            .base
-            .join(image.file.as_ref().context("ask: image has no file")?);
-        if crate::footage::is_sequence(&path) {
-            let source = crate::footage::Source::open(&path)?;
-            let index = source
-                .frame_index_exact(&self.image_time(name, pose, request)?, pose.render.fps)?;
-            path = source.files()[index].clone();
-        } else if crate::footage::is_media(&path) {
-            let probe=std::process::Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries",
-                "stream=width,height,duration,avg_frame_rate:stream_side_data=rotation:format=duration","-of","json"])
-                .arg(&path).output().context("ask: movie info requires ffprobe on PATH")?;
-            ensure!(
-                probe.status.success(),
-                "ask: cannot read movie info for {}; restore the movie or check it with ffprobe",
-                path.display()
-            );
-            let value: Value = serde_json::from_slice(&probe.stdout)?;
-            let stream = &value["streams"][0];
-            let mut width = stream["width"]
-                .as_u64()
-                .context("ask: movie has no width")?;
-            let mut height = stream["height"]
-                .as_u64()
-                .context("ask: movie has no height")?;
-            if stream["side_data_list"]
-                .as_array()
-                .and_then(|a| a.iter().find_map(|v| v["rotation"].as_i64()))
-                .is_some_and(|r| r.rem_euclid(180) == 90)
-            {
-                std::mem::swap(&mut width, &mut height);
-            }
-            let duration = stream["duration"]
-                .as_str()
-                .filter(|v| *v != "N/A")
-                .or_else(|| value["format"]["duration"].as_str())
-                .context("ask: movie has no duration")?
-                .parse::<f64>()?;
-            let fps = stream["avg_frame_rate"]
-                .as_str()
-                .context("ask: movie has no frame rate")?
-                .parse::<vork_time::Time>()?;
-            ensure!(
-                duration.is_finite() && duration >= 0. && fps > vork_time::Time::ZERO,
-                "ask: movie timing is invalid; check it with ffprobe"
-            );
-            return Ok(json!({"width":width,"height":height,"duration":duration,"fps":fps}));
-        }
-        let (width, height) = image::image_dimensions(&path).with_context(|| {
-            format!(
-                "ask: read image info {}; restore a readable image",
-                path.display()
-            )
-        })?;
-        Ok(json!({"width":width,"height":height}))
+        image_info(image, &self.base, &self.opened, pose.render.fps, || self.image_time(name, pose, request))
     }
+}
+
+/// Read resource metadata. Only sequences need a sampled time to choose the file.
+pub(crate) fn image_info(
+    image: &vork_scene::v2::Image,
+    base: &std::path::Path,
+    opened: &crate::footage::Opened,
+    fps: vork_time::Time,
+    sequence_time: impl FnOnce() -> Result<vork_time::exact::Germ>,
+) -> Result<Value> {
+    if let Some(render) = &image.render {
+        return Ok(json!({"width":render.resolution[0],"height":render.resolution[1]}));
+    }
+    let mut path = base.join(image.file.as_ref().context("ask: image has no file")?);
+    if crate::footage::is_sequence(&path) {
+        let source = opened.source(&path)?;
+        let index = source.frame_index_exact(&sequence_time()?, fps)?;
+        path = source.files()[index].clone();
+    } else if crate::footage::is_media(&path) {
+        return opened.movie_info(&path);
+    }
+    let (width, height) = image::image_dimensions(&path).with_context(|| {
+        format!(
+            "ask: read image info {}; restore a readable image",
+            path.display()
+        )
+    })?;
+    Ok(json!({"width":width,"height":height}))
 }

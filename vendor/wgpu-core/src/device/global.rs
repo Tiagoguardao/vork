@@ -279,6 +279,12 @@ impl Global {
         let _ = buffer.unmap();
     }
 
+    pub fn device_is_lost(&self, device_id: DeviceId) -> bool { !self.hub.devices.get(device_id).is_valid() }
+
+    pub fn device_texture_binding_size(&self, device_id: DeviceId, desc: &resource::TextureDescriptor) -> Option<u64> {
+        self.hub.devices.get(device_id).texture_binding_size(desc)
+    }
+
     pub fn device_create_texture(
         &self,
         device_id: DeviceId,

@@ -337,3 +337,31 @@ fn ffmpeg_clock_probe_is_reused_across_processes_and_invalidated() {
     assert_eq!(std::fs::read(&mov).unwrap(), b"preserve output");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "renders a canvas compositor; requires a supported GPU and pinned Slang"]
+fn numbered_still_and_compositor_share_the_exact_frame() {
+    let binary = std::env::var_os("VORK_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_vork").into());
+    let dir = std::env::temp_dir().join(format!("vork-still-frame-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scene = dir.join("scene.json");
+    let frames = dir.join("frames");
+    let doc = serde_json::json!({"version":2,"render":{"resolution":[8,8],"fps":24},
+        "nodes":[],"composition":{"space":"2d","compositor":[{"material":{"program":{
+            "source":"struct Inputs {}; float4 composite(CompositeContext c, Inputs i) { float v = (c.frame & 1u) == 1u ? 1. : 0.; return float4(v,v,v,1.); }"
+        }}}]}});
+    std::fs::write(&scene, serde_json::to_vec(&doc).unwrap()).unwrap();
+    for (at, index) in [("0.0624999999", 1u32), ("0.0625", 2), ("0.0625000001", 2),
+                        ("16777217/24", 16_777_217)] {
+        let output = Command::new(&binary).arg("render").arg(&scene)
+            .arg("--out").arg(&frames).args(["--at", at]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(frames.join(format!("{index:06}.png")).is_file(), "{at}");
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(frames.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["frames"][0]["index"], index);
+        assert_eq!(meta["exposure"]["worst_near_black"]["frame"], index);
+        // The compositor paints a white or black picture from ctx.frame alone.
+        assert_eq!(meta["exposure"]["mean"].as_f64().unwrap() > 0.5, index % 2 == 1);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

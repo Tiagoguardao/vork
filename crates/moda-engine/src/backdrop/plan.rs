@@ -582,144 +582,17 @@ fn is_node_blur_eligible(scene: &Scene, node: &RawNode) -> bool {
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
-/// `boundsFromPath` (`utils/geometryHelpers.ts:692-852`): move/line + cubic &
-/// quadratic extrema; an arc through the cubic Béziers it is drawn with.
-fn bounds_from_cmds(cmds: &[pt::PathCmd]) -> Option<Rect> {
-    let mut min_x = f64::INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    let mut cur = (0.0f64, 0.0f64);
-    let upd = |x: f64, y: f64, mn_x: &mut f64, mn_y: &mut f64, mx_x: &mut f64, mx_y: &mut f64| {
-        *mn_x = mn_x.min(x);
-        *mn_y = mn_y.min(y);
-        *mx_x = mx_x.max(x);
-        *mx_y = mx_y.max(y);
-    };
-
-    fn cubic_extrema(p0: f64, p1: f64, p2: f64, p3: f64) -> Vec<f64> {
-        let a = -3.0 * p0 + 9.0 * p1 - 9.0 * p2 + 3.0 * p3;
-        let b = 6.0 * p0 - 12.0 * p1 + 6.0 * p2;
-        let c = -3.0 * p0 + 3.0 * p1;
-        let mut out = Vec::new();
-        if a.abs() < 1e-10 {
-            if b.abs() > 1e-10 {
-                let t = -c / b;
-                if (0.0..=1.0).contains(&t) {
-                    out.push(t);
-                }
-            }
-        } else {
-            let disc = b * b - 4.0 * a * c;
-            if disc >= 0.0 {
-                let s = disc.sqrt();
-                for t in [(-b + s) / (2.0 * a), (-b - s) / (2.0 * a)] {
-                    if (0.0..=1.0).contains(&t) {
-                        out.push(t);
-                    }
-                }
-            }
-        }
-        out
-    }
-    fn cubic_eval(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
-        let mt = 1.0 - t;
-        mt * mt * mt * p0 + 3.0 * mt * mt * t * p1 + 3.0 * mt * t * t * p2 + t * t * t * p3
-    }
-    fn quad_extrema(p0: f64, p1: f64, p2: f64) -> Vec<f64> {
-        let denom = p0 - 2.0 * p1 + p2;
-        if denom.abs() < 1e-10 {
-            return Vec::new();
-        }
-        let t = (p0 - p1) / denom;
-        if (0.0..=1.0).contains(&t) {
-            vec![t]
-        } else {
-            Vec::new()
-        }
-    }
-    fn quad_eval(p0: f64, p1: f64, p2: f64, t: f64) -> f64 {
-        let mt = 1.0 - t;
-        mt * mt * p0 + 2.0 * mt * t * p1 + t * t * p2
-    }
-
-    for c in cmds {
-        match c {
-            pt::PathCmd::Move { x, y } => {
-                cur = (*x, *y);
-                upd(cur.0, cur.1, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-            }
-            pt::PathCmd::Line { x, y } => {
-                upd(*x, *y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                cur = (*x, *y);
-            }
-            pt::PathCmd::Curve { x, y, cp1, cp2 } => {
-                upd(cur.0, cur.1, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                upd(*x, *y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                for t in cubic_extrema(cur.0, cp1.0, cp2.0, *x) {
-                    let ex = cubic_eval(cur.0, cp1.0, cp2.0, *x, t);
-                    let ey = cubic_eval(cur.1, cp1.1, cp2.1, *y, t);
-                    upd(ex, ey, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                }
-                for t in cubic_extrema(cur.1, cp1.1, cp2.1, *y) {
-                    let ex = cubic_eval(cur.0, cp1.0, cp2.0, *x, t);
-                    let ey = cubic_eval(cur.1, cp1.1, cp2.1, *y, t);
-                    upd(ex, ey, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                }
-                cur = (*x, *y);
-            }
-            pt::PathCmd::Quadratic { x, y, cp } => {
-                upd(cur.0, cur.1, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                upd(*x, *y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                for t in quad_extrema(cur.0, cp.0, *x) {
-                    let ex = quad_eval(cur.0, cp.0, *x, t);
-                    let ey = quad_eval(cur.1, cp.1, *y, t);
-                    upd(ex, ey, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                }
-                for t in quad_extrema(cur.1, cp.1, *y) {
-                    let ex = quad_eval(cur.0, cp.0, *x, t);
-                    let ey = quad_eval(cur.1, cp.1, *y, t);
-                    upd(ex, ey, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                }
-                cur = (*x, *y);
-            }
-            arc @ pt::PathCmd::Arc { x, y, .. } => {
-                // The arc as the Béziers it is drawn with (`tess::path_bounds`), so a bulge past its endpoints is in
-                // the bounds: a layer blur's capture taken over the endpoint hull cut the node's own body.
-                let from = pt::PathCmd::Move { x: cur.0, y: cur.1 };
-                if let Some([x0, y0, x1, y1]) = tess::path_bounds(&[from, arc.clone()]) {
-                    upd(x0, y0, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                    upd(x1, y1, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                }
-                upd(*x, *y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
-                cur = (*x, *y);
-            }
-        }
-    }
-    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
-        return None;
-    }
-    Some(Rect {
-        x: min_x,
-        y: min_y,
-        w: max_x - min_x,
-        h: max_y - min_y,
-    })
-}
-
 /// `getNodeLocalExtent` (WebGPURenderOrchestrator.ts:1451-1465) and the local
 /// rect the canvas AABB is taken over.
 pub(crate) fn node_local_rect(node: &RawNode) -> Option<Rect> {
     if node.node_type() == "path" {
-        let cmds = node
-            .points()
-            .map(pt::cmds_from_path_points)
-            .unwrap_or_default();
-        let b = bounds_from_cmds(&cmds)?;
-        if b.w <= 0.0 || b.h <= 0.0 {
-            return None;
-        }
-        Some(b)
+        // Progressive ramps and glass share the rounded silhouette: the path
+        // coverage below tessellates path_cmds_for_node, which rounds live corners.
+        let b = crate::tess::drawn_node_path_bounds(node)?;
+        // A capture has area. The geometry owner also returns point and line boxes.
+        let (w, h) = (b.max_x - b.min_x, b.max_y - b.min_y);
+        (w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite())
+            .then_some(Rect { x: b.min_x, y: b.min_y, w, h })
     } else {
         Some(Rect {
             x: 0.0,
@@ -741,8 +614,11 @@ pub(crate) fn node_local_rect(node: &RawNode) -> Option<Rect> {
 /// local corners through the affine, THEN take the AABB — see
 /// effects/mask.rs `node_canvas_aabb` for the exact shape).
 pub(crate) fn node_canvas_aabb(scene: &Scene, node: &RawNode) -> Option<Rect> {
+    local_rect_canvas_aabb(scene, node, node_local_rect(node)?)
+}
+
+pub(crate) fn local_rect_canvas_aabb(scene: &Scene, node: &RawNode, local: Rect) -> Option<Rect> {
     let a = scene.node_canvas_affine(node.id())?;
-    let local = node_local_rect(node)?;
     let apply = |x: f64, y: f64| (a.a * x + a.c * y + a.e, a.b * x + a.d * y + a.f);
     let corners = [
         apply(local.x, local.y),
@@ -1527,7 +1403,7 @@ fn build_coverage_vertices_target_px(
     ctx: &PlanCtx,
     dropped: &mut Vec<String>,
 ) -> Option<Vec<f32>> {
-    let (cmds, closed, fill_rule) = match node.node_type() {
+    let (cmds, fill_rule) = match node.node_type() {
         "rectangle" | "container" => (
             crate::shape_to_path::rect_outline_cmds(
                 node.f64("width").unwrap_or(0.0),
@@ -1536,7 +1412,6 @@ fn build_coverage_vertices_target_px(
                 node.json_field("cornerSmoothing"),
                 node.json_field("cornerStyle"),
             ),
-            true,
             pt::FillRule::NonZero,
         ),
         "star" => (
@@ -1547,7 +1422,6 @@ fn build_coverage_vertices_target_px(
                 Some(node.f64("innerRadiusRatio").unwrap_or(0.5)),
                 node.f64("cornerRadius").unwrap_or(0.0),
             ),
-            true,
             pt::FillRule::NonZero,
         ),
         "polygon" => (
@@ -1557,12 +1431,10 @@ fn build_coverage_vertices_target_px(
                 node.f64("sides").unwrap_or(3.0),
                 node.f64("cornerRadius").unwrap_or(0.0),
             ),
-            true,
             pt::FillRule::NonZero,
         ),
         "path" => (
             tess::path_cmds_for_node(node),
-            node.bool("closed").unwrap_or(false),
             pt::fill_rule_from_str(node.str("fillRule")),
         ),
         _ => return None,
@@ -1575,7 +1447,7 @@ fn build_coverage_vertices_target_px(
     let geo = tess::tessellate_combined(
         &cmds,
         0.0,
-        closed,
+        true,
         pt::LineCap::Butt,
         pt::LineJoin::Miter,
         fill_rule,
@@ -1736,51 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn pixelate_and_dither_clamps() {
-        let scene = scene_with(moda_scene::value::json!([
-            { "id": "p", "type": "rectangle", "x": 0, "y": 0, "width": 100, "height": 100,
-              "effects": [{ "id": "backdrop-0", "type": "pixelate", "pixelSize": 900 }] },
-            { "id": "d", "type": "rectangle", "x": 200, "y": 0, "width": 100, "height": 100,
-              "effects": [{ "id": "backdrop-0", "type": "dither", "pixelSize": 900, "pattern": "atkinson",
-                                   "brightness": 250, "contrast": 500 }] },
-        ]));
-        let p = compute_backdrop_split(
-            &scene,
-            scene.effective_node("p").unwrap(),
-            &ctx(&scene),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        match p.op {
-            BackdropOp::Pixelate { cell_px } => assert_eq!(cell_px, 400.0),
-            ref o => panic!("{o:?}"),
-        }
-        let d = compute_backdrop_split(
-            &scene,
-            scene.effective_node("d").unwrap(),
-            &ctx(&scene),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        match d.op {
-            BackdropOp::Dither {
-                cell_px,
-                pattern,
-                brightness,
-                contrast,
-            } => {
-                assert_eq!(cell_px, 256.0);
-                assert_eq!(pattern, 3);
-                assert_eq!(brightness, 100.0);
-                assert_eq!(contrast, 200.0);
-            }
-            ref o => panic!("{o:?}"),
-        }
-        // Pixelate / dither sample with no outward expansion.
-        assert_region_close(p.region_px, [0, 0, 100, 100]);
-    }
-
-    #[test]
     fn glass_param_mapping() {
         // bg-glass-default: 400x300 at (440,250), frost 30, refraction 60,
         // depth 40, lightIntensity 40.
@@ -1846,6 +1673,41 @@ mod tests {
     }
 
     #[test]
+    fn progressive_ramp_and_glass_measure_the_rounded_path_they_cover() {
+        use moda_scene::value::json;
+        let scene = scene_with(json!([{
+            "id":"rounded","type":"path","x":25,"y":8,"closed":true,"cornerRadius":25,
+            "points":[{"type":"move","x":0,"y":125},{"type":"line","x":86,"y":0},{"type":"line","x":170,"y":125}],
+            "effects":[{"id":"r","type":"background-blur","radius":14,"progressive":{
+                "start":{"x":0,"y":0},"end":{"x":0,"y":1}}},
+                {"id":"g","type":"glass","depth":75,"refraction":70,"frost":2}]
+        }]));
+        let n = scene.effective_node("rounded").unwrap();
+        let splits = compute_backdrop_splits(&scene, n, &ctx(&scene), &mut Vec::new());
+        assert_eq!(splits.len(), 2);
+        for split in splits {
+            let CoverageSource::Geometry(mesh) = split.coverage else { panic!("expected the tessellated path") };
+            let mut top = f32::INFINITY;
+            let mut bottom = f32::NEG_INFINITY;
+            for p in mesh.positions.chunks_exact(2) {
+                top = top.min(p[1]);
+                bottom = bottom.max(p[1]);
+            }
+            assert!(top > 20., "rounding cuts off the authored tip at y=8");
+            // The polygon approximates the rounded curves to the tessellator's edge tolerance.
+            match split.op {
+                BackdropOp::Blur { ramp: Some(r), .. } => {
+                    assert!((r.start_px[1] - top).abs() < 0.25);
+                    assert!((r.end_px[1] - bottom).abs() < 0.25);
+                }
+                BackdropOp::Glass { depth_px, .. } =>
+                    assert!((depth_px - 0.75 * (bottom - top) * 0.5).abs() < 0.25),
+                other => panic!("unexpected effect {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn star_coverage_vertices_in_target_px() {
         let scene = scene_with(moda_scene::value::json!([
             { "id": "s", "type": "star", "x": 100, "y": 100, "width": 200, "height": 200,
@@ -1872,4 +1734,49 @@ mod tests {
             c => panic!("wrong coverage {c:?}"),
         }
     }
+    #[test]
+    fn pixelate_and_dither_clamps() {
+        let scene = scene_with(moda_scene::value::json!([
+            { "id": "p", "type": "rectangle", "x": 0, "y": 0, "width": 100, "height": 100,
+              "effects": [{ "id": "backdrop-0", "type": "pixelate", "pixelSize": 900 }] },
+            { "id": "d", "type": "rectangle", "x": 200, "y": 0, "width": 100, "height": 100,
+              "effects": [{ "id": "backdrop-0", "type": "dither", "pixelSize": 900, "pattern": "atkinson",
+                                   "brightness": 250, "contrast": 500 }] },
+        ]));
+        let p = compute_backdrop_split(
+            &scene,
+            scene.effective_node("p").unwrap(),
+            &ctx(&scene),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        match p.op {
+            BackdropOp::Pixelate { cell_px } => assert_eq!(cell_px, 400.0),
+            ref o => panic!("{o:?}"),
+        }
+        let d = compute_backdrop_split(
+            &scene,
+            scene.effective_node("d").unwrap(),
+            &ctx(&scene),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        match d.op {
+            BackdropOp::Dither {
+                cell_px,
+                pattern,
+                brightness,
+                contrast,
+            } => {
+                assert_eq!(cell_px, 256.0);
+                assert_eq!(pattern, 3);
+                assert_eq!(brightness, 100.0);
+                assert_eq!(contrast, 200.0);
+            }
+            ref o => panic!("{o:?}"),
+        }
+        // Pixelate / dither sample with no outward expansion.
+        assert_region_close(p.region_px, [0, 0, 100, 100]);
+    }
+
 }

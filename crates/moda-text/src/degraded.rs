@@ -21,10 +21,7 @@
 //! (`renderRichTextNodeToCanvasWithFixedSize`) + `core/text/textSizing.ts`
 //! (`getRichTextCanvasLogicalSize`): texture logical size = intrinsic
 //! content size (+6px horizontal texture padding each side), rasterized at
-//! `qualityScale = 2`. Output is honestly **Degraded** — the feature
-//! manifest reports `expected_ssim_band [0.90, 0.97]` (DECISION §1.6) and
-//! pixels are emitted only behind `--best-effort-text` (PLAN §2), except for
-//! mask coverage where the browser ALWAYS uses the Canvas2D texture.
+//! `qualityScale = 2`. The raster provides fallback text and mask coverage.
 //!
 //! Deliberate Canvas2D parity behaviors (copy, don't fix):
 //! - letterSpacing is added **between graphemes only** (measurement.ts:
@@ -181,6 +178,8 @@ pub struct DegradedRaster {
 // ---------------------------------------------------------------------------
 
 pub struct DegradedEngine {
+    /// Exact scene and system colour faces, in fallback order, for a canvas font host.
+    emoji_fonts: Option<EmojiFonts>,
     inner: Mutex<EngineInner>,
     id: u64,
     /// What the per-canvas MANIFEST declared and what actually loaded, so a caller can
@@ -220,10 +219,6 @@ struct EngineInner {
     /// different metrics — the probe-proven (+6,+6)px mask:text-alpha
     /// misplacement. Built from MANIFEST.json by [`load_catalog_fonts`].
     family_aliases: HashMap<String, String>,
-    /// Emoji cluster → its vector-lane image cell (`emoji_cell_rgba`), misses included.
-    emoji_cells: HashMap<String, Option<std::sync::Arc<crate::host::RgbaImage>>>,
-    /// `EmojiEffect::key` → its effect copy (`emoji_effect_rgba`).
-    emoji_effects: HashMap<String, std::sync::Arc<crate::host::RgbaImage>>,
     /// vork: while [`DegradedEngine::glyph_outlines`] runs the draw walk, every glyph it draws.
     recording: Option<GlyphRecording>,
 }
@@ -264,13 +259,12 @@ pub enum OutlineSegment {
     Close,
 }
 
-/// Source of [`DegradedEngine::id`].
-static NEXT_ENGINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+mod colour_glyphs;
+pub use colour_glyphs::{EmojiRaster, ShapedEmoji};
+use colour_glyphs::EmojiFonts;
 
-/// Texels per em of an emoji image cell ([`DegradedEngine::emoji_cell_rgba`]): the
-/// Noto SVG set's 128 px, near the colour fonts' largest strikes (Noto's 109 ppem, Apple's
-/// 160 px sbix).
-pub const EMOJI_CELL_TEXELS: u32 = 128;
+/// Engine and shaped-run identities used by renderer caches.
+static NEXT_ENGINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 static ENGINE:OnceLock<std::sync::RwLock<Option<std::sync::Arc<DegradedEngine>>>> =
     OnceLock::new();
@@ -519,7 +513,7 @@ fn compose_catalog_engine(
     baked: Option<&BakedCatalog>,
     catalog_dir: &std::path::Path,
 ) -> DegradedEngine {
-    compose_catalog_engine_from_snapshot(fallback_dir, baked, catalog_dir, None)
+    compose_catalog_engine_from_snapshot(fallback_dir, baked, catalog_dir, None, false)
 }
 
 /// The degraded engine for `catalog_dir`'s fonts as `manifest` describes them (the snapshot a `TextHost` loaded),
@@ -528,6 +522,10 @@ pub fn build_catalog_engine_from_snapshot(
     catalog_dir: &std::path::Path,
     manifest: &serde_json::Value,
 ) -> DegradedEngine {
+    build_host_engine(catalog_dir, manifest, false)
+}
+
+pub(crate) fn build_host_engine(catalog_dir: &std::path::Path, manifest: &serde_json::Value, canvas: bool) -> DegradedEngine {
     // Match the directory-based builder: the current request's catalog must
     // pass through the checked per-canvas layer, even on the one-shot CLI.
     let baked = if resolve_catalog_dir().as_deref() == Some(catalog_dir) {
@@ -539,7 +537,7 @@ pub fn build_catalog_engine_from_snapshot(
         resolve_degraded_fallback_dir().as_deref(),
         baked,
         catalog_dir,
-        Some(manifest),
+        Some(manifest), canvas,
     )
 }
 
@@ -564,6 +562,7 @@ fn compose_catalog_engine_from_snapshot(
     baked: Option<&BakedCatalog>,
     catalog_dir: &std::path::Path,
     manifest: Option<&serde_json::Value>,
+    canvas: bool,
 ) -> DegradedEngine {
     let mut db = fontdb::Database::new();
     let allow_system = manifest
@@ -593,6 +592,7 @@ fn compose_catalog_engine_from_snapshot(
     // blobs above are shared, so charging them per entry would over-count by ~46 MB an
     // engine. Skipped entirely when this IS the baked dir (a catalog-less render).
     let mut catalog_bytes = 0;
+    let mut authored_faces = HashMap::new();
     let mut declared_all = std::collections::HashSet::new();
     let mut declared_with_ttf = std::collections::HashSet::new();
     let mut loaded_keys = std::collections::HashSet::new();
@@ -619,19 +619,23 @@ fn compose_catalog_engine_from_snapshot(
             aliases.remove(family);
         }
         aliases.extend(load.aliases);
+        authored_faces = load.faces;
         catalog_bytes = load.bytes;
         declared_all = load.all;
         declared_with_ttf = load.with_ttf;
         loaded_keys = load.loaded;
     }
-    DegradedEngine::from_parts(
+    let emoji_fonts = canvas.then(|| EmojiFonts::new(authored_faces, allow_system));
+    let mut engine = DegradedEngine::from_parts(
         db,
         aliases,
         catalog_bytes,
         declared_all,
         declared_with_ttf,
         loaded_keys,
-    )
+    );
+    engine.emoji_fonts = emoji_fonts;
+    engine
 }
 
 /// The `wght` axis range of a variable face, or None for a static one.
@@ -856,14 +860,13 @@ impl DegradedEngine {
         drop_static_faces_a_variable_face_draws(&mut db);
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         DegradedEngine {
+            emoji_fonts: None,
             inner: Mutex::new(EngineInner {
                 font_system,
                 swash: SwashCache::new(),
                 width_cache: HashMap::new(),
                 metrics_cache: HashMap::new(),
                 family_aliases,
-                emoji_cells: HashMap::new(),
-                emoji_effects: HashMap::new(),
                 recording: None,
             }),
             id: NEXT_ENGINE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -923,61 +926,6 @@ impl DegradedEngine {
         self.id
     }
 
-    /// One colour emoji cluster as the vector lane's image cell
-    /// (`vector::VectorEmoji`): straight RGBA, [`EMOJI_CELL_TEXELS`] texels per em
-    /// wide and `EMOJI_CELL_HEIGHT_EM / EMOJI_CELL_WIDTH_EM` of that tall, the baseline
-    /// `EMOJI_CELL_ASCENT_EM` below the top.
-    ///
-    /// The glyph comes from this font system's colour emoji face (Apple Color Emoji's
-    /// sbix strikes or the bundled Noto Color Emoji's CBDT ones natively; the wasm
-    /// editor's fontdb holds only the bundled Noto face), shaped with rustybuzz so ZWJ
-    /// sequences, skin tones, keycaps and flags resolve to their ligature glyph. It is
-    /// scaled so its advance fits the one-em layout slot and centred in it.
-    ///
-    /// `None` when no face draws the cluster in colour (only a monochrome or notdef glyph
-    /// resolves, or the font system is still empty): there is no cell, and the draw that
-    /// asked for it fails (`moda-text-draw`'s `emoji_image`). Cached per engine, misses included.
-    pub fn emoji_cell_rgba(&self, cluster: &str) -> Option<std::sync::Arc<crate::host::RgbaImage>> {
-        let mut inner = self.inner.lock().expect("degraded engine poisoned");
-        if let Some(hit) = inner.emoji_cells.get(cluster) {
-            return hit.clone();
-        }
-        let made = if inner.font_system.db().faces().next().is_none() {
-            None
-        } else {
-            rasterize_emoji_cell(&mut inner, cluster).map(std::sync::Arc::new)
-        };
-        inner.emoji_cells.insert(cluster.to_string(), made.clone());
-        made
-    }
-
-    /// An effect pass's copy of an emoji cell ([`crate::vector::EmojiEffect`]): the
-    /// cell's silhouette at [`crate::vector::EMOJI_EFFECT_TEXELS_PER_EM`], shaped with the
-    /// analytic glyph shader's own formulas over its signed distance (a drop shadow or
-    /// glow softens the edge over ± the blur, a stroke is the band outside the edge), in
-    /// the pass colour with its opacity baked in, grown by `pad_texels` on every side.
-    /// Straight RGBA; a glow's copy draws through `text-emoji-additive`, which adds it
-    /// like the glyph glow's additive pipeline.
-    pub fn emoji_effect_rgba(
-        &self,
-        cluster: &str,
-        effect: &crate::vector::EmojiEffect,
-    ) -> Option<std::sync::Arc<crate::host::RgbaImage>> {
-        let cell = self.emoji_cell_rgba(cluster)?;
-        let key = effect.key(cluster);
-        let mut inner = self.inner.lock().expect("degraded engine poisoned");
-        if let Some(hit) = inner.emoji_effects.get(&key) {
-            return Some(hit.clone());
-        }
-        let made = std::sync::Arc::new(emoji_effect_raster(&cell, effect));
-        // Effect parameters follow slider drags; keep the recent ones only.
-        if inner.emoji_effects.len() >= 128 {
-            inner.emoji_effects.clear();
-        }
-        inner.emoji_effects.insert(key, made.clone());
-        Some(made)
-    }
-
     /// Which of `required` this engine has no face for.
     ///
     /// The caller already validates its TextHost against the same required set; this is
@@ -1027,13 +975,16 @@ impl DegradedEngine {
     /// content size at the node's wrap width, plus 6px horizontal texture
     /// padding each side. Returns (width_logical, height_logical).
     pub fn canvas_logical_size(&self, spec: &TextNodeSpec) -> (f64, f64) {
-        let paragraphs = parse_rich_text_to_paragraphs(&spec.html);
+        self.logical_size(spec, &self.font_paragraphs(&spec.html))
+    }
+
+    fn logical_size(&self, spec: &TextNodeSpec, paragraphs: &[Paragraph]) -> (f64, f64) {
         let max_width = spec.wrap_width();
         let (iw, ih) = {
             let mut inner = self.inner.lock().expect("degraded engine poisoned");
             measure_paragraphs_intrinsic_size(
                 &mut inner,
-                &paragraphs,
+                paragraphs,
                 max_width,
                 spec.paragraph_spacing.max(0.0),
                 spec.line_height_policy,
@@ -1052,7 +1003,7 @@ impl DegradedEngine {
     /// anchor: a justified paragraph fills the box, and a right-aligned paragraph under a left-aligned one ends at
     /// the box's right edge. Auto-width text has no box: its lines align in the texture.
     fn raster_geometry(&self, spec: &TextNodeSpec, paragraphs: &[Paragraph]) -> RasterGeometry {
-        let (natural_w, height) = self.canvas_logical_size(spec);
+        let (natural_w, height) = self.logical_size(spec, paragraphs);
         let wrap_width = natural_w.max(0.0).min(spec.wrap_width());
         let fixed_box = spec
             .width
@@ -1173,7 +1124,7 @@ impl DegradedEngine {
         spec: &TextNodeSpec,
         raster_scale: RasterScale,
     ) -> Result<Option<DegradedRaster>, String> {
-        let mut paragraphs = parse_rich_text_to_paragraphs(&spec.html);
+        let mut paragraphs = self.font_paragraphs(&spec.html);
         self.validate_paragraphs(&paragraphs)?;
         apply_fill_override(&mut paragraphs, spec.fill_override.as_deref());
         let geometry = self.raster_geometry(spec, &paragraphs);
@@ -1415,7 +1366,7 @@ impl DegradedEngine {
                         color[3] = 1.0;
                     }
                     draw_segment_text(
-                        &mut inner,
+                        self, &mut inner,
                         &mut canvas,
                         &seg.text,
                         &seg.style,
@@ -1427,7 +1378,7 @@ impl DegradedEngine {
                     // Tab leaders (`crate::tab_stops`), copy by copy on the paragraph's grid.
                     for (text, x) in crate::tab_stops::leader_pieces(seg.tab.as_ref(), positions[i].start_x) {
                         draw_segment_text(
-                            &mut inner,
+                            self, &mut inner,
                             &mut canvas,
                             text,
                             &seg.style,
@@ -1786,6 +1737,16 @@ impl DegradedEngine {
             if run.style.letter_spacing != 0.0 && run.text.chars().any(crate::parser::zwnj_shapes_after) {
                 return Err("nonzero letter-spacing on contextually shaped text is not supported by the degraded text lane".to_string());
             }
+            if run.style.emoji.is_some() { continue; }
+            if self.emoji_fonts.is_some() {
+                for segment in crate::emoji::split_text_into_segments(&run.text) {
+                    if let crate::emoji::Segment::Emoji(cluster) = segment {
+                        if !crate::emoji::regional_pair(&cluster) {
+                            return Err(format!("no font draws {cluster:?} in colour; supply a colour emoji font or install one"));
+                        }
+                    }
+                }
+            }
             let attrs = attrs_for_style(&run.style, &aliases);
             let list = attrs_list_for(&inner.font_system, &run.text, &attrs);
             let shape = ShapeLine::new(&mut inner.font_system, &run.text, &list, Shaping::Advanced, 8);
@@ -1805,6 +1766,50 @@ impl DegradedEngine {
         Ok(())
     }
 
+    /// A style boundary inside a colour glyph belongs after that glyph. Keep its base's style
+    /// and each character's original source index on the complex-script layout and raster lane.
+    fn font_paragraphs(&self, html: &str) -> Vec<Paragraph> {
+        let mut paragraphs = parse_rich_text_to_paragraphs(html);
+        if self.emoji_fonts.is_none() {
+            return paragraphs;
+        }
+        for paragraph in &mut paragraphs {
+            let text: String = paragraph.runs.iter().map(|r| r.text.as_str()).collect();
+            let mut clusters = crate::emoji::split_text_into_segments_with_ranges(&text).into_iter()
+                .filter_map(|(range, segment)| match segment {
+                    crate::emoji::Segment::Emoji(cluster) => Some((range, cluster)),
+                    _ => None,
+                }).peekable();
+            if clusters.peek().is_none() { continue; }
+            let chars: Vec<_> = text.chars().collect();
+            let source = crate::types::SourceIndices::new(paragraph.runs.iter().flat_map(|r| r.style.source.values()).collect());
+            let mut resolved = Vec::new();
+            let (mut cursor, mut run_end) = (0, 0);
+            for run in &paragraph.runs {
+                run_end += run.text.chars().count();
+                let mut emit = |range: std::ops::Range<usize>, emoji| {
+                    if range.is_empty() { return; }
+                    let mut style = run.style.clone();
+                    style.source = source.slice(range.clone());
+                    style.emoji = emoji;
+                    resolved.push(crate::types::InlineRun { text: chars[range].iter().collect(), style });
+                };
+                while clusters.peek().is_some_and(|(range, _)| range.start < run_end) {
+                    let (range, cluster) = clusters.next().unwrap();
+                    emit(cursor..range.start, None);
+                    cursor = range.end;
+                    emit(range, self.resolve_emoji(&run.style.font_family, &cluster));
+                }
+                if cursor < run_end {
+                    emit(cursor..run_end, None);
+                    cursor = run_end;
+                }
+            }
+            paragraph.runs = resolved;
+        }
+        paragraphs
+    }
+
     /// The lines [`Self::render_node`] draws, as JSON in the vector layout dump's shape
     /// (`crate::vector::dump_rich_text_node_vector`): paragraphs → lines (`lineTopY`, `lineHeightPx`,
     /// `baselineY`, `lineStartX`, `totalWidth`, `listLeftOffset`) → segments (`text`, `x`, `width`). Positions are
@@ -1812,7 +1817,7 @@ impl DegradedEngine {
     /// with right-to-left text come back `"bidi": true` (their segments are in logical order, not drawn order).
     pub fn layout_json(&self, spec: &TextNodeSpec) -> Result<serde_json::Value, String> {
         use serde_json::{json, Value};
-        let paragraphs = parse_rich_text_to_paragraphs(&spec.html);
+        let paragraphs = self.font_paragraphs(&spec.html);
         self.validate_paragraphs(&paragraphs)?;
         let geometry = self.raster_geometry(spec, &paragraphs);
         let (width_logical, height_logical) = (geometry.width, geometry.height);
@@ -2101,6 +2106,7 @@ fn measure_paragraphs_intrinsic_size(
 /// What one catalog dir contributed to an engine.
 #[derive(Default)]
 struct CatalogLoad {
+    faces: HashMap<String, Vec<(u64, fontdb::ID)>>,
     aliases: HashMap<String, String>,
     bytes: u64,
     /// Every key the manifest listed.
@@ -2233,6 +2239,9 @@ fn load_catalog_fonts_from_manifest(
                 out.loaded_families.insert(family.to_lowercase());
             }
         }
+        let faces = out.faces.entry(catalog_family.to_lowercase()).or_default();
+        let order = entry["order"].as_u64().unwrap_or(faces.len() as u64);
+        faces.extend(ids.iter().map(|id| (order, *id)));
         for id in ids {
             let Some(face) = db.face(id) else { continue };
             let Some((face_family, _)) = face.families.first() else {
@@ -2425,6 +2434,9 @@ impl EngineInner {
     /// tracking wider than a space (`letter-spacing: 6px` at 20 px) the word
     /// gap came out narrower than the letter gaps and the words ran together.
     fn measure_canvas2d(&mut self, text: &str, style: &InlineStyle) -> f64 {
+        if let Some(emoji) = &style.emoji {
+            return if text.is_empty() { 0. } else { emoji.advance_em * style.font_size + style.letter_spacing };
+        }
         if style.letter_spacing == 0.0 || text.is_empty() {
             return self.width_em(text, style) * style.font_size;
         }
@@ -2527,6 +2539,7 @@ impl FontMetricsProvider for ProviderRef<'_> {
 /// its graphemes are placed left to right in reverse and a Hebrew word keeps its letter order.
 #[allow(clippy::too_many_arguments)]
 fn draw_segment_text(
+    engine: &DegradedEngine,
     inner: &mut EngineInner,
     canvas: &mut Canvas,
     text: &str,
@@ -2537,6 +2550,12 @@ fn draw_segment_text(
     scale: f64,
 ) {
     if text.is_empty() {
+        return;
+    }
+    if let Some(run) = &style.emoji {
+        // font_paragraphs resolved the cluster before wrapping; the raster uses
+        // the same positions even for a flag or a multi-glyph ZWJ sequence.
+        engine.draw_colour_run(run, canvas, (x * scale, baseline_y * scale), style.font_size * scale, color[3]);
         return;
     }
     if style.letter_spacing == 0.0 {
@@ -2742,113 +2761,32 @@ fn attrs_list_for(font_system: &FontSystem, text: &str, attrs: &Attrs) -> AttrsL
     if !text.chars().any(maybe_emoji) {
         return list;
     }
-    let Some(family) = color_emoji_family(font_system) else {
-        return list;
-    };
-    let emoji = settle_weight(font_system.db(), attrs.clone().family(Family::Name(family)));
+    let fallback = color_emoji_family(font_system);
     for (start, g) in text.grapheme_indices(true) {
         if g.chars().any(maybe_emoji)
             && matches!(crate::emoji::split_text_into_segments(g).as_slice(), [crate::emoji::Segment::Emoji(_)])
         {
-            list.add_span(start..start + g.len(), &emoji);
+            let family = fallback;
+            if let Some(family) = family {
+                let emoji = settle_weight(font_system.db(), attrs.clone().family(Family::Name(family)));
+                list.add_span(start..start + g.len(), &emoji);
+            }
         }
     }
     list
 }
 
-/// [`DegradedEngine::emoji_cell_rgba`]'s raster.
-fn rasterize_emoji_cell(inner: &mut EngineInner, cluster: &str) -> Option<crate::host::RgbaImage> {
-    use crate::vector::ops::{EMOJI_CELL_ASCENT_EM, EMOJI_CELL_HEIGHT_EM, EMOJI_CELL_WIDTH_EM};
-    let EngineInner {
-        font_system, swash, ..
-    } = inner;
-    // Name the colour face outright: through the generic family a VS16 sequence whose base
-    // the text face also covers (❤️, ☀️) would shape to that face's monochrome glyph.
-    let family = color_emoji_family(font_system);
-    let attrs = match family {
-        Some(name) => Attrs::new().family(Family::Name(name)),
-        None => Attrs::new(),
-    };
-    let list = AttrsList::new(&attrs);
-    let shape = ShapeLine::new(font_system, cluster, &list, Shaping::Advanced, 8);
-    let layout = |size: f64| shape.layout(size as f32, None, CosmicWrap::None, None, None, Hinting::Disabled);
-    // Scale the cluster so its advance fits the one-em cell, then centre it.
-    let advance_em: f64 = layout(1.0)
-        .iter()
-        .flat_map(|l| l.glyphs.iter())
-        .map(|g| g.w as f64)
-        .sum();
-    let em_px = EMOJI_CELL_TEXELS as f64 / EMOJI_CELL_WIDTH_EM;
-    let size = em_px * EMOJI_CELL_WIDTH_EM / advance_em.max(EMOJI_CELL_WIDTH_EM);
-    let width = EMOJI_CELL_TEXELS;
-    let height = (em_px * EMOJI_CELL_HEIGHT_EM).round() as u32;
-    let origin = (
-        ((width as f64 - advance_em * size) / 2.0) as f32,
-        (em_px * EMOJI_CELL_ASCENT_EM) as f32,
-    );
-    let mut canvas = Canvas::new(width, height);
-    let mut drew = false;
-    for line in &layout(size) {
-        for glyph in &line.glyphs {
-            let phys = glyph.physical(origin, 1.0);
-            let img = swash.get_image(font_system, phys.cache_key).clone()?;
-            // A monochrome glyph (notdef, or a text face's symbol) is not an emoji image.
-            if img.content != SwashContent::Color {
-                return None;
-            }
-            let (gx, gy) = (phys.x + img.placement.left, phys.y - img.placement.top);
-            let (gw, gh) = (img.placement.width as i64, img.placement.height as i64);
-            for row in 0..gh {
-                for col in 0..gw {
-                    let i = ((row * gw + col) * 4) as usize;
-                    let a = img.data[i + 3] as f64 / 255.0;
-                    if a > 0.0 {
-                        let c = [
-                            img.data[i] as f64 / 255.0,
-                            img.data[i + 1] as f64 / 255.0,
-                            img.data[i + 2] as f64 / 255.0,
-                            a,
-                        ];
-                        canvas.blend(gx as i64 + col, gy as i64 + row, c, 1.0);
-                        drew = true;
-                    }
-                }
-            }
-        }
-    }
-    if !drew {
-        return None;
-    }
-    // Straight RGBA: the `text-emoji` pipeline's colour blend is `src-alpha,
-    // one-minus-src-alpha` (a premultiplied cell would darken its soft edges).
-    let rgba = canvas.data;
-    Some(crate::host::RgbaImage {
-        width,
-        height,
-        rgba,
-    })
-}
-
-/// [`DegradedEngine::emoji_effect_rgba`]'s raster.
 fn emoji_effect_raster(
     cell: &crate::host::RgbaImage,
     effect: &crate::vector::EmojiEffect,
 ) -> crate::host::RgbaImage {
-    // The cell's alpha at the effect resolution (a box filter over `down` × `down`).
-    let down = ((EMOJI_CELL_TEXELS as f64 / crate::vector::EMOJI_EFFECT_TEXELS_PER_EM).round() as usize).max(1);
-    let (cw, ch) = (cell.width as usize / down, cell.height as usize / down);
+    let (cw, ch) = (cell.width as usize, cell.height as usize);
     let pad = effect.pad_texels as usize;
     let (w, h) = (cw + 2 * pad, ch + 2 * pad);
     let mut mask = vec![0f32; w * h];
     for y in 0..ch {
         for x in 0..cw {
-            let mut sum = 0u32;
-            for dy in 0..down {
-                for dx in 0..down {
-                    sum += cell.rgba[((y * down + dy) * cell.width as usize + x * down + dx) * 4 + 3] as u32;
-                }
-            }
-            mask[(y + pad) * w + x + pad] = sum as f32 / (255.0 * (down * down) as f32);
+            mask[(y + pad) * w + x + pad] = cell.rgba[(y * cw + x) * 4 + 3] as f32 / 255.0;
         }
     }
     let shaped = effect.blur_texels > 0.0 || effect.stroke_texels > 0.0;
@@ -3097,6 +3035,78 @@ impl Canvas {
 mod tests {
     use super::*;
 
+    #[test]
+    fn colour_emoji_has_no_monochrome_substitute() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf").to_vec());
+        let mut engine = DegradedEngine::from_db(db);
+        engine.emoji_fonts = Some(EmojiFonts::new(Default::default(), true));
+        assert!(engine.resolve_emoji("", "©️").is_none());
+    }
+
+    #[test]
+    fn unsupported_tag_uses_the_base_flag_after_exhausting_complete_sequences() {
+        // A system face can deliberately substitute artwork for an unknown flag.
+        // Exercise Unicode fallback with just this face, which has only the base.
+        let mut db = fontdb::Database::new();
+        let ids = db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(
+            include_bytes!("../tests/fonts/colour/Narrow.ttf").to_vec(),
+        )));
+        let mut engine = DegradedEngine::from_db(db);
+        let lists = HashMap::from([("narrow".into(), vec![(0, ids[0])])]);
+        engine.emoji_fonts = Some(EmojiFonts::new(lists, true));
+        let tagged = engine.resolve_emoji("narrow", "🏴\u{e0078}\u{e007f}").unwrap();
+        let bare = engine.resolve_emoji("narrow", "🏴").unwrap();
+        assert_eq!(tagged.id, bare.id);
+        assert_eq!(tagged.advance_em, 0.5);
+    }
+
+    #[test]
+    fn mixed_emoji_uses_the_ordinary_fallback_for_arabic_and_exact_colour_faces() {
+        let root = fixtures_root();
+        let colour = root.join("crates/moda-text/tests/fonts/colour");
+        let fallback = root.join("crates/vork-std/tests/fonts");
+        let manifest = serde_json::json!({"systemFonts":false, "keys":{
+            "a":{"family":"first","ttfPath":"Wide.ttf"},
+            "b":{"family":"second","ttfPath":"Narrow.ttf"}
+        }});
+        let engine = compose_catalog_engine_from_snapshot(Some(&fallback), None, &colour, Some(&manifest), true);
+        let arabic = "<span style='font-family:first;font-size:64px'>سلام</span>";
+        let plain = spec(&format!("<p>{arabic}</p>"), 500., 200.);
+        let mixed = spec(&format!("<p>{arabic}<span style='font-family:first;font-size:64px'>✅</span>\
+            <span style='font-family:second;font-size:64px'>✅</span></p>"), 500., 200.);
+        let widths = |spec| {
+            let layout = engine.layout_json(spec).unwrap();
+            layout["paragraphs"][0]["lines"][0]["segments"].as_array().unwrap().iter()
+                .filter(|s| !s["text"].as_str().unwrap().trim().is_empty())
+                .map(|s| (s["text"].as_str().unwrap().to_owned(), s["width"].as_f64().unwrap())).collect::<Vec<_>>()
+        };
+        let plain_width = widths(&plain);
+        let mixed_widths = widths(&mixed);
+        assert_eq!(mixed_widths[0], plain_width[0]);
+        assert_eq!(mixed_widths[1..], [("✅".into(),64.), ("✅".into(),32.)]);
+        let image = engine.render_node(&mixed).unwrap();
+        for rgb in [[255,0,0], [0,0,255]] {
+            assert!(image.rgba.chunks_exact(4).any(|px| px[3] >= 250 &&
+                px[..3].iter().zip(rgb).all(|(c, expected)| c.abs_diff(expected) <= 3)), "missing {rgb:?}");
+        }
+    }
+
+    #[test]
+    fn complex_text_keeps_the_base_style_across_a_family_sequence() {
+        let mut engine = DegradedEngine::from_db(fontdb::Database::new());
+        engine.emoji_fonts = Some(EmojiFonts::new(Default::default(), true));
+        let paragraphs = engine.font_paragraphs(
+            "<p><span style='color:blue'>ش👨</span><span>‍👩</span><span style='color:red'>‍👧‍👦س</span></p>"
+        );
+        let runs = &paragraphs[0].runs;
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0].text.as_str(), runs[0].style.color.as_str()), ("ش", "blue"));
+        assert_eq!((runs[1].text.as_str(), runs[1].style.color.as_str()), ("👨‍👩‍👧‍👦", "blue"));
+        assert_eq!((runs[2].text.as_str(), runs[2].style.color.as_str()), ("س", "red"));
+        assert_eq!(runs[2].style.source.get(0), Some(8));
+    }
+
     fn fixtures_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -3176,144 +3186,6 @@ mod tests {
         // OS default that is present).
         let sans = db.family_name(&fontdb::Family::SansSerif);
         assert!(names.contains(&sans), "{sans} in {names:?}");
-    }
-
-    /// and the export must pick the faces the editor's canvas picks for the glyphs Fraunces lacks. The editor's
-    /// engine loads the bundled fallback set first (VFS `_degraded/NN-…`, sorted before every catalog face) beside
-    /// only the faces the scene was fed; the desktop's render fonts dir lists every bundled family and then the
-    /// fallback set as `_fallback/<file>`. Loaded in manifest order, the export drew `→` in Anton and `✓` in IBM
-    /// Plex Mono while the canvas drew both, and `⑩`, in Noto Sans CJK SC. Also: a variable face reports the
-    /// weight it is drawn at (Fraunces 400, not its default instance's 900).
-    #[test]
-    #[ignore = "needs unported Moda fixture editor font bundle (Fraunces variable, CJK, emoji, math and symbols)"]
-    fn export_and_canvas_pick_the_same_faces_beside_a_fallback_tier_glyph() {
-        let repo = fixtures_root().parent().unwrap().to_path_buf();
-        let public = repo.join("packages/editor/public");
-        let fallback = public.join("wasm-degraded-fonts");
-        let fraunces = public.join("fonts/google/fraunces/Fraunces[SOFT,WONK,opsz,wght].ttf");
-        let math = public.join("fonts/noto/NotoSansMath-Regular.ttf");
-        let symbols = public.join("fonts/noto/NotoSansSymbols2-Regular.ttf");
-
-        // The editor: `_degraded/` faces (the scene has CJK and dingbats, so CJK SC and emoji are installed), then
-        // the faces fed for the scene, in VFS path order.
-        let canvas_files = [
-            fallback.join("NotoSans-Regular.ttf"),
-            fallback.join("NotoSans-Bold.ttf"),
-            fallback.join("NotoSansArabic-Regular.ttf"),
-            fallback.join("NotoSansCJKsc-Regular.otf"),
-            fallback.join("NotoColorEmoji.ttf"),
-            fraunces.clone(),
-            math.clone(),
-            symbols.clone(),
-        ];
-        // `from_font_sources` without its OS fonts (a no-op on wasm, not here).
-        let mut db = fontdb::Database::new();
-        for path in &canvas_files {
-            db.load_font_data(std::fs::read(path).unwrap());
-        }
-        let canvas = DegradedEngine::from_db(db);
-
-        // The export: `writeRenderFontsDir`'s manifest — bundled families first, the fallback set last.
-        let dir = std::env::temp_dir().join(format!("degraded-1761-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key = |family: &str, path: &std::path::Path| {
-            serde_json::json!({ "family": family, "weight": 400, "style": "normal", "vectorOnly": true, "ttfPath": path })
-        };
-        let mut keys = serde_json::Map::new();
-        for (family, path) in [
-            ("Anton", public.join("fonts/google/anton/Anton-Regular.ttf")),
-            ("Fraunces", fraunces.clone()),
-            ("IBM Plex Mono", public.join("fonts/google/ibmplexmono/IBMPlexMono-Regular.ttf")),
-            ("Noto Sans Math", math.clone()),
-            ("Noto Sans Symbols 2", symbols.clone()),
-        ] {
-            keys.insert(format!("{family}-400-normal"), key(family, &path));
-        }
-        for file in [
-            "NotoColorEmoji.ttf",
-            "NotoSans-Bold.ttf",
-            "NotoSans-BoldItalic.ttf",
-            "NotoSans-Italic.ttf",
-            "NotoSans-Regular.ttf",
-            "NotoSansArabic-Regular.ttf",
-            "NotoSansCJKsc-Regular.otf",
-        ] {
-            let family = file.rsplit_once('.').unwrap().0;
-            keys.insert(format!("_fallback/{file}"), key(family, &fallback.join(file)));
-        }
-        let manifest = serde_json::json!({ "systemFonts": false, "keys": keys });
-        std::fs::write(dir.join("MANIFEST.json"), manifest.to_string()).unwrap();
-        let export = DegradedEngine::load_with_catalogs(None, &[&dir]);
-
-        let text = "Roadmap → ⑩ shipped ✓";
-        let faces = |engine: &DegradedEngine| -> Vec<(String, Option<String>, u16)> {
-            engine
-                .resolve_faces("Fraunces", 400, false, text)
-                .expect("resolve")
-                .into_iter()
-                .filter(|c| !text[c.start..c.end].trim().is_empty())
-                .map(|c| (text[c.start..c.end].to_string(), c.family, c.weight))
-                .collect()
-        };
-        let (canvas, export) = (faces(&canvas), faces(&export));
-        std::fs::remove_dir_all(&dir).ok();
-        for (part, family, weight) in &canvas {
-            let want = if part.chars().all(|c| c.is_ascii_alphabetic()) {
-                "Fraunces"
-            } else {
-                "Noto Sans CJK SC"
-            };
-            assert_eq!(family.as_deref(), Some(want), "canvas {part:?}: {canvas:?}");
-            assert_eq!(*weight, 400, "canvas {part:?}: {canvas:?}");
-        }
-        assert_eq!(export, canvas, "export vs canvas faces");
-    }
-
-    /// Text in the default family that lands on this tier (a Hebrew word in it) draws its Latin and digits in Noto
-    /// Sans, the vector lane's face for the default family, when no OS fonts are loaded (the desktop's render fonts
-    /// dir, `systemFonts: false`) — not in whichever face the set lists first (a display face) and the emoji face,
-    /// which is where cosmic-text's macOS fallback lists, naming only OS fonts, left them. `serif` too, with no Noto
-    /// Serif in the set.
-    #[test]
-    #[ignore = "needs unported Moda fixture full Fraunces Bold and fonts-degraded/NotoColorEmoji.ttf"]
-    fn the_default_family_draws_in_noto_sans_without_os_fonts() {
-        let root = fixtures_root().join("fixtures");
-        let fonts = root.join("oracle/fonts");
-        let dir =
-            std::env::temp_dir().join(format!("degraded-generic-families-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key = |family: &str, path: std::path::PathBuf| {
-            serde_json::json!({ "family": family, "weight": 400, "style": "normal", "vectorOnly": true, "ttfPath": path })
-        };
-        let manifest = serde_json::json!({ "systemFonts": false, "keys": {
-            "a-display": key("Fraunces", fonts.join("fraunces/Fraunces[SOFT,WONK,opsz,wght]-Bold.ttf")),
-            "b-emoji": key("NotoColorEmoji", root.join("fonts-degraded/NotoColorEmoji.ttf")),
-            "c-noto": key("Noto Sans", fonts.join("noto-sans/NotoSans-Regular.ttf")),
-            "d-hebrew": key("Noto Sans Hebrew", fonts.join("noto-sans-hebrew/NotoSansHebrew[wdth,wght]-Regular.ttf")),
-        }});
-        std::fs::write(dir.join("MANIFEST.json"), manifest.to_string()).unwrap();
-        let engine = DegradedEngine::load_with_catalogs(None, &[&dir]);
-        let text = "Price שלום 12.00 total";
-        for family in ["", "sans-serif", "serif"] {
-            let clusters = engine.resolve_faces(family, 400, false, text).expect("resolve");
-            for c in &clusters {
-                let part = &text[c.start..c.end];
-                if part.trim().is_empty() {
-                    continue;
-                }
-                let want = if part.chars().any(|ch| ('\u{0590}'..='\u{05FF}').contains(&ch)) {
-                    "Noto Sans Hebrew"
-                } else {
-                    "Noto Sans"
-                };
-                assert_eq!(
-                    c.family.as_deref(),
-                    Some(want),
-                    "{family:?}: {part:?} in {clusters:?}"
-                );
-            }
-        }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `layout_json` reports the lines the tier draws, and they wrap at the NODE's width, not the padded
@@ -3795,159 +3667,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The baked catalog is SHARED, not copied into every engine.
-    ///
-    /// Layering it in per engine is what keeps rare-script coverage, but the baked set
-    /// is 49.5 MB on disk (measured; ~30 MB of it four CJK variable fonts). Read fresh
-    /// per engine and charged to the host LRU's 256 MB budget, that would collapse the
-    /// warm cache to four or five entries and defeat the lane it serves. So the blobs
-    /// are read once per process and handed out as shared `Arc`s, and only the
-    /// PER-CANVAS bytes are charged.
-    ///
-    /// Both directions matter: charging zero for everything would "fix" the budget by
-    /// making it blind, so the per-canvas side is asserted exactly.
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts baked catalog manifest and Montserrat-Regular.ttf"]
-    fn the_baked_catalog_is_shared_and_only_per_canvas_bytes_are_charged() {
-        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        let root = fixtures_root();
-        std::env::set_var("MODA_FONTS_DIR", root.join("fixtures/oracle/fonts"));
-        let face = root.join("fixtures/oracle/fonts/montserrat/Montserrat-Regular.ttf");
-        assert!(face.is_file(), "fixture missing: {}", face.display());
-
-        let base = std::env::temp_dir().join(format!(
-            "moda-bytes-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let empty = base.join("empty");
-        std::fs::create_dir_all(&empty).expect("dir");
-        let per = base.join("per");
-        std::fs::create_dir_all(per.join("f")).expect("dir");
-        std::fs::copy(&face, per.join("f/face.ttf")).expect("copy");
-        std::fs::write(
-            per.join("MANIFEST.json"),
-            r#"{"keys":{"Solo Family-400-normal":{"family":"Solo Family","ttfPath":"f/face.ttf"}}}"#,
-        )
-        .expect("manifest");
-
-        assert_eq!(
-            build_catalog_engine(&empty).catalog_bytes(),
-            0,
-            "the shared baked catalog was charged to this engine — with ~50 MB per entry \
-             the host LRU collapses to a handful of canvases"
-        );
-        let face_len = std::fs::metadata(per.join("f/face.ttf"))
-            .expect("meta")
-            .len();
-        assert_eq!(
-            build_catalog_engine(&per).catalog_bytes(),
-            face_len,
-            "the per-canvas face was not charged — a budget that counts nothing is not a budget"
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-        uninstall_engine();
-    }
-
-    /// A per-canvas family must BEAT the baked one of the same name.
-    ///
-    /// This is the layering's whole point and the half a tie-free test cannot reach:
-    /// `a_per_canvas_family_reaches_the_tier_and_changes_the_glyphs` uses a name nothing
-    /// else supplies, so it never forms a collision. Here the per-canvas catalog claims
-    /// "Lato" — a family the baked oracle set really has — backed by Montserrat's face,
-    /// so the only way the render can differ from the baked one is if the per-canvas
-    /// entry won.
-    ///
-    /// Goes through `build_catalog_engine`, the production entry point, rather than a
-    /// helper: after the shared-baked-blob change that is where load ORDER is decided,
-    /// and a helper-level test would no longer cover it.
-    #[test]
-    #[ignore = "needs unported Moda fixture montserrat/Montserrat-Regular.ttf"]
-    fn a_per_canvas_family_beats_the_baked_one_of_the_same_name() {
-        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        let root = fixtures_root();
-        let montserrat = root.join("fixtures/oracle/fonts/montserrat/Montserrat-Regular.ttf");
-        assert!(
-            montserrat.is_file(),
-            "fixture missing: {}",
-            montserrat.display()
-        );
-        std::env::set_var("MODA_FONTS_DIR", root.join("fixtures/oracle/fonts"));
-
-        let base = std::env::temp_dir().join(format!(
-            "moda-override-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let over = base.join("over");
-        std::fs::create_dir_all(over.join("f")).expect("dir");
-        std::fs::copy(&montserrat, over.join("f/face.ttf")).expect("copy");
-        // Claims the BAKED family name, backed by a different face.
-        std::fs::write(
-            over.join("MANIFEST.json"),
-            r#"{"keys":{"Lato-400-normal":{"family":"Lato","ttfPath":"f/face.ttf"}}}"#,
-        )
-        .expect("manifest");
-        let plain = base.join("plain");
-        std::fs::create_dir_all(&plain).expect("dir");
-
-        let html = "<p style=\"font-family: Lato; font-size: 40px; color: #111\">Handgloves</p>";
-        let overridden = build_catalog_engine(&over)
-            .render_node(&spec(html, 900.0, 90.0))
-            .expect("override render")
-            .rgba;
-        let baked_only = build_catalog_engine(&plain)
-            .render_node(&spec(html, 900.0, 90.0))
-            .expect("baked render")
-            .rgba;
-
-        assert_ne!(
-            overridden, baked_only,
-            "the per-canvas 'Lato' did not win — the baked face still shaped the text, so a \
-             canvas overriding a baked family silently gets the wrong typeface"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-        uninstall_engine();
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded fallback directory"]
-    fn a_catalog_engine_keeps_the_noto_fallback_set() {
-        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        // The Noto fallback set is a PROCESS property and must survive a per-canvas
-        // catalog install, or pointing the tier at a canvas's fonts would take away the
-        // faces that cover complex scripts — trading one substitution bug for a worse
-        // one (tofu).
-        //
-        // Isolated to the fallback dir ALONE — no catalog dirs and, crucially, NO SYSTEM
-        // FONTS. Two things would otherwise supply this Arabic and leave the test green
-        // with the fallback deleted: the ambient oracle catalog that layering now loads
-        // (it carries NotoSansArabic), and any dev box whose OS ships Noto — mine does,
-        // which is exactly how an earlier version of this assertion passed under that
-        // mutation. `load_with_catalogs` always scans system fonts, so the db is built
-        // by hand here, the same way `catalog_only_engine` does for the same reason.
-        let mut db = fontdb::Database::new();
-        db.load_fonts_dir(resolve_degraded_fallback_dir().expect("vendored fallback dir"));
-        let e = DegradedEngine::from_db(db);
-
-        let r = e
-            .render_node(&spec(
-                "<p style=\"font-family: Cairo; font-size: 30px\">مرحبا بالعالم</p>",
-                1080.0,
-                110.0,
-            ))
-            .expect("raster");
-        let ink = r.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
-        assert!(
-            ink > 200,
-            "Arabic drew no ink from an engine whose catalog dir is empty — the Noto \
-             fallback set was lost, got {ink} px"
-        );
-    }
-
     fn spec(html: &str, w: f64, h: f64) -> TextNodeSpec {
         TextNodeSpec {
             node_id: "t".into(),
@@ -4047,85 +3766,6 @@ mod tests {
         DegradedEngine::from_db(db)
     }
 
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/MANIFEST.json and broad-script font set"]
-    fn cosmic_renders_complex_scripts_from_catalog_only() {
-        // Every complex script a customer can type must (a) have a baked Noto
-        // face whose cmap covers it in the prod-faithful catalog-only oracle,
-        // and (b) produce ink on the cosmic engine — i.e. the face is found and
-        // shaped, not another font's `.notdef` box (tofu). Shaping CORRECTNESS
-        // (joining, bidi, conjuncts, marks) is proven by the rendered-image
-        // evidence in the PR writeup; this pins that the fonts RESOLVE in prod.
-        //
-        // The complex-script set is `moda_text::complex_script` (the runs routed
-        // to this cosmic lane). A face missing here renders tofu in prod, so the
-        // coverage assertion is the real regression guard (ink alone can't tell
-        // a shaped glyph from a `.notdef` box).
-        //
-        // LANE SCOPE: this is the baked catalog dir (MODA_FONTS_DIR=
-        // /opt/moda/native/fonts) that the degraded engine loads on the warm
-        // moda-py lane AND the non-catalog CLI lane — under NATIVE_RENDER_WARM_FONTS
-        // (default ON) both preserve MODA_FONTS_DIR (the CLI lane only runs with
-        // uses_catalog=False there), so both cover these scripts. The ONLY lane that
-        // wouldn't is the catalog-materialized CLI subprocess (MODA_FONTS_DIR
-        // stripped for the per-canvas --fonts dir), reached only under the
-        // WARM_FONTS kill switch; carrying these vectorOnly fallback TTFs into
-        // materialized dirs belongs with the moda-fonts materialize path (a separate
-        // concern from the baked set) and is not a regression (that lane rendered
-        // these scripts as tofu before this change too).
-        let ttfs = oracle_ttfs();
-        // Parse each baked face once, then reuse across the per-script coverage
-        // checks (the fontdb `db` in `catalog_only_engine` owns its own copies).
-        let faces: Vec<rustybuzz::Face<'_>> = ttfs
-            .iter()
-            .filter_map(|b| rustybuzz::Face::from_slice(b, 0))
-            .collect();
-        let e = catalog_only_engine();
-        let base = "font-family: Inter; font-size: 30px; color: #111";
-        // (name, sample text, a representative codepoint that MUST be covered)
-        let cases: &[(&str, &str, u32)] = &[
-            ("Arabic", "مرحبا بالعالم", 0x0645),
-            ("Hebrew", "שלום עולם", 0x05E9),
-            ("Devanagari", "नमस्ते दुनिया", 0x0928),
-            ("Thai", "สวัสดีชาวโลก", 0x0E2A),
-            ("Tamil", "வணக்கம் உலகம்", 0x0BB5),
-            ("Telugu", "నమస్కారం", 0x0C28),
-            ("Bengali", "নমস্কার বিশ্ব", 0x09A8),
-            ("Khmer", "ជំរាបសួរ", 0x1787),
-            ("mixed-bidi", "hello مرحبا world 123", 0x0645),
-            // #7275 residual — rare complex scripts, baked TTF-only (vectorOnly):
-            // routed to this lane by `complex_script` but previously unbaked, so
-            // they rendered `.notdef` tofu in prod. Now covered → 100%.
-            ("Syriac", "ܫܠܡܐ ܥܠܡܐ", 0x0710),
-            ("Thaana", "ދިވެހިބަސް", 0x0780),
-            ("NKo", "ߒߞߏ ߞߊ߲", 0x07C1),
-            ("Samaritan", "ࠀࠁࠋ", 0x0800),
-            ("Mandaic", "ࡀࡁࡂ", 0x0840),
-            ("Adlam", "𞤀𞤁𞤂", 0x1E900),
-            ("Mongolian", "ᠮᠣᠩᠭᠣᠯ", 0x1820),
-            ("Brahmi", "𑀓𑀔𑀕", 0x11013),
-            ("Limbu", "ᤁᤂᤃ", 0x1901),
-            ("Tai Tham", "ᨠᨡᨢ", 0x1A20),
-            ("Hanifi Rohingya", "𐴀𐴁𐴂", 0x10D00),
-        ];
-        for (name, text, cp) in cases {
-            let ch = char::from_u32(*cp).unwrap();
-            assert!(
-                any_oracle_face_covers(&faces, ch),
-                "{name}: no baked oracle face covers U+{cp:04X} — renders tofu in prod"
-            );
-            let html = format!("<p style=\"{base}\">{text}</p>");
-            let r = e
-                .render_node(&spec(&html, 900.0, 80.0))
-                .unwrap_or_else(|e| panic!("{name}: render failed: {e}"));
-            let ink = r.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
-            assert!(
-                ink > 500,
-                "{name}: expected complex-script ink (font resolved), got {ink}px"
-            );
-        }
-    }
-
     /// Marks drawn past the lines at a tight line-height (Devanagari's reph and i-matra, Thai tone marks over an
     /// upper vowel) stay in the texture: it grows above the first line by the ink there, and the quad moves up by as
     /// much, so the lines sit where they did. Text whose ink stays in its lines keeps the texture it had.
@@ -4156,41 +3796,6 @@ mod tests {
             .expect("render");
         assert_eq!((plain.pad_top, plain.pad_bottom), (0.0, 0.0));
         assert_eq!(plain.height, (plain.logical_h * plain.quality_scale).floor() as u32);
-    }
-
-    /// A below-base ra (ra-phala) is a conjunct, not a virama and a full ra. The Indic shaper finds the below-base
-    /// consonant by asking whether `blwf` would substitute virama + ra; a font whose `blwf` is a format-3 context
-    /// lookup (Noto Sans Bengali 3.011, the Google Fonts release) was told no, so গ্র drew as গ্‌র (a visible virama).
-    /// harfrust's `would_apply` fix: `native/vendor/harfrust/MODA-PATCH.md`.
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-indic/NotoSansBengali-ContextFormat3Test.ttf"]
-    fn format3_context_blwf_forms_ra_phala() {
-        let font = std::fs::read(
-            fixtures_root().join("fixtures/fonts-indic/NotoSansBengali-ContextFormat3Test.ttf"),
-        )
-        .unwrap();
-        let e = DegradedEngine::from_font_data(vec![font]);
-        let ink_width = |text: &str| {
-            let style = "font-family: 'Noto Sans Bengali'; font-size: 48px; color: #111";
-            let html = format!("<p style=\"{style}\">{text}</p>");
-            let r = e
-                .render_node(&spec(&html, 600.0, 80.0))
-                .unwrap_or_else(|err| panic!("{text}: render failed: {err}"));
-            let w = r.width as usize;
-            let columns: Vec<usize> = r
-                .rgba
-                .chunks_exact(4)
-                .enumerate()
-                .filter(|(_, p)| p[3] > 0)
-                .map(|(i, _)| i % w)
-                .collect();
-            columns.iter().max().unwrap() - columns.iter().min().unwrap()
-        };
-        // The conjunct (half ga + ra-phala) is narrower than ga, a visible virama and ra (a ZWNJ asks for those).
-        for (joined, explicit) in [("গ্র", "গ্\u{200C}র"), ("প্রিয়", "প্\u{200C}রিয়")] {
-            let (j, x) = (ink_width(joined), ink_width(explicit));
-            assert!(j < x, "{joined}: ink {j} px, not narrower than the explicit-virama form ({x} px)");
-        }
     }
 
     /// A ZERO WIDTH NON-JOINER is the author's "don't join here" (Persian هفت‌سین, می‌روم; a Devanagari
@@ -4359,172 +3964,6 @@ mod tests {
         DegradedEngine::from_db(db)
     }
 
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded/NotoColorEmoji.ttf"]
-    fn wasm_emoji_rasterizes_in_color_without_system_fonts() {
-        // Regression: the wasm degraded engine was fed ONLY catalog TTFs, so
-        // emoji shaped to notdef (tofu). With the bundled NotoColorEmoji.ttf in
-        // the fontdb (and no OS color-emoji font to mask the bug), the plain,
-        // ZWJ, flag, and skin-tone clusters must all produce colored pixels.
-        let e = wasm_like_engine();
-        let r = e
-            .render_node(&spec(
-                "<p style=\"font-family: Inter; font-size: 36px; color: #1d2733\">\
-                 e \u{1F3A8} \u{1F680} \u{1F354} \u{1F44B}\u{1F3FD} \u{1F1FA}\u{1F1F8}</p>",
-                600.0,
-                80.0,
-            ))
-            .expect("raster");
-        let colored = r
-            .rgba
-            .chunks_exact(4)
-            .filter(|p| p[3] > 128 && (p[0] as i32 - p[2] as i32).abs() > 30)
-            .count();
-        assert!(
-            colored > 200,
-            "expected colored emoji pixels (no OS fonts), got {colored}"
-        );
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded/NotoColorEmoji.ttf"]
-    fn emoji_cells_come_from_the_colour_face() {
-        // The vector lane's emoji image: the bundled Noto Color Emoji glyph (CBDT), in a
-        // 128 × 160 straight-alpha cell, for plain, skin-tone, ZWJ, flag and VS16 clusters.
-        let e = wasm_like_engine();
-        // (Noto draws the ZWJ family as grey silhouettes on a tile, so it is checked for
-        // ink, not hue: one glyph, not three shrunk side by side, fills most of the cell.)
-        let clusters = [
-            ("\u{1F680}", true),
-            ("\u{1F44B}\u{1F3FD}", true),
-            ("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", false),
-            ("\u{1F1EF}\u{1F1F5}", true),
-            ("\u{2764}\u{FE0F}", true),
-        ];
-        for (cluster, hued) in clusters {
-            let img = e.emoji_cell_rgba(cluster).unwrap_or_else(|| panic!("no cell for {cluster}"));
-            assert_eq!((img.width, img.height), (EMOJI_CELL_TEXELS, 160));
-            let colored = img
-                .rgba
-                .chunks_exact(4)
-                .filter(|p| p[3] > 128 && (p[0] as i32 - p[2] as i32).abs() > 30)
-                .count();
-            let inked = img.rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
-            assert!(inked > 3000, "{cluster}: {inked} inked texels");
-            assert!(!hued || colored > 500, "{cluster}: {colored} coloured texels");
-            // Straight alpha: a soft edge texel keeps a colour brighter than its alpha.
-            assert!(
-                !hued || img.rgba.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 128 && p[0].max(p[1]).max(p[2]) > p[3]),
-                "{cluster}: straight alpha"
-            );
-            // Nothing spills past the one-em advance's cell edges.
-            let ink_cols: Vec<usize> = (0..img.width as usize)
-                .filter(|&x| (0..img.height as usize).any(|y| img.rgba[(y * img.width as usize + x) * 4 + 3] > 0))
-                .collect();
-            assert!(ink_cols.first() > Some(&0) && ink_cols.last() < Some(&(img.width as usize - 1)), "{cluster}");
-        }
-        // A letter has no colour glyph: no cell (the caller records the miss).
-        assert!(e.emoji_cell_rgba("a").is_none());
-        // Cached, and a new engine gets a new id.
-        assert!(e.emoji_cell_rgba("\u{1F680}").is_some());
-        assert_ne!(e.id(), wasm_like_engine().id());
-    }
-
-    /// An emoji in a run this tier shapes takes the colour face even where the asked family or an earlier face maps
-    /// it: EB Garamond maps the regional indicators (as boxed letters), so 🇯🇵 drew as "J" "P" in boxes. A text
-    /// presentation mark (©) stays in the text face.
-    #[test]
-    #[ignore = "needs unported Moda fixture NotoColorEmoji.ttf and EBGaramond[wght].ttf"]
-    fn emoji_in_shaped_runs_take_the_colour_face() {
-        let mut db = fontdb::Database::new();
-        for name in ["NotoSans-Regular.ttf", "NotoColorEmoji.ttf"] {
-            db.load_font_data(std::fs::read(fixtures_root().join("fixtures/fonts-degraded").join(name)).expect("font"));
-        }
-        let garamond = fixtures_root().join("../packages/editor/public/fonts/google/ebgaramond/EBGaramond[wght].ttf");
-        db.load_font_data(std::fs::read(garamond).expect("EB Garamond"));
-        let engine = DegradedEngine::from_db(db);
-        let text = "Tokyo \u{1F1EF}\u{1F1F5} \u{1F525} \u{A9}";
-        let clusters = engine.resolve_faces("EB Garamond", 400, false, text).expect("resolve");
-        let face_of = |part: &str| {
-            let at = text.find(part).unwrap();
-            clusters.iter().find(|c| c.start == at).and_then(|c| c.family.clone()).unwrap_or_default()
-        };
-        assert_eq!(face_of("\u{1F1EF}"), "Noto Color Emoji", "{clusters:?}");
-        assert_eq!(face_of("\u{1F525}"), "Noto Color Emoji", "{clusters:?}");
-        assert!(face_of("T").starts_with("EB Garamond"), "{clusters:?}");
-        assert!(face_of("\u{A9}").starts_with("EB Garamond"), "{clusters:?}");
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded/NotoColorEmoji.ttf"]
-    fn emoji_effect_copies_follow_the_silhouette() {
-        use crate::vector::EmojiEffect;
-        let e = wasm_like_engine();
-        let fx = |blur: f32, stroke: f32, additive: bool| EmojiEffect {
-            color: [1.0, 0.0, 0.0, 1.0],
-            gain: 1.0,
-            blur_texels: blur,
-            stroke_texels: stroke,
-            pad_texels: (blur + stroke) as u32 + 1,
-            additive,
-        };
-        let a = |img: &crate::host::RgbaImage, x: usize, y: usize| img.rgba[(y * img.width as usize + x) * 4 + 3];
-        // Stroke: a ring just outside the silhouette, empty deep inside and far outside.
-        let ring = e.emoji_effect_rgba("\u{1F534}", &fx(0.0, 4.0, false)).expect("red circle");
-        assert_eq!((ring.width, ring.height), (64 + 10, 80 + 10));
-        let (cx, cy) = (ring.width as usize / 2, 5 + 64 - 26); // inside the disc
-        assert_eq!(a(&ring, cx, cy), 0, "stroke is outside only");
-        assert_eq!(a(&ring, 0, 0), 0);
-        let row: Vec<u8> = (0..ring.width as usize).map(|x| a(&ring, x, cy)).collect();
-        assert!(row.iter().filter(|&&v| v > 200).count() >= 4, "two ring crossings: {row:?}");
-        assert!(ring.rgba.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 0 && p[2] == 0), "straight red");
-        // Shadow blur: soft beyond the edge, solid inside.
-        let soft = e.emoji_effect_rgba("\u{1F534}", &fx(6.0, 0.0, false)).unwrap();
-        let row: Vec<u8> = (0..soft.width as usize).map(|x| a(&soft, x, cy)).collect();
-        assert_eq!(a(&soft, soft.width as usize / 2, cy), 255);
-        assert!(row.iter().filter(|&&v| v > 10 && v < 245).count() >= 8, "a ramp: {row:?}");
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded/NotoColorEmoji.ttf and NotoSansCJKsc-Regular.otf"]
-    fn wasm_non_catalog_alias_has_coherent_advances() {
-        // Regression (634d2b14 "Roboto Bk" smear): a non-catalog display alias
-        // with no exact catalog face must fall back to a Noto face with REAL
-        // metrics, not collapse to overlapping/zero advances. Measure a known
-        // string and assert the rendered ink spans a plausible horizontal
-        // extent (no crush-onto-each-other smear).
-        let e = wasm_like_engine();
-        let r = e
-            .render_node(&spec(
-                "<p style=\"font-family: Roboto Bk; font-size: 48px; color: #1d2733\">CONSUMERS</p>",
-                900.0,
-                90.0,
-            ))
-            .expect("raster");
-        // Find the horizontal ink span (first..last column with an opaque pixel).
-        let w = r.width as usize;
-        let h = r.height as usize;
-        let mut min_x = w;
-        let mut max_x = 0usize;
-        for y in 0..h {
-            for x in 0..w {
-                let a = r.rgba[(y * w + x) * 4 + 3];
-                if a > 64 {
-                    min_x = min_x.min(x);
-                    max_x = max_x.max(x);
-                }
-            }
-        }
-        let span = max_x.saturating_sub(min_x);
-        // "CONSUMERS" at 48px/2x quality should span hundreds of px, not a
-        // few-dozen-px overlapping smear. Floor chosen well below a coherent
-        // render and well above a collapsed-advance smear.
-        assert!(
-            span > 300,
-            "ink span too narrow ({span}px) — overlapping/smeared advances"
-        );
-    }
-
     /// Regression (probe-proven 2026-07-17, mask:text-alpha (+6,+6)px): the
     /// oracle/prod Inter TTFs are opsz-bracketed releases whose name-table
     /// family is "Inter 24pt" (name IDs 1/16), while the catalog — like the
@@ -4557,75 +3996,6 @@ mod tests {
         assert!(
             (145.0..165.0).contains(&ascent),
             "ascent {ascent}px at 160px — Inter face not resolved (Noto substitution gives ~171px)"
-        );
-    }
-
-    /// Deterministic variant (NO system fonts — a box with a real "Inter"
-    /// installed can't mask a broken alias): the MANIFEST-driven catalog load
-    /// aliases "inter" → "Inter 24pt", leaves matching names unaliased, and
-    /// metrics resolve through the alias.
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/MANIFEST.json"]
-    fn manifest_alias_covers_bracketed_families_only() {
-        let mut db = fontdb::Database::new();
-        let aliases =
-            load_catalog_fonts(&mut db, &fixtures_root().join("fixtures/oracle/fonts")).aliases;
-        assert_eq!(aliases.get("inter").map(String::as_str), Some("Inter 24pt"));
-        // Families whose name-table family equals the catalog name need none.
-        assert!(!aliases.contains_key("noto sans"), "spurious: {aliases:?}");
-        let e = DegradedEngine::from_db_with_aliases(db, aliases);
-        let style = InlineStyle {
-            font_family: "Inter".into(),
-            font_weight: "800".into(),
-            font_size: 160.0,
-            ..default_style()
-        };
-        let mut inner = e.inner.lock().unwrap();
-        let (ascent, _descent) = inner.canvas_font_metrics(&style);
-        assert!(
-            (145.0..165.0).contains(&ascent),
-            "ascent {ascent}px at 160px — alias not applied"
-        );
-    }
-
-    /// Drift pin: the wasm lane's reader-based alias derivation
-    /// (`manifest_family_aliases`, fed by the VFS in `install_fonts`) must
-    /// produce EXACTLY the aliases the filesystem lane derives while loading
-    /// (`load_catalog_fonts`) — otherwise the wasm editor's degraded
-    /// rasters/mask sizing resolve different faces than the server lanes.
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/MANIFEST.json"]
-    fn manifest_alias_reader_matches_fs_lane() {
-        let dir = fixtures_root().join("fixtures/oracle/fonts");
-        let mut db = fontdb::Database::new();
-        let fs_aliases = load_catalog_fonts(&mut db, &dir).aliases;
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("MANIFEST.json")).unwrap())
-                .unwrap();
-        let reader_aliases =
-            manifest_family_aliases(&manifest, |rel| std::fs::read(dir.join(rel)).ok());
-        assert_eq!(fs_aliases, reader_aliases);
-        // And the engine built the wasm way (shared sources + reader aliases)
-        // resolves the bracket-named catalog family like the fs engine.
-        let sources: Vec<std::sync::Arc<Vec<u8>>> = manifest["keys"]
-            .as_object()
-            .unwrap()
-            .values()
-            .filter_map(|e| e.get("ttfPath").and_then(|p| p.as_str()))
-            .filter_map(|rel| std::fs::read(dir.join(rel)).ok().map(std::sync::Arc::new))
-            .collect();
-        let e = DegradedEngine::from_font_sources_with_aliases(sources, reader_aliases);
-        let style = InlineStyle {
-            font_family: "Inter".into(),
-            font_weight: "800".into(),
-            font_size: 160.0,
-            ..default_style()
-        };
-        let mut inner = e.inner.lock().unwrap();
-        let (ascent, _descent) = inner.canvas_font_metrics(&style);
-        assert!(
-            (145.0..165.0).contains(&ascent),
-            "ascent {ascent}px at 160px — wasm-lane alias not applied"
         );
     }
 
@@ -4851,53 +4221,9 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-degraded/NotoColorEmoji.ttf"]
-    fn emoji_rasterize_in_color() {
-        let e = oracle_engine();
-        let r = e
-            .render_node(&spec(
-                "<p style=\"font-family: Inter; font-size: 36px; color: #1d2733\">Wave: 👋🏽</p>",
-                400.0,
-                60.0,
-            ))
-            .expect("raster");
-        // The skin-tone cluster (Q-42 coverage-gap class) must produce
-        // colored, non-text-color pixels (sbix/CBDT bitmap strike).
-        let colored = r
-            .rgba
-            .chunks_exact(4)
-            .filter(|p| p[3] > 128 && (p[0] as i32 - p[2] as i32).abs() > 30)
-            .count();
-        assert!(colored > 50, "expected colored emoji pixels, got {colored}");
-    }
-
     fn oracle_fonts(files: &[&str]) -> DegradedEngine {
         let dir = fixtures_root().join("fixtures/oracle/fonts");
         DegradedEngine::from_font_data(files.iter().map(|f| std::fs::read(dir.join(f)).unwrap()).collect())
-    }
-
-    /// A family asked at a weight it lacks draws in its nearest face, as CSS and the vector lane do: Instrument
-    /// Serif (Regular only) at 700 drew in the first bold face in the set (DejaVu Sans Bold here), Latin and all.
-    #[test]
-    #[ignore = "needs unported Moda fixture instrument-serif/InstrumentSerif-Regular.ttf and Inter Bold"]
-    fn a_weight_the_family_lacks_draws_in_its_nearest_face() {
-        let e = oracle_fonts(&[
-            "inter/Inter_24pt-Bold.ttf",
-            "inter/Inter_24pt-Regular.ttf",
-            "instrument-serif/InstrumentSerif-Regular.ttf",
-        ]);
-        for weight in [400, 500, 700, 900] {
-            let clusters = e.resolve_faces("Instrument Serif", weight, false, "Sea Glass").unwrap();
-            for c in &clusters {
-                assert_eq!(c.family.as_deref(), Some("Instrument Serif"), "weight {weight}: {c:?}");
-                assert_eq!(c.weight, 400, "weight {weight}: {c:?}");
-            }
-        }
-        // Raw font blobs use the name-table family; the catalog's "Inter" alias is not installed here.
-        let bold = e.resolve_faces("Inter 24pt", 700, false, "Sea").unwrap();
-        assert!(!bold.is_empty());
-        assert!(bold.iter().all(|c| c.weight == 700 && c.family.as_deref() == Some("Inter 24pt")), "{bold:?}");
     }
 
     /// Thai the run's face lacks goes to Noto Sans Thai at its nearest weight whatever weight was asked;
@@ -4938,29 +4264,4 @@ mod tests {
         }
     }
 
-    /// A static face of a family beside a variable face of it (the bundled fallback Noto Sans Arabic Regular and
-    /// the installed variable Noto Sans Arabic) took every weight: fontdb lists the variable face at its default
-    /// 400, so bold drew Regular, silently. The variable face now draws each weight it spans, whichever loaded first.
-    #[test]
-    #[ignore = "needs unported Moda fixture Lora-Regular.ttf and Lora[wght].ttf"]
-    fn a_variable_face_draws_the_weights_a_static_face_of_its_family_shadowed() {
-        let static_regular = fixtures_root().join("fixtures/oracle/fonts/lora/Lora-Regular.ttf");
-        let public = fixtures_root().parent().unwrap().join("packages/editor/public");
-        let variable = public.join("fonts/google/lora/Lora[wght].ttf");
-        let (static_regular, variable) = (std::fs::read(static_regular).unwrap(), std::fs::read(variable).unwrap());
-        for fonts in [vec![static_regular.clone(), variable.clone()], vec![variable, static_regular]] {
-            let e = DegradedEngine::from_font_data(fonts);
-            let mut ink = Vec::new();
-            for weight in [400u16, 700] {
-                let clusters = e.resolve_faces("Lora", weight, false, "Sea Glass").unwrap();
-                let drawn = |c: &ResolvedCluster| c.family.as_deref() == Some("Lora") && c.weight == weight;
-                assert!(clusters.iter().all(drawn), "{weight}: {clusters:?}");
-                let style = format!("font-family: Lora; font-size: 40px; font-weight: {weight}");
-                let html = format!("<p style=\"{style}\">Sea Glass</p>");
-                let r = e.render_node(&spec(&html, 400.0, 60.0)).expect("raster");
-                ink.push(r.rgba.chunks_exact(4).map(|p| u64::from(p[3])).sum::<u64>());
-            }
-            assert!(ink[1] * 10 > ink[0] * 12, "700 draws heavier than 400: {ink:?}");
-        }
-    }
 }

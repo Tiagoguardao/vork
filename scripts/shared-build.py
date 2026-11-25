@@ -38,6 +38,9 @@ def run(args, **kwargs):
     return subprocess.check_output([str(x) for x in args], text=True, **kwargs).strip()
 
 
+RACY_NS = 2_000_000_000
+
+
 def tree_digest(paths, cache):
     """Memoize byte hashes only while every input's stat identity is unchanged."""
     files = []
@@ -60,6 +63,13 @@ def tree_digest(paths, cache):
             raise RuntimeError('toolchain changed while fingerprinting')
     cache.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=cache)
+    # Racy stats (as in git): an edit of the same size within one filesystem timestamp tick leaves
+    # every stat field unchanged, so memoize only inputs older than RACY_NS on the filesystem's clock.
+    now = os.fstat(fd).st_mtime_ns
+    if any(now - max(stat[3], stat[4]) < RACY_NS for _, _, stat in files):
+        os.close(fd)
+        os.unlink(temporary)
+        return result
     with os.fdopen(fd, 'w') as f:
         json.dump(result, f)
     os.replace(temporary, memo)

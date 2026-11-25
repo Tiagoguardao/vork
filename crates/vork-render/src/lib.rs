@@ -6,6 +6,14 @@
 //! compiles the pass order; frame.rs owns FrameSlot and walks it; values.rs
 //! prepares per-frame values;
 //! passes/ encodes each GPU pass.
+// Expand to a binding in the caller's scope: an extra block would end the span early.
+macro_rules! profile_span {
+    ($guard:ident, $name:expr) => {
+        #[cfg(feature = "frame-profile")]
+        let $guard = crate::frame_profile::span($name);
+    };
+}
+
 mod tool_report;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod vulkan_runtime;
@@ -37,7 +45,7 @@ mod computed_geometry;
 mod curves;
 mod points;
 mod point_publication;
-pub mod constants;
+pub(crate) mod constants;
 pub mod failure;
 #[doc(hidden)]
 pub mod disk_cache;
@@ -83,6 +91,7 @@ mod pipelines;
 mod plan;
 mod probes;
 mod output_run;
+mod asset_revision;
 mod audio;
 mod audio_output;
 mod png_output;
@@ -91,7 +100,7 @@ mod hair;
 mod fibre_transport;
 mod compositor;
 mod display_program;
-pub mod output_device;
+pub(crate) mod output_device;
 #[cfg(test)]
 mod display_program_tests;
 mod render_images;
@@ -103,10 +112,16 @@ mod shadow_envelope;
 mod shadow_containment;
 mod shadows;
 pub mod shot;
-pub mod session;
 mod texture_source;
 #[doc(hidden)]
 pub mod footage;
+mod footage_canvas;
+#[cfg(any(vork_nvdecode, vork_vtdecode))]
+mod footage_device;
+#[cfg(vork_vtdecode)]
+mod footage_metal;
+#[cfg(vork_nvdecode)]
+mod footage_nvidia;
 mod catcher;
 mod timing;
 #[cfg(feature = "frame-profile")]
@@ -153,6 +168,7 @@ mod lights;
 mod light_temperature;
 mod targets;
 mod canvas;
+mod canvas_host_memory;
 mod canvas_parallel;
 mod canvas_timing;
 mod canvas_draw;
@@ -331,8 +347,7 @@ struct Uniform {
     field_geometry: [u32; 4],
 }
 pub struct Renderer {
-    pub(crate) instance: wgpu::Instance,
-    pub(crate) adapter: wgpu::Adapter,
+    canvas_pipelines: Option<moda_text_draw::device::PipelineDevice>,
     denoiser: Mutex<Option<denoise::Engine>>,
     command_finish: OnceLock<command_finish::CommandFinish>,
     timestamp_marker: OnceLock<timing::Marker>,
@@ -402,26 +417,31 @@ pub struct Renderer {
 pub(crate) struct DeviceNeeds {
     /// Hardware ray queries: acceleration structures and the techniques that trace them.
     pub(crate) ray_queries: bool,
+    /// Prefer array attachments when opening a device. Existing devices can draw the scalar path.
+    pub(crate) prefer_layered_captures: bool,
 }
 impl DeviceNeeds {
     /// Everything vork can use: a renderer opened before its scenes are known.
-    pub(crate) const ALL: Self = Self { ray_queries: true };
+    pub(crate) const ALL: Self = Self { ray_queries: true, prefer_layered_captures: true };
     /// Both needs together.
     pub(crate) fn with(self, other: Self) -> Self {
-        Self { ray_queries: self.ray_queries || other.ray_queries }
+        Self { ray_queries: self.ray_queries || other.ray_queries, prefer_layered_captures: self.prefer_layered_captures || other.prefer_layered_captures }
     }
     /// Whether a device opened for `self` provides all of `needs`.
     fn covers(self, needs: Self) -> bool {
-        self.with(needs) == self
+        !needs.ray_queries || self.ray_queries
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Library users that never call settle_pipelines still persist new pipelines.
-        let _ = self.settle_pipelines();
+        // Canvas workers can request a save as they finish compiling.
+        drop(self.canvas_pipelines.take());
+        // Even if a variant or the device failed, persist work that completed before teardown.
+        let _ = self.compiler.settle();
+        let _ = self.compiler.save();
+        self.compiler.close_saves();
         crate::timing::forget(&self.device);
-        moda_text_draw::device::forget_pipeline_host(&self.device);
     }
 }
 /// The GPU a process renders on: `vork render --gpu N` / `vork setup --gpu N` (through `select_gpu`) or
@@ -762,17 +782,18 @@ impl Renderer {
         let warnings = warnings::Collector::default();
         let _scope = warnings.enter();
         let settings = profile.resolve(&Default::default()).map_err(|error| error.context(failure::FailureKind::Usage))?;
-        let scene = load_with_settings(path, settings, &profile.name, None)?;
+        let opened = footage::Opened::default();
+        let scene = load_with_settings_in(path, settings, &profile.name, None, &opened)?;
         let base = path.parent().unwrap_or(Path::new("."));
-        if audio::has_audio(&scene.nodes) { audio::Mix::new(&scene, base).map_err(failure::scene)?; }
+        if audio::may_have_audio(&scene) { audio::Mix::new_in(&scene, base, &opened).map_err(failure::scene)?; }
         let mut renderer = pollster::block_on(Self::create(DeviceNeeds::ALL, true)).map_err(failure::setup)?;
         renderer.check_only = !shaders;
         // A 2D canvas: its fonts load and its text lays out (Moda's text engine, CPU side).
         if scene.is_canvas() {
-            return canvas::check(&scene, base, &renderer).with_context(|| format!("check scene {}", path.display())).map_err(failure::scene);
+            return canvas::check(&scene, base, &renderer, &opened).with_context(|| format!("check scene {}", path.display())).map_err(failure::scene);
         }
         let installed = renderer.install_with_options(scene, base,
-            InstallOptions { variants: pipelines::VariantCompile::Setup, ..Default::default() })
+            InstallOptions { opened, variants: pipelines::VariantCompile::Setup, ..Default::default() })
             .with_context(|| format!("install scene {}", path.display()))?;
         shot::check_timeline(&installed)?;
         Ok(())
@@ -893,6 +914,7 @@ impl Renderer {
         let features = adapter.features()
             & (wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                | if needs.prefer_layered_captures { wgpu::Features::MULTIVIEW | wgpu::Features::MULTISAMPLE_ARRAY } else { wgpu::Features::empty() }
                 | material_table
                 | wgpu::Features::INDIRECT_FIRST_INSTANCE
                 | wgpu::Features::PIPELINE_CACHE
@@ -980,6 +1002,9 @@ impl Renderer {
                     .shared_instance()
                     .raw_instance()
                     .enumerate_device_extension_properties(hal.raw_physical_device())?;
+                let _cuda = features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+                    .then(|| vulkan_runtime::nvidia_ray_driver(&hal, &info.name))
+                    .transpose()?;
                 let supported = extensions.iter().any(|ext| {
                     std::ffi::CStr::from_ptr(ext.extension_name.as_ptr())
                         == ash::khr::external_semaphore_fd::NAME
@@ -1092,10 +1117,11 @@ impl Renderer {
         let (camera_memory, camera_memory_usage_at_creation, camera_memory_override_lowered) =
             residency::camera_budget(&device, device_memory, camera_memory_override);
         // Moda's 2D engine creates its pipelines on this device through the same compiler and cache.
-        moda_text_draw::device::set_pipeline_host(&device, std::sync::Arc::new(compiler.clone()));
+        let canvas_pipelines = moda_text_draw::device::PipelineDevice::new(&device, Some(std::sync::Arc::new(compiler.clone())));
+        #[cfg(not(target_arch = "wasm32"))]
+        if needs.prefer_layered_captures && !prepare_release { moda_engine::frame::prepare_capture_pipelines(&device); }
         Ok(Self {
-            instance: instance.clone(),
-            adapter,
+            canvas_pipelines: Some(canvas_pipelines),
             denoiser: Mutex::new(None),
             command_finish: OnceLock::new(),
             timestamp_marker: OnceLock::new(),
@@ -1227,8 +1253,8 @@ impl Renderer {
     /// usually runs while it is idle, and may run beside its next render. A process about to exit
     /// saves whatever is finished,
     /// after its output is delivered (`finish_pipeline_save`): otherwise a one-shot would never
-    /// leave its pipelines for the next process. Setup and library teardown, which
-    /// must leave the whole cache on disk, call `settle_pipelines`.
+    /// leave its pipelines for the next process. Setup and library teardown wait for outstanding
+    /// variants and save synchronously.
     pub(crate) fn save_pipelines_soon(&self) {
         self.compiler.save_soon();
     }
@@ -1303,7 +1329,7 @@ impl Renderer {
         if scene.has_composition_parts() {
             for (image, root) in scene.canvas_pictures() {
                 let resolution = scene.images[image].render.as_ref().expect("a picture renders").resolution;
-                let picture = canvas_world::Picture::new(self, root, scene.composition_scene(root, resolution)?, base)
+                let picture = canvas_world::Picture::new(self, root, scene.composition_scene(root, resolution)?, base, &options.opened)
                     .with_context(|| format!("images.{image}: node {root:?}"))?;
                 options.canvases.insert(image.to_string(), picture);
             }
@@ -1328,7 +1354,7 @@ impl Renderer {
         lights::validate_visibility(&scene)?;
         // The media this open reads, once each: every clock plan compiled from here on and
         // the images installed share it, and it ends with the open.
-        let opened = footage::Opened::default();
+        let opened = options.opened.clone();
         animation::fold_material_inputs(&mut scene, base, &opened)?;
         if scene.propagation.is_some() && !scene.render.settings.integrator.is_path() {
             eprintln!("warning: authored curved propagation uses std/path transport for this scene and its render-image captures");
@@ -1466,20 +1492,28 @@ fn load_scene_document(path: &Path) -> Result<Scene> {
 /// The ordinary expansion/parser path, also used for in-memory session documents.
 fn decode_scene_document(bytes: &[u8], path: &Path) -> Result<Scene> {
     let base = path.parent().unwrap_or(Path::new("."));
+    let expansion_files = std::cell::RefCell::new(std::collections::BTreeSet::new());
     let expanded = || -> Result<serde_json::Value> {
         let mut document = vork_scene::v2::diagnostics::read_document(bytes)?;
-        expand_standard_geometry(&mut document, base)?;
+        expansion_files.replace(expand_standard_geometry(&mut document, base)?);
         Ok(document)
     };
     // The expanded document is read into the scene and gone; a decode error makes it again to explain itself.
-    expanded().and_then(|document| Scene::parse_value_with_source(document, bytes, Some(path), expanded)).map_err(failure::scene)
+    let mut scene = expanded().and_then(|document| Scene::parse_value_with_source(document, bytes, Some(path), expanded)).map_err(failure::scene)?;
+    scene.expansion_files = expansion_files.into_inner();
+    Ok(scene)
 }
 
 /// Setup and scene loading share the pure builders' ordinary JSON results.
 /// Validation still consumes the expanded scene before any device is opened.
-fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Result<()> {
+fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let sources = std::cell::RefCell::new(std::collections::BTreeSet::new());
     let cache = std::cell::OnceCell::new();
     vork_std::expand_scene_with(document, base, &|function, argument| {
+        if function == "text" {
+            let options: serde_json::Value = serde_json::from_str(argument)?;
+            if let Some(font) = options["font"].as_str() { sources.borrow_mut().insert(PathBuf::from(font)); }
+        }
         let mut key = blake3::Hasher::new();
         // Conservatively bind every builder source and the target/build options.
         key.update(env!("VORK_BUILD_ID").as_bytes());
@@ -1492,7 +1526,8 @@ fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Re
         vork_std::evaluate_with_cache(function, argument,
             || String::from_utf8(disk_cache::read(&path())?).ok(),
             |result| { let _ = disk_cache::write(&path(), result.as_bytes()); })
-    })
+    })?;
+    Ok(sources.into_inner())
 }
 /// A repository scene with its authored render settings: `X.json` plus, when
 /// present, the sibling profile `X.profile.json` (the repo's convention for its
@@ -1542,26 +1577,40 @@ pub fn load_test_fixture(path: &Path, techniques: &str) -> Result<Scene> {
         Ok(scene)
     })().map_err(failure::scene)
 }
-/// Load content and resolved settings, apply the optional rewrite, then validate renderer support.
+#[cfg(test)]
 pub(crate) fn load_with_settings(path: &Path, settings: vork_scene::Settings, profile: &str, edit: Option<shot::SceneEdit>) -> Result<Scene> {
+    load_with_settings_in(path, settings, profile, edit, &Default::default())
+}
+/// Load content and resolved settings, apply the optional rewrite, then validate renderer support.
+fn load_with_settings_in(path: &Path, settings: vork_scene::Settings, profile: &str, edit: Option<shot::SceneEdit>, opened: &footage::Opened) -> Result<Scene> {
     let mut scene = load_scene_document(path).with_context(|| format!("load scene {}", path.display()))?;
     scene.render.settings = settings;
-    validate_inputs(&scene, path.parent().unwrap_or(Path::new(".")))
+    admit_scene(scene, path, profile, edit, InputIdentity::Reuse, opened).map(|(scene, _)| scene)
+}
+
+fn admit_scene(mut scene: Scene, path: &Path, profile: &str, edit: Option<shot::SceneEdit>,
+    identity: InputIdentity, opened: &footage::Opened) -> Result<(Scene, Option<std::collections::BTreeSet<PathBuf>>)> {
+    let base = path.parent().unwrap_or(Path::new("."));
+    let mut files = validate_inputs_for(&scene, base, identity, opened)
         .with_context(|| format!("load scene {} with profile {profile}", path.display()))?;
     if let Some(edit) = edit {
-        edit(&mut scene, path.parent().unwrap_or(Path::new(".")))
-            .with_context(|| format!("edit scene {}", path.display())).map_err(failure::scene)?;
-        validate_inputs(&scene, path.parent().unwrap_or(Path::new(".")))?;
+        edit(&mut scene, base).with_context(|| format!("edit scene {}", path.display())).map_err(failure::scene)?;
+        files = validate_inputs_for(&scene, base, identity, opened)?;
     }
-    Ok(scene)
+    Ok((scene, files))
+}
+
+#[cfg(test)]
+fn validate_inputs(scene: &Scene, base: &Path) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+    validate_inputs_for(scene, base, InputIdentity::Reuse, &Default::default())
 }
 
 /// Preserve the existing schema-first failure category while reporting all
 /// typed scene and source problems, including after an author-side edit.
-fn validate_inputs(scene: &Scene, base: &Path) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+fn validate_inputs_for(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
     let mut errors = Vec::new();
     let mut files = None;
-    for result in [validate(scene), validate_files(scene, base).map(|paths| files = paths)] {
+    for result in [validate(scene), inspect_files(scene, base, identity, opened).map(|paths| files = paths)] {
         if let Err(error) = result { errors.push(scene.authored_error(error)); }
     }
     if errors.is_empty() {
@@ -1590,23 +1639,39 @@ fn source_file(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputIdentity {
+    Reuse,
+    Export,
+}
+
+#[cfg(test)]
+fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+    inspect_files(scene, base, InputIdentity::Reuse, &Default::default())
+}
+
 /// Source admission uses the CPU validators before any native pipeline or upload.
 /// Independent sources are all visited even when another source cannot be opened.
-/// Return the same sources for installation identity, or None when their complete
-/// dependency set is not known. This never adds an admission requirement.
-fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+/// Return the same sources for installation or export identity, or None when
+/// their complete dependency set is unknown. This never adds an admission requirement.
+fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
     let base = if base.as_os_str().is_empty() {Path::new(".")} else {base};
     let mut errors = Vec::new();
-    let mut files = std::collections::BTreeSet::new();
+    let mut files = scene.expansion_files.clone();
     // A canvas with no world inside reads images through its paints, which `canvas::sources` lists, and through
     // its view and its image graph, whose image files the walk below lists: a rendered image is not read there.
     let paints_only = scene.is_canvas() && !canvas::has_worlds(&scene.nodes);
-    let mut complete = scene.programs.is_empty() && scene.simulation.is_none()
+    // A session collecting proof and native observations can identify a world
+    // installation's authored programs. Canvas and simulation have other readers.
+    let compiler_tracked = identity == InputIdentity::Reuse && !scene.is_canvas() && !scene.has_composition_parts()
+        && programs::session_inputs::current().is_some();
+    // One-shot exports have no compiler observation for transitive imports.
+    let mut complete = (scene.programs.is_empty() || compiler_tracked) && scene.simulation.is_none()
         && (paints_only || scene.images.values().all(|image| image.render.is_none()));
     for file in scene.nodes.iter().flat_map(|node| scene.audio_sources(node)).collect::<std::collections::BTreeSet<_>>() {
         let path = base.join(&file);
         files.insert(path.clone());
-        if let Err(error) = source_file(&path).map_err(anyhow::Error::from).and_then(|_| audio::load(&path).map(|_| ())) {
+        if let Err(error) = opened.audio(&path) {
             errors.push(error.context(format!("audio {file}: restore the file or correct its path")));
         }
     }
@@ -1680,7 +1745,10 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
         let result = (|| -> Result<()> {
             let file = image.file.as_ref().context("display programs read file images; export the rendered image to a file and bind that file")?;
             let path = base.join(file);
-            source_file(&path).with_context(||format!("restore display image {file} or correct its path"))?;
+            if footage::is_media(&path) && !footage::is_sequence(&path) {
+                opened.revision(&path).map(|_| ())
+            } else { source_file(&path).map(|_| ()).map_err(anyhow::Error::from) }
+                .with_context(||format!("restore display image {file} or correct its path"))?;
             files.insert(path);
             Ok(())
         })();
@@ -1716,7 +1784,8 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
     }
     for name in programs {
         if let Some(file) = scene.programs.get(name).and_then(|program|program.file.as_ref()) {
-            if let Err(error) = source_file(base.join(file)) {
+            files.insert(base.join(file));
+            if !vork_slang::RevisionFiles::contains_source(&base.join(file)) && let Err(error) = source_file(base.join(file)) {
                 errors.push(anyhow::Error::new(error).context(format!("program {name} ({file}): restore the source file or correct its path")));
             }
         }
@@ -1729,7 +1798,7 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
                     let result = (|| -> Result<()> {
                         let executable = std::env::current_exe()?.canonicalize()?;
                         let path = executable.parent().context("locate executable directory")?.join(relative);
-                        source_file(&path).with_context(|| format!("library image {}", path.display()))?;
+                        source_file(scene.library_files.get(&path).unwrap_or(&path)).with_context(|| format!("library image {}", path.display()))?;
                         files.insert(path);
                         Ok(())
                     })();
@@ -1746,7 +1815,7 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
         let path = match source {
             texture_source::TextureSource::File(file) => base.join(file),
             texture_source::TextureSource::Media {file, ..} => {
-                complete = false;
+                complete &= identity == InputIdentity::Export;
                 base.join(file)
             }
             texture_source::TextureSource::Render(_) | texture_source::TextureSource::Canvas(_) => { complete = false; continue; }
@@ -1756,10 +1825,13 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
                 files.extend(footage::sequence(&path)?);
             } else {
                 files.insert(path.clone());
+                if footage::is_media(&path) {
+                    opened.revision(&path)?;
+                    return Ok(());
+                }
                 match source_file(&path) {
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                        && !footage::is_media(&path)
                         && !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies")) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -1782,7 +1854,12 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
     }
     // A 2D canvas reads its fonts and painted images itself (canvas::Document reports their errors); they are
     // part of what a session must see unchanged before it reuses the document.
-    if scene.is_canvas() && !canvas::sources(scene, base, &mut files) { complete = false; }
+    let for_export = identity == InputIdentity::Export;
+    if (scene.is_canvas() || (for_export && scene.has_composition_parts()))
+        && !canvas::sources(scene, base, &mut files, for_export, opened)
+    {
+        complete = false;
+    }
     vork_scene::v2::diagnostics::joined(errors).context("scene input problems").map_err(failure::scene)?;
     Ok(complete.then_some(files))
 }
@@ -1926,6 +2003,38 @@ mod tests {
         })();
         std::fs::remove_dir_all(root)?;
         result
+    }
+
+    #[test]
+    fn drop_saves_queued_pipeline_keys_after_a_sticky_error() -> Result<()> {
+        for failure in ["variant", "device"] {
+            let mut renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("keys.entry");
+            renderer.compiler = pipelines::Compiler::new(
+                &renderer.device, None, pipelines::Known::load(path.clone(), false), pipelines::Blob::ledger_only(),
+            );
+            if failure == "variant" {
+                renderer.compiler.spawn_variant(pipelines::VariantCompile::Background, || anyhow::bail!("test variant failed"));
+            } else {
+                assert!(renderer.errors.frame_complete(Err(anyhow::anyhow!("test device failure"))).is_err());
+            }
+            assert!(renderer.settle_pipelines().is_err());
+
+            // Keep the shared persistence worker busy until after the embedder drops the renderer.
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            disk_cache::persist(move || { let _ = gate.recv_timeout(std::time::Duration::from_secs(10)); });
+            let key = blake3::hash(b"finished canvas pipeline");
+            renderer.compiler.remember(key);
+            renderer.save_pipelines_soon();
+            assert!(renderer.compiler.save_pending());
+            drop(renderer);
+            let saved = disk_cache::read(&path);
+            release.send(())?;
+            disk_cache::wait_persistence()?;
+            assert_eq!(saved, Some(key.as_bytes().to_vec()), "{failure} error lost the queued save");
+        }
+        Ok(())
     }
 
     #[test]

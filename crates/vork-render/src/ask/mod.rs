@@ -44,7 +44,7 @@ impl Question {
         );
         let kind = found[0];
         ensure!(
-            matches!(kind, "node" | "field" | "buffer" | "image" | "audio"),
+            matches!(kind, "node" | "field" | "buffer" | "image" | "audio" | "text" | "path"),
             "not built yet: {kind} answers"
         );
         ensure!(
@@ -69,10 +69,15 @@ impl Question {
                 bail!("not built yet: node {}", read.as_deref().unwrap())
             }
             ("node", Some("transform" | "bounds" | "screen"))
+            | ("text", Some("size"))
+            | ("path", Some("length"))
             | ("field", None)
             | ("buffer", None | Some("count"))
             | ("image", Some("info"))
             | ("audio", None | Some("loudness" | "spectrum")) => {}
+            ("node", Some("size")) => bail!("ask: use the text address key with read size for canvas text"),
+            ("node", Some("length")) => bail!("ask: use the path address key with read length for a canvas path"),
+            ("text" | "path", None) => bail!("not built yet: {kind} without read; see vork help ask"),
             ("image", None) => bail!("not built yet: image pixels"),
             _ => bail!("ask: {kind} has no requested property; see vork help ask"),
         }
@@ -212,7 +217,9 @@ fn run_on_cpu(path: &Path, value: &Value) -> Result<Value> {
             questions,
         );
     }
-    answer(&CpuScene::load(path)?, questions)
+    let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let scene = evaluation::load(path, base)?;
+    Reader::new(scene, base, Default::default())?.batch(questions)
 }
 
 /// Session calls consume the last successfully opened document, never reread its JSON file.
@@ -223,7 +230,7 @@ pub fn scene(scene: vork_scene::Scene, base: &Path, value: &Value) -> Result<Val
         if questions.iter().all(|q| q.kind == "audio") {
             return audio_answers(&crate::audio::Mix::new(&scene, base)?, questions);
         }
-        answer(&CpuScene::new(scene, base)?, questions)
+        Reader::new(scene, base, Default::default())?.batch(questions)
     })().map_err(crate::failure::scene)
 }
 
@@ -231,24 +238,88 @@ pub fn scene(scene: vork_scene::Scene, base: &Path, value: &Value) -> Result<Val
 pub(crate) struct Reader(ReaderKind);
 enum ReaderKind {
     Picture(CpuScene),
-    Sound(crate::audio::Mix),
+    Canvas {
+        scene: vork_scene::Scene,
+        base: std::path::PathBuf,
+        audio: std::cell::OnceCell<crate::audio::Mix>,
+        opened: crate::footage::Opened,
+    },
 }
 impl Reader {
-    pub fn new(scene: vork_scene::Scene, base: &Path) -> Result<Self> {
+    pub fn new(scene: vork_scene::Scene, base: &Path, opened: crate::footage::Opened) -> Result<Self> {
         let _warnings = crate::warnings::Collector::quiet().enter();
         if scene.is_canvas() {
-            Ok(Self(ReaderKind::Sound(crate::audio::Mix::new(
-                &scene, base,
-            )?)))
+            Ok(Self(ReaderKind::Canvas { scene, base: base.to_owned(), opened, audio: Default::default() }))
         } else {
-            Ok(Self(ReaderKind::Picture(CpuScene::new(scene, base)?)))
+            Ok(Self(ReaderKind::Picture(CpuScene::new(scene, base, opened)?)))
         }
     }
     pub fn ask(&self, value: &Value) -> Result<Value> {
         let _warnings = crate::warnings::Collector::quiet().enter();
+        self.batch(questions(value)?)
+    }
+    fn batch(&self, questions: Vec<Question>) -> Result<Value> {
         match &self.0 {
-            ReaderKind::Picture(scene) => answer(scene, questions(value)?),
-            ReaderKind::Sound(mix) => audio_answers(mix, questions(value)?),
+            ReaderKind::Picture(scene) => answer(scene, questions),
+            ReaderKind::Canvas { scene, base, audio, opened } => {
+                if questions.iter().any(|q| q.kind == "audio") && audio.get().is_none() {
+                    let _ = audio.set(crate::audio::Mix::new_in(scene, base, opened)?);
+                }
+                if questions.iter().all(|q| q.kind == "audio") {
+                    return if questions.is_empty() { Ok(json!([])) }
+                        else { audio_answers(audio.get().unwrap(), questions) };
+                }
+                // Canvas evaluation may settle an image while sampling a style or a movie.
+                // Restore the session's installed resources even if a later question refuses.
+                struct RestoreImages(crate::canvas_draw::Images);
+                impl Drop for RestoreImages {
+                    fn drop(&mut self) {
+                        crate::canvas_draw::restore_images(self.0.take());
+                    }
+                }
+                let _images = RestoreImages(moda_assets::engine_seam::installed());
+                let document = crate::canvas::Document::new_with_paints(scene, base, None, opened)?;
+                document.install_images()?;
+                let mut answers = Vec::with_capacity(questions.len());
+                let mut bounds = document.bounds_batch(questions.iter()
+                    .filter(|q| q.kind == "node" && q.read.as_deref() != Some("transform"))
+                    .map(|q| q.name.as_str()));
+                for q in questions {
+                    if q.kind == "audio" {
+                        answers.push(audio_answer(audio.get().unwrap(), &q)?);
+                        continue;
+                    }
+                    ensure!(
+                        q.instance.is_none() && q.camera.is_none(),
+                        "ask: canvas nodes have no instance or camera selector"
+                    );
+                    let mut values = Vec::with_capacity(q.times.len());
+                    for time in &q.times {
+                        let request = vork_time::Request::from(time);
+                        values.push(if q.kind == "image" {
+                            let image = scene.images.get(&q.name)
+                                .with_context(|| format!("ask: unknown image {:?}", q.name))?;
+                            info::image_info(image, base, opened, scene.render.fps, || {
+                                document.measure_image_time(&q.name, image, &request)
+                            })?
+                        } else {
+                            document.measure(
+                                &q.name,
+                                &q.kind,
+                                q.read.as_deref().unwrap_or(""),
+                                &request,
+                                &mut bounds,
+                            )?
+                        });
+                    }
+                    answers.push(if q.many {
+                        Value::Array(values)
+                    } else {
+                        values.remove(0)
+                    });
+                }
+                Ok(Value::Array(answers))
+            }
         }
     }
 }
@@ -257,7 +328,7 @@ fn answer(scene: &CpuScene, questions: Vec<Question>) -> Result<Value> {
     let audio = questions
         .iter()
         .any(|q| q.kind == "audio")
-        .then(|| crate::audio::Mix::new(&scene.scene, &scene.base))
+        .then(|| crate::audio::Mix::new_in(&scene.scene, &scene.base, &scene.opened))
         .transpose()?;
     let mut poses: Vec<(vork_time::Clock, Pose)> = Vec::new();
     let mut result = Vec::with_capacity(questions.len());
@@ -317,7 +388,7 @@ fn answer(scene: &CpuScene, questions: Vec<Question>) -> Result<Value> {
                 }
                 "image" => scene.image_info(&question.name, pose, &request)?,
                 "field" => fields::read(scene, pose, &request, &question.name)?,
-                _ => unreachable!(),
+                other => bail!("not built yet: {other} answers"),
             };
             per_time.push(value);
         }
@@ -414,6 +485,12 @@ fn screen(
         box_[2] = box_[2].max(x + dx);
         box_[3] = box_[3].max(y + dy);
     }
+    let mut screen = screen_box(box_, width, height)?;
+    screen["depth"] = json!([near.max(clip.unwrap_or(0.)), far]);
+    Ok(screen)
+}
+
+pub(crate) fn screen_box(mut box_: [f64; 4], width: f64, height: f64) -> Result<Value> {
     box_ = [
         box_[0].floor(),
         box_[1].floor(),
@@ -434,9 +511,7 @@ fn screen(
     } else {
         0.
     };
-    Ok(
-        json!({"box":box_.map(|v| v as i64),"inside":inside,"depth":[near.max(clip.unwrap_or(0.)),far]}),
-    )
+    Ok(json!({"box":box_.map(|v| v as i64),"inside":inside}))
 }
 fn audio_answer(mix: &crate::audio::Mix, question: &Question) -> Result<Value> {
     let mut per_time = Vec::with_capacity(question.times.len());

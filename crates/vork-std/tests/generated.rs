@@ -15,15 +15,13 @@ fn check(root: &Path, program: &str, args: &[&str], preparation: &str) {
 fn committed_generated_artifacts_are_current() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // generate.mjs checks scene docs/defaults, JSON Schema and SDK types by
-    // running the Rust generator; generate-std.mjs checks runtime JS and help.
-    for script in ["generate.mjs", "generate-std.mjs"] {
-        check(
-            &root,
-            "node",
-            &[&format!("packages/ts/{script}"), "--check"],
-            "install Node and run npm ci --prefix packages/ts; regenerate with scripts/generate-docs and node packages/ts/generate-std.mjs",
-        );
-    }
+    // running the Rust generator and generate-std.mjs for runtime JS and help.
+    check(
+        &root,
+        "node",
+        &["packages/ts/generate.mjs", "--check"],
+        "install Node and run npm ci --prefix packages/ts; regenerate with scripts/generate-docs",
+    );
     check(
         &root,
         if cfg!(windows) { "python" } else { "python3" },

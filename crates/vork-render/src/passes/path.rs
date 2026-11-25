@@ -633,7 +633,11 @@ pub(crate) fn record(
     let chunks = height.div_ceil(rows) as usize;
     let alignment = d.limits().min_uniform_buffer_offset_alignment as usize;
     let stride = std::mem::size_of::<PathUniform>().next_multiple_of(alignment);
-    let mut uniforms = vec![0u8; stride * chunks];
+    let uniform_bytes = chunks.checked_mul(stride)
+        .filter(|&bytes| bytes as u64 <= d.limits().max_buffer_size
+            && bytes.saturating_sub(stride) <= u32::MAX as usize)
+        .ok_or_else(|| crate::gpu_memory::DeviceLimit("path settings exceed buffer or dynamic-offset limit".into()))?;
+    let mut uniforms = vec![0u8; uniform_bytes];
     for chunk in 0..chunks {
         params.boundaries[2] = chunk as u32 * rows;
         uniforms[chunk * stride..chunk * stride + std::mem::size_of::<PathUniform>()]
@@ -1033,12 +1037,28 @@ mod tests {
             assert!(matches!(s.path.as_ref().unwrap().kernel,
                 crate::pipelines::ProgramKernel::Path { boundaries: 0, .. }),
                 "no-solid paths installed camera containment work");
+            let software_masked_time = || {
+                r.pipeline_timings()
+                    .into_iter()
+                    .find_map(|(label, ms)| (label == "software masked TLAS slots").then_some(ms))
+            };
             let mut a = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
             // Attribute only slot work to the count, after install variants settle.
             r.compiler.settle()?;
             let count = r.compiler.created();
+            let masked = software_masked_time();
+            assert_eq!(
+                masked.is_some(),
+                r.adapter_info.device_type == wgpu::DeviceType::Cpu,
+                "only CPU adapters should exercise the software masked TLAS pipeline"
+            );
             let mut b = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
             r.compiler.settle()?;
+            assert_eq!(
+                software_masked_time(),
+                masked,
+                "creating a second slot compiled the software masked TLAS pipeline"
+            );
             assert_eq!(
                 count,
                 r.compiler.created(),

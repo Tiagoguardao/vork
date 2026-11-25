@@ -354,7 +354,7 @@ pub fn map_paragraphs_to_msdf_runs(paras: &[Paragraph], catalog: &Catalog) -> Ve
                             text: cluster,
                             font_size_px,
                             color: run.style.color.clone(),
-                            letter_spacing: 0.0,
+                            letter_spacing,
                             line_height_multiple,
                             line_height_auto,
                             paragraph_break_before: if !emitted_in_para {
@@ -370,7 +370,7 @@ pub fn map_paragraphs_to_msdf_runs(paras: &[Paragraph], catalog: &Catalog) -> Ve
                     paragraph_direction,
                             font_weight: None,
                             font_style: "normal".to_string(),
-                            font_family: String::new(),
+                            font_family: run.style.font_family.clone(),
                             text_decoration: td.clone(),
                             decoration: Default::default(),
                             font_features: Vec::new(),
@@ -378,9 +378,9 @@ pub fn map_paragraphs_to_msdf_runs(paras: &[Paragraph], catalog: &Catalog) -> Ve
                             fill: None,
                             paint: run.style.paint,
                             small_caps_full_size: None,
-                            character: Default::default(),
+                            character: run.style.character.clone(),
                             lang: run.style.lang.clone(),
-                            vertical: Default::default(),
+                            vertical: run.style.vertical,
                             ruby: Default::default(),
                             list_kind: list_kind.clone(),
                             list_level,
@@ -668,9 +668,9 @@ pub fn convert_msdf_runs_to_paragraphs(runs: &[MsdfRun]) -> Vec<Paragraph> {
     }
     // Group by paragraphIndex; JS Map keeps insertion order, then keys are
     // sorted numerically (runsToParagraphs.ts:40) — BTreeMap gives sorted.
-    let mut groups: BTreeMap<usize, Vec<&MsdfRun>> = BTreeMap::new();
-    for run in runs {
-        groups.entry(run.paragraph_index).or_default().push(run);
+    let mut groups: BTreeMap<usize, Vec<(usize, &MsdfRun)>> = BTreeMap::new();
+    for (index, run) in runs.iter().enumerate() {
+        groups.entry(run.paragraph_index).or_default().push((index, run));
     }
 
     let mut paragraphs = Vec::new();
@@ -678,7 +678,7 @@ pub fn convert_msdf_runs_to_paragraphs(runs: &[MsdfRun]) -> Vec<Paragraph> {
         if runs_in_para.is_empty() {
             continue;
         }
-        let first = runs_in_para[0];
+        let first = runs_in_para[0].1;
         let align = first.paragraph_align;
         let wrap = first.paragraph_wrap;
         let tab_stops = first.paragraph_tab_stops.clone();
@@ -690,12 +690,14 @@ pub fn convert_msdf_runs_to_paragraphs(runs: &[MsdfRun]) -> Vec<Paragraph> {
         let list_style = first.list_style;
 
         let mut inline_runs: Vec<InlineRun> = Vec::new();
-        for run in &runs_in_para {
+        for (index, run) in runs_in_para {
             match run.kind {
                 RunKind::Text => {
                     inline_runs.push(InlineRun {
                         text: run.text.clone(),
                         style: InlineStyle {
+                            emoji_slot: None,
+                            emoji: None,
                             source: run.source.clone(),
                             font_family: if run.font_family.is_empty() {
                                 "sans-serif".to_string()
@@ -749,13 +751,15 @@ pub fn convert_msdf_runs_to_paragraphs(runs: &[MsdfRun]) -> Vec<Paragraph> {
                     inline_runs.push(InlineRun {
                         text: EMOJI_PLACEHOLDER.to_string(),
                         style: InlineStyle {
+                            emoji_slot: Some(index),
+                            emoji: None,
                             source: crate::types::SourceIndices::new(vec![run.source.get(0)]),
                             font_family: "sans-serif".to_string(),
                             font_size: run.font_size_px,
                             font_weight: "400".to_string(),
                             font_style: "normal".to_string(),
                             color: run.color.clone(),
-                            letter_spacing: 0.0,
+                            letter_spacing: run.letter_spacing,
                             line_height: if run.line_height_multiple != 0.0 {
                                 run.line_height_multiple
                             } else {
@@ -774,7 +778,7 @@ pub fn convert_msdf_runs_to_paragraphs(runs: &[MsdfRun]) -> Vec<Paragraph> {
                             fill: None,
                             paint: None,
                             small_caps_full_size: None,
-                            character: Default::default(),
+                            character: run.character.clone(),
                             lang: run.lang.clone(),
                             vertical: run.vertical,
                             ruby: run.ruby.clone(),

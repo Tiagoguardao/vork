@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Decide whether the selected source must ship VideoToolbox and verify Cargo's receipt."""
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--historical", action="store_true", help="explicit source-SHA bisect build")
+parser.add_argument("--build", type=Path, help="Cargo JSONL to check after compilation")
+args = parser.parse_args()
+required = not args.historical or Path("crates/vork-render/native/hwdecode/metal.m").is_file()
+if args.build is None:
+    print(str(required).lower())
+elif required:
+    def records(receipt):
+        for line in receipt:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # Shader-cache launchers can also print diagnostics.
+            if isinstance(record, dict):
+                yield record
+
+    with args.build.open() as receipt:
+        if not any(record.get("reason") == "build-script-executed"
+                   and "vork-render" in record["package_id"]
+                   and "vork_vtdecode" in record.get("cfgs", [])
+                   for record in records(receipt)):
+            parser.exit(1, "selected macOS source requires the vork_vtdecode build cfg\n")

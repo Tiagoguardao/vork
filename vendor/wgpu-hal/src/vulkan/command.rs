@@ -1305,6 +1305,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
         desc: &crate::ComputePassDescriptor<'_, super::QuerySet>,
     ) {
         self.bind_point = vk::PipelineBindPoint::COMPUTE;
+        if super::fault::requested() {
+            self.fault_pass = desc.label.unwrap_or("").into();
+        }
         if let Some(label) = desc.label {
             unsafe { self.begin_debug_marker(label) };
             self.rpass_debug_marker_active = true;
@@ -1331,6 +1334,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &super::ComputePipeline) {
+        self.fault_pipeline = pipeline.raw;
         unsafe {
             self.device.raw.cmd_bind_pipeline(
                 self.active,
@@ -1341,6 +1345,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn dispatch(&mut self, count: [u32; 3]) {
+        if super::fault::requested() {
+            unsafe {
+                super::fault::checkpoint(
+                    self.device.raw.handle(),
+                    self.active,
+                    &self.fault_pass,
+                    self.fault_pipeline,
+                    alloc::format!("dispatch {count:?}"),
+                )
+            };
+        }
         unsafe {
             self.device
                 .raw
@@ -1348,6 +1363,20 @@ impl crate::CommandEncoder for super::CommandEncoder {
         };
     }
     unsafe fn dispatch_indirect(&mut self, buffer: &super::Buffer, offset: wgt::BufferAddress) {
+        if super::fault::requested() {
+            unsafe {
+                super::fault::checkpoint(
+                    self.device.raw.handle(),
+                    self.active,
+                    &self.fault_pass,
+                    self.fault_pipeline,
+                    alloc::format!(
+                        "indirect dispatch, arguments in buffer {:#x} at offset {offset}",
+                        vk::Handle::as_raw(buffer.raw)
+                    ),
+                )
+            };
+        }
         unsafe {
             self.device
                 .raw

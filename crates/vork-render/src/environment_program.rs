@@ -56,7 +56,7 @@ impl Primary {
         let mut text = program.slang.clone();
         for dependency in &program.dependencies {
             use std::fmt::Write;
-            writeln!(text,"// dependency {}",blake3::hash(&std::fs::read(dependency)?))?;
+            writeln!(text,"// dependency {}",blake3::hash(&vork_slang::RevisionFiles::read(dependency)?))?;
         }
         let origin = if spatial { "origin" } else { "float3(0.)" };
         // The input word base is a frame value: kernels stay shared across scenes.
@@ -68,6 +68,7 @@ impl Primary {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn install_source(
     r: &Renderer,
     scene: &v2::Scene,

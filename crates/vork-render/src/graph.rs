@@ -466,8 +466,29 @@ impl Graph {
         Self::for_outputs(plan, readback, plan.effects.outputs)
     }
     pub(crate) fn for_outputs(plan:&crate::plan::ScenePlan, readback:bool, outputs:Option<crate::compositor::Dependencies>)->Result<Self> {
+        Self::for_view_outputs(plan, readback, outputs, None)
+    }
+    /// Shared pipelines/layouts keep the union plan; each view executes only
+    /// its selected lighting and reconstruction providers.
+    pub(crate) fn for_view(plan:&crate::plan::ScenePlan, readback:bool,
+        outputs:crate::compositor::Dependencies, settings:&vork_scene::v2::Settings)->Result<Self> {
+        Self::for_view_outputs(plan, readback, Some(outputs), Some(settings))
+    }
+    fn for_view_outputs(plan:&crate::plan::ScenePlan, readback:bool,
+        outputs:Option<crate::compositor::Dependencies>, settings:Option<&vork_scene::v2::Settings>)->Result<Self> {
         let mut b = Builder::default();
         declare(&mut b, plan);
+        if let Some(settings)=settings {
+            let integrator=&settings.integrator;
+            for d in &mut b.0 {
+                match d.pass {
+                    Pass::Ao => d.enabled &= integrator.indirect().is_some(),
+                    Pass::Reflections => d.enabled &= matches!(integrator.reflections(),Some(vork_scene::Reflections::Auto | vork_scene::Reflections::Ray)),
+                    Pass::Denoise => d.enabled &= integrator.denoiser().is_some() || settings.reconstruct,
+                    _ => (),
+                }
+            }
+        }
         let view=outputs.is_none_or(|o|o.color || o.controls());
         let sinks: &[_] = match (view,readback) {
             (true,true)=>&[VIEW_COLOUR,CPU_READBACK],
@@ -969,9 +990,16 @@ pub(crate) enum PublicationDiagnostic {
     SolverStatus(String),
 }
 pub(crate) type PublicationChecks = std::sync::Arc<Mutex<Vec<(wgpu::SubmissionIndex, Vec<(PublicationDiagnostic, wgpu::Buffer)>)>>>;
+/// Probe captures are shared. Only ordered, accepted exposures may publish them.
+#[derive(Default)]
+pub(crate) struct ProbeCollection {
+    pub(crate) submitted: u64,
+    pub(crate) accepted: u64,
+}
 /// Transient and frame-scoped backings shared by all frame slots and views of
 /// one installed scene. Used only while creating slots.
 pub(crate) struct Transients {
+    pub(crate) probe_collection: std::sync::Arc<Mutex<ProbeCollection>>,
     intervals: HashMap<&'static str, (u16, u16)>,
     state: crate::residency::Cache<Mutex<State>>,
     /// Submission-ordered input history for the shared published render images.
@@ -985,6 +1013,7 @@ pub(crate) struct Transients {
 impl Transients {
     pub(crate) fn new(graph: &Graph, ledger: &std::sync::Arc<crate::residency::Ledger>) -> Self {
         Self {
+            probe_collection: Default::default(),
             intervals: graph.intervals.clone(),
             state: crate::residency::Cache::new(ledger),
             submit: Mutex::default(),
@@ -1269,6 +1298,7 @@ mod tests {
     fn recording_failure_survives_transient_eviction() -> Result<()> {
         let ledger = std::sync::Arc::new(crate::residency::Ledger::default());
         let transients = Transients {
+            probe_collection: Default::default(),
             intervals: Default::default(),
             state: crate::residency::Cache::new(&ledger),
             submit: Default::default(),
@@ -1295,6 +1325,7 @@ mod tests {
     fn asynchronous_publication_failure_invalidates_all_slots() -> Result<()> {
         let ledger = std::sync::Arc::new(crate::residency::Ledger::default());
         let transients = Transients {
+            probe_collection: Default::default(),
             intervals: Default::default(), state: crate::residency::Cache::new(&ledger),
             submit: Default::default(), recording_error: Default::default(),
             publication_checks: Default::default(),

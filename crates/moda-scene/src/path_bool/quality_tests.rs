@@ -449,12 +449,6 @@ fn checked_lane_fixes_the_exact_lanes_wrong_answers() {
             0x22ba_7aac_e3a3_6349,
             Op::Boolean(BooleanOp::Exclude),
         ),
-        // Stroke outlines (the sweep's Blob Brush union seed stopped failing when the outliner's fit changed).
-        (
-            Family::BrushStroke,
-            0xdf51_5f89_755d_453a,
-            Op::Pathfinder(PathfinderOp::Merge),
-        ),
         (
             Family::NearCopy,
             0xf7e6_a103_df62_4bc7,

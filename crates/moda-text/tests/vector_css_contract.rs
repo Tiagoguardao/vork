@@ -8,6 +8,10 @@ use moda_text::{
 };
 
 fn draw_with(css: &str, stroke: bool, prepare: impl FnOnce(&mut TextNodeSpec)) -> VectorNodeOps {
+    draw_at_scale(css, stroke, 1., prepare)
+}
+
+fn draw_at_scale(css: &str, stroke: bool, scale: f64, prepare: impl FnOnce(&mut TextNodeSpec)) -> VectorNodeOps {
     let root = std::path::Path::new("/rmbugs-vector-fonts");
     moda_text::host::install_vfs(std::collections::HashMap::from([(
         root.join("variable.ttf").to_string_lossy().into_owned(),
@@ -29,7 +33,7 @@ fn draw_with(css: &str, stroke: bool, prepare: impl FnOnce(&mut TextNodeSpec)) -
         ..Default::default()
     };
     prepare(&mut spec);
-    match build_vector_node_ops(&spec, &store, &catalog, 1., VectorPlacement::VectorParity) {
+    match build_vector_node_ops(&spec, &store, &catalog, scale, VectorPlacement::VectorParity) {
         VectorEngineDecision::Vector(ops) => ops,
         other => panic!("{other:?}"),
     }
@@ -37,6 +41,16 @@ fn draw_with(css: &str, stroke: bool, prepare: impl FnOnce(&mut TextNodeSpec)) -
 
 fn draw(css: &str, stroke: bool) -> VectorNodeOps {
     draw_with(css, stroke, |_| {})
+}
+
+#[test]
+fn fresh_stroked_glyphs_record_the_scale_used_to_bake_their_bounds() {
+    let a = draw_at_scale("", true, 1., |_| {});
+    let b = draw_at_scale("", true, 2., |_| {});
+    assert_eq!(a.baked_padding_scale, Some(1.));
+    assert_eq!(b.baked_padding_scale, Some(2.));
+    let records = |v: &VectorNodeOps| v.ops.iter().flat_map(|op| op.records.iter().map(|r| r.em_box)).collect::<Vec<_>>();
+    assert_ne!(records(&a), records(&b));
 }
 
 #[test]

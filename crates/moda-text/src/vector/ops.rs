@@ -136,6 +136,32 @@ impl GlyphXform {
         }
     }
 
+    /// One em along the short principal axis has no resolvable thickness once it
+    /// falls within f32 roundoff of the composed em (or of the unscaled em).
+    fn collapsed(self) -> bool {
+        if self.lin == Self::IDENTITY.lin {
+            return false;
+        }
+        let [a, c, b, d] = self.lin.map(f64::from);
+        let major = ((a + d).hypot(b - c) + (a - d).hypot(b + c)) * 0.5;
+        let area = (a * d - b * c).abs();
+        !(area > f64::from(f32::EPSILON) * major * major.max(1.))
+    }
+
+    /// Effects use glyph em. A transformed glyph gets its AA after the linear
+    /// map so neither its margin nor its pivot depends on an inverse em box.
+    fn quad_padding(self, bounds: [f32; 4], aa: f64, effect: f64, size: f64) -> ([f32; 4], f32) {
+        let (pad, local_aa) = if self.lin == Self::IDENTITY.lin {
+            (effect + aa, 0.)
+        } else {
+            (effect, (aa * size) as f32)
+        };
+        ([
+            (f64::from(bounds[0]) - pad) as f32, (f64::from(bounds[1]) - pad) as f32,
+            (f64::from(bounds[2]) + pad) as f32, (f64::from(bounds[3]) + pad) as f32,
+        ], local_aa)
+    }
+
     /// `self ∘ inner`: `inner` applied first, both about the same em-box centre (`lin·(p − C) + C + off`), so the
     /// result is `lin = L·Lᵢ`, `off = L·oᵢ + o`. E8.22 composes a run's character scale and rotation under a
     /// KineticText transform this way.
@@ -194,7 +220,7 @@ fn unit_group(spec: &TextNodeSpec, cp: usize) -> u32 {
 
 /// The centre of each multi-glyph KineticText unit's ink at rest (node-local px), keyed by the unit's first code
 /// point: the union of its glyphs' outline bounds, as the layout placed them.
-fn unit_pivots(spec: &TextNodeSpec, segments: &[PlacedSegment]) -> HashMap<u32, (f64, f64)> {
+fn unit_pivots(spec: &TextNodeSpec, segments: &[PlacedSegment], emojis: &[PlacedEmoji]) -> HashMap<u32, (f64, f64)> {
     let mut boxes: HashMap<u32, ([f64; 4], usize)> = HashMap::new();
     for seg in segments {
         for g in &seg.placed {
@@ -231,6 +257,13 @@ fn unit_pivots(spec: &TextNodeSpec, segments: &[PlacedSegment]) -> HashMap<u32, 
             e.1 += 1;
         }
     }
+    for emoji in emojis {
+        let Some(cp) = emoji.code_point else { continue };
+        let b = emoji.ink();
+        let (bounds, count) = boxes.entry(unit_group(spec, cp)).or_insert((b, 0));
+        *bounds = [bounds[0].min(b[0]), bounds[1].min(b[1]), bounds[2].max(b[2]), bounds[3].max(b[3])];
+        *count += 1;
+    }
     boxes
         .into_iter()
         .filter(|(_, (_, n))| *n > 1)
@@ -255,36 +288,58 @@ pub fn unit_transforms_cap(len: usize, html: &str) -> usize {
     len.min(UNIT_TRANSFORMS_MAX_LENGTH.max(crate::parser::source_code_point_count(html)))
 }
 
-/// One analytic glyph instance (the row `packAnalyticInstances` consumes). The
-/// base 9 fields (36 bytes) are followed by the KineticText per-glyph transform:
-/// `glyph_lin` (row-major 2×2), `glyph_off` (px), `glyph_opacity`.
-/// For a node with no `unitTransforms` every record carries {@link GlyphXform::IDENTITY}
-/// and the shader fast-paths it to the original math (byte-exact static text).
+/// One analytic glyph instance, shared by solid, gradient and effect passes.
+/// The transform pivots about the em box centre. Transformed records carry the
+/// node-local AA margin separately so it cannot move that centre.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct VectorAnalyticRecord {
     pub pen_x: f32,
     pub baseline_y: f32,
     pub font_size_px: f32,
-    /// Padded glyph bounds in em units [minX, minY, maxX, maxY].
+    /// Effect-expanded glyph bounds in em units [minX, minY, maxX, maxY].
     pub em_box: [f32; 4],
     pub first_curve: u32,
     pub curve_count: u32,
-    /// Per-glyph linear part (rotation·scale), row-major `[a, c, b, d]`.
+    /// Composed per-glyph linear map, row-major `[a, c, b, d]`.
     pub glyph_lin: [f32; 4],
     /// Per-glyph px offset.
     pub glyph_off: [f32; 2],
     /// Per-glyph opacity (0..1); multiplies coverage alpha, inherited by effects.
     pub glyph_opacity: f32,
+    /// AA margin in node-local px around the transformed box. Zero for em-padded records.
+    pub local_aa_px: f32,
 }
 
-// ABI tripwire (mirrors the 464-byte assert on `GradientInstance` in
-// paint/gradient.rs): this record IS the GPU analytic-instance row — 16 floats /
-// 64 bytes, hand-packed field-by-field in `moda-engine`'s `text_draw.rs`, packed
-// again in TS `packAnalyticInstances`, and consumed by the `vector_text` WGSL
-// vertex layouts (`glyph_lin`@36, `glyph_off`@52, `glyph_opacity`@60). A field or
-// type change here that desyncs those four edit sites trips this at compile time.
-const _: () = assert!(core::mem::size_of::<VectorAnalyticRecord>() == 64);
+impl VectorAnalyticRecord {
+    /// Node-local corners after the glyph transform. The caller supplies the em box
+    /// with any draw-uniform padding already applied.
+    pub fn quad_corners(&self, em_box: [f32; 4]) -> [[f32; 2]; 4] {
+        let [l, t, r, b] = em_box;
+        let size = self.font_size_px;
+        let cx = self.pen_x + (l + r) * 0.5 * size;
+        let cy = self.baseline_y + (t + b) * 0.5 * size;
+        let [xx, xy, yx, yy] = self.glyph_lin;
+        if self.local_aa_px > 0. {
+            let hx = (r - l) * 0.5 * size;
+            let hy = (b - t) * 0.5 * size;
+            let rx = xx.abs() * hx + xy.abs() * hy + self.local_aa_px;
+            let ry = yx.abs() * hx + yy.abs() * hy + self.local_aa_px;
+            let x = cx + self.glyph_off[0];
+            let y = cy + self.glyph_off[1];
+            return [[x - rx, y - ry], [x + rx, y - ry], [x + rx, y + ry], [x - rx, y + ry]];
+        }
+        [(l, t), (r, t), (r, b), (l, b)].map(|(x, y)| {
+            let dx = self.pen_x + x * size - cx;
+            let dy = self.baseline_y + y * size - cy;
+            [cx + xx * dx + xy * dy + self.glyph_off[0],
+             cy + yx * dx + yy * dy + self.glyph_off[1]]
+        })
+    }
+}
+
+// Kept in step with text_draw's packing and the three analytic vertex layouts.
+const _: () = assert!(core::mem::size_of::<VectorAnalyticRecord>() == 68);
 
 /// Which extracted pipeline draws an op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,8 +352,7 @@ pub enum VectorOpPipeline {
     Analytic,
     /// `vector-text-analytic-gradient`.
     AnalyticGradient,
-    /// `<id>.vector-text-fill` (module/instance ride the engine batch).
-    AnalyticShaderFill,
+
 }
 
 /// One draw in node-local space (depth/model/clip ride the engine batch).
@@ -338,6 +392,11 @@ pub struct VectorOp {
 /// Everything the engine needs to draw one vector text node.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VectorNodeOps {
+    /// Font size and render scale when analytic instances carry unpadded outline bounds.
+    /// The draw uniform supplies the antialiasing margin at the current model scale.
+    pub uniform_padding: Option<(f64, f64)>,
+    /// Effective device scale used when the record builder displaced the outline itself.
+    pub baked_padding_scale: Option<f64>,
     pub ops: Vec<VectorOp>,
     /// The layout's curve buffer, shared by every draw of the layout ([`VectorLayout`]): 6 floats per quadratic
     /// segment, em units,
@@ -351,18 +410,17 @@ pub struct VectorNodeOps {
     /// Colour emoji clusters, drawn as textured quads (the engine's `text-emoji` image
     /// pipeline) above the glyph passes. Their layout slot is 1 em + letter spacing, like
     /// the MSDF lane's placeholder; the bitmap comes from the colour emoji font at draw
-    /// time (`degraded::DegradedEngine::emoji_cell_rgba`).
+    /// time from the shaped run and requested raster size.
     pub emojis: Vec<VectorEmoji>,
 }
 
 /// One emoji cluster placed in node-local px.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorEmoji {
+    pub shaped: Option<std::sync::Arc<crate::degraded::ShapedEmoji>>,
+    pub ppem: u32,
     pub cluster: String,
-    /// The image's corners, top-left, top-right, bottom-right, bottom-left, as `[x, y]`
-    /// pairs: an axis-aligned cell of [`EMOJI_CELL_WIDTH_EM`] × [`EMOJI_CELL_HEIGHT_EM`]
-    /// em with its top [`EMOJI_CELL_ASCENT_EM`] above the baseline, turned onto the path
-    /// for type on a path.
+    /// The sampled rectangle's four corners in node space after placement.
     pub corners: [f32; 8],
     /// Node opacity (the emoji is not tinted by the run colour or fill).
     pub opacity: f32,
@@ -373,11 +431,22 @@ pub struct VectorEmoji {
     pub effect: Option<EmojiEffect>,
 }
 
-/// Texels per em of an emoji effect texture (half the cell's: the passes are soft).
+impl VectorEmoji {
+    /// The texels sampled by this draw, shared by GPU upload and ink queries.
+    pub fn image(&self, engine: &crate::degraded::DegradedEngine) -> Option<std::sync::Arc<crate::host::RgbaImage>> {
+        let run = self.shaped.as_ref()?;
+        match &self.effect {
+            Some(fx) => engine.emoji_effect(run, self.ppem, fx),
+            None => engine.emoji_raster(run, self.ppem).map(|r| r.image),
+        }
+    }
+}
+
+/// Effect density for hostless layout previews. Font-backed draws use their target scale.
 pub const EMOJI_EFFECT_TEXELS_PER_EM: f64 = 64.0;
 
 /// One effect pass over an emoji cell, in the effect texture's texels
-/// ([`EMOJI_EFFECT_TEXELS_PER_EM`] per em of the copy's size), quantised so a drag that
+/// at the selected ppem, quantised so a drag that
 /// barely changes a blur reuses the texture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmojiEffect {
@@ -396,43 +465,17 @@ pub struct EmojiEffect {
 }
 
 impl EmojiEffect {
-    /// The key a batch's emoji list carries for this copy of `cluster` (the engine
-    /// resolves its texture from it, [`EmojiEffect::parse_key`]).
-    pub fn key(&self, cluster: &str) -> String {
-        let c = self.color;
-        format!(
-            "\u{1}fx {} {} {} {} {} {} {} {} {}\u{1}{cluster}",
-            c[0], c[1], c[2], c[3], self.gain, self.blur_texels, self.stroke_texels, self.pad_texels,
-            u8::from(self.additive)
-        )
-    }
-
-    /// Inverse of [`EmojiEffect::key`]: the effect (if any) and the cluster.
-    pub fn parse_key(key: &str) -> (Option<EmojiEffect>, &str) {
-        let Some(rest) = key.strip_prefix("\u{1}fx ") else {
-            return (None, key);
-        };
-        let Some((params, cluster)) = rest.split_once('\u{1}') else {
-            return (None, key);
-        };
-        let v: Vec<f32> = params.split(' ').filter_map(|s| s.parse().ok()).collect();
-        if v.len() != 9 {
-            return (None, key);
-        }
-        let effect = EmojiEffect {
-            color: [v[0], v[1], v[2], v[3]],
-            gain: v[4],
-            blur_texels: v[5],
-            stroke_texels: v[6],
-            pad_texels: v[7] as u32,
-            additive: v[8] != 0.0,
-        };
-        (Some(effect), cluster)
+    /// Cache identity of this effect over a selected glyph raster.
+    pub fn key(&self) -> [u32; 9] {
+        let [r, g, b, a] = self.color.map(f32::to_bits);
+        [r, g, b, a, self.gain.to_bits(), self.blur_texels.to_bits(),
+            self.stroke_texels.to_bits(), self.pad_texels, u32::from(self.additive)]
     }
 }
 
 /// The emoji image cell, in em of the run's font size. One em wide (the layout slot), and
 /// taller than it so a colour-font glyph's descent below the baseline is not clipped.
+const DEFAULT_EMOJI_RECT: [f64; 4] = [0., -EMOJI_CELL_ASCENT_EM, EMOJI_CELL_WIDTH_EM, EMOJI_CELL_HEIGHT_EM - EMOJI_CELL_ASCENT_EM];
 pub const EMOJI_CELL_WIDTH_EM: f64 = 1.0;
 pub const EMOJI_CELL_HEIGHT_EM: f64 = 1.25;
 /// How far the cell's top sits above the baseline.
@@ -965,6 +1008,8 @@ pub(crate) fn placement_v_offset(
 /// its segments in order.
 #[derive(Debug, Clone)]
 pub struct LaidLine {
+    pub advance: f64,
+    pub baseline: f64,
     pub top: f64,
     pub height: f64,
     pub source: Vec<crate::types::SourceIndices>,
@@ -1021,6 +1066,10 @@ struct PlacedSegment {
 
 /// An emoji's image slot as the line walk places it.
 struct PlacedEmoji {
+    shaped: Option<std::sync::Arc<crate::degraded::ShapedEmoji>>,
+    ink_em: [f64; 4],
+    paint: Option<u32>,
+    alpha: f32,
     cluster: String,
     x: f64,
     baseline_y: f64,
@@ -1030,6 +1079,26 @@ struct PlacedEmoji {
     code_point: Option<usize>,
     /// Vertical text: the line's column (the emoji stands upright on its centre line).
     column: Option<crate::vertical::ColumnFrame>,
+}
+
+impl PlacedEmoji {
+    fn advance_em(&self) -> f64 {
+        self.shaped.as_ref().map_or(1., |s| s.advance_em)
+    }
+
+    fn place_rect(&self, em: [f64; 4]) -> [f64; 4] {
+        let fs = self.font_size_px;
+        let (x, y) = match &self.column {
+            Some(c) => (c.centre_x() - self.advance_em() * fs / 2., self.x + (1. - EMOJI_CELL_HEIGHT_EM) * fs / 2. + fs),
+            None => (self.x, self.baseline_y),
+        };
+        [x + em[0]*fs, y + em[1]*fs, x + em[2]*fs, y + em[3]*fs]
+    }
+
+    fn ink(&self) -> [f64; 4] {
+        self.place_rect(self.ink_em)
+    }
+
 }
 
 /// One text node laid out on the vector lane ([`accept_vector_layout`]): immutable, and the one layout its box,
@@ -1072,6 +1141,11 @@ impl VectorLayout {
         self.lines.iter().map(|line| line.top + line.height).fold(0.0, f64::max)
     }
 
+    /// Includes placed colour glyphs whose current fill is transparent.
+    pub fn has_emojis(&self) -> bool {
+        !self.emojis.is_empty()
+    }
+
     /// The lines this layout draws, top to bottom.
     pub fn lines(&self) -> &[LaidLine] {
         &self.lines
@@ -1104,6 +1178,11 @@ impl VectorLayout {
                     None => b,
                     Some(a) => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
                 });
+            }
+        }
+        for emoji in &self.emojis {
+            if let Some(cp) = emoji.code_point.filter(|&cp| cp < count) {
+                boxes[cp] = Some(emoji.ink());
             }
         }
         boxes
@@ -1212,6 +1291,7 @@ pub fn accept_vector_layout(
     catalog: &Catalog,
     placement: VectorPlacement,
     fit_width: bool,
+    font_host: Option<&crate::TextHost>,
 ) -> Result<VectorLayout, VectorDecline> {
     let routed = |reason: String, cause: String, families: Vec<String>| VectorDecline {
         reason,
@@ -1305,7 +1385,7 @@ pub fn accept_vector_layout(
         families: Vec::new(),
         outlines,
     };
-    let mut layout = place_vector_layout(spec, &resolved, store, catalog, placement, fit_width)
+    let mut layout = place_vector_layout(spec, &resolved, store, catalog, placement, fit_width, font_host)
         .map_err(|e| thrown(e, false))?;
     layout.outline(store, catalog).map_err(|e| thrown(e, true))?;
     LAYOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1325,7 +1405,7 @@ pub fn build_vector_node_ops(
     analytic_pad_scale: f64,
     placement: VectorPlacement,
 ) -> VectorEngineDecision {
-    let layout = match accept_vector_layout(spec, store, catalog, placement, false) {
+    let layout = match accept_vector_layout(spec, store, catalog, placement, false, None) {
         Ok(layout) => layout,
         Err(VectorDecline { reason, cause, families, .. }) => {
             return VectorEngineDecision::Fallback { reason, cause, families }
@@ -1397,6 +1477,7 @@ fn place_vector_layout(
     catalog: &Catalog,
     placement: VectorPlacement,
     fit_width: bool,
+    font_host: Option<&crate::TextHost>,
 ) -> Result<VectorLayout, ShapeError> {
     // renderWithVector:657-659 box coercions.
     let box_w = spec.width.unwrap_or(400.0).max(0.0);
@@ -1408,7 +1489,16 @@ fn place_vector_layout(
     let vertical = writing_mode.is_vertical() && resolved.iter().any(|r| r.vertical.glyph.is_some());
 
     // buildLayout (VectorTextRenderer.ts:1073-1087).
-    let paragraphs = convert_msdf_runs_to_paragraphs(resolved);
+    let mut paragraphs = convert_msdf_runs_to_paragraphs(resolved);
+    if let Some(host) = font_host {
+        for slot in paragraphs.iter_mut().flat_map(|p| &mut p.runs) {
+            let Some(index) = slot.style.emoji_slot else { continue };
+            let run = &resolved[index];
+            let glyph = host.canvas_engine().resolve_emoji(&run.font_family, &run.text)
+                .ok_or_else(|| ShapeError::Other(format!("no font draws {:?} in colour; supply a colour emoji font or install one", run.text)))?;
+            slot.style.emoji = Some(glyph);
+        }
+    }
     // Q-121: the measurer carries the placement parity — `Canvas2dParity`
     // (hybrid arm) measures letter-spaced runs with Canvas2D semantics, so
     // wrap, alignment, segment positions and decoration widths all agree
@@ -1510,18 +1600,7 @@ fn place_vector_layout(
     let mut segments: Vec<PlacedSegment> = Vec::new();
     let mut lines: Vec<LaidLine> = Vec::new();
 
-    // Emoji: each layout placeholder takes the next emoji run in `convertMsdfRunsToParagraphs`
-    // order (`emoji_<n>`); the cursor advances on every placeholder, drawn or not, so a line
-    // another frame draws can't shift later emoji onto the wrong cluster.
-    let emoji_map = crate::ops::emoji_runs_in_layout_order(resolved);
-    let mut next_emoji: usize = 0;
     let mut placed_emojis: Vec<PlacedEmoji> = Vec::new();
-    let count_placeholders = |line: &crate::types::Line| -> usize {
-        line.segments
-            .iter()
-            .map(|s| s.text.chars().filter(|&c| c == crate::runs::EMOJI_PLACEHOLDER).count())
-            .sum()
-    };
 
     let mut bullet_primitives: Buckets<f32> = Buckets::new();
     let mut decoration_primitives: Buckets<f32> = Buckets::new();
@@ -1551,10 +1630,7 @@ fn place_vector_layout(
             let slot = match &area {
                 Some(a) => match a.visible(p, line_index) {
                     Some(s) => Some(*s),
-                    None => {
-                        next_emoji += count_placeholders(line);
-                        continue;
-                    }
+                    None => continue,
                 },
                 None => None,
             };
@@ -1704,7 +1780,8 @@ fn place_vector_layout(
 
             // Glyph segments (whitespace-only segments position but draw nothing).
             for (seg, seg_start_x, is_marker) in draw_segments {
-                if seg.text.contains(crate::runs::EMOJI_PLACEHOLDER) {
+                if let Some(index) = seg.style.emoji_slot {
+                    let run = &resolved[index];
                     // An emoji segment: each placeholder is an image slot at its prefix's width
                     // (the MSDF walk's rule for coalesced placeholders); no glyphs to shape.
                     // The same shift a glyph segment of this size takes, so the emoji keeps the
@@ -1727,17 +1804,19 @@ fn place_vector_layout(
                             prefix.push(ch);
                             continue;
                         }
-                        let id = next_emoji;
-                        next_emoji += 1;
-                        let Some(run) = emoji_map.get(id) else {
-                            prefix.push(ch);
-                            continue;
-                        };
                         let code_point = if !is_marker { seg.style.source.get(source_offset) } else { None };
                         placed_emojis.push(PlacedEmoji {
                             cluster: run.text.clone(),
+                            ink_em: match (font_host, &seg.style.emoji) {
+                                (Some(host), Some(glyph)) => host.canvas_engine().emoji_raster(glyph, glyph.ppem(seg.style.font_size))
+                                    .map_or(glyph.ink_em, |r| r.ink_em),
+                                _ => DEFAULT_EMOJI_RECT,
+                            },
+                            shaped: seg.style.emoji.clone(),
+                            paint: run.paint,
+                            alpha: css_color_to_normalized_rgba(&run.color).map_or(1., |c| c[3] as f32),
                             x: seg_start_x + crate::measure::TextMeasurer::measure(&measurer, &prefix, &seg.style),
-                            baseline_y,
+                            baseline_y: baseline_y - seg.style.character.baseline_shift,
                             font_size_px: seg.style.font_size,
                             path_shift,
                             code_point,
@@ -1920,6 +1999,8 @@ fn place_vector_layout(
             }
 
             lines.push(LaidLine {
+                advance: positions.iter().map(|segment| segment.width).sum(),
+                baseline: baseline_y,
                 top: slot.map(|s| s.top()).unwrap_or(pen_y),
                 height: line.line_height_px,
                 source: line.segments.iter().map(|s| s.style.source.clone()).collect(),
@@ -1952,6 +2033,17 @@ fn place_vector_layout(
 }
 
 impl VectorLayout {
+    /// A common padding uniform suffices when only the final quad reads the margin.
+    /// Glyph pivots on paths, shaped runs and effect copies can read it earlier.
+    pub fn uniform_padding_font(&self, spec: &TextNodeSpec) -> Option<f64> {
+        let size = self.segments.first()?.font_size_px;
+        (self.path.is_none() && spec.unit_transforms.is_empty() && !self.has_emojis()
+            && spec.gradient.is_none() && spec.effects.is_empty() && spec.stroke_width.unwrap_or(0.) <= 0.
+            && self.segments.iter().all(|s| s.font_size_px == size && s.fill.is_none()
+                && s.column.is_none() && !s.character.transforms_glyphs() && !s.synthetic_oblique))
+            .then_some(size)
+    }
+
 /// The node's ordered draws from its layout: `spec` gives what a draw adds to the layout (opacity, fill override,
 /// gradient, the ranges' paints, stroke, effects, KineticText unit transforms, fills and range), `analytic_pad_scale` the glyph quads'
 /// antialiasing pad. The layout fields of `spec` are not read: they are this layout.
@@ -1962,6 +2054,13 @@ pub fn ops(
     store: &VectorFontStore,
     catalog: &Catalog,
     analytic_pad_scale: f64,
+) -> Result<VectorNodeOps, ShapeError> {
+    self.draw_ops(spec, store, catalog, analytic_pad_scale, analytic_pad_scale, None)
+}
+
+pub fn draw_ops(
+    &self, spec: &TextNodeSpec, store: &VectorFontStore, catalog: &Catalog,
+    analytic_pad_scale: f64, image_scale: f64, host: Option<&crate::TextHost>,
 ) -> Result<VectorNodeOps, ShapeError> {
     let VectorLayout {
         first_align,
@@ -2004,11 +2103,8 @@ pub fn ops(
         .as_ref()
         .map(|g| !g.stops.is_empty())
         .unwrap_or(false);
-    // `wantsShaderFill = !hasGradient && !!args.shaderFill` (drawRuns:355-356);
-    // the engine only sets spec.shader_fill for ELIGIBLE ids (the production
-    // null-pipeline fallback → per-run solid colors).
-    let wants_shader_fill = !has_gradient && spec.shader_fill;
-    let bucket_override: Option<[f32; 4]> = if has_gradient || wants_shader_fill {
+
+    let bucket_override: Option<[f32; 4]> = if has_gradient {
         Some([1.0, 1.0, 1.0, 1.0]) // WHITE_RGBA — collapses to one bucket
     } else {
         spec.fill_override
@@ -2039,7 +2135,7 @@ pub fn ops(
     // On a path the pivot is the same box, read along the path: the unit's ink centre in the text's advance maps to a
     // distance along the path (`path_unit_s`, per unit), and its glyphs gather toward that distance (see below).
     let unit_pivots = if kinetic && !spec.unit_groups.is_empty() {
-        unit_pivots(spec, segments)
+        unit_pivots(spec, segments, placed_emojis)
     } else {
         HashMap::new()
     };
@@ -2121,12 +2217,6 @@ pub fn ops(
             if curve_count == 0 {
                 continue; // outline-less glyph (space) — no instance
             }
-            let em_box = [
-                (bounds[0] as f64 - pad_em) as f32,
-                (bounds[1] as f64 - pad_em) as f32,
-                (bounds[2] as f64 + pad_em) as f32,
-                (bounds[3] as f64 + pad_em) as f32,
-            ];
             // KineticText units: the transform turns about the unit's centre W, not the glyph's C (the shader's pivot):
             // L(p − W) + W + o = L(p − C) + C + o + (L − I)(C − W).
             // On a path the unit transform is applied as the glyph is placed on the path instead (`path_unit`).
@@ -2139,8 +2229,8 @@ pub fn ops(
             let xform = match unit.filter(|_| on_path.is_none()).map(|(_, w)| w) {
                 Some((wx, wy)) => {
                     let size = seg.font_size_px;
-                    let cx = pen_x + (em_box[0] as f64 + em_box[2] as f64) * 0.5 * size;
-                    let cy = glyph_baseline_y + (em_box[1] as f64 + em_box[3] as f64) * 0.5 * size;
+                    let cx = pen_x + (bounds[0] as f64 + bounds[2] as f64) * 0.5 * size;
+                    let cy = glyph_baseline_y + (bounds[1] as f64 + bounds[3] as f64) * 0.5 * size;
                     let (dx, dy) = (cx - wx, cy - wy);
                     let [a, c, b, d] = xform.lin.map(f64::from);
                     GlyphXform {
@@ -2156,12 +2246,12 @@ pub fn ops(
             // E8.22: the run's scale and rotation shape the outline first; a KineticText transform acts on top.
             let shape = |xform: GlyphXform| {
                 let xform = if seg.character.transforms_glyphs() {
-                    xform.after(seg.character.glyph_xform(em_box, seg.font_size_px as f32))
+                    xform.after(seg.character.glyph_xform(bounds, seg.font_size_px as f32))
                 } else {
                     xform
                 };
                 if seg.synthetic_oblique {
-                    xform.with_synthetic_oblique(em_box, seg.font_size_px as f32)
+                    xform.with_synthetic_oblique(bounds, seg.font_size_px as f32)
                 } else {
                     xform
                 }
@@ -2193,8 +2283,8 @@ pub fn ops(
                         continue 'glyphs;
                     };
                     let c = (
-                        (em_box[0] as f64 + em_box[2] as f64) * 0.5 * size,
-                        (em_box[1] as f64 + em_box[3] as f64) * 0.5 * size,
+                        (bounds[0] as f64 + bounds[2] as f64) * 0.5 * size,
+                        (bounds[1] as f64 + bounds[3] as f64) * 0.5 * size,
                     );
                     let Some((group, (wx, wy))) = path_unit else {
                         let (lin, off) = crate::text_path::place_on_path(
@@ -2318,8 +2408,8 @@ pub fn ops(
                     };
                     let (lin, p1) = crate::vertical::place(&frame, &place);
                     let c = (
-                        pen_x + (em_box[0] as f64 + em_box[2] as f64) * 0.5 * size,
-                        glyph_baseline_y + (em_box[1] as f64 + em_box[3] as f64) * 0.5 * size,
+                        pen_x + (bounds[0] as f64 + bounds[2] as f64) * 0.5 * size,
+                        glyph_baseline_y + (bounds[1] as f64 + bounds[3] as f64) * 0.5 * size,
                     );
                     let (l, off) = crate::vertical::compose(
                         xform.lin.map(f64::from),
@@ -2337,6 +2427,21 @@ pub fn ops(
                 }
                 _ => xform,
             };
+            if collect_extrude {
+                extrude_glyphs.push(crate::vector::extrude::ExtrudePlacedGlyph {
+                    font: font.clone(),
+                    gid,
+                    pen_x,
+                    baseline_y: glyph_baseline_y,
+                    font_size_px: seg.font_size_px,
+                    em_bounds: bounds,
+                    xform,
+                });
+            }
+            if xform.collapsed() {
+                continue;
+            }
+            let (em_box, local_aa_px) = xform.quad_padding(bounds, pad_em, 0., seg.font_size_px);
             // KineticText fill: the fill record alone takes the code point's fill amount (the effect copies below
             // keep the glyph's opacity, so a stroke stays).
             let fill = code_point
@@ -2347,6 +2452,7 @@ pub fn ops(
                 baseline_y: glyph_baseline_y as f32,
                 font_size_px: seg.font_size_px as f32,
                 em_box,
+                local_aa_px,
                 first_curve,
                 curve_count,
                 glyph_lin: xform.lin,
@@ -2365,24 +2471,15 @@ pub fn ops(
                     xform,
                 });
             }
-            if collect_extrude {
-                extrude_glyphs.push(crate::vector::extrude::ExtrudePlacedGlyph {
-                    font: font.clone(),
-                    gid,
-                    pen_x,
-                    baseline_y: glyph_baseline_y,
-                    font_size_px: seg.font_size_px,
-                    em_bounds: bounds,
-                    xform,
-                });
-            }
+
         }
     }
 
     let total_instances: usize = buckets.entries.iter().map(|(_, _, r)| r.len()).sum::<usize>()
         + fill_buckets.iter().map(|(_, r)| r.len()).sum::<usize>();
     let has_primitives = !all_primitive_tris.is_empty();
-    let mut out = VectorNodeOps::default();
+    let mut out = VectorNodeOps { baked_padding_scale: analytic_pad_scale.is_finite().then_some(analytic_pad_scale.max(1e-3)),
+        ..Default::default() };
 
     // Emoji cells in node-local px; along a path, the cell turns onto the tangent at its
     // advance centre like a glyph does (`text_path::place_on_path`). Each effect pass
@@ -2390,6 +2487,11 @@ pub fn ops(
     // cell as a tinted silhouette copy first, back to front, so the emoji carry the
     // text's effects; the emoji themselves come last, over them.
     struct EmojiFrame {
+        shaped: Option<std::sync::Arc<crate::degraded::ShapedEmoji>>,
+        ppem: u32,
+        effect_ppem: u32,
+        effect_rect: [f64; 4],
+        fill: f32,
         cluster: String,
         font_size_px: f64,
         /// The cell rect, before the path turn: x0, y0, x1, y1.
@@ -2403,37 +2505,23 @@ pub fn ops(
     let mut frames: Vec<EmojiFrame> = Vec::new();
     for e in placed_emojis {
         // Its code point addresses a unit only in KineticText.
-        let code_point = e.code_point.filter(|_| kinetic);
+        let code_point = e.code_point;
         if spec.unit_range.as_ref().is_some_and(|range|
             code_point.is_none_or(|cp| !range.contains(&cp))) {
             continue;
         }
         let fs = e.font_size_px;
-        let y0 = e.baseline_y - EMOJI_CELL_ASCENT_EM * fs;
-        let rect = match &e.column {
-            // Vertical text: upright on the column's centre line, its em down the column.
-            Some(c) => {
-                let x0 = c.centre_x() - 0.5 * EMOJI_CELL_WIDTH_EM * fs;
-                let top = e.x + 0.5 * (fs - EMOJI_CELL_HEIGHT_EM * fs);
-                [x0, top, x0 + EMOJI_CELL_WIDTH_EM * fs, top + EMOJI_CELL_HEIGHT_EM * fs]
-            }
-            None => [
-                e.x,
-                y0,
-                e.x + EMOJI_CELL_WIDTH_EM * fs,
-                y0 + EMOJI_CELL_HEIGHT_EM * fs,
-            ],
-        };
+        let ink = e.ink();
         let turn = match (&on_path, path_start, path_spacing.as_mut()) {
             (Some((_, measure)), Some(_start), Some(spacing)) => {
-                let centre_x = e.x + 0.5 * EMOJI_CELL_WIDTH_EM * fs;
+                let centre_x = e.x + 0.5 * e.advance_em() * fs;
                 let mut along = spacing.distance(centre_x) + path_ink_shift;
-                let half_width = 0.5 * EMOJI_CELL_WIDTH_EM * fs;
+                let half_width = (centre_x - ink[0]).max(ink[2] - centre_x);
                 if measure.is_closed() && along < half_width {
                     path_ink_shift += half_width - along;
                     along = half_width;
                 }
-                if !measure.fits_closed_glyph(along, 0.5 * EMOJI_CELL_WIDTH_EM * fs) {
+                if !measure.fits_closed_glyph(along, half_width) {
                     continue;
                 }
                 let Some((point, (cos, sin))) = measure.at(along) else {
@@ -2451,8 +2539,29 @@ pub fn ops(
         let pivot = code_point
             .and_then(|cp| unit_pivots.get(&unit_group(spec, cp)))
             .copied()
-            .unwrap_or(((rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5));
+            .unwrap_or(((ink[0] + ink[2]) * 0.5, (ink[1] + ink[3]) * 0.5));
+        let fill_weight = code_point.and_then(|cp| spec.unit_fill.get(cp)).copied().unwrap_or(1.);
+        let fill = fill_weight.clamp(0., 1.) * bucket_override.map(|c| c[3])
+            .or_else(|| e.paint.and_then(|p| spec.run_colors.get(p as usize)).map(|c| c[3])).unwrap_or(e.alpha);
+        let [a, c, b, d] = xform.lin.map(f64::from);
+        let ppem = e.shaped.as_ref().map_or(128, |s| s.ppem(fs * image_scale * a.hypot(b).max(c.hypot(d))));
+        let sample_rect = |ppem| -> Result<[f64; 4], ShapeError> {
+            match (&e.shaped, host) {
+                (Some(s), Some(host)) => host.canvas_engine().emoji_raster(s, ppem)
+                    .map(|r| e.place_rect(r.sampled_em)).ok_or_else(|| ShapeError::Other(format!("cannot rasterize {:?} at {ppem} ppem", e.cluster))),
+                _ => Ok(e.place_rect(DEFAULT_EMOJI_RECT)),
+            }
+        };
+        let rect = sample_rect(ppem)?;
+        let effect_ppem = e.shaped.as_ref().map_or(EMOJI_EFFECT_TEXELS_PER_EM as u32, |run| {
+            let pad_em = effect_passes.iter().map(|p|
+                (p.blur_px + p.stroke_px) / (fs * p.scale).max(1e-3)
+            ).fold(0., f64::max).min(EFFECT_PAD_MAX_EM);
+            run.fit_ppem(f64::from(ppem), pad_em)
+        });
+        let effect_rect = if effect_passes.is_empty() || effect_ppem == ppem { rect } else { sample_rect(effect_ppem)? };
         frames.push(EmojiFrame {
+            shaped: e.shaped.clone(), ppem, effect_ppem, effect_rect, fill,
             cluster: e.cluster.clone(),
             font_size_px: fs,
             rect,
@@ -2463,8 +2572,8 @@ pub fn ops(
     }
     // One copy's corners: the rect grown by `pad` px, turned onto the path, scaled about
     // `origin` by `scale` (echo), then moved by `offset`.
-    let corners_of = |f: &EmojiFrame, pad: f64, scale: f64, origin: (f64, f64), offset: (f64, f64)| {
-        let [x0, y0, x1, y1] = f.rect;
+    let corners_of = |f: &EmojiFrame, rect: [f64; 4], pad: f64, scale: f64, origin: (f64, f64), offset: (f64, f64)| {
+        let [x0, y0, x1, y1] = rect;
         let local = [(x0 - pad, y0 - pad), (x1 + pad, y0 - pad), (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)];
         let mut corners = [0f32; 8];
         for (i, (qx, qy)) in local.into_iter().enumerate() {
@@ -2500,16 +2609,17 @@ pub fn ops(
         for f in &frames {
             // The copy's own size (an echo copy shrinks), and its effect in that size's texels.
             let size = (f.font_size_px * pass.scale).max(1e-3);
-            let texels_per_px = EMOJI_EFFECT_TEXELS_PER_EM / size;
+            let texels_per_px = f64::from(f.effect_ppem) / size;
             let quantise = |px: f64| ((px * texels_per_px * 2.0).round() / 2.0) as f32;
             let blur_texels = quantise(pass.blur_px);
             let stroke_texels = quantise(pass.stroke_px);
             let reach = (blur_texels + stroke_texels) as f64 + 1.0;
-            let pad_texels = reach.min(EFFECT_PAD_MAX_EM * EMOJI_EFFECT_TEXELS_PER_EM).ceil() as u32;
+            let pad_texels = reach.min(EFFECT_PAD_MAX_EM * f64::from(f.effect_ppem)).ceil() as u32;
             let pad_px = pad_texels as f64 / texels_per_px / pass.scale.max(1e-3);
             out.emojis.push(VectorEmoji {
                 cluster: f.cluster.clone(),
-                corners: corners_of(f, pad_px, pass.scale, box_centre, (pass.pen_offset_x, pass.pen_offset_y)),
+                shaped: f.shaped.clone(), ppem: f.effect_ppem,
+                corners: corners_of(f, f.effect_rect, pad_px, pass.scale, box_centre, (pass.pen_offset_x, pass.pen_offset_y)),
                 opacity: 1.0,
                 effect: Some(EmojiEffect {
                     color: pass.color,
@@ -2522,16 +2632,17 @@ pub fn ops(
             });
         }
     }
-    for f in &frames {
+    for f in frames.iter().filter(|f| f.fill > 0. && f.xform.opacity > 0.) {
         out.emojis.push(VectorEmoji {
             cluster: f.cluster.clone(),
-            corners: corners_of(f, 0.0, 1.0, box_centre, (0.0, 0.0)),
-            opacity: spec.opacity as f32 * f.xform.opacity,
+            shaped: f.shaped.clone(), ppem: f.ppem,
+            corners: corners_of(f, f.rect, 0.0, 1.0, box_centre, (0.0, 0.0)),
+            opacity: spec.opacity as f32 * f.xform.opacity * f.fill,
             effect: None,
         });
     }
 
-    if total_instances == 0 && !has_primitives {
+    if total_instances == 0 && !has_primitives && extrude_glyphs.is_empty() {
         // "nothing visible, but handled (don't fall back)" (drawRunsAnalytic:582)
         return Ok(out);
     }
@@ -2640,17 +2751,14 @@ pub fn ops(
                     } else {
                         (g.base_pad_em / scale.max(1e-3)).min(1.0)
                     };
-                    let pad_em = (base_pad_em + extra_pad_em).min(EFFECT_PAD_MAX_EM);
+                    let effect_pad = extra_pad_em.min(EFFECT_PAD_MAX_EM - base_pad_em);
+                    let (em_box, local_aa_px) = g.xform.quad_padding(g.em_bounds, base_pad_em, effect_pad, font_size_px);
                     VectorAnalyticRecord {
                         pen_x: (pen_x + pass.pen_offset_x) as f32,
                         baseline_y: (baseline_y + pass.pen_offset_y) as f32,
                         font_size_px: font_size_px as f32,
-                        em_box: [
-                            (g.em_bounds[0] as f64 - pad_em) as f32,
-                            (g.em_bounds[1] as f64 - pad_em) as f32,
-                            (g.em_bounds[2] as f64 + pad_em) as f32,
-                            (g.em_bounds[3] as f64 + pad_em) as f32,
-                        ],
+                        em_box,
+                        local_aa_px,
                         first_curve: g.first_curve,
                         curve_count: g.curve_count,
                         // Effects parity: the pass re-emits each glyph
@@ -2712,9 +2820,7 @@ pub fn ops(
 
     // 3. Glyph fill buckets (:634-650).
     if !curve_points.is_empty() && total_instances > 0 {
-        let fill_pipeline = if wants_shader_fill {
-            VectorOpPipeline::AnalyticShaderFill
-        } else if has_gradient {
+        let fill_pipeline = if has_gradient {
             VectorOpPipeline::AnalyticGradient
         } else {
             VectorOpPipeline::Analytic
@@ -2828,7 +2934,7 @@ mod tests {
             format!("<span style=\"font-family: Inter; font-size: 32px; --nf-paint: {paint}\">{text}</span>")
         };
         let mut s = spec(&format!("<p>{}{}{}</p>", run(0, "A"), run(1, "B"), run(2, "C")));
-        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false)
+        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false, None)
             .expect("the vector lane lays this text out");
         let (red, blue, green) = ([1.0, 0.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.5], [0.0, 1.0, 0.0, 0.5]);
         let mut draw = |colors: [[f32; 4]; 3]| {
@@ -2864,7 +2970,7 @@ mod tests {
             format!("<span style=\"font-family: Inter; font-size: 32px; letter-spacing: -12px; --nf-paint: {paint}\">{text}</span>")
         };
         let mut s = spec(&format!("<p>{}{}{}</p>", run(0, "A"), run(1, "B"), run(0, "C")));
-        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false)
+        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false, None)
             .expect("the vector lane lays this text out");
         let (red, blue, green): ([f32; 4], [f32; 4], [f32; 4]) = ([1.0, 0.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.5], [0.0, 1.0, 0.0, 0.5]);
         s.run_colors = std::sync::Arc::new(vec![red, blue]);
@@ -2892,7 +2998,7 @@ mod tests {
             format!("<p><span style=\"font-family: Inter; font-size: 32px; color: {color}; --nf-paint: 0; text-decoration: underline\">{text}</span></p>")
         };
         let mut s = spec(&format!("{}{}", line("rgb(255, 0, 0)", "A"), line("rgb(0, 0, 255)", "B")));
-        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false)
+        let layout = accept_vector_layout(&s, &store, &catalog, VectorPlacement::VectorParity, false, None)
             .expect("the vector lane lays this text out");
         let underlines = |ops: &VectorNodeOps| -> Vec<([f32; 4], Option<u32>)> {
             ops.ops.iter().filter(|op| op.pipeline == VectorOpPipeline::Tess).map(|op| (op.color, op.paint)).collect()
@@ -2903,6 +3009,79 @@ mod tests {
         s.run_colors = std::sync::Arc::new(vec![green]);
         let supplied = layout.ops(&s, &store, &catalog, 1.0).expect("the layout draws");
         assert_eq!(underlines(&supplied), [(green, Some(0)), (green, Some(0))]);
+    }
+
+    #[test]
+    fn shrunken_piece_keeps_device_space_antialias_margin() {
+        check_piece_quad(GlyphXform::resolve(0., 0., 0.1, 0., 1.), false);
+    }
+
+    fn check_piece_quad(transform: GlyphXform, collapsed: bool) {
+        let (store, catalog) = store_and_catalog();
+        let mut spec = spec(r#"<p><span style="font-family: Inter; font-size: 64px">A</span></p>"#);
+        spec.unit_transforms = vec![transform].into();
+        let layout = accept_vector_layout(&spec, &store, &catalog, VectorPlacement::VectorParity, false, None).unwrap();
+        let draw = layout.ops(&spec, &store, &catalog, 1.).unwrap();
+        let records: Vec<_> = draw.ops.iter().flat_map(|op| op.records.iter()).collect();
+        if collapsed {
+            assert!(records.is_empty(), "a collapsed glyph emitted {records:?}");
+            return;
+        }
+        let [rec] = records[..] else { panic!("expected one glyph") };
+        let unpadded = VectorAnalyticRecord { local_aa_px: 0., ..*rec };
+        let ink = unpadded.quad_corners(layout.segments[0].placed[0].bounds);
+        let quad = rec.quad_corners(rec.em_box);
+        for i in 0..2 {
+            let interval = |points: [[f32; 2]; 4]| points.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| (lo.min(p[i]), hi.max(p[i])));
+            let (lo, hi) = interval(ink);
+            let (left, right) = interval(quad);
+            assert!((lo - left - 2.).abs() < 1e-4 && (right - hi - 2.).abs() < 1e-4,
+                "axis {i}: ink {lo}..{hi}, quad {left}..{right}");
+        }
+    }
+
+    #[test]
+    fn piece_quad_thin_diagonal_preserves_ink_center() {
+        check_piece_quad(GlyphXform { lin: [1., 0., 0., 2e-7], ..GlyphXform::IDENTITY }, false);
+    }
+
+    #[test]
+    fn piece_quad_squeezed_rotated_glyph() {
+        let word = GlyphXform { lin: [1., 0., 0., 0.01], ..GlyphXform::IDENTITY };
+        check_piece_quad(word.after(GlyphXform::resolve(0., 0., 1., 45., 1.)), false);
+    }
+
+    #[test]
+    fn piece_quad_squeezed_synthetic_italic() {
+        let word = GlyphXform { lin: [1., 0., 0., 0.02], ..GlyphXform::IDENTITY };
+        check_piece_quad(word.with_synthetic_oblique([0., -0.75, 0.75, 0.], 64.), false);
+    }
+
+    #[test]
+    fn piece_quad_rank_one_after_f32_composition() {
+        let flat = GlyphXform { lin: [1., 0., 0., 0.], ..GlyphXform::IDENTITY };
+        let word = GlyphXform::resolve(0., 0., 1., 30., 1.).after(flat);
+        check_piece_quad(word.after(GlyphXform::resolve(0., 0., 1., 20., 1.)), true);
+    }
+
+    #[test]
+    fn piece_rank_is_relative_to_the_composed_and_original_em() {
+        let rotate = GlyphXform::resolve(0., 0., 1., 20., 1.);
+        for scale in [0.01, 1., 1e6] {
+            let outer = GlyphXform::resolve(0., 0., scale, 30., 1.);
+            let flat = GlyphXform { lin: [1., 0., 0., 0.], ..GlyphXform::IDENTITY };
+            assert!(outer.after(flat).after(rotate).collapsed());
+            let thin = GlyphXform { lin: [1., 0., 0., 0.001], ..GlyphXform::IDENTITY };
+            assert!(!outer.after(thin).after(rotate).collapsed());
+        }
+        assert!(!GlyphXform::resolve(0., 0., 1e-5, 0., 1.).collapsed());
+    }
+
+    #[test]
+    fn subnormal_piece_scale_collapses() {
+        let s = GlyphXform::resolve(0., 0., 1e-40, 0., 1.);
+        assert!(s.collapsed());
     }
 
     fn expected_vector(
@@ -3386,26 +3565,6 @@ mod tests {
         assert_eq!(via_dispatch, via_otjs);
     }
 
-    /// Regression: Fraunces carries the REQUIRED `rvrn` feature (which
-    /// remaps e.g. italic `l`→`l.alt`) that the otjs walk never applies. Even
-    /// though `string_to_glyphs` does NOT throw on it, the vector lane must
-    /// reroute it through HarfBuzz so the canvas glyphs match the browser/DOM
-    /// editor. (Before this fix it stayed on the otjs path and rendered the
-    /// wrong default-master glyph.)
-    #[test]
-    #[ignore = "needs unported Moda fixture full Fraunces Regular with rvrn (spacing subset omits rvrn)"]
-    fn shape_vector_reroutes_rvrn_fonts_through_harfbuzz() {
-        let (store, catalog) = crate::test_fixtures::oracle_store_and_catalog();
-        let font = store
-            .font_for_variant(&catalog, "Fraunces", 400, "normal", None)
-            .unwrap();
-        // The otjs walk parses and shapes Fraunces without throwing ...
-        assert!(shape(&font, "circle").is_ok());
-        // ... but `rvrn` makes the otjs glyphs disagree with the browser, so the
-        // vector lane must reroute to HarfBuzz.
-        assert!(store.font_needs_harfbuzz(&catalog, "Fraunces", 400, "normal", None));
-    }
-
     /// Q-122 (Phase 2): the hybrid arm's ls==0 lane shapes through HarfBuzz
     /// — a Lato node (GSUB liga in type-7 extension lookups, the exact otjs
     /// `lookupType: 7` throw) SERVES vector under `Canvas2dParity`
@@ -3872,10 +4031,6 @@ mod tests {
         let glow = expected_vector(&g, &store, &catalog, VectorPlacement::VectorParity, "vector");
         assert_eq!(glow.emojis.len(), 2);
         assert!(glow.emojis[0].effect.as_ref().is_some_and(|fx| fx.additive && fx.blur_texels > 10.0));
-        // Keys round-trip.
-        let key = sh_fx.key("🚀");
-        assert_eq!(EmojiEffect::parse_key(&key), (Some(sh_fx.clone()), "🚀"));
-        assert_eq!(EmojiEffect::parse_key("🚀"), (None, "🚀"));
     }
 
     #[test]
@@ -4523,83 +4678,6 @@ mod tests {
         );
         let n: usize = ops.ops.iter().map(|o| o.tris.len() / 6).sum();
         assert_eq!(n, 2);
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-variable/InterVariable.ttf"]
-    fn font_variation_settings_instance_the_drawn_face() {
-        // E6.3: a variable face drawn at the run's axis values. `wght` 700 set
-        // on the Regular variant draws what the Bold named instance draws, and
-        // differs from 400; explicit `opsz` beats the automatic one; an axis
-        // the face lacks changes nothing.
-        let (store, catalog) = crate::test_fixtures::variable_store_and_catalog();
-        let draw = |css: &str| {
-            let html = format!(
-                "<p><span style=\"font-family: Inter Variable; font-size: 40px; {css}\">Variable type</span></p>"
-            );
-            let ops = expected_vector(
-                &spec(&html),
-                &store,
-                &catalog,
-                VectorPlacement::VectorParity,
-                "expected vector decision",
-            );
-            ops.ops[0]
-                .records
-                .iter()
-                .map(|r| (r.pen_x, r.em_box))
-                .collect::<Vec<_>>()
-        };
-        let regular = draw("");
-        let bold = draw("font-weight: 700");
-        let wght700 = draw("font-variation-settings: 'wght' 700");
-        assert_ne!(bold, regular, "the Bold instance is another face");
-        assert_eq!(wght700, bold, "wght 700 on Regular = the Bold instance");
-        let last = |v: &[(f32, [f32; 4])]| v[v.len() - 1].0;
-        assert!(last(&wght700) > last(&regular) + 5.0, "bolder is wider");
-        // The run's value wins over the variant's pinned coordinate.
-        assert_eq!(
-            draw("font-weight: 700; font-variation-settings: 'wght' 400"),
-            regular
-        );
-        // At 40px the automatic opsz is the axis max (32); an explicit 14 differs.
-        assert_ne!(draw("font-variation-settings: 'opsz' 14"), regular);
-        assert_eq!(draw("font-variation-settings: 'opsz' 32"), regular);
-        assert_eq!(draw("font-variation-settings: 'XXXX' 5"), regular);
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture fonts-variable/InterVariable.ttf"]
-    fn a_span_at_other_axis_values_draws_its_own_outlines_of_a_shared_glyph() {
-        // The same glyph at two instances in one text: the span's `wght` 900 "e" and the run's 400 "e" are one glyph
-        // id of one variant. The curve store kept one entry per (variant, glyph), so whichever drew first gave its
-        // outline to both (a bold span bled onto the regular letters after it, or vanished).
-        let (store, catalog) = crate::test_fixtures::variable_store_and_catalog();
-        let html = "<p><span style=\"font-family: Inter Variable; font-size: 40px\">ee</span>\
-            <span style=\"font-family: Inter Variable; font-size: 40px; font-variation-settings: 'wght' 900\">ee</span>\
-            <span style=\"font-family: Inter Variable; font-size: 40px\">ee</span></p>";
-        let ops = expected_vector(
-            &spec(html),
-            &store,
-            &catalog,
-            VectorPlacement::VectorParity,
-            "expected vector decision",
-        );
-        let records: Vec<_> = ops.ops.iter().flat_map(|o| o.records.iter()).collect();
-        assert_eq!(records.len(), 6);
-        let curves = |i: usize| (records[i].first_curve, records[i].em_box);
-        assert_eq!(curves(0), curves(1));
-        assert_eq!(
-            curves(0),
-            curves(4),
-            "the regular e after the span is the regular e"
-        );
-        assert_eq!(curves(2), curves(3));
-        assert_ne!(curves(2), curves(0), "the span's e is the wght 900 outline");
-        assert!(
-            records[2].em_box[2] > records[0].em_box[2],
-            "bolder is wider"
-        );
     }
 
     // ── KineticText per-glyph transform + opacity (Slice B) ──

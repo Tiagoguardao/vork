@@ -13,8 +13,9 @@ It may run on a worker while the render device starts. `PreparedEncoder::open(de
 queue, frames, ring_depth)` validates device limits, creates the output and attaches GPU resources.
 The selected frame count lets FFmpeg readback validate exact movie timing before opening its destination, including when native macOS attachment fails.
 Dropping a preparation without opening it cancels and reclaims its native session,
-leaving an existing output untouched. On Linux, driver loading and CUDA initialization
-run in prepare; context creation, Vulkan UUID matching and NVENC attachment remain in open.
+leaving an existing output untouched. On Linux, CUDA initialization waits for an
+NVIDIA rendering device and runs during preflight, or during open when called directly.
+Context creation, Vulkan UUID matching and NVENC attachment run in open.
 
 Frames start at zero and must arrive in order; duplicate and future indices fail explicitly.
 Install one `Surface` per graph ring entry and output. Record `surface.record_copy` after the
@@ -30,7 +31,10 @@ Texture values represent encoded sRGB components; do not supply linear-light col
   MP4 mux. No CPU pixel readback. The renderer writes directly to installed BGRA IOSurfaces when supported;
   other sources use GPU conversion into the entry surface. CoreVideo retains the installed
   surfaces, and ring release waits through compression and file consumption.
-  Rec.709 matrix/primaries/transfer are explicit. Metal completion hands off asynchronously.
+  Rec.709 matrix/primaries/transfer are explicit. `uses_completion_handoff()` lets the
+  canvas push immediately after GPU submission, before exposure/readback acceptance.
+  Metal completion hands off asynchronously in frame order; the existing three slots
+  bound compression and writer retention. Every frame is still validated before finish.
 * Linux Auto: wgpu Vulkan texture -> device-local, dedicated exportable buffer -> opaque fd
   imported into CUDA on the matching Vulkan device UUID -> one NVENC session. NVENC accepts
   RGBA/BGRA and performs its RGB-to-YUV conversion. No CPU pixel readback. Only compressed
@@ -75,8 +79,12 @@ no independent reorder queue, staging recycler or surface-capacity policy.
 All video outputs use limited-range Rec.709 YUV with matching matrix and transfer
 tags on native VideoToolbox/NVENC and readback ffmpeg. The primaries tag is the
 frames' display's (`EncodeSettings.primaries`): BT.709 for sRGB pictures, P3 at D65
-(H.273 code 12) for Display P3 pictures. The frames are 8-bit, so they carry SDR displays only. The ffmpeg path explicitly converts RGB to limited-range BT.709
-YUV before encoding, so its conversion agrees with the stream metadata.
+(H.273 code 12) for Display P3 pictures. The frames are 8-bit, so they carry SDR displays only. For software H.264, a compute pass packs planar `yuv420p` before GPU readback.
+The pass uses horizontal chroma pair averaging and the vertical bicubic downsample
+used by FFmpeg's default same-size BT.709 conversion. The FFmpeg pipe tags the
+result and feeds it directly to libx264. The RGB readback path uses FFmpeg's
+conversion for ProRes, hardware readback and devices or small frames that
+cannot use the GPU conversion.
 
 MOV destinations select ProRes 4444 (full chroma plus alpha). Auto uses a native
 VideoToolbox session and IOSurfaces on Mac, preferring hardware and allowing

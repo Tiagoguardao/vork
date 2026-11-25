@@ -118,7 +118,7 @@ pub fn render_mask_raster(
             VectorOpPipeline::Tess | VectorOpPipeline::Analytic => {
                 op.blur_px == 0.0 && op.stroke_px == 0.0 && !op.additive
             }
-            VectorOpPipeline::AnalyticGradient | VectorOpPipeline::AnalyticShaderFill => false,
+            VectorOpPipeline::AnalyticGradient => false,
         };
         if !plain {
             return Err("effect-pass".to_string());

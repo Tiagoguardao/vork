@@ -64,8 +64,7 @@ fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
   return vec4<f32>(pos[vid], 0.0, 1.0);
 }
 
-@fragment
-fn fs_prepare(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs_prepare(frag: vec4<f32>, shadow: ShadowUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>) -> vec4<f32> {
   let size = shadow.frame.xy;
   let uv = (frag.xy - shadow.frame.zw) / size;
   let a = textureSampleLevel(inputTexture, inputSampler, uv, 0.0).a;
@@ -73,8 +72,7 @@ fn fs_prepare(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(0.0, 0.0, 0.0, s);
 }
 
-@fragment
-fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs_composite(frag: vec4<f32>, shadow: ShadowUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>, captureTexture: texture_2d<f32>) -> vec4<f32> {
   let uv = frag.xy / shadow.frame.xy;
   let s = textureSampleLevel(inputTexture, inputSampler, uv, 0.0).a;
   let a = textureSampleLevel(captureTexture, inputSampler, uv, 0.0).a;
@@ -88,22 +86,44 @@ fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(workingRgb(shadow.color.rgb) * alpha, alpha);
 }
 
-@fragment
-fn fs_source(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs_source(frag: vec4<f32>, shadow: ShadowUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>) -> vec4<f32> {
   return textureSampleLevel(inputTexture, inputSampler, frag.xy / shadow.frame.xy, 0.0);
 }
 
-@fragment
-fn fs_feather_source(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs_feather_source(frag: vec4<f32>, shadow: ShadowUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>) -> vec4<f32> {
   let uv = frag.xy / shadow.frame.xy;
   let a = textureSampleLevel(inputTexture, inputSampler, uv, 0.0).a;
   return vec4<f32>(0.0, 0.0, 0.0, min(1.0, 127.0 * a));
 }
 
-@fragment
-fn fs_feather(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs_feather(frag: vec4<f32>, shadow: ShadowUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>, captureTexture: texture_2d<f32>) -> vec4<f32> {
   let uv = frag.xy / shadow.frame.xy;
   let s = textureSampleLevel(inputTexture, inputSampler, uv, 0.0).a;
   let c = textureSampleLevel(captureTexture, inputSampler, uv, 0.0);
   return c * clamp(2.0 * s - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_prepare(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs_prepare(frag, shadow, inputSampler, inputTexture);
+}
+
+@fragment
+fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs_composite(frag, shadow, inputSampler, inputTexture, captureTexture);
+}
+
+@fragment
+fn fs_source(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs_source(frag, shadow, inputSampler, inputTexture);
+}
+
+@fragment
+fn fs_feather_source(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs_feather_source(frag, shadow, inputSampler, inputTexture);
+}
+
+@fragment
+fn fs_feather(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs_feather(frag, shadow, inputSampler, inputTexture, captureTexture);
 }

@@ -19,7 +19,7 @@ pub(crate) fn prepare(r:&Renderer,scene:&vork_scene::v2::Scene,base:&Path)->Resu
     if !program.warnings.trim().is_empty() {eprintln!("{}",program.warnings);}
     let words=program.inputs.pack(&std::collections::BTreeMap::new(),|_,_|unreachable!())?;
     let mut text=program.native.clone();
-    for dependency in &program.dependencies {text.push_str(&format!("\n// dependency {}\n",blake3::hash(&std::fs::read(dependency)?)));}
+    for dependency in &program.dependencies {text.push_str(&format!("\n// dependency {}\n",blake3::hash(&vork_slang::RevisionFiles::read(dependency)?)));}
     for (name,v) in [("propagation_lower",p.bounds[0]),("propagation_upper",p.bounds[1])] {
         text.push_str(&format!("\npublic float3 {name}() {{return float3({:.9e},{:.9e},{:.9e});}}\n",v[0],v[1],v[2]));
     }

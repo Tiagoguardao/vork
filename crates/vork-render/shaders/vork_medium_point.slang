@@ -75,29 +75,28 @@ public float3 medium_integrated_coefficient(float3 coefficient,float3 sigma,floa
 // positive amplitude, even when its point value underflows at the ray origin.
 // Saturate after exp: exp(log(FP32_MAX)) can itself overflow because the
 // rounded logarithm lies above the exact representable endpoint.
-public float medium_exponential_tau(float amplitude,float log_density,float slope,float distance,bool infinite) {
-    if(amplitude==0.) {return 0.;}
-    let log_sigma=log(amplitude)+log_density;
-    if(infinite) {
-        if(slope>=0.) {return asfloat(0x7f800000u);}
-        return min(exp(log_sigma-log(-slope)),REG_FP32_MAX);
-    }
-    if(distance==0.) {return 0.;}
-    let x=slope*distance;var log_length=log(distance);
-    if(abs(x)<.001) {log_length+=log(1.+x*(.5+x*(1./6.+x/24.)));}
-    else if(x>0.) {log_length=x+log(1.-exp(-x))-log(slope);}
-    else {log_length=log(1.-exp(x))-log(-slope);}
-    return min(exp(log_sigma+log_length),REG_FP32_MAX);
-}
 public float3 medium_exponential_tau(float3 amplitude,float log_density,float slope,float distance,bool infinite) {
-    return float3(medium_exponential_tau(amplitude.x,log_density,slope,distance,infinite),
-        medium_exponential_tau(amplitude.y,log_density,slope,distance,infinite),
-        medium_exponential_tau(amplitude.z,log_density,slope,distance,infinite));
+    let positive=amplitude>float3(0.);
+    if(infinite && slope>=0.) {return select(positive,float3(asfloat(0x7f800000u)),float3(0.));}
+    if(!infinite && distance==0.) {return float3(0.);}
+    float log_length;
+    if(infinite) {log_length=-log(-slope);}
+    else {
+        let x=slope*distance;
+        if(abs(x)<.001) {log_length=log(distance)+log(1.+x*(.5+x*(1./6.+x/24.)));}
+        else if(x>0.) {log_length=x+log(1.-exp(-x))-log(slope);}
+        else {log_length=log(1.-exp(x))-log(-slope);}
+    }
+    let log_sigma=log(select(positive,amplitude,float3(1.)))+log_density;
+    return select(positive,min(exp(log_sigma+log_length),float3(REG_FP32_MAX)),float3(0.));
+}
+public float medium_exponential_tau(float amplitude,float log_density,float slope,float distance,bool infinite) {
+    return medium_exponential_tau(float3(amplitude),log_density,slope,distance,infinite).x;
 }
 public float3 medium_exponential_coefficient(float3 amplitude,float log_density) {
-    var result=float3(0.);
-    for(uint c=0u;c<3u;c++) {if(amplitude[c]>0.) {result[c]=min(exp(log(amplitude[c])+log_density),REG_FP32_MAX);}}
-    return result;
+    let positive=amplitude>float3(0.);
+    let log_sigma=log(select(positive,amplitude,float3(1.)))+log_density;
+    return select(positive,min(exp(log_sigma),float3(REG_FP32_MAX)),float3(0.));
 }
 
 // Henyey–Greenstein response and proposal shared by all transport estimators.

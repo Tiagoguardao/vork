@@ -339,13 +339,6 @@ fn bakes_too_many_inner_shadows(node: &RawNode) -> bool {
     crate::effects::inner_shadow_quad_count(node) > 1
 }
 
-/// `hasRenderableSourceMaskShaderEffect(node)` — a renderable source-mask shader
-/// effect routes the node through the custom-shader pipeline, so the SDF body
-/// fast path must decline.
-fn has_source_mask_shader_effect(node: &RawNode) -> bool {
-    moda_scene::shader_effects::renderable_source_mask_effect(node).is_some()
-}
-
 /// `classifySolidShapeBody` (`WebGPUShapeSystem.ts:1924-1986`). Returns `None`
 /// for an ineligible body (the caller falls back to tessellation). Node-intrinsic
 /// only: the active-mask and `disableOpaqueFastPath` checks are the caller's.
@@ -354,7 +347,7 @@ pub fn classify_solid_shape_body(node: &RawNode, shape_type: ShapeType) -> Optio
     if shape_type == ShapeType::Ellipse && !ellipse_is_full_sweep(node) {
         return None;
     }
-    if has_source_mask_shader_effect(node) || bakes_too_many_inner_shadows(node) {
+    if bakes_too_many_inner_shadows(node) {
         return None;
     }
     if !blend_mode_is_normal(node) {
@@ -453,7 +446,7 @@ pub fn classify_gradient_shape(
     node: &RawNode,
     shape_type: ShapeType,
 ) -> Option<GradientShapeClass> {
-    if has_source_mask_shader_effect(node) || bakes_too_many_inner_shadows(node) {
+    if bakes_too_many_inner_shadows(node) {
         return None;
     }
     let Some(paint) = sdf_gradient_paint(node) else {
@@ -770,57 +763,6 @@ mod tests {
             }
         }
         raw(m)
-    }
-
-    #[test]
-    fn stroke_pattern_conic_shader_blend_reject() {
-        // Visible solid stroke on a SHARP rect still disqualifies (the SDF
-        // stroke ring is curved-only; sharp strokes stay on tessellation).
-        assert!(classify_solid_shape_body(
-            &solid_rect(json!({"strokes":[{"id":"stroke-0","paint":{"type":"solid","color":"#000"},"width":4.0}]})),
-            ShapeType::Rect
-        )
-        .is_none());
-        // A zero-width stroke does NOT disqualify.
-        assert!(classify_solid_shape_body(
-            &solid_rect(json!({"strokes":[{"id":"stroke-0","paint":{"type":"solid","color":"#000"},"width":0.0}]})),
-            ShapeType::Rect
-        )
-        .is_some());
-        // Non-solid fill paints (video draws its poster through the pattern
-        // texture path).
-        let stops = json!([{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]);
-        for paint in [
-            json!({"type": "image", "src": "a.png"}),
-            json!({"type": "video", "src": "a.mp4"}),
-            json!({"type": "linear", "start": {"x": 0, "y": 50}, "end": {"x": 100, "y": 50}, "stops": stops}),
-            json!({"type": "radial", "center": {"x": 50, "y": 50}, "radiusX": 50, "radiusY": 50, "rotation": 0,
-                   "stops": stops}),
-            json!({"type": "conic", "center": {"x": 50, "y": 50}, "angle": 0, "stops": stops}),
-            json!({"type": "shader", "shaderId": "plasma"}),
-        ] {
-            let ty = paint["type"].clone();
-            assert!(
-                classify_solid_shape_body(
-                    &solid_rect(json!({"fills": [{"id": "fill-0", "paint": paint}]})),
-                    ShapeType::Rect
-                )
-                .is_none(),
-                "a {ty} fill should reject the SOLID path"
-            );
-        }
-        // Non-normal blend mode.
-        assert!(classify_solid_shape_body(
-            &solid_rect(json!({"blendMode":"multiply"})),
-            ShapeType::Rect
-        )
-        .is_none());
-        // 'normal' is fine.
-        assert!(classify_solid_shape_body(
-            &solid_rect(json!({"blendMode":"normal"})),
-            ShapeType::Rect
-        )
-        .is_some());
     }
 
     #[test]
@@ -1326,5 +1268,67 @@ mod tests {
             0.0, 0.0, 1.0, 0.0, //
             0.0, 0.0, 0.0, 1.0,
         ]
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+    use moda_scene::value::json;
+    fn solid_rect(extra: Value) -> RawNode {
+        let mut m = json!({"id": "n", "type": "rectangle", "width": 100.0, "height": 80.0,
+            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#3a86ff"}}]});
+        if let Value::Object(e) = extra { for (k, v) in e { m.as_object_mut().unwrap().insert(k, v); } }
+        RawNode::from_value(m).unwrap()
+    }
+
+    #[test]
+    fn stroke_image_conic_blend_reject() {
+        // Visible solid stroke on a SHARP rect still disqualifies (the SDF
+        // stroke ring is curved-only; sharp strokes stay on tessellation).
+        assert!(classify_solid_shape_body(
+            &solid_rect(json!({"strokes":[{"id":"stroke-0","paint":{"type":"solid","color":"#000"},"width":4.0}]})),
+            ShapeType::Rect
+        )
+        .is_none());
+        // A zero-width stroke does NOT disqualify.
+        assert!(classify_solid_shape_body(
+            &solid_rect(json!({"strokes":[{"id":"stroke-0","paint":{"type":"solid","color":"#000"},"width":0.0}]})),
+            ShapeType::Rect
+        )
+        .is_some());
+        // Non-solid fill paints (video draws its poster through the pattern
+        // texture path).
+        let stops = json!([{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]);
+        for paint in [
+            json!({"type": "image", "src": "a.png"}),
+            json!({"type": "video", "src": "a.mp4"}),
+            json!({"type": "linear", "start": {"x": 0, "y": 50}, "end": {"x": 100, "y": 50}, "stops": stops}),
+            json!({"type": "radial", "center": {"x": 50, "y": 50}, "radiusX": 50, "radiusY": 50, "rotation": 0,
+                   "stops": stops}),
+            json!({"type": "conic", "center": {"x": 50, "y": 50}, "angle": 0, "stops": stops}),
+        ] {
+            let ty = paint["type"].clone();
+            assert!(
+                classify_solid_shape_body(
+                    &solid_rect(json!({"fills": [{"id": "fill-0", "paint": paint}]})),
+                    ShapeType::Rect
+                )
+                .is_none(),
+                "a {ty} fill should reject the SOLID path"
+            );
+        }
+        // Non-normal blend mode.
+        assert!(classify_solid_shape_body(
+            &solid_rect(json!({"blendMode":"multiply"})),
+            ShapeType::Rect
+        )
+        .is_none());
+        // 'normal' is fine.
+        assert!(classify_solid_shape_body(
+            &solid_rect(json!({"blendMode":"normal"})),
+            ShapeType::Rect
+        )
+        .is_some());
     }
 }

@@ -8,8 +8,7 @@ pub(crate) struct Credit {
 }
 impl Credit {
     pub(crate) fn wait(&self) {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("output_credit_wait");
+        profile_span!(_profile, "output_credit_wait");
         let mut busy = self.busy.lock().unwrap();
         while *busy {
             busy = self.free.wait(busy).unwrap();

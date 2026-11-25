@@ -321,6 +321,8 @@ impl MeshRoot {
 
 /// Structural choices fixed for one install, independent of other installs.
 pub struct InstallOptions {
+    pub(crate) opened: crate::footage::Opened,
+    pub(crate) previous_resources: Option<StaticResources>,
     /// Host loops must refuse promotion before allocating path views.
     pub(crate) raster_only: bool,
     /// Internal lowering declaration; scene authoring is exposed separately.
@@ -364,6 +366,8 @@ pub struct InstallOptions {
 impl Default for InstallOptions {
     fn default() -> Self {
         Self {
+            opened: Default::default(),
+            previous_resources: None,
             raster_only: false,
             geometry_stages: None,
             initial_time: vork_time::Request::Numeric(0.),
@@ -395,6 +399,10 @@ impl Default for InstallOptions {
 }
 
 pub struct InstalledScene {
+    pub(crate) opened: crate::footage::Opened,
+    pub(crate) static_resources: StaticResources,
+    pub(crate) editable_bindings: std::collections::BTreeMap<String, (usize, vork_slang::InputLayout)>,
+    pub(crate) compiler_inputs: Option<std::sync::Arc<std::sync::Mutex<vork_slang::InstalledInputs>>>,
     pub(crate) geometry_stages: Vec<crate::geometry_chain::Kind>,
     pub(crate) has_catchers: bool,
     pub(crate) footage: std::collections::BTreeMap<String, crate::footage::Installed>,
@@ -410,6 +418,8 @@ pub struct InstalledScene {
     pub(crate) computed_geometry: Vec<Option<crate::computed_geometry::Mesh>>,
     pub(crate) compositor: std::collections::HashMap<String, compositor::Program>,
     pub(crate) image_order: Vec<String>,
+    /// Installed provider choices in image_order, independent of the main view.
+    pub(crate) image_settings: Vec<vork_scene::v2::Settings>,
     pub(crate) main_outputs: compositor::Dependencies,
     pub(crate) main_subset: Option<crate::render_images::Subset>,
     pub(crate) capture_controls: bool,
@@ -614,9 +624,13 @@ impl InstalledScene {
         // In particular, cold BRDF qualification must not hold up host shader
         // preparation while it waits for its bounded GPU probes. Scope both
         // jobs so every error path joins before scene/device resources go away.
+        let revision_files = vork_slang::RevisionFiles::current();
+        let compiler_inputs = programs::session_inputs::current();
         let warnings = crate::warnings::Collector::current();
         let (display_program, mut environment, environment_install_ms) = std::thread::scope(|scope| -> Result<_> {
             let environment = scope.spawn(|| -> Result<_> {
+                let _revision = revision_files.enter();
+                let _inputs = programs::session_inputs::enter(compiler_inputs.clone());
                 let _warning_scope = warnings.as_ref().map(|collector| collector.enter());
                 let start = Instant::now();
                 let environment = if scene_inputs {environment::Environment::new_in(
@@ -709,6 +723,9 @@ impl InstalledScene {
         let image_order = planned_image_order.clone();
         let image_slots = image_order.iter().enumerate().map(|(slot,name)|(name.clone(),slot)).collect();
         let mut textures = TextureInstaller::new(r, &image_slots);
+        if let Some(previous) = options.previous_resources.as_ref().filter(|p| p.device.as_ref() == Some(&r.device)) {
+            textures.previous_views = Some(previous.views.clone());
+        }
         textures.opened = opened.clone();
         textures.canvases = options.canvases.clone();
         textures.fps = render.fps;
@@ -910,6 +927,8 @@ impl InstalledScene {
         let mut ray_shadows = light_shadow_rays || ray_refraction || effects.probes || promoted_transport || program_trace || compute_trace;
         let field_controls = !effects.path && input.geometry.values().any(|g|matches!(g.topology,vork_scene::v2::Topology::Implicit));
         let mut slang = crate::slang_forward::SlangScene {
+                revision_files,
+                installed_inputs: compiler_inputs.clone(),
                 program_trace,
                 bounded_secondary_compilation: render.settings.bounded_secondary_compilation,
                 approximate_field_boundaries: render.settings.approximate_field_boundaries && field_controls,
@@ -959,6 +978,7 @@ impl InstalledScene {
         let mut material_ranges = std::collections::HashMap::<String, (Vec<usize>, usize)>::new();
         let mut material_ids = std::collections::HashMap::new();
         // Record index of each authored material name, shared by all its uses.
+        let mut editable_layouts = std::collections::BTreeMap::new();
         let mut native_ids = std::collections::BTreeMap::<String, usize>::new();
         // Install static geometry in shared, bounded vertex/index pages. Draw order and
         // local indices remain unchanged; each draw keeps its byte offsets.
@@ -1248,7 +1268,13 @@ impl InstalledScene {
                             .with_context(|| format!("materials.{name}.inputs: program {}", program.name))?;
                         let authored = &input.materials[name];
                         // Equal initial cells do not make distinct mutable grids aliases.
-                        let unique_inputs=animated_inputs.contains_key(name) || authored.inputs.values().any(|value|
+                        let editable = options.previous_resources.is_some() && !effects.path
+                            && !stages[name].medium && !animated_inputs.contains_key(name)
+                            && programs.editable_layout(program).is_some();
+                        if editable {
+                            editable_layouts.insert(name.to_owned(), programs.input_layout(id).clone());
+                        }
+                        let unique_inputs=editable || animated_inputs.contains_key(name) || authored.inputs.values().any(|value|
                             matches!(value,vork_scene::v2::Input::Grid(binding) if computed_attribute_sources.contains(&binding.grid)));
                         let mut material = materials::PendingMaterial::program(
                             id,
@@ -1545,33 +1571,44 @@ impl InstalledScene {
         }
 
         let object_ids = segmentation.metadata();
+        let mut static_resources = StaticResources::default();
+        let mut upload = |label, bytes: &[u8], usage: wgpu::BufferUsages| {
+            let upload = || upload_static_geometry(r, label, bytes, usage, constants::SCENE_BUFFER_PAGE_BYTES);
+            let Some(previous) = &options.previous_resources else { return upload(); };
+            let key = (blake3::hash(bytes), usage.bits());
+            if let Some(buffer) = static_resources.buffers.get(&key) { return Ok(buffer.clone()); }
+            let buffer = match previous.buffers.get(&key).filter(|_| previous.device.as_ref() == Some(&r.device)) {
+                Some(buffer) => buffer.clone(),
+                None => upload()?,
+            };
+            static_resources.device.get_or_insert_with(|| r.device.clone());
+            std::sync::Arc::make_mut(&mut static_resources.buffers).insert(key, buffer.clone());
+            Ok(buffer)
+        };
         for (page, data) in geometry_pages.into_iter().enumerate() {
             if data.vertices.is_empty() {
                 continue;
             }
-            let attributes = init(
-                &r.device,
+            let attributes = upload(
                 "scene static attributes",
                 &data.attributes,
                 // Ray hits read attribute streams in place (rt::hit_record).
                 wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
-            );
-            let vertices = init(
-                &r.device,
+            )?;
+            let vertices = upload(
                 "scene static vertices",
                 &data.vertices,
                 wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::STORAGE
                     | crate::rt::geometry_usage(geometry_rays),
-            );
-            let indices = init(
-                &r.device,
+            )?;
+            let indices = upload(
                 "scene static indices",
                 bytemuck::cast_slice(&data.indices),
                 wgpu::BufferUsages::INDEX
                     | wgpu::BufferUsages::STORAGE
                     | crate::rt::geometry_usage(geometry_rays),
-            );
+            )?;
             for draw in draws
                 .iter_mut()
                 .filter(|d| d.geometry_page == Some(page))
@@ -1775,10 +1812,10 @@ impl InstalledScene {
         // Resolve material-emitter reachability from installed sources and responses,
         // including off-camera geometry and animation. Only these previs views
         // need the existing low-budget raster ray-lighting providers.
-        let mut previs_emission = false;
+        let mut previs_emission = vec![false; views.len()];
         if views.iter().any(|view| view.settings.previs) {
             let emission_receivers: Vec<_> = materials.iter().map(materials::PendingMaterial::emission_receiver_mask).collect();
-            for view in views.iter().filter(|view|view.settings.previs && view.settings.integrator.raster()
+            for (index, view) in views.iter().enumerate().filter(|(_,view)|view.settings.previs && view.settings.integrator.raster()
                 .is_some_and(|raster|raster.fast_gi.is_none() && raster.probes.is_none())) {
                 let included=crate::render_images::included_nodes(&nodes,view.root.as_deref())?;
                 let visibility_possible=|object:u32,mask:u32| {
@@ -1817,23 +1854,25 @@ impl InstalledScene {
                     && !materials[draw.material].zero_opacity()
                     && draw.instances.clone().any(|object|camera_visible(object) || (secondary_view
                         && visibility_possible(object,constants::RAY_SPECULAR | constants::RAY_TRANSMISSION))));
-                previs_emission |= receiver;
+                previs_emission[index] = receiver;
             }
         }
-        if previs_emission {
+        if previs_emission.iter().any(|&needed| needed) {
             // Reuse draft's cheap GPU reconstruction for this noisy low-budget
             // transport. An explicit denoise choice wins; never open a CPU
             // denoiser as an implicit previs fallback.
             let denoise_emission = allocation_dependencies.beauty && render.settings.promotion_denoise.is_none()
                 && crate::denoise::open_fast(r).is_ok();
-            for view in std::iter::once(&mut render).chain(views.iter_mut()) {
-                if view.settings.previs && let Some(raster) = view.settings.integrator.raster_mut() {
+            for (view, needed) in views.iter_mut().zip(&previs_emission) {
+                if *needed && let Some(raster) = view.settings.integrator.raster_mut() {
                     view.settings.bounded_secondary_compilation = true;
                     raster.fast_gi = Some(vork_scene::FastGi { method: vork_scene::FastGiMethod::Ray });
                     raster.reflections = vork_scene::Reflections::Ray;
                     if denoise_emission {raster.denoiser = Some(Default::default());}
                 }
             }
+            // The main render is also stored separately for frame submission.
+            render.settings = views[0].settings.clone();
             slang.bounded_secondary_compilation = true;
             effects.denoise |= denoise_emission;
             slang.denoise = effects.denoise;
@@ -1841,7 +1880,7 @@ impl InstalledScene {
             effects.ray_indirect = true;
             effects.reflections = true;
             crate::warnings::approximated("previs_material_emission", serde_json::json!({"profile":"std/previs","effect":"material-emitter lighting"}),
-                "std/previs approximates material-emitter lighting with low-sample raster ray lighting; indirect light, reflections and transmission may be noisy or incomplete. Use std/final or std/path for exact lighting.".into());
+                "std/previs approximates material-emitter lighting with low-sample raster ray lighting; indirect light, reflections and transmission may be noisy or incomplete. Use std/final for delivery or std/path for more complete light transport.".into());
         }
         let limits = r.device.limits();
         // Captures share this installed light_plan. Media also consumes map transport.
@@ -1883,7 +1922,7 @@ impl InstalledScene {
                     && (objects[object as usize].metadata[1]&constants::RAY_VOLUME!=0
                         || visible_track || imported_track || nodes[node].dynamic)
             }));
-        rays |= medium_sources || previs_emission;
+        rays |= medium_sources || previs_emission.iter().any(|&needed| needed);
         ray_shadows |= medium_sources;
         let transport_needed=allocation_dependencies.beauty || allocation_dependencies.aovs
             || allocation_dependencies.catcher || effects.implicit;
@@ -2075,7 +2114,10 @@ impl InstalledScene {
                     let image=input.images.get(name).context("missing emitter profile image")?;
                     let file=image.file.as_ref().context("local emission profiles require an IES file")?;
                     let path=base.join(file);
-                    let profile=crate::ies::parse(&std::fs::read(&path).with_context(||format!("read emission profile {}",path.display()))?)?;
+                    let bytes = std::fs::read(&path).with_context(||format!("read emission profile {}",path.display()))?;
+                    let profile = crate::ies::parse(&bytes)
+                        .map_err(|error| crate::texture_source::decode_context(error, "decode IES emission profile", &path))
+                        .with_context(|| format!("images.{name}.file: expected LM-63 Type C photometry"))?;
                     let address=record_words+u32::try_from(material_words.len())?;
                     material_words.extend(profile.words());
                     profile_assets.insert(name.clone(),address);address
@@ -2121,7 +2163,8 @@ impl InstalledScene {
                     if let Some(source) = source.filter(|source| computed_attribute_sources.contains(source)) {
                         row[0] |= 1 << slot;
                         if vork_scene::v2::is_color_attribute(name) { row[1 + slot * 4 + 3] = 1f32.to_bits(); }
-                        published.push((source.clone(), root.instance_index.expect("instance row"), slot));
+                        let NodeKind::Mesh { instances: Some(instances), .. } = &node.kind else { unreachable!() };
+                        published.push((source.clone(), instances.count.clone(), root.instance_index.expect("instance row"), slot));
                     } else if let Some(value) = crate::attributes::instance_value(node, root.instance_index, name, &buffer_data) {
                         row[0] |= 1 << slot;
                         row[1+slot*4..1+(slot+1)*4].copy_from_slice(&value.map(f32::to_bits));
@@ -2132,8 +2175,8 @@ impl InstalledScene {
                 let attribute_row = if !published.is_empty() {
                     let offset = record_words + material_words.len() as u32;
                     material_words.extend_from_slice(&row);
-                    material_attribute_sources.extend(published.into_iter().map(|(source, index, slot)|
-                        (source, index, offset + 1 + slot as u32 * 4)));
+                    material_attribute_sources.extend(published.into_iter().map(|(source, count, index, slot)|
+                        (source, count, index, offset + 1 + slot as u32 * 4)));
                     offset
                 } else if row[0] == 0 { 0 } else {
                     *instance_attribute_rows.entry(row).or_insert_with_key(|row| {
@@ -2217,6 +2260,18 @@ impl InstalledScene {
             image.per_sample=sampled_media.contains(name);
             image.final_compositor=final_media.contains(name);
         }
+        let view = input.view_material()?.0;
+        let editable_bindings = editable_layouts.into_iter().filter(|(name, _)|
+            view.as_ref() != Some(name) && !compositor.contains_key(name)
+            && !nodes.iter().any(|node| match &node.node.kind {
+                NodeKind::Camera { material, .. } => material.as_ref() == Some(name),
+                NodeKind::Light { material, medium, .. } => material.as_ref() == Some(name) || medium.as_ref() == Some(name),
+                _ => false,
+            })
+        ).map(|(name, layout)| {
+            let offset = records[native_ids[&name]].tag[3] as usize;
+            (name, (offset, layout))
+        }).collect();
         let material_table = textures.table(&mat_layout, record_bytes, shadow_solids.count>crate::passes::path::INLINE_BOUNDARIES)?;
         let mut materials: Vec<_> = materials
             .into_iter()
@@ -2657,7 +2712,7 @@ impl InstalledScene {
             opened,
         )?} else {None};
         if let Some(compute) = &mut compute {
-            compute.bind_material_attributes(program_buffers.as_ref().unwrap(), material_attribute_sources)?;
+            compute.bind_material_attributes(r, program_buffers.as_ref().unwrap(), material_attribute_sources)?;
         }
         if let Some(compute) = &compute {
             for (i, draw) in draws.iter().enumerate() {
@@ -2954,8 +3009,15 @@ impl InstalledScene {
                 }
             })
             .collect();
+        // A capture may be the only ray-lighting consumer; its source topology
+        // and weights must not depend on the main view's cheaper integrator.
+        let capture_emitter_sources = !previs_emission[0] && previs_emission[1..].iter().any(|&needed| needed)
+            && crate::emitters::has_sources(&draws, &instances, &materials, true);
+        let shared_emitter_sources = medium_sources || capture_emitter_sources;
+        let retained_blas = options.previous_resources.as_ref()
+            .map(|previous| (previous.blas.as_ref(), &mut static_resources.blas));
         let rays = rays
-            .then(|| crate::rt::Rays::new(r, &draws, &instances, &objects, &plan.casters.instances[0], ray_refraction || effects.ray_indirect || effects.reflections || crate::rt::other_hit_surfaces(&scene) || program_coverage || program_trace, &materials, &render.settings.integrator, &solids.boundaries, &solids.owners, &subsurface_ids, &occupancy_solids, medium_sources))
+            .then(|| crate::rt::Rays::new(r, &draws, &instances, &objects, &plan.casters.instances[0], ray_refraction || effects.ray_indirect || effects.reflections || crate::rt::other_hit_surfaces(&scene) || program_coverage || program_trace, &materials, &render.settings.integrator, &solids.boundaries, &solids.owners, &subsurface_ids, &occupancy_solids, shared_emitter_sources, retained_blas))
             .transpose()?;
         // Point shape construction and immutable compute-query snapshots need
         // the retained source topology. Only computed publications keep it after
@@ -3002,7 +3064,18 @@ impl InstalledScene {
         }
         pipeline_ms += effect_wait.elapsed().as_secs_f64() * 1000.;
         let sampling = crate::sampling::Parameters::new(&r.device, &scene, &render);
+        if options.previous_resources.is_some() {
+            static_resources.device.get_or_insert_with(|| r.device.clone());
+            static_resources.views = std::sync::Arc::new(textures.resident.take());
+        }
+        if let Some(capture) = &compiler_inputs {
+            ensure!(capture.lock().unwrap().valid(), "compiler inputs changed during installation; retry the command");
+        }
         Ok(Self {
+            opened: opened.clone(),
+            compiler_inputs,
+            editable_bindings,
+            static_resources,
             has_catchers: crate::catcher::has_catchers(&scene) && (allocation_dependencies.beauty || allocation_dependencies.catcher),
             geometry_stages,
             footage: std::mem::take(&mut textures.footage), file_images,
@@ -3011,6 +3084,7 @@ impl InstalledScene {
             displacement,
             compositor,
             image_order: planned_image_order,
+            image_settings: views.into_iter().skip(1).map(|view| view.settings).collect(),
             main_outputs: output_dependencies,
             shadows: crate::residency::Cache::new(&r.residency),
             compute,
@@ -3119,7 +3193,7 @@ impl InstalledScene {
 
     /// Render one frame, growing frame storage on the same installation if needed.
     pub fn render_frame(&mut self, r: &Renderer, slot: &mut FrameSlot, time: f32) -> Result<crate::FrameOutput> {
-        if slot.probe_generation != self.reservations.probe_pages || slot.dielectric_spill_reservation != self.reservations.dielectric_spill {
+        if slot.reservations != self.reservations {
             self.refresh_frame_slot(r, slot)?;
         }
         loop {
@@ -3127,7 +3201,8 @@ impl InstalledScene {
                 Ok(output) => return Ok(output),
                 Err(error) => {
                     let Some(redo) = error.downcast_ref::<crate::FrameRedo>() else { return Err(error); };
-                    self.redo_frame(r, std::slice::from_mut(slot), redo.0, (time * self.render.fps.as_f32()).round() as usize)?;
+                    let frame = slot.nominal_frame as usize;
+                    self.redo_frame(r, std::slice::from_mut(slot), redo.0, frame)?;
                 }
             }
         }
@@ -3146,9 +3221,8 @@ impl InstalledScene {
 
         loop {
             for slot in slots.iter_mut().filter(|slot| slot.pending) {
-                // Captures can reuse an earlier exposure's provisional image.
-                // Until its producers are accepted, a successor is not independent.
-                match slot.collect_for_redo(r, self.graph.views.images.is_empty()) {
+                let independent = self.graph.views.images.is_empty();
+                match slot.collect_for_redo(r, independent) {
                     Ok(()) => {},
                     // A refused successor keeps no completed frame: it is resubmitted
                     // after the redo, and the frame loop handles its refusal then.
@@ -3167,6 +3241,13 @@ impl InstalledScene {
                 crate::gpu_memory::DeviceLimit(format!("frame storage cannot grow beyond {:?}: a shading band of camera evaluations, or a merge batch of transparent fragments, needs more records than the device can address",
                     self.reservations)));
 
+            // Slot order need not be submission order. Another drained slot can
+            // reveal probe demand after we have already collected a successor.
+            if grown.probe_pages > self.reservations.probe_pages {
+                for slot in slots.iter_mut() {
+                    slot.completed = None;
+                }
+            }
             if grown.probe_pages>self.reservations.probe_pages {
                 self.probes.as_mut().context("probe demand without installed probes")?.rebuild(r)?;
                 // Every shadow reader pins the old probe bindings. Rebuild the
@@ -3175,6 +3256,7 @@ impl InstalledScene {
                 let bytes=replacement.bytes();
                 self.shadows.insert(replacement,bytes);
             }
+            self.transients.probe_collection = Default::default();
             self.reservations = grown;
             growths += 1;
             self.transients.begin_generation();
@@ -3320,6 +3402,84 @@ fn group_draws(
         draw_groups.extend(std::iter::repeat_n(range.clone(), range.len()));
     }
     draw_groups
+}
+
+/// Immutable geometry buffers and sampled textures from one session generation.
+#[derive(Clone, Default)]
+pub(crate) struct StaticResources {
+    blas: std::sync::Arc<crate::rt::StaticBlas>,
+    views: std::sync::Arc<materials::ResidentViews>,
+    device: Option<wgpu::Device>,
+    buffers: std::sync::Arc<std::collections::HashMap<(blake3::Hash, u32), wgpu::Buffer>>,
+}
+
+/// Keep the GPU buffer contiguous while bounding each host-visible staging allocation.
+fn upload_static_geometry(
+    r: &Renderer,
+    label: &str,
+    bytes: &[u8],
+    usage: wgpu::BufferUsages,
+    chunk_bytes: usize,
+) -> Result<wgpu::Buffer> {
+    if bytes.len() <= chunk_bytes {
+        return Ok(init(&r.device, label, bytes, usage));
+    }
+    let buffer = crate::gpu_memory::buffer(&r.device, &wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.len() as u64,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    r.errors.check()?;
+    for (index, contents) in bytes.chunks(chunk_bytes).enumerate() {
+        r.queue.write_buffer(&buffer, (index * chunk_bytes) as u64, contents);
+        r.errors.check()?;
+        // Retire this staging allocation before asking the driver for the next.
+        r.wait(Some(crate::command_finish::Segments::flush(&r.queue)))?;
+    }
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod static_geometry_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn large_static_geometry_uses_bounded_upload_with_contiguous_offsets() -> Result<()> {
+        let r = crate::test_renderer()?;
+        // Force two full chunks and a short final chunk without a large GPU allocation.
+        let data: Vec<u8> = (0..36).collect();
+        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC;
+        let before = crate::command_finish::submission_count();
+        let heartbeats = crate::gpu_memory::wait_heartbeat_count();
+        let geometry = upload_static_geometry(&r, "test static geometry", &data, usage, 16)?;
+        let heartbeats = crate::gpu_memory::wait_heartbeat_count() - heartbeats;
+        assert_eq!(crate::command_finish::submission_count() - before - heartbeats, 3,
+            "each staging chunk must be submitted and retired before the next upload");
+
+        let readback = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("static geometry readback"),
+            size: data.len() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&geometry, 0, &readback, 0, readback.size());
+        let submission = r.queue.submit([encoder.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = send.send(result);
+        });
+        r.wait(Some(submission))?;
+        receive.recv()??;
+        {
+            let contents = readback.get_mapped_range(..);
+            assert_eq!(&*contents, &data);
+        }
+        readback.unmap();
+        Ok(())
+    }
 }
 
 #[cfg(all(test, vork_private_tests))]

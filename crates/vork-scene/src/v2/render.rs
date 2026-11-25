@@ -64,7 +64,7 @@ pub(super) fn refuse_node_bindings(scene: &serde_json::Value) -> Result<()> {
             let inputs = scene.get("materials").and_then(|m| m.get(name))
                 .and_then(|m| m.get("inputs")).and_then(Value::as_object);
             ensure!(!inputs.into_iter().flatten().any(|(_, input)| input.get("node").is_some()),
-                "compositor {{node:NAME}} was renamed to {{step:NAME}}; see vork help upgrade");
+                "{}", crate::migration::message("compositor.node", &[]));
         }
     }
     Ok(())
@@ -522,16 +522,6 @@ mod color_tests {
     }
 
     #[test]
-    fn retired_white_balance_uses_unknown_field_diagnostics() {
-        for value in [serde_json::json!(null), serde_json::json!({"temperature":3200.,"tint":0.})] {
-            let bytes = serde_json::to_vec(&serde_json::json!({"version":2,"render":{"white_balance":value}})).unwrap();
-            let error = Scene::from_json(&bytes).unwrap_err().to_string();
-            assert!(error.contains("unknown field") && error.contains("white_balance"), "{error}");
-            assert!(error.contains("alid names"), "{error}");
-        }
-    }
-
-    #[test]
     fn display_is_a_program_instance() {
         assert!(matches!(Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}]}"#).unwrap().view(), NameOr::Inline(_)));
         let scene = Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}],"composition":{"space":"3d","view":{"program":"std/standard","inputs":{"gamma":1.74}}}}"#).unwrap();
@@ -707,23 +697,10 @@ mod beta_token_tests {
     use super::*;
 
     #[test]
-    fn fast_gi_rejects_removed_settings_and_path_transport() {
-        for field in ["ao", "indirect"] {
-            let error = serde_json::from_value::<Settings>(serde_json::json!({field:{}})).unwrap_err().to_string();
-            assert!(error.contains(field) && error.contains("unknown field"), "{error}");
-        }
-        assert!(serde_json::from_value::<Settings>(serde_json::json!({"integrator":"path","fast_gi":{}})).is_err());
-        for field in ["fast_gi_ray_count", "fast_gi_step_count"] {
-            assert!(serde_json::from_value::<FastGi>(serde_json::json!({field:2})).is_err());
-        }
-    }
-
-    #[test]
-    fn ao_strength_is_rejected_and_null_disables() {
-        let error = serde_json::from_value::<Settings>(serde_json::json!({"fast_gi":{"strength":1}})).unwrap_err().to_string();
-        assert!(error.contains("unknown field") && error.contains("strength"), "{error}");
+    fn fast_gi_accepts_null_for_raster_and_rejects_path_transport() {
         let disabled: Settings = serde_json::from_value(serde_json::json!({"fast_gi":null})).unwrap();
         assert!(disabled.integrator.indirect().is_none());
+        assert!(serde_json::from_value::<Settings>(serde_json::json!({"integrator":"path","fast_gi":{}})).is_err());
     }
 
     #[test]
@@ -738,36 +715,6 @@ mod beta_token_tests {
         let error = serde_json::from_value::<Settings>(serde_json::json!({"reflections":null})).unwrap_err().to_string();
         assert!(error.contains("invalid type"), "{error}");
         assert!(serde_json::from_value::<Integrator>(serde_json::json!({"integrator":"raster","reflections":"off"})).is_err());
-    }
-
-    #[test]
-    fn removed_probe_settings_name_the_rejected_fields() {
-        for (field, value) in [("visibility_fallback", "dark"), ("visibility_method", "ray"), ("emitter_sampling", "mis"), ("ray_correction", "extra_bounce"), ("screen_correction", "extra_bounce")] {
-            let error = serde_json::from_value::<crate::Scene>(serde_json::json!({
-                "version": 2, "render": {"settings": {"integrator": "raster", "probes": {"volume": {field: value}}}}
-            })).unwrap_err();
-            assert!(error.to_string().contains(field), "{error}");
-        }
-    }
-
-    #[test]
-    fn removed_path_settings_name_the_rejected_fields() {
-        for (field, value) in [("environment_method", "source"), ("coat_method", "albedo"), ("volume_method", "sampled")] {
-            let error = serde_json::from_value::<crate::Scene>(serde_json::json!({
-                "version": 2, "render": {"settings": {"integrator": "path", field: value}}
-            })).unwrap_err();
-            assert!(error.to_string().contains(field), "{error}");
-        }
-    }
-
-    #[test]
-    fn removed_camera_distortion_names_the_rejected_field() {
-        for value in [serde_json::json!({"k1": 0.1}), serde_json::Value::Null] {
-            let error = serde_json::from_value::<crate::Scene>(serde_json::json!({
-                "version": 2, "nodes": [{"type": "camera", "distortion": value}]
-            })).unwrap_err();
-            assert!(error.to_string().contains("distortion"), "{error}");
-        }
     }
 
     #[test]

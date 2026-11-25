@@ -13,8 +13,7 @@
 //!   path's own space and mapped to canvas space by its `transform`, so caps,
 //!   joins, the miter limit, inside / outside alignment and non-uniform scales
 //!   are the drawn ones. A plain stroke is outlined by `i_overlay`'s stroker on
-//!   the flattened centre line; a variable-width, tapered, wavy, dynamic or
-//!   calligraphic one by the stroke outliner (`stroke_outline`). Dashes are
+//!   the flattened centre line. Dashes are
 //!   ignored: a dashed line still bounds regions, as in Illustrator;
 //! - an **unstroked closed** path counts by its outline, as a zero-width edge
 //!   (its fill rule decides inside and outside);
@@ -50,7 +49,7 @@
 //! { "op": "at" | "regions",
 //!   "sources": [ { "points": PathPoint[],        // the path, in its own space
 //!                  "closed"?: false, "fillRule"?: "nonzero" | "evenodd",
-//!                  "cornerRadius"?, "strokes"?: [Stroke], "inkChannels"?, "brush"?,
+//!                  "cornerRadius"?, "strokes"?: [Stroke],
 //!                  "transform"?: [a, b, c, d, e, f] } ],   // own space → canvas
 //!   "at": [x, y],                              // op "at", canvas space
 //!   "within"?: [minX, minY, maxX, maxY],       // op "at": give up (outside) past this box
@@ -91,7 +90,6 @@ use super::{BooleanError, Bounds, FillRule, PathPoint};
 use crate::blend::flatten_path_to_polyline;
 use crate::path_geom::fit::{fit_polyline, FitSeg};
 use crate::path_geom::vec2::{v2, V2};
-use crate::stroke_outline::{stroke_outline, Outline, OutlineOptions};
 use crate::types::{Affine, RawNode};
 
 /// Most sources one request may carry.
@@ -109,8 +107,6 @@ const MAX_FLAT_VERTICES: usize = 4_000_000;
 const MAX_BRIDGES: usize = 20_000;
 /// Chords per curve are capped, so a huge curve cannot allocate without bound.
 const MAX_CHORDS_PER_CURVE: usize = 512;
-/// The outliner's polylines are thinned to within this (px) of themselves.
-const DECIMATE: f64 = 0.01;
 /// Narrowest bridge (half width, px), so a hairline's bridge still seals.
 const MIN_BRIDGE_HALF: f64 = 0.25;
 /// Bridges one open end may make (to different paths), nearest first.
@@ -136,8 +132,7 @@ type Box4 = [f64; 4];
 enum Ink {
     /// A plain stroke: `i_overlay`'s stroker on the flattened centre line.
     Plain { width: f64, cap: String, join: String, miter_limit: f64, align: String },
-    /// A variable stroke: the stroke outliner.
-    Outline { node: RawNode, brush: Option<Value> },
+
 }
 
 /// One piece of line art. Its ink is built on first use.
@@ -248,22 +243,7 @@ impl RegionSource {
                     Ok(rings)
                 }
             }
-            Some(Ink::Outline { node, brush }) => {
-                // Polylines (tolerance 0): the outliner's own samples (≤ ~4° of
-                // turn apart), unfitted, thinned within DECIMATE.
-                let opts = OutlineOptions { tolerance: 0.0, ..OutlineOptions::default() };
-                match stroke_outline(node, brush.as_ref(), &opts).map_err(|e| e.message)? {
-                    Outline::Shape { points, .. } => {
-                        let rings: Contours = flatten_closed(&points, FLATTEN_TOLERANCE / self.scale)
-                            .iter()
-                            .map(|r| decimate(r, DECIMATE / self.scale))
-                            .filter(|r| r.len() >= 3)
-                            .collect();
-                        Ok(resolve(to_canvas(rings), OverlayFill::NonZero))
-                    }
-                    Outline::Empty => Ok(Vec::new()),
-                }
-            }
+
         }
     }
 }
@@ -330,14 +310,10 @@ fn centrelines(points: &[PathPoint], m: Option<Affine>, scale: f64) -> Vec<Vec<V
         .collect()
 }
 
-fn has(v: &Option<Value>) -> bool {
-    v.as_ref().is_some_and(|v| !v.is_null())
-}
-
 /// One source from its request object (its ink is built on first use).
 pub fn parse_source(o: &Map) -> Result<RegionSource, String> {
     let local = parse_points(o.get("points"), "points")?;
-    if local.len() > crate::stroke_outline::MAX_POINTS {
+    if local.len() > 100_000 {
         return Err("at most 100000 points per source".into());
     }
     let closed = o.get("closed").and_then(Value::as_bool).unwrap_or(false);
@@ -360,35 +336,21 @@ pub fn parse_source(o: &Map) -> Result<RegionSource, String> {
     node.insert("type".into(), json!("path"));
     node.insert("points".into(), Value::Array(local.iter().map(PathPoint::to_json).collect()));
     node.insert("closed".into(), json!(closed));
-    for k in ["cornerRadius", "strokes", "inkChannels"] {
+    for k in ["cornerRadius", "strokes"] {
         if let Some(v) = o.get(k) {
             node.insert(k.into(), v.clone());
         }
     }
     let raw = RawNode::new(node);
-    let stroke = crate::paint::model_stroke(&raw).filter(|s| s.width.is_finite() && s.width > 0.0);
-    let brush = o.get("brush").filter(|b| b.is_object()).cloned();
+    let stroke = crate::paint::top_stroke(&raw).filter(|s| s.width.is_finite() && s.width > 0.0);
+
     let (ink, half_width, cap_reaches) = match stroke {
         None => (None, 0.0, false),
         Some(s) => {
-            let variable = has(&s.profile)
-                || has(&s.taper)
-                || has(&s.wave)
-                || has(&s.dynamic)
-                || brush.is_some()
-                || raw.json_field("inkChannels").is_some_and(|v| !v.is_null());
+
             let cap = s.cap.clone().unwrap_or_else(|| "butt".into());
             let reaches = cap == "round" || cap == "square";
-            if variable {
-                // A variable stroke can be wider than its weight: the
-                // outliner's largest half width decides its reach.
-                let opts = OutlineOptions { tolerance: 0.0, ..OutlineOptions::default() };
-                let hw = match stroke_outline(&raw, brush.as_ref(), &opts) {
-                    Ok(Outline::Shape { max_half_width, .. }) => max_half_width,
-                    _ => s.width / 2.0,
-                };
-                (Some(Ink::Outline { node: raw, brush }), hw * scale, reaches)
-            } else {
+            {
                 let align = s.align.clone().unwrap_or_else(|| "center".into());
                 let aligned = closed && (align == "inside" || align == "outside");
                 let ink = Ink::Plain {
@@ -527,48 +489,6 @@ fn local_polylines(points: &[PathPoint], tol: f64) -> Contours {
         out.push(cur);
     }
     out
-}
-
-/// A closed ring thinned by Douglas–Peucker to within `tol` of itself.
-fn decimate(ring: &Contour, tol: f64) -> Contour {
-    let n = ring.len();
-    if n <= 8 {
-        return ring.clone();
-    }
-    // Split the loop at its first vertex and the vertex farthest from it.
-    let d0 = |k: usize| (ring[k][0] - ring[0][0]).hypot(ring[k][1] - ring[0][1]);
-    let far = (1..n).max_by(|&i, &j| d0(i).total_cmp(&d0(j))).unwrap_or(n / 2);
-    let mut keep = vec![false; n + 1];
-    keep[0] = true;
-    keep[far] = true;
-    keep[n] = true;
-    let at = |i: usize| ring[i % n];
-    let seg = |p: [f64; 2], a: [f64; 2], b: [f64; 2]| {
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let l2 = dx * dx + dy * dy;
-        let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
-        (p[0] - a[0] - dx * t).hypot(p[1] - a[1] - dy * t)
-    };
-    let mut stack = vec![(0usize, far), (far, n)];
-    while let Some((a, b)) = stack.pop() {
-        if b <= a + 1 {
-            continue;
-        }
-        let (mut worst, mut idx) = (0.0, a);
-        for i in a + 1..b {
-            let d = seg(at(i), at(a), at(b));
-            if d > worst {
-                worst = d;
-                idx = i;
-            }
-        }
-        if worst > tol {
-            keep[idx] = true;
-            stack.push((a, idx));
-            stack.push((idx, b));
-        }
-    }
-    (0..n).filter(|&i| keep[i]).map(|i| ring[i]).collect()
 }
 
 fn overlay_fill(rule: FillRule) -> OverlayFill {
@@ -1123,7 +1043,7 @@ impl Arrangement {
             return RegionAt::NoLines;
         }
         if let Some(i) = self.faces.iter().position(|f| in_box(&f.bounds, p) && contains(&f.shape, p)) {
-            return RegionAt::Region(self.region(i));
+            return self.region(i).map_or(RegionAt::Outside, RegionAt::Region);
         }
         if self.ink.iter().any(|(c, b)| in_box(b, p) && contains(c, p)) {
             return RegionAt::OnLine;
@@ -1133,7 +1053,7 @@ impl Arrangement {
 
     /// Every region, in reading order (top to bottom, then left to right).
     pub fn regions(&self) -> Vec<FilledRegion> {
-        let mut out: Vec<FilledRegion> = (0..self.faces.len()).map(|i| self.region(i)).collect();
+        let mut out: Vec<FilledRegion> = (0..self.faces.len()).filter_map(|i| self.region(i)).collect();
         out.sort_by(|a, b| (a.sample.1.round(), a.sample.0).partial_cmp(&(b.sample.1.round(), b.sample.0)).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -1148,7 +1068,7 @@ impl Arrangement {
             .collect()
     }
 
-    fn region(&self, i: usize) -> FilledRegion {
+    fn region(&self, i: usize) -> Option<FilledRegion> {
         let face = &self.faces[i];
         let center = ((face.bounds[0] + face.bounds[2]) / 2.0, (face.bounds[1] + face.bounds[3]) / 2.0);
         let sample = interior_sample(&face.shape, &face.bounds).unwrap_or(center);
@@ -1184,18 +1104,18 @@ impl Arrangement {
         };
         let mut points = Vec::new();
         let mut count = 0;
-        let mut bounds = Bounds { min_x: f64::INFINITY, min_y: f64::INFINITY, max_x: f64::NEG_INFINITY, max_y: f64::NEG_INFINITY };
         for ring in &rings {
-            if refit_ring(ring, &mut points, &mut bounds) {
+            if refit_ring(ring, &mut points) {
                 count += 1;
             }
         }
-        FilledRegion { points, subpath_count: count, bounds, sample, area: face.area }
+        let bounds = crate::path_geom::bounds::path_bounds(&points)?;
+        Some(FilledRegion { points, subpath_count: count, bounds, sample, area: face.area })
     }
 }
 
 /// One ring refitted to cubics within `FIT_TOLERANCE`, breaking at corners.
-fn refit_ring(ring: &Contour, out: &mut Vec<PathPoint>, bounds: &mut Bounds) -> bool {
+fn refit_ring(ring: &Contour, out: &mut Vec<PathPoint>) -> bool {
     let n = ring.len();
     if n < 3 {
         return false;
@@ -1214,11 +1134,6 @@ fn refit_ring(ring: &Contour, out: &mut Vec<PathPoint>, bounds: &mut Bounds) -> 
     let Some(first) = segs.first() else { return false };
     let start = first.start();
     out.push(PathPoint::Move { x: start.x, y: start.y });
-    // The ring's own extent (the fit stays within FIT_TOLERANCE of it; its
-    // control points may not).
-    for p in &pts {
-        bounds.include(p.x, p.y);
-    }
     let last = segs.len() - 1;
     for (k, s) in segs.iter().enumerate() {
         match s {

@@ -1,5 +1,5 @@
 //! Authored seconds retain their spelling until a discrete consumer needs it.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use num_traits::ToPrimitive;
 use crate::exact::{Rational, decimal};
@@ -79,6 +79,19 @@ impl Request {
         ensure!(value.is_finite(), "time exceeds finite numeric evaluation range");
         Ok(value)
     }
+    /// Absolute output frame nearest this instant. A point exactly halfway
+    /// between two frames belongs to the later frame.
+    pub fn nearest_frame(&self, fps: crate::Time) -> Result<u32> {
+        use crate::exact::Germ;
+        if let Self::Frame(index, rate) = self && *rate == fps {
+            return Ok(*index);
+        }
+        let rate = fps.exact();
+        let half = Germ::point(Rational::new(1.into(), 2.into()));
+        let index = self.exact()?.scale(&rate).add(&half).floor();
+        u32::try_from(index).context("frame index exceeds u32 identity capacity")
+    }
+
     pub fn exact(&self) -> Result<crate::exact::Germ> {
         use crate::exact::{Germ, ieee};
         Ok(match self {
@@ -94,6 +107,32 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nearest_frame_uses_the_exact_instant_and_output_rate() -> Result<()> {
+        use crate::exact::Germ;
+        for rate in ["24", "30", "23.976", "29.97", "24000/1001", "30000/1001"] {
+            let fps = rate.parse()?;
+            for lower in [1u32, 16_777_216, u32::MAX - 1] {
+                let halfway = Rational::new((2 * u64::from(lower) + 1).into(), 2.into()) / decimal(rate)?;
+                for (instant, expected) in [
+                    (Germ::left(halfway.clone()), lower),
+                    (Germ::point(halfway.clone()), lower + 1),
+                    (Germ::right(halfway), lower + 1),
+                ] {
+                    assert_eq!(Request::Exact(instant).nearest_frame(fps)?, expected);
+                }
+            }
+            assert_eq!(Request::Frame(u32::MAX, fps).nearest_frame(fps)?, u32::MAX);
+        }
+        let fps = crate::Time::integer(24);
+        for (at, index) in [("0.0624999999", 1), ("0.0625", 2), ("0.0625000001", 2)] {
+            assert_eq!(Request::Authored(at.parse()?).nearest_frame(fps)?, index);
+        }
+        assert_eq!(Request::Frame(3, crate::Time::integer(48)).nearest_frame(fps)?, 2);
+        assert!(Request::Authored("4294967296".parse()?).nearest_frame(crate::Time::ONE).is_err());
+        Ok(())
+    }
+
     #[test]
     fn bounded_frame_lowering_matches_unbounded_rounding() -> Result<()> {
         for rate in ["24", "30000/1001", "60000/1001", "1/9223372036854775807", "9223372036854775807"] {

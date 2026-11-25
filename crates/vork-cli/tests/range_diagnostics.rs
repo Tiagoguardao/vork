@@ -415,7 +415,7 @@ fn previs_emitter_approximation_renders_and_warns_once() {
         assert_eq!(stderr.matches("WARNING: std/previs approximates material-emitter lighting").count(),usize::from(lit),"{stderr}");
         assert_eq!(stderr.matches("WARNING:").count(),usize::from(lit),"{stderr}");
         if lit {
-            assert!(stderr.contains("std/final or std/path for exact lighting"),"{stderr}");
+            assert!(stderr.contains("std/final for delivery or std/path for more complete light transport"),"{stderr}");
             let pixels=decode_rgba(&image);
             // Away from the directly visible source, a receiver with no analytic
             // or environment lights must receive material emission.

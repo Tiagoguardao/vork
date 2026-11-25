@@ -5,6 +5,8 @@ export type AskTime = number | string;
 export type AskQuestion = { at?: AskTime | AskTime[] } & (
   { node: string; read: 'transform' | 'bounds'; instance?: number } |
   { node: string; read: 'screen'; instance?: number; camera?: string } |
+  { text: string; read: 'size' } |
+  { path: string; read: 'length' } |
   { field: string } |
   { buffer: string; range?: [number, number] } |
   { buffer: string; read: 'count' } |

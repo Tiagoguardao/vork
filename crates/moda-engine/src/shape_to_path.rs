@@ -17,12 +17,8 @@
 //! positions it.
 
 use crate::tess::moda_engine_path_types::PathCmd;
-use crate::tess::path_cmd_from_blend_point;
 use moda_scene::value::Value;
 
-// The converters live in `moda_scene::shape_outline` (the live geometry
-// effects read shape outlines at scene resolution); these wrap them in the
-// tessellator's command type.
 pub use moda_scene::shape_outline::{expand_corner_radii, normalize_rounded_rect_radii, KAPPA};
 
 /// `rectangleToPathPoints` (rectangleToPath.ts:32-...) with x=y=0, rotation 0
@@ -33,9 +29,6 @@ pub fn rectangle_to_path_cmds(
     corner_radius: Option<&Value>,
 ) -> Vec<PathCmd> {
     moda_scene::shape_outline::rectangle_outline(width, height, corner_radius)
-        .iter()
-        .map(path_cmd_from_blend_point)
-        .collect()
 }
 
 /// `cornerSmoothing` as stored (0–1, clamped; absent or invalid → 0).
@@ -110,9 +103,6 @@ pub fn ellipse_to_path_cmds(
         sweep_angle,
         inner_radius_ratio,
     )
-    .iter()
-    .map(path_cmd_from_blend_point)
-    .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,5 @@
 /// derived: wgpu COPY_BYTES_PER_ROW_ALIGNMENT, required by texture-to-buffer copies.
 pub(crate) const COPY_ROW_ALIGNMENT: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
-/// quality/performance setting: caps the existing NVENC capability probe dimensions.
-pub(crate) const NVENC_PROBE_EXTENT: u32 = 256;
 /// quality/performance setting: existing portable H.264 encoding speed preset.
 pub(crate) const SOFTWARE_PRESET: &str = "veryfast";
 /// quality/performance setting: existing portable H.264 constant rate factor.

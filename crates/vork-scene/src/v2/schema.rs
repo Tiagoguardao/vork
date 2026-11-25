@@ -3,14 +3,7 @@
 /// The published form.
 pub(super) fn authored_schema() -> schemars::Schema {
     // Everything derived below iterates object keys; see `sorted_keys`.
-    let mut schema: schemars::Schema = serde_json::from_value(sorted_keys(full_schema().to_value())).unwrap();
-    let values = schema.clone().to_value();
-    let reference = reference(&values);
-    schema.as_object_mut().unwrap().insert(
-        "x-vork-differences".into(),
-        serde_json::json!(reference.lines().collect::<Vec<_>>()),
-    );
-    schema
+    serde_json::from_value(sorted_keys(full_schema().to_value())).unwrap()
 }
 /// Every authored type: what the decode diagnostics walk.
 pub(super) fn full_schema() -> schemars::Schema {
@@ -715,27 +708,14 @@ fn help_shapes(schema: &serde_json::Value) -> std::collections::BTreeMap<String,
 /// in insertion order whenever any crate in the build enables its
 /// `preserve_order` feature (the Moda crates do), and sorted otherwise; generated
 /// documents must not depend on which packages a build happens to include.
-fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<_> = map.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            serde_json::Value::Object(entries.into_iter().map(|(key, value)| (key, sorted_keys(value))).collect())
-        }
-        serde_json::Value::Array(items) => serde_json::Value::Array(items.into_iter().map(sorted_keys).collect()),
-        other => other,
-    }
+fn sorted_keys(mut value: serde_json::Value) -> serde_json::Value {
+    value.sort_all_objects();
+    value
 }
 
 pub fn documents() -> Vec<(&'static str, String)> {
     let schema = sorted_keys(authored_schema().to_value());
-    let reference = schema["x-vork-differences"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|line| line.as_str().unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let reference = reference(&schema);
     let advanced = advanced_fields(&schema);
     let shapes = help_shapes(&schema);
     // One field store for `vork help TOPIC --all` and `vork help field PATH`:
@@ -820,7 +800,22 @@ pub fn documents() -> Vec<(&'static str, String)> {
         let (_, after) = rest.split_once("<!-- generated-call-keys:end -->").expect("call keys end");
         format!("{before}<!-- generated-call-keys:start -->\n--set KEY=VALUE accepts {}.\n<!-- generated-call-keys:end -->{after}", super::CallOverrides::KEYS.join(", "))
     }
-    vec![
+    // The authored defaults report is intentionally absent from public snapshots.
+    // In a full checkout it is regenerated in either test configuration.
+    let defaults_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/DEFAULTS.md");
+    let defaults = match std::fs::read_to_string(defaults_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !cfg!(vork_private_tests) => None,
+        Err(error) => panic!("read authored defaults report: {error}"),
+    };
+    let defaults = defaults.map(|defaults| {
+        let start = "<!-- generated-defaults:start -->";
+        let end = "<!-- generated-defaults:end -->";
+        let (before, rest) = defaults.split_once(start).expect("defaults start marker");
+        let (_, after) = rest.split_once(end).expect("defaults end marker");
+        format!("{before}{start}\n| Field | Input default | Origin |\n|---|---|---|\n{}\n{end}{after}", rows.join("\n"))
+    });
+    let mut documents = vec![
         ("docs/help/index.md", call_keys(&index)),
         ("docs/help/render.md", call_keys(include_str!("../../../../docs/help/render.md"))),
         ("packages/ts/src/lib/call-keys.ts", format!("// Generated from CallOverrides::KEYS; run scripts/generate-docs.\nexport const callKeys = {} as const;\n", serde_json::to_string(super::CallOverrides::KEYS).unwrap())),
@@ -833,17 +828,9 @@ pub fn documents() -> Vec<(&'static str, String)> {
             "crates/vork-scene/src/v2/reference.txt",
             format!("{store}\n"),
         ),
-        (
-            "docs/DEFAULTS.md",
-            format!(
-                "# Defaults and standards\n\nGenerated from Rust scene types; run `scripts/generate-docs`. See [defaults policy](design/defaults.md) for precedence and rationale.\nStd compositor socket defaults: [COMPOSITOR.md](COMPOSITOR.md).\n\nRender calls default to `std/final`: scene-ray reflections, diffuse indirect light and physical shadows, with a smaller camera budget and bundled OIDN denoising by default. Retained probes are removed. Raster reconstruction preserves transmitting, strongly reflecting and mixed-surface pixels; scene effects requiring path transport retain the call's denoise intent at the same camera budget. `denoise=false` turns OIDN off and uses the profile reconstruction. Without a fast GPU denoiser, draft and final announce it and use 16 and 32 samples undenoised; explicit `denoise=true` uses the CPU denoiser. This affects glass, hair and interior lighting. `std/draft` uses OIDN at four samples; `std/final` uses eight; `--set samples=N` overrides the profile budget; `std/path` uses 64 samples independently of denoising; custom level-2 profiles without an explicit sample count use the same budget. Converged references must request `samples=4096`. `std/previs` is the explicit blocking-look exception: four samples, direct lights and ray shadows, environment reflections, low-sample ray lighting for emissive receivers (with fast GPU denoising when available unless explicitly overridden), otherwise no general GI, probes or denoising by default; it does not estimate final transport. These quality-level choices are separate from the bare input defaults below.\n\nThe disk cache defaults to a 16 GiB ceiling, further limited to half of cache bytes plus available filesystem space (vork storage policy). `VORK_CACHE_BYTES` overrides the ceiling in bytes; `0` disables persistence. Invalid values use the default. `VORK_CACHE_DIR` overrides the platform cache directory. All artifact kinds share least-recently-used eviction at startup and before publication. Entries larger than the budget are not persisted.\n\nRaster quality levels use triangle visibility with physical emitter sampling shared\nwith path transport.\n\n`std/hair` evaluates Chiang scattering at every quality level. Raster no longer substitutes the EEVEE Color-only diffuse response, which discarded Melanin and Direct Absorption inputs. This changes raster hair appearance in `scenes/hair/`, curve hair and custom scenes using the bundled material; explicit custom diffuse Hair closures retain their meaning.\n\n<!-- generated-defaults:start -->\n| Field | Input default | Origin |\n|---|---|---|\n{}\n<!-- generated-defaults:end -->\n",
-                rows.join("\n")
-            ),
-        ),
-    ].into_iter()
-        // The development-only defaults report is not part of the public help surface.
-        .filter(|(path, _)| *path != "docs/DEFAULTS.md" || cfg!(vork_private_tests))
-        .collect()
+    ];
+    if let Some(defaults) = defaults { documents.push(("docs/DEFAULTS.md", defaults)); }
+    documents
 }
 
 #[cfg(test)]
@@ -998,9 +985,6 @@ mod tests {
                 store.lines().find(|entry| entry.contains(line.split(';').nth(1).unwrap_or(line))));
             assert!(line.contains("; default "), "missing default: {path}");
             assert!(line.contains("; when to change: "), "missing guidance: {path}");
-        }
-        for removed in ["settings.shadow_resolution:", "settings.denoiser:"] {
-            assert!(!store.contains(removed), "internal technique leaked: {removed}");
         }
         for path in [
             "node.translation",

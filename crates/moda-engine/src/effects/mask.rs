@@ -42,8 +42,7 @@ use moda_scene::{transform, Scene};
 
 use crate::seams::{MaskDraw, MaskImage, MaskPaint, MaskPlan, MaskRef, MaskText, MaskType};
 
-/// Paint-surface textures a frame's masks sample: `paint-surface:` src → a view of the texture the frame's pattern
-/// cache holds for it.
+/// GPU texture views for rendered masks and registered captures.
 pub type SurfaceViews = std::collections::HashMap<String, wgpu::TextureView>;
 use crate::shape_to_path;
 use crate::tess::{self, moda_engine_path_types as pt};
@@ -52,9 +51,247 @@ use crate::tess::{self, moda_engine_path_types as pt};
 // Plan side (GPU-free)
 // ---------------------------------------------------------------------------
 
+/// The page index keeps the structural reads of isolated cameras alongside its
+/// other selection predicates. Several masks on a page share this inventory.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct MaskPageScope {
+    membership: Option<std::sync::Arc<MaskMembership>>,
+}
+
+#[derive(Debug, Default)]
+struct MaskMembership {
+    owners: HashMap<String, Vec<String>>,
+    // Rows whose visibility or composition can select a different raster mode
+    // for a sibling (backdrop MSAA and analytic shape pipelines).
+    raster: HashMap<String, RasterInput>,
+    ambiguous: std::collections::HashSet<String>,
+    document_context: u64,
+    wrap_free: bool,
+}
+
+impl MaskMembership {
+    fn of(scene: &Scene) -> Self {
+        let mut membership = Self::default();
+        scene.visit_effective_nodes(|id, node| {
+            if let Some(source) = moda_scene::display_list::clip_mask_source_of(scene, id) {
+                membership.owners.entry(source).or_default().push(id.to_owned());
+            }
+            if let Some(input) = RasterInput::of(scene, node) {
+                membership.raster.insert(id.to_owned(), input);
+            }
+        });
+        membership.wrap_free = scene.text_flow().wrap_ids.is_empty();
+        for owners in membership.owners.values_mut() { owners.sort_unstable(); }
+        let mut seen = std::collections::HashSet::new();
+        let pages: std::collections::HashSet<_> = scene.doc().pages.iter().map(|page| page.id()).collect();
+        // Canvas roots live in their own document list. A canonical group can
+        // itself be named "canvas" (the host's viewBox transform group).
+        let edges = scene.children_by_parent().iter().map(|(id, children)|
+            ((!pages.contains(id.as_str())).then_some(id.as_str()), children));
+        for (parent, children) in edges.chain(std::iter::once((None, &scene.doc().canvas_root_node_ids))) {
+            for id in children {
+                if !seen.insert(id) || scene.parent_map().get(id).map(String::as_str) != parent {
+                    membership.ambiguous.insert(id.clone());
+                }
+            }
+        }
+        membership.document_context = document_context(scene);
+        membership
+    }
+}
+
+fn observe_camera_mode(scene: &Scene, node: &RawNode, flags: &mut [bool; 3]) {
+    for (flag, contribution) in flags.iter_mut().zip(crate::frame::SourceEffects::raster(scene, node, true)) {
+        *flag |= contribution;
+    }
+}
+
+/// A sibling contributes only these camera flags, regardless of its own pixels.
+/// When ancestry can change its flags under isolation, the next composition
+/// write to its branch asks the ordinary planner again.
+#[derive(Debug, PartialEq, Eq)]
+enum RasterInput {
+    Visible([bool; 3]),
+    DependsOnAncestors,
+}
+
+impl RasterInput {
+    fn of(scene: &Scene, node: &RawNode) -> Option<Self> {
+        use crate::backdrop::{blend, plan};
+        let blur = plan::has_active_background_blur(node);
+        let body = blend::precludes_shape_sdf(scene, node, true);
+        let composite = blend::composite_blend_split(node).is_some();
+        let grouped = crate::paint::layers::stack_needs_split_at(node, 0.5, true);
+        let opaque = crate::paint::layers::stack_needs_split_at(node, 1., true);
+        if !(blur || body || composite || grouped || opaque) { return None; }
+        if composite || grouped != opaque || scene.hidden_from_paint_order(node.id())
+            || scene.transform_parent_chain(node.id()).iter().any(|id|
+                scene.node(id).is_some_and(|n| matches!(n.node_type(), "section" | "boolean"))) {
+            Some(Self::DependsOnAncestors)
+        } else {
+            Some(Self::Visible([blur, body, opaque]))
+        }
+    }
+}
+
+/// The same read set decides both the capture key and what can be isolated.
+/// Generated geometry, sibling clipping and document text flow keep their
+/// ordinary complete-document dependencies.
+struct MaskInputs<'a> {
+    sources: std::collections::BTreeSet<&'a str>,
+    outside_clips: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> MaskInputs<'a> {
+    fn read(scene: &'a Scene, root: &'a str, ancestors: &[String], membership: &'a MaskMembership) -> Option<Self> {
+        if ancestors.iter().any(|id| {
+            membership.ambiguous.contains(id) || scene.node(id).is_none_or(|node| node.str("_transformSourceId").is_some())
+                || scene.boolean_source_by_id().contains_key(id) || scene.group_appearance_by_id().contains_key(id)
+                || scene.transient_by_parent().contains_key(id)
+        }) { return None; }
+        let mut sources = std::collections::BTreeSet::new();
+        let mut references = Vec::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if !sources.insert(id) { continue; }
+            let node = scene.node(id)?;
+            if node.node_type() == "blend" { references.extend(moda_scene::blend::dependency_ids(node)); }
+            references.extend(node.str("clipMaskNodeId").filter(|id| !id.is_empty()));
+            // A clip to the layer below reads preceding siblings. Only the root
+            // can read siblings outside this occurrence. Derived geometry and
+            // unrevisioned or document-dependent text need their full context.
+            if membership.ambiguous.contains(id) || scene.boolean_source_by_id().contains_key(id) || scene.transient_by_parent().contains_key(id)
+                || scene.group_appearance_by_id().contains_key(id) || node.str("_transformSourceId").is_some()
+                || (id == root && node.truthy("clipToBelow"))
+                || (node.node_type() == "richtext" && !crate::text_draw::layout_is_local(scene, node)) {
+                return None;
+            }
+            pending.extend(scene.children_by_parent().get(id).into_iter().flatten().map(String::as_str));
+        }
+        if references.iter().any(|id| !sources.contains(id)) { return None; }
+        let mut outside_clips = Vec::new();
+        for id in sources.iter().copied().chain(ancestors.iter().map(String::as_str)) {
+            if let Some((target, owners)) = membership.owners.get_key_value(id) {
+                for owner in owners {
+                    if !sources.contains(owner.as_str()) && !ancestors.contains(owner) {
+                        outside_clips.push((target.as_str(), owner.as_str()));
+                    }
+                }
+            }
+        }
+        Some(Self { sources, outside_clips })
+    }
+
+    fn document(&self, scene: &Scene, root: &str, ancestors: &[String], membership: &MaskMembership) -> Option<moda_scene::types::SceneDocument> {
+        use moda_scene::types::{is_page_bg_id, SceneDocument};
+        let doc = scene.doc();
+        if !membership.ambiguous.is_empty() || !self.outside_clips.is_empty()
+            || scene.transient_by_id().keys().any(|id| !is_page_bg_id(id) || scene.node(id).is_some()) {
+            return None;
+        }
+        // Keep the branches whose visibility selects a camera pipeline as well
+        // as the isolated occurrence. An unrelated blur needs its own row and
+        // placement in the tree, even though its body will never be emitted.
+        let mut included = self.sources.clone();
+        let mut branches = vec![root];
+        for id in membership.raster.keys() {
+            if self.sources.contains(id.as_str()) || ancestors.contains(id) || is_page_bg_id(id) { continue; }
+            branches.push(id);
+            let mut pending = vec![id.as_str()];
+            while let Some(id) = pending.pop() {
+                if included.insert(id) {
+                    pending.extend(scene.children_by_parent().get(id).into_iter().flatten().map(String::as_str));
+                }
+            }
+        }
+        let mut children = HashMap::<&str, std::collections::BTreeSet<&str>>::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for mut child in branches {
+            while let Some(parent) = scene.parent_map().get(child) {
+                let kept = children.entry(parent).or_default();
+                if !kept.insert(child) { break; }
+                child = parent;
+            }
+            if !scene.parent_map().contains_key(child) { roots.insert(child); }
+        }
+        let mut nodes = Vec::with_capacity(included.len() + children.len());
+        for id in &included { nodes.push(scene.node(id)?.mask_snapshot()); }
+        for (id, kept) in children {
+            if included.contains(id) { continue; }
+            let node = scene.node(id)?;
+            // A resolved boolean or painted grouping reads even its omitted siblings.
+            if scene.boolean_source_by_id().contains_key(id) || scene.group_appearance_by_id().contains_key(id) {
+                return None;
+            }
+            let mut fields = node.fields().iter().filter(|(k, _)| *k != "children")
+                .map(|(k, v)| (k.clone(), v.clone())).collect::<moda_scene::types::JsonMap>();
+            let ordered: Vec<_> = if kept.len() == 1 { kept.into_iter().collect() } else {
+                scene.children_by_parent().get(id)?.iter().map(String::as_str).filter(|id| kept.contains(id)).collect()
+            };
+            fields.insert("children".into(), moda_scene::value::json!(ordered));
+            nodes.push(node.with_fields(fields));
+        }
+        nodes.sort_unstable_by_key(|node| scene.row_of(node.id()));
+        // Page order and dimensions position even a source on an otherwise empty page.
+        let pages = doc.pages.iter().map(|page| {
+            let mut projected = moda_scene::types::RawPage(page.0.iter().filter(|(k, _)| *k != "nodeIds")
+                .map(|(k, v)| (k.clone(), v.clone())).collect());
+            let on_page: Vec<_> = roots.iter().copied().filter(|id|
+                scene.page_id_by_node().get(*id).is_some_and(|p| p == page.id())).collect();
+            let ordered = if on_page.len() < 2 { on_page.into_iter().map(str::to_owned).collect() } else {
+                scene.children_by_parent().get(page.id()).into_iter().flatten()
+                    .filter(|id| on_page.contains(&id.as_str())).cloned().collect()
+            };
+            projected.set_node_ids(ordered);
+            projected
+        }).collect();
+        let canvas = doc.canvas_root_node_ids.iter().filter(|id| roots.contains(&id.as_str())).cloned().collect();
+        Some(SceneDocument {
+            nodes, pages, config: doc.config.clone(), canvas_root_node_ids: canvas,
+            layout_mode: doc.layout_mode.clone(), grid_columns: doc.grid_columns,
+            unknown_envelope_keys: Vec::new(), unknown_node_types: Vec::new(),
+        })
+    }
+}
+
+impl MaskPageScope {
+    fn membership(&mut self, scene: &Scene) -> &MaskMembership {
+        self.membership.get_or_insert_with(|| std::sync::Arc::new(MaskMembership::of(scene)))
+    }
+
+    pub(crate) fn clip_bindings(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.membership.iter().flat_map(|m| &m.owners)
+            .flat_map(|(target, owners)| owners.iter().map(move |owner| (owner, target)))
+    }
+
+    /// The ordinary composition writer visits descendants of changed ancestors.
+    /// A previously invisible blur or split can now participate in a capture.
+    pub(crate) fn raster_stands(&self, scene: &Scene, node: &RawNode) -> bool {
+        self.membership.as_ref().is_none_or(|m| {
+            if m.wrap_free != scene.text_flow().wrap_ids.is_empty() { return false; }
+            let was = m.raster.get(node.id());
+            was != Some(&RasterInput::DependsOnAncestors) && was == RasterInput::of(scene, node).as_ref()
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.membership.as_ref().map_or(0, |m| std::mem::size_of::<MaskMembership>()
+            + 2 * std::mem::size_of::<usize>() + m.owners.capacity() * std::mem::size_of::<(String, Vec<String>)>()
+            + m.owners.iter().map(|(id, owners)| id.capacity() + owners.capacity() * std::mem::size_of::<String>()
+                + owners.iter().map(String::capacity).sum::<usize>()).sum::<usize>()
+            + m.ambiguous.capacity() * std::mem::size_of::<String>() + m.ambiguous.iter().map(String::capacity).sum::<usize>()
+            + m.raster.capacity() * std::mem::size_of::<(String, RasterInput)>() + m.raster.keys().map(String::capacity).sum::<usize>())
+    }
+}
+
 /// Per-page mask planning state: builds `MaskPlan`s lazily per owner.
-pub struct PlanMasks {
+pub(crate) type RetainedMaskLookup<'a> = &'a dyn Fn(&str) -> Option<&'a MaskPlan>;
+
+pub struct PlanMasks<'a> {
+    pub(crate) scope: MaskPageScope,
     pub masks: Vec<MaskPlan>,
+    /// Sources already proved current by the parent unit's ordinary row dependencies.
+    pub(crate) retained: Option<RetainedMaskLookup<'a>>,
     owner_to_id: HashMap<String, Option<usize>>,
     /// Actual mask reads made by the shared planner while recording retained units.
     reads: Option<Vec<usize>>,
@@ -92,11 +329,13 @@ pub struct PlanMasks {
     shader_time_s: f64,
 }
 
-impl Default for PlanMasks {
+impl Default for PlanMasks<'_> {
     /// Default: text masks available.
     fn default() -> Self {
         PlanMasks {
+            scope: Default::default(),
             masks: Vec::new(),
+            retained: None,
             owner_to_id: HashMap::new(),
             reads: None,
             dropped: Vec::new(),
@@ -109,7 +348,7 @@ impl Default for PlanMasks {
     }
 }
 
-impl PlanMasks {
+impl PlanMasks<'_> {
     pub(crate) fn record_reads(&mut self) { self.reads.get_or_insert_with(Vec::new); }
 
     pub(crate) fn reads(&self) -> &[usize] { self.reads.as_deref().unwrap_or(&[]) }
@@ -148,6 +387,13 @@ impl PlanMasks {
         warnings.dropped.extend(self.dropped);
         warnings.skipped.extend(self.skipped);
         self.masks
+    }
+
+    /// A range can reuse the page's clip owners and raster inputs. Only a full
+    /// collection can install them in both the segment and its page effects.
+    pub(crate) fn into_range_masks(self, page: &MaskPageScope, warnings: &mut crate::frame::PlanWarnings) -> Option<Vec<MaskPlan>> {
+        if page.membership.is_none() && self.scope.membership.is_some() { return None; }
+        Some(self.into_masks(warnings))
     }
 
     /// Nearest mask context for a node (`getActiveMaskContextForNode`): the node's own clip to the layer below,
@@ -191,74 +437,6 @@ impl PlanMasks {
             from = owner.continue_from();
         }
         None
-    }
-
-    /// E8.5: the clip of a vector pattern layer (`pattern_paint`): a vector mask of `positions` (the layer's
-    /// region, node-local triangles) under `affine`, composed with the node's own mask context (the nearest
-    /// clipping ancestor of `node_id`). `owner_key` names the layer (unique per node and layer); a second call
-    /// with it returns the first mask. `None` when the region is empty.
-    pub fn pattern_clip(
-        &mut self,
-        scene: &Scene,
-        owner_key: &str,
-        node_id: &str,
-        positions: Vec<f32>,
-        affine: moda_scene::types::Affine,
-    ) -> Option<MaskRef> {
-        if let Some(cached) = self.owner_to_id.get(owner_key).copied() {
-            return cached.map(|id| self.mask_ref_at(id));
-        }
-        self.owner_to_id.insert(owner_key.to_string(), None);
-        let local = crate::pattern_paint::positions_bounds(&positions)?;
-        let [x0, y0, x1, y1] = crate::pattern_paint::map_bounds(local, affine);
-        let (bw, bh) = (x1 - x0, y1 - y0);
-        if !(bw > 0.0 && bh > 0.0) || ![x0, y0, bw, bh].iter().all(|v| v.is_finite()) {
-            return None;
-        }
-        let ancestor = self
-            .mask_ref_for_node(scene, node_id)
-            .map(|r| r.mask_id as usize);
-        let count = (positions.len() / 2) as u32;
-        let id = self.masks.len();
-        self.masks.push(MaskPlan {
-            source_node_id: node_id.to_string(),
-            owner_node_id: owner_key.to_string(),
-            origin: [x0, y0],
-            size: [bw, bh],
-            model_matrix: [
-                affine.a as f32,
-                affine.b as f32,
-                0.0,
-                0.0,
-                affine.c as f32,
-                affine.d as f32,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                affine.e as f32,
-                affine.f as f32,
-                0.0,
-                1.0,
-            ],
-            positions,
-            mask_type: MaskType::Vector,
-            invert: false,
-            feather: 0.0,
-            draws: vec![MaskDraw {
-                first: 0,
-                count,
-                paint: MaskPaint::Solid([1.0, 1.0, 1.0, 1.0]),
-            }],
-            mode: 0,
-            image: None,
-            text: None,
-            ancestor,
-        });
-        self.owner_to_id.insert(owner_key.to_string(), Some(id));
-        Some(self.mask_ref_at(id))
     }
 
     /// The reference to mask `id` of this table.
@@ -319,9 +497,7 @@ impl PlanMasks {
         // clips to its box.
         let mask_type = if owner.node_type() == "group" {
             MaskType::from_node_value(
-                scene
-                    .envelope_mask_record(&mask_node_id)
-                    .or_else(|| scene.effective_node(&mask_node_id))?
+                scene.effective_node(&mask_node_id)?
                     .str("maskType"),
             )
         } else {
@@ -345,6 +521,15 @@ impl PlanMasks {
         ancestor: Option<usize>,
         empty: bool,
     ) -> Option<usize> {
+        if let Some(previous) = self.retained.and_then(|get| get(owner_id))
+            .filter(|mask| mask.source_node_id == mask_node_id && mask.mask_type == mask_type)
+        {
+            let mut mask = previous.clone();
+            mask.ancestor = ancestor;
+            let id = self.masks.len();
+            self.masks.push(mask);
+            return Some(id);
+        }
         let id = self.build_mask_of_inner(scene, owner_id, mask_node_id, mask_type, ancestor, empty)?;
         let node = scene.effective_node(mask_node_id)?;
         let invert = node.truthy("maskInvert");
@@ -381,7 +566,7 @@ impl PlanMasks {
             let width = mask.size[0] as f32;
             let height = mask.size[1] as f32;
             if !mask.positions.is_empty() {
-                mask.positions = vec![0.0, 0.0, width, 0.0, width, height, 0.0, 0.0, width, height, 0.0, height];
+                mask.positions = vec![0.0, 0.0, width, 0.0, width, height, 0.0, 0.0, width, height, 0.0, height].into();
             }
             if let Some(image) = &mut mask.image {
                 image.dims = [width, height];
@@ -400,22 +585,17 @@ impl PlanMasks {
         empty: bool,
     ) -> Option<usize> {
         let mask_node_id = mask_node_id.to_string();
-        // The resolved record: a mask source with a live geometry effect (a Warp, Roughen, …; warped text too)
-        // clips with the effected outline it draws, as in Illustrator.
-        // An envelope (E8.17) clips with its bent art as one outline.
-        let mask_node = scene
-            .envelope_mask_record(&mask_node_id)
-            .or_else(|| scene.effective_node(&mask_node_id))?;
+        let mask_node = scene.effective_node(&mask_node_id)?;
         let source_type = scene.canonical_or_transient(&mask_node_id)
             .map_or(mask_node.node_type(), |node| node.node_type());
         if mask_type != MaskType::Vector
             && ((mask_type == MaskType::Luminance && self.working_color && !one_solid_layer(mask_node))
                 || !matches!(source_type, "rectangle" | "ellipse" | "polygon" | "star" | "path" | "line" | "richtext" | "container" | "boolean")
+                || mask_reads_store_image(mask_node)
                 || crate::layer_blur::plan::needs_layer_capture(mask_node)
                 || (mask_node.node_type() == "container" && scene.children_by_parent().get(mask_node.id()).is_some_and(|children| !children.is_empty()))
                 || (mask_node.node_type() == "line" && mask_node.str("textContent").is_some_and(|text| !text.is_empty()))
-                || crate::effects::shadow::has_drop_shadow_quad(mask_node)
-                || moda_scene::paint::node_fills_shared(mask_node).iter().any(|fill| matches!(fill.paint, moda_scene::paint::Paint::Shader(_))))
+                || crate::effects::shadow::has_drop_shadow_quad(mask_node))
         {
             return self.build_rendered_mask(scene, owner_id, &mask_node_id, mask_type, ancestor, empty);
         }
@@ -490,6 +670,7 @@ impl PlanMasks {
         let MaskGeometry {
             mut positions,
             fill_dropped,
+            stroke_dropped,
             note,
             box_fallback,
             ..
@@ -587,11 +768,17 @@ impl PlanMasks {
             };
             whole(MaskPaint::Source { opacity })
         } else if vector {
+            if let Some(why) = &stroke_dropped {
+                self.dropped.push(format!("mask {mask_node_id} (clips {owner_id}): stroke dropped: {why}"));
+            }
             whole(white(1.0))
         } else if quad || fill_dropped.is_some() {
             whole(white(node_opacity))
         } else {
             let layered = paint_layer_draws(scene, mask_node, node_opacity);
+            for why in layered.strokes_dropped {
+                self.dropped.push(format!("mask {mask_node_id} (clips {owner_id}): stroke dropped: {why}"));
+            }
             if let Some(why) = layered.fill_dropped {
                 // The whole geometry tessellated, a layer clone's did not:
                 // fail closed as for the combined geometry above.
@@ -653,11 +840,11 @@ impl PlanMasks {
             origin: [bx, by],
             size: [bw, bh],
             model_matrix,
-            positions,
+            positions: positions.into(),
             mask_type,
             invert: false,
             feather: 0.0,
-            draws,
+            draws: draws.into(),
             mode,
             image,
             text,
@@ -667,7 +854,7 @@ impl PlanMasks {
     }
 }
 
-impl PlanMasks {
+impl PlanMasks<'_> {
     fn build_rendered_mask(
         &mut self,
         scene: &Scene,
@@ -677,8 +864,12 @@ impl PlanMasks {
         ancestor: Option<usize>,
         empty: bool,
     ) -> Option<usize> {
-        let mut document = scene.doc().clone();
         let ancestors = scene.transform_parent_chain(mask_node_id);
+        let membership = self.scope.membership(scene);
+        let document_context = membership.document_context;
+        let inputs = MaskInputs::read(scene, mask_node_id, &ancestors, membership);
+        let mut document = inputs.as_ref().and_then(|reads| reads.document(scene, mask_node_id, &ancestors, membership))
+            .unwrap_or_else(|| scene.doc().mask_snapshot());
         for node in &mut document.nodes {
             if ancestors.iter().any(|id| id == node.id()) {
                 let fields = node.fields_mut();
@@ -693,10 +884,28 @@ impl PlanMasks {
         let capture_scene = Scene::from_document(document.clone()).ok()?;
         let isolate = std::collections::HashSet::from([mask_node_id]);
         let mut bounds: Option<(f64, f64, f64, f64)> = None;
+        let mut camera_modes = Vec::new();
         let mut lists: Vec<_> = capture_scene.doc().pages.iter()
-            .map(|page| moda_scene::display_list::build_display_list(&capture_scene, page.id()))
+            .map(|page| {
+                if inputs.is_none() {
+                    return moda_scene::display_list::build_display_list(&capture_scene, page.id());
+                }
+                let mut mode = [false; 3];
+                let list = moda_scene::display_list::build_page_list(&capture_scene, page.id(), true, |node| {
+                    observe_camera_mode(&capture_scene, node, &mut mode);
+                });
+                camera_modes.push(mode);
+                list
+            })
             .collect();
         lists.push(moda_scene::display_list::build_display_list_for_canvas(&capture_scene));
+        if inputs.is_some() && capture_scene.is_freeform() {
+            let mut mode = [false; 3];
+            for id in capture_scene.flattened_z_order_for_canvas() {
+                if let Some(node) = capture_scene.effective_node(&id) { observe_camera_mode(&capture_scene, node, &mut mode); }
+            }
+            camera_modes.push(mode);
+        }
         for item in lists.iter().flat_map(|list| &list.items) {
             if !capture_scene.is_node_isolated(&item.node_id, &isolate) {
                 continue;
@@ -708,7 +917,7 @@ impl PlanMasks {
                     let (px, py) = page_index.map_or((0.0, 0.0), |index| capture_scene.page_position(index));
                     for step in nodes {
                         let geometry = mask_geometry_positions(&step, Some(&capture_scene));
-                        if let Some([x0, y0, x1, y1]) = crate::pattern_paint::positions_bounds(&geometry.positions) {
+                        if let Some([x0, y0, x1, y1]) = crate::geometry_bounds::positions_bounds(&geometry.positions) {
                             bounds = union_aabb(bounds, Some((x0 + px, y0 + py, x1 - x0, y1 - y0)));
                         }
                     }
@@ -755,23 +964,43 @@ impl PlanMasks {
         let bw = (right - bx).max(1.0);
         let bh = (bottom - by).max(1.0);
         let id = self.masks.len();
+        let source_fingerprint = match &inputs {
+            Some(reads) => fingerprint_rows(scene, reads.sources.iter().copied()),
+            None => rendered_mask_fingerprint(scene, mask_node_id),
+        };
+        let cache_key = inputs.as_ref().and_then(|reads| {
+            use std::hash::{Hash, Hasher};
+            let mut key = rustc_hash::FxHasher::default();
+            document_context.hash(&mut key);
+            for id in &ancestors {
+                crate::residency::node_hashes_in(scene, scene.effective_node(id)?).full.hash(&mut key);
+            }
+            source_fingerprint.hash(&mut key);
+            reads.outside_clips.hash(&mut key);
+            camera_modes.hash(&mut key);
+            Some(key.finish())
+        });
         self.masks.push(MaskPlan {
             source_node_id: mask_node_id.to_string(),
             owner_node_id: owner_id.to_string(),
             origin: [bx, by],
             size: [bw, bh],
             model_matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, bx as f32, by as f32, 0.0, 1.0],
-            positions: if empty { Vec::new() } else { vec![0.0, 0.0, bw as f32, 0.0, bw as f32, bh as f32, 0.0, 0.0, bw as f32, bh as f32, 0.0, bh as f32] },
+            positions: if empty { Vec::new() } else { vec![0.0, 0.0, bw as f32, 0.0, bw as f32, bh as f32, 0.0, 0.0, bw as f32, bh as f32, 0.0, bh as f32] }.into(),
             mask_type,
             invert: false,
             feather: 0.0,
-            draws: vec![MaskDraw { first: 0, count: if empty { 0 } else { 6 }, paint: MaskPaint::Source { opacity: 1.0 } }],
+            draws: vec![MaskDraw { first: 0, count: if empty { 0 } else { 6 }, paint: MaskPaint::Source { opacity: 1.0 } }].into(),
             mode: 3,
             image: Some(MaskImage {
-                rgba: Vec::new(), width: 1, height: 1, offset: [0.0; 2],
+                rgba: Default::default(), width: 1, height: 1, offset: [0.0; 2],
                 dims: [bw as f32, bh as f32], scale: [1.0; 2], rotation_rad: 0.0,
                 surface: Some(format!("rendered-mask:{owner_id}")),
-                rendered: Some(std::sync::Arc::new(crate::seams::RenderedMask { document: std::sync::Arc::new(document), node_id: mask_node_id.to_string(), shader_time_s: self.shader_time_s, source_fingerprint: rendered_mask_fingerprint(scene, mask_node_id), cache_key: rendered_mask_cache_key(scene, mask_node_id), shader_clock: Default::default() })),
+                rendered: Some(std::sync::Arc::new(crate::seams::RenderedMask {
+                    document: std::sync::Arc::new(document), node_id: mask_node_id.to_string(),
+                    shader_time_s: self.shader_time_s, source_fingerprint, cache_key,
+                    prepared: Default::default(), shader_clock: Default::default(), asset_reads: Default::default(),
+                })),
             }),
             text: None,
             ancestor,
@@ -780,53 +1009,22 @@ impl PlanMasks {
     }
 }
 
-/// Only self-contained canvas primitives: native text can read area/thread nodes and generated
-/// content can read arbitrary sources. Those keep the ordinary capture path.
-fn rendered_mask_cache_key(scene: &Scene, root: &str) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let mut pending = vec![root.to_string()];
-    let mut sources = std::collections::BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if !sources.insert(id.clone()) { continue; }
-        let node = scene.effective_node(&id)?;
-        match node.node_type() {
-            "group" | "container" | "path" | "rectangle" | "ellipse" => {},
-            "richtext" if node.json_field("vorkText").is_some() => {},
-            _ => return None,
-        }
-        if node.truthy("clipToBelow") { return None; }
-        if scene.transient_by_parent().contains_key(&id) { return None; }
-        if let Some(children) = scene.children_by_parent().get(&id) {
-            pending.extend(children.iter().cloned());
-        }
-    }
-    for id in &sources {
-        let node = scene.effective_node(id)?;
-        if let Some(mask) = node.json_field("clipMaskNodeId").and_then(|v| v.as_str()) {
-            if !sources.contains(mask) { return None; }
-        }
-    }
+/// Page layout and root membership stand for the lifetime of the parent topology.
+fn document_context(scene: &Scene) -> u64 {
+    use std::hash::Hasher;
     let mut h = rustc_hash::FxHasher::default();
     h.write(b"rendered-mask");
-    rendered_mask_fingerprint(scene, root).hash(&mut h);
     let doc = scene.doc();
     h.write(&moda_scene::value::to_vec(&(
         &doc.canvas_root_node_ids, &doc.layout_mode, &doc.grid_columns,
-        &doc.brush_hashes, &doc.pattern_hashes,
     )).expect("mask capture document inputs"));
     for page in &doc.pages {
         h.write(&moda_scene::value::to_vec(&page.0).expect("mask capture page"));
     }
-    // Visibility and ordering on ancestors also affect the isolated walk. Their opacity,
-    // effects and clipping are removed by build_rendered_mask; hashing them is conservative.
-    for id in scene.transform_parent_chain(root) {
-        crate::residency::node_hashes_in(scene, scene.effective_node(&id)?).full.hash(&mut h);
-    }
-    Some(h.finish())
+    h.finish()
 }
 
-pub(crate) fn rendered_mask_fingerprint(scene: &Scene, mask_node_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
+fn rendered_mask_fingerprint(scene: &Scene, mask_node_id: &str) -> u64 {
     let mut pending = vec![mask_node_id.to_string()];
     let mut sources = std::collections::BTreeSet::new();
     while let Some(node_id) = pending.pop() {
@@ -842,8 +1040,13 @@ pub(crate) fn rendered_mask_fingerprint(scene: &Scene, mask_node_id: &str) -> u6
             }
         }
     }
+    fingerprint_rows(scene, sources.iter().map(String::as_str))
+}
+
+fn fingerprint_rows<'a>(scene: &Scene, sources: impl Iterator<Item = &'a str>) -> u64 {
+    use std::hash::{Hash, Hasher};
     let mut fingerprint = rustc_hash::FxHasher::default();
-    fingerprint.write(&moda_scene::value::to_vec(&(&scene.doc().code, &scene.doc().config.raw)).expect("mask document inputs"));
+    fingerprint.write(&moda_scene::value::to_vec(&&scene.doc().config.raw).expect("mask document inputs"));
     for node_id in sources {
         node_id.hash(&mut fingerprint);
         if let Some(node) = scene.effective_node(&node_id) {
@@ -967,7 +1170,7 @@ fn container_clip_is_redundant(scene: &Scene, container: &RawNode, node_id: &str
             source.node_type(),
             "rectangle" | "ellipse" | "polygon" | "star" | "path" | "container"
         )
-    }) && !strokes_visibly(node)
+    }) && !moda_scene::paint::strokes_visibly(node)
         && !moda_scene::effect::node_effects_json(node)
             .iter()
             .any(moda_scene::effect::is_visible_json)
@@ -987,7 +1190,7 @@ fn container_clip_is_redundant(scene: &Scene, container: &RawNode, node_id: &str
 }
 
 /// `Scene.getNodeBoundsCanvas` for mask nodes: transformed AABB of the
-/// node-local box (w/h shapes) or path control-point hull. Distort-warped
+/// node-local box (w/h shapes) or the path's rendered outline. Distort-warped
 /// GEOMETRY nodes use the warped local quad's AABB — their
 /// coverage geometry warps, so the texture must cover the warped extent.
 /// Richtext keeps the unwarped AABB (its coverage is the unwarped Degraded
@@ -1030,7 +1233,7 @@ fn node_canvas_aabb(scene: &Scene, node: &RawNode) -> Option<(f64, f64, f64, f64
         }
     }
     let local: (f64, f64, f64, f64) = if node.node_type() == "path" {
-        let b = transform::bounds_from_points(node.points()?)?;
+        let b = tess::drawn_node_path_bounds(node)?;
         (b.min_x, b.min_y, b.max_x - b.min_x, b.max_y - b.min_y)
     } else {
         let w = node.f64("width")?;
@@ -1057,6 +1260,7 @@ struct MaskGeometry {
     /// `paint::gradient_box`), when the node is a path-like shape.
     path_bounds: Option<[f64; 4]>,
     fill_dropped: Option<String>,
+    stroke_dropped: Option<String>,
     /// A tolerated degradation to report (`PlanWarnings::skipped`).
     note: Option<String>,
 }
@@ -1115,9 +1319,7 @@ fn mask_geometry_positions(node: &RawNode, scene: Option<&Scene>) -> MaskGeometr
 fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskGeometry {
     // Brush plan (#107): an art / scatter / pattern stroke masks with its
     // placed artwork (plus the path's own fill), as it draws.
-    if let Some(g) = scene.and_then(|scene| placed_brush_mask_geometry(scene, node)) {
-        return g;
-    }
+
     let w = node.f64("width").unwrap_or(0.0);
     let h = node.f64("height").unwrap_or(0.0);
     // Line masks tessellate per PART, mirroring `tessellateLineForMask`
@@ -1131,9 +1333,7 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
         let mut spec = ltp::LineSpec::from_json(|k| node.json_field(k));
         // Brush plan §4.9: a line with a width profile / taper / wave masks with its body's
         // outline (built on the undashed body, dash as arc-length windows), as it draws.
-        if tess::outline::needs_outline(node, |_| None::<&moda_scene::value::Value>) {
-            tess::outline::outlined_line_spec(node, &mut spec);
-        }
+
         let parts_of = |spec: &ltp::LineSpec| -> Vec<ltp::LinePart> {
             if spec.has_arrows() {
                 let mut v = vec![ltp::convert_line_body(spec)];
@@ -1148,36 +1348,7 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
         let mut fill_dropped: Option<String> = None;
         let mut note: Option<String> = None;
         for part in &parts {
-            if spec.body_outlined && part.kind == ltp::LinePartKind::Body && part.stroke_width > 0.0
-            {
-                let mut undashed = spec.clone();
-                undashed.dash = None;
-                let body_cmds = parts_of(&undashed).swap_remove(0).cmds;
-                let body = tess::outline::line_body_as_path(node, &body_cmds, part.stroke_width);
-                let (geometry, n) = tess::outline::tessellate_outlined(
-                    &body,
-                    None,
-                    &tess::outline::OutlineBody {
-                        cmds: &body_cmds,
-                        closed: false,
-                        fill_rule: pt::FillRule::NonZero,
-                        stroke_width: part.stroke_width,
-                        trim: None,
-                        dash: spec.dash.as_deref().filter(|d| !d.is_empty()),
-                        dash_offset: moda_scene::paint::node_stroke_style(node)
-                            .dash_offset
-                            .unwrap_or(0.0),
-                        line_cap: pt::line_cap_from_str(part.line_cap.as_deref()),
-                        line_join: pt::line_join_from_str(part.line_join.as_deref()),
-                        stroke_align: pt::stroke_align_from_str(None),
-                        cut: None,
-                    },
-                    tess::outline::current_band(),
-                );
-                note = note.or(n);
-                positions.extend(geometry.positions);
-                continue;
-            }
+
             let geometry = tess::tessellate_combined(
                 &part.cmds,
                 part.stroke_width,
@@ -1202,56 +1373,62 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
             box_fallback: false,
             fill_dropped,
             note,
+            ..Default::default()
         };
     }
-    let (cmds, closed) = match node.node_type() {
-        "rectangle" => (
-            shape_to_path::rect_outline_cmds(w, h, node.json_field("cornerRadius"), node.json_field("cornerSmoothing"), node.json_field("cornerStyle")),
-            true,
-        ),
-        "container" => (
-            shape_to_path::rect_outline_cmds(w, h, node.json_field("cornerRadius"), node.json_field("cornerSmoothing"), node.json_field("cornerStyle")),
-            true,
-        ),
-        "ellipse" => (
-            shape_to_path::ellipse_to_path_cmds(
-                w,
-                h,
-                node.f64("startAngle"),
-                node.f64("sweepAngle"),
-                node.f64("innerRadiusRatio"),
-            ),
-            true,
-        ),
-        "path" => (
-            tess::path_cmds_for_node(node),
-            node.bool("closed").unwrap_or(false),
+    if node.node_type() == "path" {
+        let cmds = tess::path_cmds_for_node(node);
+        let style = moda_scene::paint::node_stroke_style(node);
+        let scale = scene
+            .and_then(|s| s.node_canvas_affine(moda_scene::scene::paint_transform_id(node)))
+            .map_or(1.0, |a| tess::curve_quality::affine_max_scale(&a));
+        let _node_scale = tess::curve_quality::enter_node_scale(scale);
+        let geometry = tess::tessellate_body(
+            node,
+            &cmds,
+            node.path_closure(),
+            crate::paint::painted_stroke_width(node),
+            pt::fill_rule_from_str(node.str("fillRule")),
+            &style,
+        );
+        return MaskGeometry {
+            positions: geometry.positions.clone(),
+            vertex_types: geometry.vertex_types.clone(),
+            path_bounds: tess::path_bounds(&cmds),
+            fill_dropped: geometry.fill_dropped.clone(),
+            stroke_dropped: geometry.stroke_dropped.clone(),
+            ..Default::default()
+        };
+    }
+    let cmds = match node.node_type() {
+        "rectangle" => shape_to_path::rect_outline_cmds(w, h, node.json_field("cornerRadius"), node.json_field("cornerSmoothing"), node.json_field("cornerStyle")),
+        "container" => shape_to_path::rect_outline_cmds(w, h, node.json_field("cornerRadius"), node.json_field("cornerSmoothing"), node.json_field("cornerStyle")),
+        "ellipse" => shape_to_path::ellipse_to_path_cmds(
+            w,
+            h,
+            node.f64("startAngle"),
+            node.f64("sweepAngle"),
+            node.f64("innerRadiusRatio"),
         ),
         // M2 converters, same cmds as the render path (frame.rs body arms):
         // `convertStarToPathNode` / `convertPolygonToPathNode` with center
         // (w/2, h/2), rotation 0, `cornerRadius || 0`.
-        "star" => (
-            tess::shape_paths::star_to_path_cmds(
-                w,
-                h,
-                node.f64("numPoints").unwrap_or(f64::NAN),
-                node.f64("innerRadiusRatio"),
-                node.f64("cornerRadius")
-                    .filter(|v| v.is_finite())
-                    .unwrap_or(0.0),
-            ),
-            true,
+        "star" => tess::shape_paths::star_to_path_cmds(
+            w,
+            h,
+            node.f64("numPoints").unwrap_or(f64::NAN),
+            node.f64("innerRadiusRatio"),
+            node.f64("cornerRadius")
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0),
         ),
-        "polygon" => (
-            tess::shape_paths::polygon_to_path_cmds(
-                w,
-                h,
-                node.f64("sides").unwrap_or(f64::NAN),
-                node.f64("cornerRadius")
-                    .filter(|v| v.is_finite())
-                    .unwrap_or(0.0),
-            ),
-            true,
+        "polygon" => tess::shape_paths::polygon_to_path_cmds(
+            w,
+            h,
+            node.f64("sides").unwrap_or(f64::NAN),
+            node.f64("cornerRadius")
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0),
         ),
         // Remaining types (image/blend/table/...) have no geometry arm in the
         // browser either (`renderCoverage`'s if-chain falls through with
@@ -1278,42 +1455,11 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
     // band in the body lane, so it must not widen the mask either.
     let stroke_width = crate::paint::painted_stroke_width(node);
     let style = moda_scene::paint::node_stroke_style(node);
-    // Brush plan P8: a variable-width or calligraphic stroke masks with its
-    // outline (the brush table comes from the scene).
-    let brush = |id: &str| scene.and_then(|s| s.doc().brush(id));
-    if stroke_width > 0.0 && node.node_type() == "path" && tess::outline::needs_outline(node, brush)
-    {
-        let (geometry, note) = tess::outline::tessellate_outlined(
-            node,
-            tess::outline::brush_id(node).as_deref().and_then(brush),
-            &tess::outline::OutlineBody {
-                cmds: &cmds,
-                closed,
-                fill_rule: pt::fill_rule_from_str(node.str("fillRule")),
-                stroke_width,
-                trim: None,
-                dash: None,
-                dash_offset: 0.0,
-                line_cap: pt::line_cap_from_str(style.cap.as_deref()),
-                line_join: pt::line_join_from_str(style.join.as_deref()),
-                stroke_align: pt::stroke_align_from_str(style.align.as_deref()),
-                cut: None,
-            },
-            tess::outline::current_band(),
-        );
-        return MaskGeometry {
-            positions: geometry.positions,
-            vertex_types: geometry.vertex_types,
-            path_bounds: tess::path_bounds(&cmds),
-            fill_dropped: geometry.fill_dropped,
-            box_fallback: false,
-            note,
-        };
-    }
+
     let geometry = tess::tessellate_combined(
         &cmds,
         stroke_width,
-        closed,
+        true,
         pt::line_cap_from_str(style.cap.as_deref()),
         pt::line_join_from_str(style.join.as_deref()),
         pt::fill_rule_from_str(node.str("fillRule")),
@@ -1328,79 +1474,18 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
     }
 }
 
-/// Mask coverage of an art / scatter / pattern brushed stroke: the path's
-/// own fill plus every placed artwork shape (its fill where painted, its
-/// stroke), all node-local — the silhouette the stroke draws. A refused
-/// placement (`too_complex`, or an artwork fill the tessellator refuses)
-/// masks with the plain stroke, as it draws. Trim and dash are not applied,
-/// as for every mask source. `None` = not a placed brush (or distorted,
-/// which draws unbrushed).
-fn placed_brush_mask_geometry(scene: &Scene, node: &RawNode) -> Option<MaskGeometry> {
-    if crate::paint::painted_stroke_width(node) <= 0.0 || crate::paint::node_distort(node).is_some()
-    {
-        return None;
-    }
-    let (kind, def) = tess::placed::placed_brush(scene, node)?;
-    let band = if tess::placed::band_dependent(kind) {
-        tess::outline::current_band()
-    } else {
-        0
+/// Store-backed image paints use the ordinary pattern sampler, including its mip chain
+/// and working-colour conversion. Capture that drawn mask just as for a group of paints.
+fn mask_reads_store_image(node: &RawNode) -> bool {
+    use moda_scene::paint as sp;
+    let stored = |paint: &sp::Paint| {
+        let sp::Paint::Image(image) = paint else { return false };
+        image.src.as_deref().is_some_and(|src| !src.starts_with("data:")
+            && !src.starts_with(PIXEL_SINK_SRC_PREFIX)
+            && moda_assets::engine_seam::resolve_streaming(src).is_some())
     };
-    let placed = tess::placed::place(
-        node,
-        kind,
-        def,
-        tess::outline::tolerance_for_band(band),
-        None,
-    );
-    let plain = |why: String| {
-        let mut g = mask_geometry_positions(&tess::placed::without_brush(node), None);
-        g.note = Some(format!("brush: {why}; masked with the plain stroke"));
-        g
-    };
-    if placed.too_complex {
-        return Some(plain("placement too complex".into()));
-    }
-    let mut out = mask_geometry_positions(&tess::placed::without_stroke(node), None);
-    for shape in &placed.nodes {
-        let shape = tess::placed::with_node_paint(shape, node);
-        let g = mask_geometry_positions(&shape, None);
-        if let Some(why) = g.fill_dropped {
-            return Some(plain(format!("artwork too complex to fill ({why})")));
-        }
-        if artwork_fill_unpainted(&shape) {
-            // Stroke-only artwork: keep its stroke band, not its fill area.
-            let style = moda_scene::paint::node_stroke_style(&shape);
-            let geometry = tess::tessellate_combined(
-                &tess::path_cmds_for_node(&shape),
-                crate::paint::painted_stroke_width(&shape),
-                shape.bool("closed").unwrap_or(false),
-                pt::line_cap_from_str(style.cap.as_deref()),
-                pt::line_join_from_str(style.join.as_deref()),
-                pt::fill_rule_from_str(shape.str("fillRule")),
-                pt::stroke_align_from_str(style.align.as_deref()),
-            );
-            for (tri, types) in geometry
-                .positions
-                .chunks_exact(6)
-                .zip(geometry.vertex_types.chunks_exact(3))
-            {
-                if types.iter().all(|t| *t == 1.0) {
-                    out.positions.extend_from_slice(tri);
-                    out.vertex_types.extend_from_slice(&[1.0; 3]);
-                }
-            }
-        } else {
-            // Placed artwork is the stroke, whatever it fills.
-            out.vertex_types
-                .extend(std::iter::repeat_n(1.0, g.positions.len() / 2));
-            out.positions.extend(g.positions);
-        }
-    }
-    if !placed.notes.is_empty() {
-        out.note = Some(format!("brush: {}", placed.notes.join("; ")));
-    }
-    Some(out)
+    sp::node_fills(node).iter().any(|f| sp::shown(f.visible, f.opacity) && stored(&f.paint))
+        || sp::node_strokes(node).iter().any(|s| sp::shown(s.visible, s.opacity) && s.width > 0. && stored(&s.paint))
 }
 
 /// Whether a mask shape's picture is one layer of one solid colour: one visible fill or stroke, a solid paint.
@@ -1437,6 +1522,7 @@ struct LayerDraws {
     draws: Vec<MaskDraw>,
     image: Option<MaskImage>,
     fill_dropped: Option<String>,
+    strokes_dropped: Vec<String>,
     notes: Vec<String>,
 }
 
@@ -1461,6 +1547,7 @@ fn paint_layer_draws(scene: &Scene, node: &RawNode, node_opacity: f32) -> LayerD
         draws: Vec::new(),
         image: None,
         fill_dropped: None,
+        strokes_dropped: Vec::new(),
         notes: Vec::new(),
     };
     let layer_opacity = |o: Option<f64>| o.unwrap_or(1.0).clamp(0.0, 1.0) as f32;
@@ -1514,6 +1601,9 @@ fn paint_layer_draws(scene: &Scene, node: &RawNode, node_opacity: f32) -> LayerD
         sp::set_fills(&mut m, Vec::new());
         sp::set_strokes(&mut m, vec![stroke.clone()]);
         let g = mask_geometry_positions(&node.with_fields(m), Some(scene));
+        if let Some(why) = &g.stroke_dropped {
+            out.strokes_dropped.push(why.clone());
+        }
         // The clone's geometry is fill + stroke band: keep the band.
         let band: Vec<f32> = if g.vertex_types.len() * 2 == g.positions.len() {
             g.positions
@@ -1570,7 +1660,7 @@ fn layer_paint(
             let kind = match other {
                 Paint::Image(_) => "image",
                 Paint::Video(_) => "video",
-                Paint::Pattern(_) => "pattern",
+
                 _ => "shader",
             };
             notes.push(format!("{kind} paint masks as opaque"));
@@ -1597,13 +1687,6 @@ fn positions_local_box(positions: &[f32]) -> [f32; 4] {
         return [0.0; 4];
     }
     [x0, y0, x1 - x0, y1 - y0]
-}
-
-/// A placed artwork shape whose fill paints nothing (`transparent`, a zero
-/// alpha colour, or transparent gradient stops) — e.g. the placer's
-/// stroke-only runs (`fill: "transparent"`).
-fn artwork_fill_unpainted(shape: &RawNode) -> bool {
-    !crate::paint::fill_paints(shape)
 }
 
 /// `getImageMaskSrc` + `computeImagePlacement` + decode, for an alpha or
@@ -1633,27 +1716,6 @@ fn image_mask_source(node: &RawNode, image: &moda_scene::paint::ImagePaint) -> O
     if image.placement.mode() == "tile" {
         return None;
     }
-    // A paint layer: its surface texture is the source (the pixels never enter the engine as a decoded image).
-    if let Some((_, w, h)) = crate::surface::parse_paint_surface_src(src) {
-        if crate::paint::node_distort(node).is_some() {
-            return None;
-        }
-        let placement = image.placement.resolve(
-            moda_scene::paint::node_image_box(node).unwrap_or([0.0; 4]),
-            Some((w as f64, h as f64)),
-        );
-        return Some(MaskImage {
-            rgba: Vec::new(),
-            width: w,
-            height: h,
-            offset: [placement.offset.0 as f32, placement.offset.1 as f32],
-            dims: [w.max(1) as f32, h.max(1) as f32],
-            scale: [placement.scale.0 as f32, placement.scale.1 as f32],
-            rotation_rad: placement.rotation.to_radians() as f32,
-            surface: Some(src.to_string()),
-            rendered: None,
-        });
-    }
     // A valid distort falls back to geometry coverage (which IS
     // warped, see mask_geometry_positions) — the image-mask placement math
     // cannot represent the warp. An invalid distort renders unwarped
@@ -1669,10 +1731,10 @@ fn image_mask_source(node: &RawNode, image: &moda_scene::paint::ImagePaint) -> O
         if resolved.state != moda_assets::ImageFillState::Loaded {
             return None;
         }
-        // Its pixels on the heap, or (a 3D unit kept on the GPU) its registered texture, sampled like a paint surface.
+        // Its pixels on the heap, or (a 3D unit kept on the GPU) its registered texture.
         let (rgba, surface) = match resolved.pixels {
-            moda_assets::engine_seam::ResolvedPixels::Heap(rgba) => (rgba.as_ref().clone(), None),
-            _ if crate::external_texture::capture_texture(src).is_some() => (Vec::new(), Some(src.to_string())),
+            moda_assets::engine_seam::ResolvedPixels::Heap(rgba) => (rgba, None),
+            _ if crate::external_texture::capture_texture(src).is_some() => (Default::default(), Some(src.to_string())),
             _ => return None,
         };
         let (w, h) = (resolved.width, resolved.height);
@@ -1705,7 +1767,7 @@ fn image_mask_source(node: &RawNode, image: &moda_scene::paint::ImagePaint) -> O
     let rotation_rad = placement.rotation.to_radians() as f32;
 
     Some(MaskImage {
-        rgba,
+        rgba: rgba.into(),
         width: w,
         height: h,
         offset,
@@ -1841,12 +1903,6 @@ fn vector_text_mask_raster(
 ///   (`if (!effectiveClip) return`), text never samples the R8 mask.
 ///
 /// `None` here = production's null; callers pick their own fallback.
-fn strokes_visibly(node: &RawNode) -> bool {
-    moda_scene::paint::node_strokes(node)
-        .iter()
-        .any(|s| moda_scene::paint::shown(s.visible, s.opacity) && s.width > 0.0)
-}
-
 pub fn effective_page_clip(scene: &Scene, node_id: &str, base: [f32; 4]) -> Option<[f32; 4]> {
     effective_page_clip_until(scene, node_id, base, None)
 }
@@ -1885,11 +1941,10 @@ pub fn effective_page_clip_until(
             if parent.node_type() == "group" && parent.truthy("clipMaskNodeId") {
                 parent
                     .str("clipMaskNodeId")
-                    // Resolved: a rectangle with a live geometry effect resolves to a path and gets no box hint.
                     .and_then(|mid| scene.effective_node(mid))
                     // A stroked mask reaches past its box (E7.18 masks with
                     // the stroke): no box hint then.
-                    .filter(|m| m.node_type() == "rectangle" && !strokes_visibly(m)
+                    .filter(|m| m.node_type() == "rectangle" && !moda_scene::paint::strokes_visibly(m)
                         && !m.truthy("maskInvert") && m.f64("maskFeather").unwrap_or(0.0) <= 0.0
                         && !crate::layer_blur::plan::needs_layer_capture(m)
                         && !crate::effects::shadow::has_drop_shadow_quad(m))
@@ -1928,37 +1983,6 @@ pub fn effective_page_clip_until(
 /// rectangle, opaque in its mask type), and missing every other mask (a path,
 /// an ellipse, a rounded or rotated rectangle, a translucent or luminance one).
 pub fn has_non_box_clip_mask(scene: &Scene, node_id: &str) -> bool {
-    const EPS: f64 = 1e-6;
-    let box_exact = |m: &RawNode| -> bool {
-        if m.node_type() != "rectangle"
-            || m.truthy("maskInvert")
-            || m.f64("maskFeather").unwrap_or(0.0) > 0.0
-            || strokes_visibly(m)
-            || crate::layer_blur::plan::needs_layer_capture(m)
-            || crate::effects::shadow::has_drop_shadow_quad(m)
-            || moda_scene::shape_outline::expand_corner_radii(m.json_field("cornerRadius"))
-                .iter()
-                .any(|r| *r > EPS)
-            || scene
-                .node_canvas_affine(m.id())
-                .is_none_or(|a| a.b.abs() > EPS || a.c.abs() > EPS)
-        {
-            return false;
-        }
-        match MaskType::from_node_value(m.str("maskType")) {
-            MaskType::Vector => true,
-            MaskType::Luminance => false,
-            MaskType::Alpha => {
-                m.f64("opacity").unwrap_or(1.0) >= 1.0
-                    && moda_scene::paint::node_fills_shared(m).iter().any(|f| {
-                        f.visible != Some(false)
-                            && f.opacity.unwrap_or(1.0) >= 1.0
-                            && matches!(f.paint, moda_scene::paint::Paint::Solid(_))
-                            && crate::paint::gradient::solid_fill_color(Some(&f.paint)).a >= 1.0
-                    })
-            }
-        }
-    };
     let mut cursor = node_id;
     let mut visited = moda_scene::scene::SeenIds::default();
     while let Some(parent_id) = scene
@@ -1974,13 +1998,46 @@ pub fn has_non_box_clip_mask(scene: &Scene, node_id: &str) -> bool {
             .filter(|p| p.node_type() == "group" && p.truthy("clipMaskNodeId"))
             .and_then(|p| p.str("clipMaskNodeId"))
         {
-            if !scene.effective_node(mid).is_some_and(box_exact) {
+            if !scene.effective_node(mid).is_some_and(|m| clip_mask_is_box(scene, m)) {
                 return true;
             }
         }
         cursor = parent_id;
     }
     false
+}
+
+/// Whether a text body can consume this mask as an ordinary box clip.
+pub(crate) fn clip_mask_is_box(scene: &Scene, m: &RawNode) -> bool {
+    const EPS: f64 = 1e-6;
+    if m.node_type() != "rectangle"
+        || m.truthy("maskInvert")
+        || m.f64("maskFeather").unwrap_or(0.0) > 0.0
+        || moda_scene::paint::strokes_visibly(m)
+        || crate::layer_blur::plan::needs_layer_capture(m)
+        || crate::effects::shadow::has_drop_shadow_quad(m)
+        || moda_scene::shape_outline::expand_corner_radii(m.json_field("cornerRadius"))
+            .iter()
+            .any(|r| *r > EPS)
+        || scene
+            .node_canvas_affine(m.id())
+            .is_none_or(|a| a.b.abs() > EPS || a.c.abs() > EPS)
+    {
+        return false;
+    }
+    match MaskType::from_node_value(m.str("maskType")) {
+        MaskType::Vector => true,
+        MaskType::Luminance => false,
+        MaskType::Alpha => {
+            m.f64("opacity").unwrap_or(1.0) >= 1.0
+                && moda_scene::paint::node_fills_shared(m).iter().any(|f| {
+                    f.visible != Some(false)
+                        && f.opacity.unwrap_or(1.0) >= 1.0
+                        && matches!(f.paint, moda_scene::paint::Paint::Solid(_))
+                        && crate::paint::gradient::solid_fill_color(Some(&f.paint)).a >= 1.0
+                })
+        }
+    }
 }
 
 /// The rounded corners of the innermost rounded clipping frame (`container`
@@ -2127,8 +2184,6 @@ fn intersect_rect(a: [f64; 4], b: [f64; 4]) -> Option<[f64; 4]> {
 /// and source, then the draw's paint, E7.18) and the per-draw slot stride.
 const MASK_GLOBALS_BYTE_SIZE: u64 = 352;
 const MASK_GLOBALS_ALIGNMENT: u64 = 512;
-/// The consumption uniforms' slot stride (`MaskUniforms`, 32 bytes used).
-const MASK_UNIFORMS_ALIGNMENT: u64 = 256;
 
 /// MSAA sample count of the coverage draw (resolved into the r8 texture).
 /// 4 is guaranteed for r8unorm render + resolve by WebGPU.
@@ -2256,11 +2311,15 @@ fn pack_mask_atlases(levels: &MaskLevels, sizes: &[[u32; 2]], dim: u32, on: bool
 
 /// Mask coverage passes per command buffer when a frame renders many masks ([`MaskAtlas`] build).
 const MASK_PASSES_PER_SUBMIT: usize = 128;
-static PASSES_PER_SUBMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MASK_PASSES_PER_SUBMIT);
+#[cfg(test)]
+thread_local! { static MASK_CHUNK: std::cell::Cell<usize> = const { std::cell::Cell::new(MASK_PASSES_PER_SUBMIT) }; }
 
-/// Mask coverage passes per command buffer (tests: a small value splits a few masks across command buffers).
-pub fn set_mask_passes_per_submit(n: usize) {
-    PASSES_PER_SUBMIT.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+#[cfg(test)]
+pub(crate) fn with_mask_passes_per_submit<T>(limit: usize, work: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore { fn drop(&mut self) { MASK_CHUNK.set(self.0); } }
+    let _restore = Restore(MASK_CHUNK.replace(limit.max(1)));
+    work()
 }
 
 pub fn coverage_scale(px_scale: f64) -> f64 {
@@ -2310,7 +2369,7 @@ pub fn coverage_placement(origin: [f64; 2], size: [f64; 2], scale: f64, max_dim:
 pub struct MaskAtlas {
     /// One consumption bind group per `MaskPlan` (engine `mask_bgl` layout:
     /// 0 = linear clamp sampler, 1 = r8unorm view, 2 = MaskUniforms).
-    bind_groups: Vec<wgpu::BindGroup>,
+    bind_groups: Vec<(wgpu::BindGroup, wgpu::Texture)>,
     // This frame's own resources (not in a [`MaskCache`]), kept alive for the frame.
     _textures: Vec<wgpu::Texture>,
     _buffers: Vec<wgpu::Buffer>,
@@ -2349,7 +2408,7 @@ pub struct MaskCache {
     tick: u64,
     /// The last atlas built for a plan (by identity) at a coverage scale, when every mask came from the cache: a
     /// frame of the same plan at the same scale (a pan) binds it again without keying every mask.
-    memo: Option<(std::sync::Weak<crate::seams::CoveragePlan>, u64, Vec<wgpu::BindGroup>)>,
+    memo: Option<(std::sync::Weak<crate::seams::CoveragePlan>, u64, Vec<(wgpu::BindGroup, wgpu::Texture)>)>,
     /// Counters for benches: masks served from the cache, rendered, and full-rect.
     pub hits: u64,
     pub renders: u64,
@@ -2584,13 +2643,13 @@ fn content_key(
             v.to_bits().hash(&mut h);
         }
         m.positions.len().hash(&mut h);
-        for v in &m.positions {
+        for v in m.positions.iter() {
             v.to_bits().hash(&mut h);
         }
         // E7.18: the mask type and each draw's range and paint.
         (m.mask_type as u8).hash(&mut h);
         m.draws.len().hash(&mut h);
-        for d in &m.draws {
+        for d in m.draws.iter() {
             d.first.hash(&mut h);
             d.count.hash(&mut h);
             hash_paint(&d.paint, &mut h);
@@ -2642,6 +2701,10 @@ impl MaskAtlas {
     }
 
     pub fn bind_group(&self, mask_id: u64) -> Option<&wgpu::BindGroup> {
+        self.binding(mask_id).map(|(group, _)| group)
+    }
+
+    pub(crate) fn binding(&self, mask_id: u64) -> Option<&(wgpu::BindGroup, wgpu::Texture)> {
         self.bind_groups.get(mask_id as usize)
     }
 
@@ -2658,14 +2721,14 @@ impl MaskAtlas {
         mask_bgl: &wgpu::BindGroupLayout,
         masks: &[MaskPlan],
         px_scale: f64,
-        surfaces: &SurfaceViews,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
         working: Option<&moda_shaders::WorkingColor>,
     ) -> Result<MaskAtlas> {
         if masks.is_empty() {
             return Ok(MaskAtlas::empty());
         }
         let mut local = MaskCache::new(device, queue, working)?;
-        Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, &mut local, false, false, surfaces)
+        Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, &mut local, false, false, surfaces, scratch)
     }
 
     /// [`MaskAtlas::build`] through a retained [`MaskCache`]: masks whose content is
@@ -2683,13 +2746,13 @@ impl MaskAtlas {
         px_scale: f64,
         cache: &mut MaskCache,
         live: bool,
-        surfaces: &SurfaceViews,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
     ) -> Result<MaskAtlas> {
         if masks.is_empty() {
             return Ok(MaskAtlas::empty());
         }
         cache.tick += 1;
-        let atlas = Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, cache, true, live, surfaces)?;
+        let atlas = Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, cache, true, live, surfaces, scratch)?;
         cache.trim();
         Ok(atlas)
     }
@@ -2707,7 +2770,7 @@ impl MaskAtlas {
         px_scale: f64,
         cache: &mut MaskCache,
         live: bool,
-        surfaces: &SurfaceViews,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
     ) -> Result<MaskAtlas> {
         let masks = &identity.masks;
         if masks.is_empty() {
@@ -2722,7 +2785,7 @@ impl MaskAtlas {
                 });
             }
         }
-        let atlas = Self::build_cached(device, queue, encoder, mask_bgl, masks, px_scale, cache, live, surfaces)?;
+        let atlas = Self::build_cached(device, queue, encoder, mask_bgl, masks, px_scale, cache, live, surfaces, scratch)?;
         cache.memo = (live && atlas._textures.is_empty() && atlas._buffers.is_empty()).then(|| {
             (std::sync::Arc::downgrade(identity), px_scale.to_bits(), atlas.bind_groups.clone())
         });
@@ -2754,7 +2817,7 @@ impl MaskAtlas {
         cache: &mut MaskCache,
         retain: bool,
         live: bool,
-        surfaces: &SurfaceViews,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
     ) -> Result<MaskAtlas> {
         let n = masks.len();
         let atlas_on = live && mask_atlas_enabled();
@@ -2956,8 +3019,7 @@ impl MaskAtlas {
             let mut image_views: Vec<Option<wgpu::TextureView>> = Vec::with_capacity(to_render.len());
             for &i in &to_render {
                 let m = &masks[i];
-                // A paint surface samples the layer's own GPU texture (the pattern cache made it for this frame);
-                // until it exists, a 1×1 transparent texture (masks nothing in: the paint hasn't arrived).
+                // Rendered masks and registered captures supply a GPU view.
                 if let (None, Some(MaskImage { surface: Some(src), .. })) = (&m.text, &m.image) {
                     let view = match surfaces.get(src) {
                         Some(v) => v.clone(),
@@ -3097,12 +3159,10 @@ impl MaskAtlas {
             // Coverage passes, ancestors-first (plan guarantees ancestor index <
             // descendant index; a cached or full-rect ancestor's view is ready).
             let globals_bgl = cache.pipeline.get_bind_group_layout(0);
-            // Many masks (a 20k-layer document at fit renders ~2,900 clipped cards' masks on its first frame) go
-            // out in several command buffers: one command buffer of thousands of passes ran for seconds and the
-            // GPU watchdog dropped the device. Each chunk is submitted before the next is recorded, so a mask's
-            // ancestors (earlier indices) are always rendered first, and all of them before the frame's own
-            // encoder (submitted after this returns) samples them.
-            let per_submit = PASSES_PER_SUBMIT.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            let per_submit = MASK_CHUNK.get();
+            #[cfg(not(test))]
+            let per_submit = MASK_PASSES_PER_SUBMIT;
             // The passes in level order (a mask's ancestors render first): each level's atlases, then its masks
             // that render on their own.
             enum CoveragePass {
@@ -3223,29 +3283,33 @@ impl MaskAtlas {
                 // Only the resolved coverage is read.
                 store: wgpu::StoreOp::Discard,
             };
-            // Many masks (a 20k-layer document at fit renders ~2,900 clipped cards' masks on its first frame) go
-            // out in several command buffers: one command buffer of thousands of passes ran for seconds and the
-            // GPU watchdog dropped the device. Each chunk is submitted before the next is recorded, so a mask's
-            // ancestors (lower levels) are always rendered first, and all of them before the frame's own encoder
-            // (submitted after this returns) samples them.
-            let mut chunk: Option<wgpu::CommandEncoder> = None;
+            // Roll over the caller's active encoder. The first chunk includes any mask
+            // source draws, and the page continues in the encoder holding the last chunk.
             let mut shared_bg1: Option<wgpu::BindGroup> = None;
             let mut shared_bg2: HashMap<Option<usize>, wgpu::BindGroup> = HashMap::new();
             let mut atlas_msaa: HashMap<[u32; 2], wgpu::TextureView> = HashMap::new();
             let mut atlas_passes = 0u64;
             for (p, item) in work.iter().enumerate() {
-                if work.len() > per_submit && p % per_submit == 0 {
-                    if let Some(done) = chunk.take() {
-                        crate::scratch::submit(queue, Some(done.finish()));
-                    }
-                    chunk = Some(device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                if p > 0 && p % per_submit == 0 {
+                    let next = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("mask coverage chunk"),
-                    }));
+                    });
+                    let done = std::mem::replace(encoder, next);
+                    crate::scratch::submit(queue, [done.finish()]);
                 }
-                let encoder: &mut wgpu::CommandEncoder = match chunk.as_mut() {
-                    Some(c) => c,
-                    None => &mut *encoder,
-                };
+                if p % per_submit == 0 {
+                    let inputs = work[p..work.len().min(p + per_submit)].iter().flat_map(|pass| {
+                        match pass {
+                            CoveragePass::Alone(slot) => std::slice::from_ref(slot),
+                            CoveragePass::Atlas(index) => &packing.atlases[*index].slots[..],
+                        }
+                    }).flat_map(|&slot| {
+                        let image = image_views[slot].as_ref().map(|v| v.texture().clone());
+                        let ancestor = masks[to_render[slot]].ancestor.map(|a| view_of(a, cache).texture().clone());
+                        [image, ancestor].into_iter().flatten()
+                    }).collect();
+                    scratch.record_storage(encoder, queue, 0, inputs);
+                }
                 match *item {
                     CoveragePass::Alone(slot) => {
                         let binds = slot_binds(slot, &mut shared_bg1, &mut shared_bg2);
@@ -3368,9 +3432,6 @@ impl MaskAtlas {
                     }
                 }
             }
-            if let Some(done) = chunk.take() {
-                crate::scratch::submit(queue, Some(done.finish()));
-            }
             cache.atlas_passes += atlas_passes;
             buffers.push(globals);
             buffers.push(vbuf);
@@ -3388,9 +3449,9 @@ impl MaskAtlas {
                         let (uniforms, group) = consumption_group(device, queue, mask_bgl, cache,
                             &masks[i], &placements[i], &e.view);
                         buffers.push(uniforms);
-                        bind_groups.push(group);
+                        bind_groups.push((group, e.view.texture().clone()));
                     } else {
-                        bind_groups.push(e.bind_group.clone());
+                        bind_groups.push((e.bind_group.clone(), e.view.texture().clone()));
                     }
                 }
                 Source::Render(r) => {
@@ -3404,7 +3465,7 @@ impl MaskAtlas {
                         &placements[i],
                         &view,
                     );
-                    bind_groups.push(bind_group.clone());
+                    bind_groups.push((bind_group.clone(), view.texture().clone()));
                     let texture = rendered[r].take().expect("each render slot once");
                     match keys[i] {
                         Some(k) => {
@@ -3751,6 +3812,145 @@ fn upload_texture(
 
 #[cfg(test)]
 mod tests {
+    fn full_document(scene: &Scene) -> MaskPageScope {
+        let mut membership = MaskMembership::of(scene);
+        // An unrelated ambiguous edge forces the complete capture representation.
+        membership.ambiguous.insert("outside-the-occurrence".into());
+        MaskPageScope { membership: Some(std::sync::Arc::new(membership)) }
+    }
+
+    #[test]
+    fn isolated_source_rows_match_the_full_camera_on_edits() {
+        use moda_scene::value::json;
+        let path = |id, x, color| json!({"id":id,"type":"path","x":x,"width":24,"height":16,
+            "points":[{"type":"move","x":0,"y":0},{"type":"line","x":24,"y":0},{"type":"line","x":0,"y":16}],
+            "closed":true,"fills":[{"id":"f","paint":{"type":"solid","color":color}}]});
+        let mut scene = scene(json!({"nodes":[
+            {"id":"canvas","type":"group","children":["outside","owner"],"x":5,"rotation":7},
+            path("outside", 142, "#ff00ff"),
+            {"id":"owner","type":"group","children":["source","body"],"clipMaskNodeId":"source","opacity":0.6},
+            {"id":"source","type":"group","children":["a","b"],"maskType":"luminance","opacity":0.8},
+            path("a", 2, "#88ff88"), path("b", 16, "#221188"), path("body", 6, "#ffff00")
+        ],"pages":[{"id":"p","width":240,"height":180,"nodeIds":["canvas"]}]}));
+        let mut scope = MaskPageScope::default();
+        let capture = |scene: &Scene, scope: MaskPageScope| {
+            let mut collector = PlanMasks { scope, ..Default::default() };
+            collector.build_rendered_mask(scene, "owner", "source", MaskType::Luminance, None, false).unwrap();
+            (collector.masks.pop().unwrap(), collector.scope)
+        };
+        for x in [16, -9, 28] {
+            scene.write_row(scene.row_of("b").unwrap(), |f| f.set("x", json!(x))).unwrap();
+            scene.refresh_worlds();
+            let (short, next) = capture(&scene, scope);
+            scope = next;
+            let (full, _) = capture(&scene, full_document(&scene));
+            let (a, b) = (short.image.as_ref().unwrap().rendered.as_ref().unwrap(),
+                full.image.as_ref().unwrap().rendered.as_ref().unwrap());
+            assert!(a.cache_key.is_some(), "the authored viewBox group owns its children");
+            assert_eq!(a.document.nodes.len(), 5);
+            assert_eq!(b.document.nodes.len(), 7);
+            assert_eq!((short.origin, short.size), (full.origin, full.size));
+            for scale in [0.5, 2.0] {
+                let scoped = a.prepare(&short, scale, None, 0.0, false).unwrap();
+                let reference = b.prepare(&full, scale, None, 0.0, false).unwrap();
+                assert_eq!(format!("{scoped:?}"), format!("{reference:?}"));
+            }
+        }
+        // An external mask reference suppresses the same node in the ordinary
+        // display list, even when the referring group is hidden.
+        let mut doc = scene.doc().clone();
+        doc.nodes.push(moda_scene::types::RawNode::from_value(json!({
+            "id":"external","type":"group","hidden":true,"children":[],"clipMaskNodeId":"a"
+        })).unwrap());
+        let external = Scene::from_document(doc).unwrap();
+        let (mask, _) = capture(&external, MaskPageScope::default());
+        let source = mask.image.unwrap().rendered.unwrap();
+        assert_eq!(source.document.nodes.len(), 8);
+        let (old, _) = capture(&scene, MaskPageScope::default());
+        let former = old.image.unwrap().rendered.unwrap();
+        assert_eq!(former.source_fingerprint, source.source_fingerprint);
+        assert_ne!(former.cache_key, source.cache_key, "external clip binding must invalidate the capture");
+    }
+
+    #[test]
+    fn isolated_path_keeps_the_sample_count_of_an_unrelated_backdrop() {
+        use moda_scene::value::json;
+        let shape = |id| json!({"id":id,"type":"path","width":24,"height":24,
+            "points":[{"type":"move","x":0,"y":0},{"type":"line","x":24,"y":5},{"type":"line","x":0,"y":16}],
+            "closed":true,"fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]});
+        let mut matte = shape("matte");
+        matte["maskType"] = json!("luminance");
+        let scene = scene(json!({"nodes":[
+            {"id":"clip","type":"group","children":["matte","body"],"clipMaskNodeId":"matte"},matte,shape("body"),
+            {"id":"other","type":"rectangle","x":48,"width":20,"height":20,
+             "effects":[{"id":"blur","type":"background-blur","radius":4}]}
+        ],"pages":[{"id":"p","width":90,"height":50,"nodeIds":["clip","other"]}]}));
+        let plan = |scope| {
+            let mut masks = PlanMasks { scope, ..Default::default() };
+            masks.build_rendered_mask(&scene,"clip","matte",MaskType::Luminance,None,false).unwrap();
+            let mask = &masks.masks[0];
+            let source = mask.image.as_ref().unwrap().rendered.as_ref().unwrap();
+            source.prepare(mask, 2., None, 0., false).unwrap()
+        };
+        let cold = plan(full_document(&scene));
+        let scoped = plan(MaskPageScope::default());
+        assert_eq!(cold.sample_count, 1);
+        assert_eq!(format!("{cold:?}"), format!("{scoped:?}"));
+    }
+
+    #[test]
+    fn isolated_shape_group_preserves_page_and_canvas_camera_inputs() {
+        use moda_scene::value::json;
+        for canvas in [false, true] {
+            let roots = json!(["owner", "glass", "unrelated"]);
+            let mut value = json!({
+                "layoutMode":"freeform",
+                "nodes":[
+                    {"id":"owner","type":"group","children":["mask","body"],"clipMaskNodeId":"mask"},
+                    {"id":"mask","type":"container","width":48,"height":36,"children":["ink"],"maskType":"luminance"},
+                    {"id":"ink","type":"ellipse","x":5,"y":4,"width":24,"height":16,
+                        "fills":[{"id":"f","paint":{"type":"solid","color":"#e8fef0"}}]},
+                    {"id":"body","type":"rectangle","width":48,"height":36},
+                    {"id":"glass","type":"rectangle","x":160,"width":12,"height":12,
+                        "effects":[{"type":"background-blur","radius":3}]},
+                    {"id":"unrelated","type":"rectangle","width":24,"height":24}
+                ],
+                "pages":[{"id":"first","width":36,"height":18,"nodeIds":[]},
+                    {"id":"second","width":90,"height":50,"freeformX":12,"freeformY":32,"nodeIds":[]}],
+                "canvasRootNodeIds":[]
+            });
+            if canvas { value["canvasRootNodeIds"] = roots; } else { value["pages"][1]["nodeIds"] = roots; }
+            let capture = |scene: &Scene, scope| {
+                let mut masks = PlanMasks { scope, ..Default::default() };
+                masks.build_rendered_mask(scene, "owner", "mask", MaskType::Luminance, None, false).unwrap();
+                masks.masks.pop().unwrap()
+            };
+            let mut keys = Vec::new();
+            let mut scope = MaskPageScope::default();
+            for radius in [3, 8, 0] {
+                value["nodes"][4]["effects"][0]["radius"] = json!(radius);
+                let scene = Scene::load(&value).unwrap();
+                if !keys.is_empty() {
+                    assert_eq!(scope.raster_stands(&scene, scene.node("glass").unwrap()), radius > 0);
+                }
+                scope.membership(&scene);
+                let short = capture(&scene, MaskPageScope::default());
+                let full = capture(&scene, full_document(&scene));
+                let picture = |mask: &MaskPlan| mask.image.as_ref().unwrap().rendered.as_ref().unwrap()
+                    .prepare(mask, 2., None, 0., false).unwrap();
+                let source = short.image.as_ref().unwrap().rendered.as_ref().unwrap();
+                assert!(source.document.nodes.iter().all(|row| row.id() != "unrelated"));
+                assert_eq!((short.origin, short.size), (full.origin, full.size));
+                let reference = picture(&full);
+                assert_eq!(reference.sample_count == 1, radius > 0);
+                assert_eq!(format!("{reference:?}"), format!("{:?}", picture(&short)));
+                keys.push(source.cache_key.unwrap());
+            }
+            assert_eq!(keys[0], keys[1], "outside blur radius preserves raster mode");
+            assert_ne!(keys[1], keys[2], "removing the last blur changes coverage");
+        }
+    }
+
     #[test]
     fn rendered_text_capture_key_tracks_its_sources_not_unrelated_glyphs() {
         let document = moda_scene::value::json!({
@@ -3763,15 +3963,25 @@ mod tests {
             "pages":[{"id":"page", "width":300, "height":200, "nodeIds":["parent"]}],
             "config":{}, "canvasRootNodeIds":[], "layoutMode":"vertical"
         });
-        let key = |value: &moda_scene::value::Value| {
+        let capture = |value: &moda_scene::value::Value| {
             let scene = Scene::load(value).unwrap();
-            super::rendered_mask_cache_key(&scene, "mask")
+            let mut masks = PlanMasks { scope: MaskPageScope::default(), ..Default::default() };
+            masks.build_rendered_mask(&scene, "parent", "mask", MaskType::Luminance, None, false).unwrap();
+            masks.masks.pop().unwrap().image.unwrap().rendered.unwrap()
         };
+        let key = |value: &_| capture(value).cache_key;
+        assert!(key(&document).is_some(), "standalone native text reads its own occurrence");
+        crate::text_draw::install_text_builder(Some(std::rc::Rc::new(|_, _, _, _, _|
+            Ok(crate::text_draw::TextBuildOutcome::Empty))));
+        let original_capture = capture(&document);
+        assert!(original_capture.cache_key.is_some());
+        assert!(original_capture.document.nodes.iter().all(|node| node.id() != "other"));
         let original = key(&document);
         assert!(original.is_some());
         let mut changed = document.clone();
         changed["nodes"][3]["vorkText"][2] = moda_scene::value::json!(2);
         assert_eq!(key(&changed), original);
+        assert_eq!(capture(&changed).cache_key, original_capture.cache_key);
         for (node, field, value) in [
             (2, "vorkText", moda_scene::value::json!([0,0,2])),
             (0, "x", moda_scene::value::json!(10)),
@@ -3781,6 +3991,7 @@ mod tests {
             let mut changed = document.clone();
             changed["nodes"][node][field] = value;
             assert_ne!(key(&changed), original, "{field}");
+            assert_ne!(capture(&changed).cache_key, original_capture.cache_key, "{field}");
         }
         let mut page = document.clone();
         page["pages"][0]["width"] = moda_scene::value::json!(400);
@@ -3790,13 +4001,85 @@ mod tests {
         assert!(key(&outside).is_none(), "external mask dependencies are not eligible");
         let mut native_text = document;
         native_text["nodes"][2].as_object_mut().unwrap().remove("vorkText");
-        assert!(key(&native_text).is_none(), "native layout can read area/thread sources");
+        crate::text_draw::install_text_builder(None);
+        assert!(key(&native_text).is_some(), "standalone box text");
+        native_text["nodes"][3]["wrapsText"] = moda_scene::value::json!({});
+        assert!(key(&native_text).is_none(), "a wrap object can change native layout");
     }
 
     use super::*;
 
     fn scene(json: moda_scene::value::Value) -> Scene {
         Scene::load(&json).unwrap()
+    }
+
+    #[test]
+    fn compound_stroke_masks_match_visible_closure_dash_and_trim() {
+        use crate::seams::DrawItem;
+        use moda_scene::value::json;
+
+        // M0 0H10 M20 0H30V10Z. The probe lies strictly inside the closing stroke.
+        let points = json!([
+            {"type":"move","x":0,"y":0}, {"type":"line","x":10,"y":0},
+            {"type":"move","x":20,"y":0}, {"type":"line","x":30,"y":0},
+            {"type":"line","x":30,"y":10}
+        ]);
+        let covers = |triangles: &[f32], [x, y]: [f32; 2]| {
+            triangles.chunks_exact(6).any(|t| {
+                let cross = |a: usize, b: usize| {
+                    (t[b] - t[a]) * (y - t[a + 1]) - (t[b + 1] - t[a + 1]) * (x - t[a])
+                };
+                let edges = [cross(0, 2), cross(2, 4), cross(4, 0)];
+                edges.iter().all(|&e| e > 0.0) || edges.iter().all(|&e| e < 0.0)
+            })
+        };
+
+        for variant in ["solid", "dash", "trim"] {
+            let mut stroke = json!({"id":"s","width":1,"paint":{"type":"solid","color":"#ffffff"}});
+            if variant == "dash" {
+                stroke["dash"] = json!([4, 4]);
+                stroke["dashOffset"] = json!(3);
+            }
+            let mut path = json!({
+                "id":"visible","type":"path","x":5,"y":5,
+                "points":points,"closed":[false,true],"strokes":[stroke]
+            });
+            if variant == "trim" {
+                path["trimPathStart"] = json!(0.75);
+                path["trimPathEnd"] = json!(1.0);
+            }
+            for (mask_type, expected) in [("alpha", MaskType::Alpha), ("luminance", MaskType::Luminance)] {
+                let mut mask = path.clone();
+                mask["id"] = json!("mask");
+                mask["maskType"] = json!(mask_type);
+                let s = scene(json!({
+                    "nodes":[path, mask,
+                        {"id":"g","type":"group","children":["mask","content"],"clipMaskNodeId":"mask"},
+                        {"id":"content","type":"rectangle","width":40,"height":20,
+                         "fills":[{"id":"f","paint":{"type":"solid","color":"#ffffff"}}]}
+                    ],
+                    "pages":[{"id":"p","width":40,"height":20,"nodeIds":["visible","g"]}]
+                }));
+                let (plan, warnings) = crate::frame::build_coverage_plan(&s, 0, &Default::default()).unwrap();
+                assert!(warnings.is_empty(), "{warnings:?}");
+                let visible = plan.items.iter().find_map(|item| match item {
+                    DrawItem::Body { node_id, geometry, .. } if node_id == "visible" => Some(geometry),
+                    _ => None,
+                }).expect("visible stroke");
+                let band: Vec<_> = visible.positions.chunks_exact(6).zip(visible.vertex_types.chunks_exact(3))
+                    .filter(|(_, types)| *types == [1.0; 3]).flat_map(|(tri, _)| tri.iter().copied()).collect();
+                let m = &plan.masks[0];
+                assert_eq!(m.mask_type, expected);
+                assert_eq!(m.draws.len(), 1);
+                assert!(matches!(m.draws[0].paint, MaskPaint::Solid([1.0, 1.0, 1.0, 1.0])));
+                assert_eq!(m.positions.as_slice(), band, "{variant} {mask_type}");
+                if variant == "solid" || variant == "trim" {
+                    assert!(covers(&m.positions, [25.0, 5.05]));
+                    assert!(!covers(&m.positions, [27.0, 4.0]));
+                    assert_eq!(covers(&m.positions, [5.0, 0.1]), variant == "solid");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3827,7 +4110,11 @@ mod tests {
         assert_ne!(key(&m), initial, "fractional translation redraws");
         m.origin[0] -= 0.25;
         m.model_matrix[12] -= 0.25;
-        m.positions[0] += 0.5;
+        let previous = &masks.masks[r.mask_id as usize];
+        assert!(std::sync::Arc::ptr_eq(&m.positions, &previous.positions));
+        std::sync::Arc::make_mut(&mut m.positions)[0] += 0.5;
+        assert!(std::sync::Arc::ptr_eq(&m.draws, &previous.draws));
+        assert_eq!(key(previous), initial, "an issued frame keeps its geometry");
         assert_ne!(key(&m), initial, "geometry changes redraw");
         m.ancestor = Some(0);
         assert!(!local_coverage(&m, &coverage_placement(m.origin, m.size, 1., 8192)));
@@ -3875,6 +4162,23 @@ mod tests {
             "pages": [{"id":"p","width":1280.0,"height":800.0,"nodeIds":["g"]}],
             "config": {"renderPageClipping": true}
         }))
+    }
+
+    #[test]
+    fn clip_contains_ellipse_but_cuts_its_drawn_cubic() {
+        let at = |degrees: f64| {
+            (1920. * degrees.to_radians().cos(), 1000. + 1920. * degrees.to_radians().sin())
+        };
+        let (x0, y0) = at(-19.);
+        let (x1, y1) = at(70.99);
+        let s = scene(moda_scene::value::json!({
+            "nodes":[{"id":"clip","type":"container","width":1920.1,"height":3000,
+                      "clipContent":true,"children":["p"]},
+                     {"id":"p","type":"path","points":[{"type":"move","x":x0,"y":y0},
+                      {"type":"arc","x":x1,"y":y1,"rx":1920,"ry":1920,"xAxisRotation":0,"largeArc":false,"sweep":true}]}],
+            "pages":[{"id":"page","width":2000,"height":3000,"nodeIds":["clip"]}]
+        }));
+        assert!(!container_clip_is_redundant(&s, s.node("clip").unwrap(), "p"));
     }
 
     /// Warped mask bounds must map each warped corner through the
@@ -4208,41 +4512,6 @@ mod tests {
         assert_eq!(inner.origin, [160.0 + 120.0, 120.0 + 80.0]);
     }
 
-    /// The image source of a mask whose top fill is an image.
-    fn top_image_source(node: &RawNode) -> Option<MaskImage> {
-        match moda_scene::paint::top_fill(node)?.paint {
-            moda_scene::paint::Paint::Image(image) => image_mask_source(node, &image),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn image_mask_requires_pattern_no_repeat() {
-        let tiled = RawNode::from_value(moda_scene::value::json!({
-            "id":"m","type":"rectangle","width":64.0,"height":64.0,
-            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:image/png;base64,xxxx", "placement": {"repeat": "repeat"}}}]
-        }))
-        .unwrap();
-        assert!(
-            top_image_source(&tiled).is_none(),
-            "Q-21: tiling → geometry"
-        );
-        let no_pattern = RawNode::from_value(moda_scene::value::json!({
-            "id":"m","type":"rectangle","width":64.0,"height":64.0,
-            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#000"}}]
-        }))
-        .unwrap();
-        assert!(top_image_source(&no_pattern).is_none());
-        // A valid distort falls back to (warped) geometry coverage —
-        // the image-mask placement math cannot represent the warp.
-        let warped = RawNode::from_value(moda_scene::value::json!({
-            "id":"m","type":"rectangle","width":64.0,"height":64.0,
-            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:image/png;base64,xxxx", "placement": {"repeat": "no-repeat"}}}],"distort":{"type":"matrix","matrix":[1,0,0,0,1,0,0.3,0.1,1]}
-        }))
-        .unwrap();
-        assert!(top_image_source(&warped).is_none());
-    }
-
     /// A distort-warped GEOMETRY mask clips to the warped
     /// silhouette — the coverage triangles must land inside the warped quad,
     /// not the unwarped box.
@@ -4265,55 +4534,6 @@ mod tests {
             (max_x - 100.0 / 1.3).abs() < 1e-3,
             "warped coverage must end at the contracted edge, got {max_x}"
         );
-    }
-
-    /// A live Warp on the mask source (Effect ▸ Warp in Illustrator) clips to the warped outline, as the source
-    /// draws: the mask reads the node's resolved (effected) record, not its canonical one.
-    #[test]
-    fn live_warp_on_the_mask_source_clips_with_the_warped_outline() {
-        let s = scene(moda_scene::value::json!({
-            "nodes": [
-                {"id":"g","type":"group","x":0.0,"y":0.0,"children":["m","c"],"clipMaskNodeId":"m"},
-                {"id":"m","type":"path","x":20.0,"y":20.0,"width":360.0,"height":360.0,"closed":true,
-                 "points":[{"type":"move","x":0.0,"y":0.0},{"type":"line","x":360.0,"y":0.0},
-                           {"type":"line","x":360.0,"y":360.0},{"type":"line","x":0.0,"y":360.0}],
-                 "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#fff"}}],
-                 "effects":[{"id":"w","type":"warp","style":"flag","bend":40}]},
-                {"id":"c","type":"rectangle","x":0.0,"y":0.0,"width":400.0,"height":400.0,
-                 "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#f33"}}]}
-            ],
-            "pages": [{"id":"p","width":400.0,"height":400.0,"nodeIds":["g"]}]
-        }));
-        let mut pm = PlanMasks::default();
-        let r = pm.mask_ref_for_node(&s, "c").expect("masked");
-        let m = &pm.masks[r.mask_id as usize];
-        // Flag at 40 % moves the rows by up to 0.8 × the height at the quarter columns: the warped outline reaches
-        // well above and below the 360 px box, so the coverage (and its texture) do too.
-        let ys: Vec<f32> = m.positions.chunks(2).map(|p| p[1]).collect();
-        let (lo, hi) = ys.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &y| (a.min(y), b.max(y)));
-        assert!(lo < -20.0 && hi > 380.0, "coverage spans the warped outline, got y {lo}..{hi}");
-        assert!(m.size[1] > 400.0, "the texture covers the warped extent, got {:?}", m.size);
-        // A warped rectangle mask is no longer a plain box: no scissor hint from its unwarped box.
-        let clip = effective_page_clip(&s, "c", [0.0, 0.0, 400.0, 400.0]).expect("visible");
-        assert_eq!(clip, [0.0, 0.0, 400.0, 400.0]);
-    }
-
-    #[test]
-    fn a_live_warp_on_a_rectangle_mask_drops_its_box_scissor() {
-        let s = scene(moda_scene::value::json!({
-            "nodes": [
-                {"id":"g","type":"group","x":0.0,"y":0.0,"children":["m","c"],"clipMaskNodeId":"m"},
-                {"id":"m","type":"rectangle","x":100.0,"y":100.0,"width":200.0,"height":100.0,
-                 "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#fff"}}],
-                 "effects":[{"id":"w","type":"warp","style":"arch","bend":50}]},
-                {"id":"c","type":"rectangle","x":0.0,"y":0.0,"width":400.0,"height":400.0,
-                 "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#f33"}}]}
-            ],
-            "pages": [{"id":"p","width":400.0,"height":400.0,"nodeIds":["g"]}]
-        }));
-        // The arch lifts the top edge above y = 100: a scissor at the unwarped box would cut it off.
-        let clip = effective_page_clip(&s, "c", [0.0, 0.0, 400.0, 400.0]).expect("visible");
-        assert!(clip[1] < 100.0, "no scissor at the unwarped box, got {clip:?}");
     }
 
     fn text_mask_scene() -> Scene {
@@ -4509,123 +4729,34 @@ mod tests {
     }
 
     #[test]
-    fn variable_width_line_masks_with_its_outline() {
-        // brushes.md §4.9: an eye-profiled line masks thin at its ends, as it draws.
-        let n = RawNode::from_value(moda_scene::value::json!({
-            "id":"m","type":"line","points":[0.0,0.0,200.0,0.0],
-            "strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000"}, "width": 20, "profile": {"preset": "eye"}}]
+    fn image_mask_requires_pattern_no_repeat() {
+        let top_image_source = |node: &RawNode| match moda_scene::paint::top_fill(node)?.paint {
+            moda_scene::paint::Paint::Image(image) => image_mask_source(node, &image),
+            _ => None,
+        };
+        let tiled = RawNode::from_value(moda_scene::value::json!({
+            "id":"m","type":"rectangle","width":64.0,"height":64.0,
+            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:image/png;base64,xxxx", "placement": {"repeat": "repeat"}}}]
         }))
         .unwrap();
-        let positions = mask_geometry_positions(&n, None).positions;
-        let reach_near = |x0: f32| {
-            positions
-                .chunks(2)
-                .filter(|p| (p[0] - x0).abs() < 3.0)
-                .map(|p| p[1].abs())
-                .fold(0.0_f32, f32::max)
-        };
         assert!(
-            (reach_near(100.0) - 10.0).abs() < 0.5,
-            "full in the middle: {}",
-            reach_near(100.0)
+            top_image_source(&tiled).is_none(),
+            "Q-21: tiling → geometry"
         );
-        assert!(
-            reach_near(4.0) < 5.0,
-            "thin at the start: {}",
-            reach_near(4.0)
-        );
-    }
-
-    fn brushed_mask_scene(ring_fill: &str) -> Scene {
-        scene(moda_scene::value::json!({
-            "nodes": [
-                {"id":"art","type":"path","x":0.0,"y":0.0,"strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000000"}, "width": 1, "brush": {"brushId": "leaf"}}],"points":[{"type":"move","x":0,"y":0},{"type":"line","x":300,"y":0}]},
-                {"id":"dots","type":"path","x":0.0,"y":0.0,"strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000000"}, "width": 1, "brush": {"brushId": "rings"}}],"points":[{"type":"move","x":0,"y":0},{"type":"line","x":300,"y":0}]},
-                {"id":"nib","type":"path","x":0.0,"y":0.0,"strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000000"}, "width": 8, "brush": {"brushId": "flat"}}],"points":[{"type":"move","x":0,"y":0},{"type":"line","x":0,"y":200}]},
-            ],
-            "pages": [{"id":"p","width":400.0,"height":300.0,"nodeIds":["art","dots","nib"]}],
-            "brushes": [
-                {"id":"leaf","name":"Leaf","type":"art","scaleWithWeight":true,"scale":{"value":1},"fit":"stretch","direction":"right",
-                 "overlap":"none","colorize":{"method":"none"},
-                 "artwork":{"nodes":[{"id":"t","type":"path","closed":true,"fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#ff0000"}}],
-                   "points":[{"type":"move","x":0,"y":0},{"type":"line","x":100,"y":10},{"type":"line","x":0,"y":20}]}]}},
-                {"id":"rings","name":"Rings","type":"scatter","scaleWithWeight":true,"size":{"value":1},"spacing":{"value":1},
-                 "scatter":{"value":0},"rotation":{"value":0},"rotationRelativeTo":"path","colorize":{"method":"none"},
-                 "artwork":{"nodes":[{"id":"r","type":"ellipse","x":0,"y":0,"width":20,"height":20,
-                   "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": ring_fill}}],"strokes": [{"id": "stroke-0", "paint": {"type": "solid", "color": "#000000"}, "width": 2}]}]}},
-                {"id":"flat","name":"Flat","type":"calligraphic",
-                 "angle":{"value":0},"roundness":{"value":0.1},"size":{"value":1}},
-            ],
-            "config": {}
+        let no_pattern = RawNode::from_value(moda_scene::value::json!({
+            "id":"m","type":"rectangle","width":64.0,"height":64.0,
+            "fills": [{"id": "fill-0", "paint": {"type": "solid", "color": "#000"}}]
         }))
+        .unwrap();
+        assert!(top_image_source(&no_pattern).is_none());
+        // A valid distort falls back to (warped) geometry coverage —
+        // the image-mask placement math cannot represent the warp.
+        let warped = RawNode::from_value(moda_scene::value::json!({
+            "id":"m","type":"rectangle","width":64.0,"height":64.0,
+            "fills": [{"id": "fill-0", "paint": {"type": "image", "src": "data:image/png;base64,xxxx", "placement": {"repeat": "no-repeat"}}}],"distort":{"type":"matrix","matrix":[1,0,0,0,1,0,0.3,0.1,1]}
+        }))
+        .unwrap();
+        assert!(top_image_source(&warped).is_none());
     }
 
-    fn y_extent(positions: &[f32]) -> f32 {
-        positions.chunks(2).map(|p| p[1].abs()).fold(0.0, f32::max)
-    }
-
-    fn area(positions: &[f32]) -> f32 {
-        positions
-            .chunks_exact(6)
-            .map(|t| ((t[2] - t[0]) * (t[5] - t[1]) - (t[4] - t[0]) * (t[3] - t[1])).abs() / 2.0)
-            .sum()
-    }
-
-    fn x_extent(positions: &[f32]) -> f32 {
-        positions.chunks(2).map(|p| p[0].abs()).fold(0.0, f32::max)
-    }
-
-    #[test]
-    fn brushed_strokes_mask_with_their_drawn_geometry() {
-        let s = brushed_mask_scene("rgba(0, 0, 0, 0)");
-        let node = |id: &str| s.effective_node(id).unwrap().clone();
-        // Art: the stretched triangle (±10 across the path), not a 1-wide band.
-        let art = mask_geometry_positions(&node("art"), Some(&s));
-        assert!(
-            y_extent(&art.positions) > 8.0,
-            "{}",
-            y_extent(&art.positions)
-        );
-        assert!(y_extent(&mask_geometry_positions(&node("art"), None).positions) <= 0.51);
-        // Scatter of stroke-only rings: the ring bands, never the ring interiors.
-        let dots = mask_geometry_positions(&node("dots"), Some(&s));
-        assert!(
-            y_extent(&dots.positions) > 9.0,
-            "{}",
-            y_extent(&dots.positions)
-        );
-        // Band area π(11² − 9²) ≈ 126 per ring vs a filled disc's π·11² ≈ 380.
-        let filled = brushed_mask_scene("#000000");
-        let discs = mask_geometry_positions(
-            &filled.effective_node("dots").unwrap().clone(),
-            Some(&filled),
-        );
-        let ratio = area(&dots.positions) / area(&discs.positions);
-        assert!(ratio < 0.5, "ring bands, not discs: {ratio}");
-        // The `transparent` keyword (what the placer writes on stroke-only runs) too.
-        let kw = brushed_mask_scene("transparent");
-        let kw_dots =
-            mask_geometry_positions(&kw.effective_node("dots").unwrap().clone(), Some(&kw));
-        assert!(
-            (area(&kw_dots.positions) - area(&dots.positions)).abs() < 1.0,
-            "`transparent` rings mask as bands: {} vs {}",
-            area(&kw_dots.positions),
-            area(&dots.positions)
-        );
-        // Calligraphic, a flat nib (angle 0, roundness 0.1) on a vertical line:
-        // the nib is 8 wide across x — as the uniform stroke is — but thin along
-        // y, so the brushed outline differs from the plain stroke.
-        let nib = mask_geometry_positions(&node("nib"), Some(&s));
-        let plain = mask_geometry_positions(&node("nib"), None);
-        assert!(!nib.positions.is_empty());
-        assert_ne!(
-            nib.positions, plain.positions,
-            "calligraphic masks with its outline"
-        );
-        assert!(
-            x_extent(&nib.positions) <= 4.01,
-            "{}",
-            x_extent(&nib.positions)
-        );
-    }
 }

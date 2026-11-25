@@ -26,6 +26,10 @@ const FILES: &[(&str, &[u8])] = &[
         "references/assets.md",
         include_bytes!("../../../skills/vork/references/assets.md"),
     ),
+    (
+        "scripts/chunk-export.py",
+        include_bytes!("../../../skills/vork/scripts/chunk-export.py"),
+    ),
 ];
 const DESTINATIONS: &[&str] = &[".agents/skills/vork", ".claude/skills/vork"];
 

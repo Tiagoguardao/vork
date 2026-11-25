@@ -52,3 +52,5 @@ creating an invalid GPU handle. The caller owns recoverable jobs outside that
 scope and discards its mutable render state; ordinary panics still propagate.
 Abort-on-panic builds decline optional scopes. No ordinary allocation is refused
 outside an optional scope. The renderer uses this for bounded 2D frame workers.
+
+Native devices expose the binding size of a texture descriptor and of an allocated texture. Native texture handles share the first size query across their views and clones. Command encoders can attach a callback that receives their submission index when the queue accepts their command buffer. Capture admission uses that index to retire texture reads.

@@ -752,7 +752,7 @@ mod tests {
         }
         let scene: v2::Scene = serde_json::from_value(serde_json::json!({"version": 2,
             "composition": {"space": "2d", "view": {"program": "std/standard", "inputs": {"exposure": 1}}}, "render": {"resolution": [32, 32]}, "nodes": []}))?;
-        crate::canvas::check(&scene, Path::new("."), &r)
+        crate::canvas::check(&scene, Path::new("."), &r, &Default::default())
     }
 
     #[test]

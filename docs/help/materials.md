@@ -11,8 +11,8 @@ reflected base light. Coat absorption follows the refracted path through the lay
 std/previs renders emissive-lit scenes using low-sample raster ray lighting and
 warns when material-emitter lighting is approximated. A fast GPU denoiser cleans
 up this preview unless denoise=false was requested. Indirect light, reflections
-and transmission may be noisy or incomplete; use std/final or std/path for exact
-lighting. Proven unlit displays and null thin transmission need no warning.
+and transmission may be noisy or incomplete; use std/final for delivery or std/path
+for more complete light transport. Proven unlit displays and null thin transmission need no warning.
 Emission alone does not make a surface unlit.
 base_color is linear RGB; base_metalness=1
 makes metal; specular_roughness controls highlight width. Inputs and defaults:

@@ -10,6 +10,24 @@ pub struct Face {
     pub bytes: Vec<u8>,
 }
 
+/// A font parse failure keeps its source path so a session can name the authored asset.
+#[derive(Debug)]
+pub struct InvalidFont {
+    pub path: PathBuf,
+    reason: ttf_parser::FaceParsingError,
+}
+impl std::fmt::Display for InvalidFont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "font {}: not a TrueType or OpenType font ({})", self.path.display(), self.reason)
+    }
+}
+impl std::error::Error for InvalidFont {}
+
+pub(crate) fn parse_face<'a>(label: &str, bytes: &'a [u8]) -> Result<ttf_parser::Face<'a>> {
+    ttf_parser::Face::parse(bytes, 0)
+        .map_err(|reason| InvalidFont { path: label.into(), reason }.into())
+}
+
 /// The CSS `font-family` name of the `index`th font list, unique per list.
 pub fn family(index: usize) -> String {
     format!("vork-font-{index}")
@@ -56,8 +74,7 @@ pub fn host(lists: &[Vec<Face>]) -> Result<moda_text::TextHost> {
     for (index, list) in lists.iter().enumerate() {
         let mut variants = Vec::new();
         for (number, face) in list.iter().enumerate() {
-            let parsed = ttf_parser::Face::parse(&face.bytes, 0)
-                .map_err(|error| anyhow::anyhow!("font {}: not a TrueType or OpenType font ({error})", face.label))?;
+            let parsed = parse_face(&face.label, &face.bytes)?;
             let style = if parsed.is_italic() {
                 "italic"
             } else if parsed.is_oblique() {
@@ -71,7 +88,7 @@ pub fn host(lists: &[Vec<Face>]) -> Result<moda_text::TextHost> {
                 "atlas_urls": ["vork:vector-lane-only"], "ttf_url": url}));
             // Moda's store reads a manifest path joined to the host's directory, overlay first.
             files.insert(url, serde_json::json!({"path": file}));
-            keys.insert(format!("{index}-{number}"), serde_json::json!({"family": family(index), "ttfPath": file}));
+            keys.insert(format!("{index}-{number}"), serde_json::json!({"family": family(index), "ttfPath": file, "order": number}));
             overlay.insert(key(&file), face.bytes.clone());
         }
         families.push(serde_json::json!({"family_name": family(index), "category": "", "variants": variants}));

@@ -21,6 +21,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use crate::pattern::ImageFillState;
 use crate::AssetStore;
 
+mod reads;
+pub use reads::{AssetReads, CaptureReads, Publication};
+
 /// A store-resolved pattern texture in engine-seam shape.
 #[derive(Debug, Clone)]
 pub struct ResolvedAsset {
@@ -43,12 +46,10 @@ pub enum ResolvedPixels {
     /// Decoded, premultiplied sRGB RGBA8 on the heap (native CLI lane, the
     /// wasm SVG/shader paths, and every placeholder).
     Heap(Arc<Vec<u8>>),
-    /// A browser-decoded raster uploaded to a GPU texture (wasm editor
-    /// lane): no heap bytes. The engine sizes a texture to
-    /// `width`×`height` and fills it from the installed
-    /// `ExternalImageUploader` keyed by `key`; `upload_id` is the
-    /// retained-cache identity (a re-install bumps it).
-    External { key: String, upload_id: u64 },
+    /// A GPU image publication. Native footage supplies its immutable texture directly.
+    /// Browser rasters use the uploader registered for `key`. A fresh `upload_id`
+    /// identifies new pixels in either case.
+    External { key: String, upload_id: u64, texture: Option<Arc<wgpu::Texture>> },
 }
 
 fn slot() -> &'static RwLock<Option<Arc<AssetStore>>> {
@@ -70,6 +71,9 @@ pub fn install_store(store: Arc<AssetStore>) {
     let mut guard = slot().write().expect("asset store lock");
     let same = guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &store) || cur.same_resources(&store));
     if same { return; }
+    if !guard.as_ref().is_some_and(|old| old.same_layout(&store)) {
+        LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     *guard = Some(store);
     STORE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -79,12 +83,20 @@ pub fn install_store(store: Arc<AssetStore>) {
 /// baked the previous store's pattern states. 0 = never installed.
 static STORE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Advances when a plan can no longer reuse its pattern instances.
+pub fn layout_generation() -> u64 {
+    LAYOUT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn store_generation() -> u64 {
     STORE_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The installed store, if any (the pixel graph adds its sink images to a copy and re-installs it).
 pub fn installed() -> Option<Arc<AssetStore>> {
+    reads::observe_store();
     slot().read().expect("asset store lock").clone()
 }
 
@@ -97,92 +109,28 @@ pub fn replace_video_frames(frames: Vec<(String, Arc<crate::PreparedImage>)>) ->
         return false;
     }
     let store = Arc::make_mut(guard.get_or_insert_with(|| Arc::new(AssetStore::default())));
+    let frames: std::collections::HashMap<_, _> = frames.into_iter()
+        .map(|(id, image)| (format!("video:{id}"), image)).collect();
+    let same_layout = frames.iter().all(|(key, image)| store.image(key).is_some_and(|old| old.same_layout(image)));
     let removed = store.clear_prefixed("video:");
+    let same_layout = same_layout && frames.len() == removed;
     let changed = removed != 0 || !frames.is_empty();
-    for (node_id, image) in frames {
-        store.insert(format!("video:{node_id}"), crate::AssetEntry::Loaded(image));
+    for (key, image) in frames {
+        store.insert(key, crate::AssetEntry::Loaded(image));
     }
+    if !same_layout { LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
     if changed {
         STORE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     changed
 }
 
-/// Remove the installed store (tests).
+/// Remove the installed store.
 pub fn clear_store() {
-    *slot().write().expect("asset store lock") = None;
-}
-
-/// Resolve a pattern source against the installed store.
-///
-/// Returns `None` when no store is installed (callers fall back to their
-/// inline path). With a store installed, EVERY source resolves here — data
-/// URIs included — so the production sizing-policy resize (and its golden-
-/// visible smoothing) and SVG rasterization apply uniformly:
-/// - `Loaded` entries carry real texels + scale factor;
-/// - `Failed` / timed-out (`Loading`) entries map to the placeholder states
-///   (the caller binds its 1x1 grey/rose solids);
-/// - sources the store has never seen resolve as `Loading` (the browser's
-///   never-requested state — `WebGPUTextureManager.ts:445-459`).
-/// M4e: a store-resolved shader image (image-backed procedural fill).
-#[derive(Debug, Clone)]
-pub struct ResolvedShaderImage {
-    /// `ShaderImageResource.ready` — false for terminal fallback entries. The
-    /// engine converts this settled state to the failed placeholder ABI; an
-    /// absent entry remains the loading placeholder ABI.
-    pub ready: bool,
-    pub width: u32,
-    pub height: u32,
-    /// STRAIGHT-alpha sRGB RGBA8 (the canvas → `copyExternalImageToTexture`
-    /// copy is un-premultiplied — `premultipliedAlpha` unset).
-    pub rgba_straight: Arc<Vec<u8>>,
-    /// heatmap `contentRect`: [offsetX, offsetY, scaleX, scaleY].
-    pub content_rect: Option<[f64; 4]>,
-}
-
-/// M4e: resolve a shader-image resource key
-/// (`moda_shaders::runtime::image_resource_key`) against the installed
-/// store. `None` = no store installed OR key never prefetched — callers bind
-/// the fallback entry (`ready: false`, 1×1 transparent), exactly like
-/// `ShaderImageResourceManager.getFallback`.
-pub fn resolve_shader_image(key: &str) -> Option<ResolvedShaderImage> {
-    use crate::shader_image::ShaderImageEntry;
-    let guard = slot().read().expect("asset store lock");
-    let store = guard.as_ref()?;
-    let Some(entry) = store.shader_image(key) else {
-        // Store installed but key never prefetched — the caller binds the
-        // 1×1 transparent fallback; record the miss (collection bug class).
-        crate::report::record(crate::report::RuntimeEvent::PlaceholderBaked {
-            src: key.to_string(),
-            state: "never-prefetched".into(),
-            shader_image: true,
-        });
-        return None;
-    };
-    match entry {
-        ShaderImageEntry::Loaded(img) => Some(ResolvedShaderImage {
-            ready: true,
-            width: img.width,
-            height: img.height,
-            rgba_straight: Arc::clone(&img.rgba_straight),
-            content_rect: img.content_rect,
-        }),
-        ShaderImageEntry::Fallback => {
-            // WF5 r3 scream channel: a fallback bake at draw time is a
-            // missing resource (the pixels stay browser-parity transparent).
-            crate::report::record(crate::report::RuntimeEvent::PlaceholderBaked {
-                src: key.to_string(),
-                state: "failed".into(),
-                shader_image: true,
-            });
-            Some(ResolvedShaderImage {
-                ready: false,
-                width: 1,
-                height: 1,
-                rgba_straight: transparent_rgba(),
-                content_rect: None,
-            })
-        }
+    let mut guard = slot().write().expect("asset store lock");
+    if guard.take().is_some() {
+        LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STORE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -192,7 +140,7 @@ pub fn resolve_shader_image(key: &str) -> Option<ResolvedShaderImage> {
 /// so a `None` here means the key is Failed/absent. Shared by
 /// [`resolve`] (whose placeholder/telemetry handling wraps it) and
 /// [`resolve_streaming`].
-fn loaded_asset(store: &AssetStore, key: &str) -> Option<ResolvedAsset> {
+pub fn loaded_asset(store: &AssetStore, key: &str) -> Option<ResolvedAsset> {
     if let Some(img) = store.image(key) {
         Some(ResolvedAsset {
             state: ImageFillState::Loaded,
@@ -214,6 +162,10 @@ fn loaded_asset(store: &AssetStore, key: &str) -> Option<ResolvedAsset> {
             pixels: ResolvedPixels::External {
                 key: key.to_string(),
                 upload_id: meta.upload_id,
+                texture: match store.entries.get(key) {
+                    Some(crate::AssetEntry::DeviceFrame(_, texture)) => Some(texture.clone()),
+                    _ => None,
+                },
             },
         })
     } else {
@@ -233,12 +185,33 @@ fn loaded_asset(store: &AssetStore, key: &str) -> Option<ResolvedAsset> {
 /// (records no `PlaceholderBaked` scream-channel event) and returns `None` for
 /// any non-`Loaded` state so the caller can resolve the poster instead.
 pub fn resolve_streaming(key: &str) -> Option<ResolvedAsset> {
+    resolve_streaming_with(key, reads::Read::Pixels)
+}
+
+fn resolve_streaming_with(key: &str, usage: reads::Read) -> Option<ResolvedAsset> {
+    reads::observe(key, usage);
     let guard = slot().read().expect("asset store lock");
     let store = guard.as_ref()?;
     loaded_asset(store, key)
 }
 
 pub fn resolve(src: &str) -> Option<ResolvedAsset> {
+    resolve_with(src, reads::Read::Pixels)
+}
+
+/// Resolve the texture for an ordinary pattern draw. Its instance depends on
+/// resource layout. The publication index can replace same-layout pixels.
+pub fn resolve_pattern_binding(src: &str) -> Option<ResolvedAsset> {
+    resolve_with(src, reads::Read::Binding)
+}
+
+/// The live-frame arm of a pattern draw, with the ordinary poster fallback on a miss.
+pub fn resolve_streaming_binding(key: &str) -> Option<ResolvedAsset> {
+    resolve_streaming_with(key, reads::Read::Binding)
+}
+
+fn resolve_with(src: &str, usage: reads::Read) -> Option<ResolvedAsset> {
+    reads::observe(src, usage);
     let guard = slot().read().expect("asset store lock");
     let store = guard.as_ref()?;
     match store.fill_state(src) {
@@ -270,7 +243,6 @@ pub fn resolve(src: &str) -> Option<ResolvedAsset> {
                     (_, true) => "timed-out".into(),
                     (_, false) => "never-prefetched".into(),
                 },
-                shader_image: false,
             });
             Some(ResolvedAsset {
                 state,
@@ -287,12 +259,9 @@ pub fn resolve(src: &str) -> Option<ResolvedAsset> {
 }
 
 #[cfg(test)]
-mod tests {
+mod retained_native_regressions {
     use super::*;
-    use crate::decode::PreparedImage;
-    use crate::shader_image::ShaderImageEntry;
-    use crate::AssetEntry;
-    use moda_shaders::runtime::image_processing::PreparedShaderImage;
+    use crate::{AssetEntry, PreparedImage};
 
     #[test]
     fn resource_generations_follow_inputs_not_store_allocations() {
@@ -304,9 +273,6 @@ mod tests {
         store.insert("failed".into(), AssetEntry::Failed);
         let external = crate::ExternalImageMeta { width: 10, height: 20, scale_factor: (1., 1.), upload_id: 7 };
         store.insert_external("capture".into(), external.clone());
-        store.insert_shader_image("shader".into(), ShaderImageEntry::Loaded(Arc::new(PreparedShaderImage {
-            width: 1, height: 1, rgba_straight: Arc::new(vec![255; 4]), content_rect: None,
-        })));
         install_store(Arc::new(store.clone()));
         let held = installed().unwrap();
         let at = store_generation();
@@ -332,13 +298,13 @@ mod tests {
         next.insert("still".into(), AssetEntry::Loaded(Arc::new(
             PreparedImage::from_premultiplied(vec![255; 4], 1, 1))));
         changes.push(next); // A new payload identity writes even when its pixels happen to match.
-        let mut next = store.clone();
-        next.insert_shader_image("shader".into(), ShaderImageEntry::Fallback);
-        changes.push(next);
-        for next in changes {
+        let last = changes.len() - 1;
+        for (i, next) in changes.into_iter().enumerate() {
             install_store(Arc::new(store.clone()));
             let at = store_generation();
+            let layout = layout_generation();
             install_store(Arc::new(next.clone()));
+            assert_eq!(layout_generation(), layout + u64::from(i != last));
             assert_eq!(store_generation(), at + 1, "a changed input advances the generation");
             install_store(Arc::new(next));
             assert_eq!(store_generation(), at + 1);
@@ -346,8 +312,6 @@ mod tests {
         clear_store();
     }
 
-    // One test fn: these share the process-global store slot and must not
-    // run on parallel test threads.
     #[test]
     fn resolve_maps_store_states_and_none_without_store() {
         let _report = crate::report::tests::serial_globals();
@@ -372,16 +336,6 @@ mod tests {
             })),
         );
         store.insert("dead".into(), AssetEntry::Failed);
-        store.insert_shader_image(
-            "shader".into(),
-            ShaderImageEntry::Loaded(Arc::new(PreparedShaderImage {
-                width: 2,
-                height: 2,
-                rgba_straight: Arc::new(vec![9, 8, 7, 6].repeat(4)),
-                content_rect: Some([0.1, 0.2, 0.3, 0.4]),
-            })),
-        );
-        store.insert_shader_image("fallback".into(), ShaderImageEntry::Fallback);
         install_store(Arc::new(store));
 
         let ok = resolve("ok").unwrap();
@@ -409,24 +363,6 @@ mod tests {
         // never requested → Loading
         assert_eq!(resolve("unknown").unwrap().state, ImageFillState::Loading);
 
-        let shader = resolve_shader_image("shader").unwrap();
-        let shader_again = resolve_shader_image("shader").unwrap();
-        assert!(shader.ready);
-        assert_eq!((shader.width, shader.height), (2, 2));
-        assert_eq!(shader.content_rect, Some([0.1, 0.2, 0.3, 0.4]));
-        assert!(Arc::ptr_eq(
-            &shader.rgba_straight,
-            &shader_again.rgba_straight
-        ));
-
-        let fallback = resolve_shader_image("fallback").unwrap();
-        let fallback_again = resolve_shader_image("fallback").unwrap();
-        assert!(!fallback.ready);
-        assert!(Arc::ptr_eq(
-            &fallback.rgba_straight,
-            &fallback_again.rgba_straight
-        ));
-
         clear_store();
 
         // External (browser-decoded, GPU-resident) raster: Loaded state, no heap
@@ -447,7 +383,7 @@ mod tests {
         assert_eq!((ext.width, ext.height), (512, 342));
         assert_eq!(ext.scale_factor, (5.0, 5.0));
         match ext.pixels {
-            ResolvedPixels::External { key, upload_id } => {
+            ResolvedPixels::External { key, upload_id, .. } => {
                 assert_eq!(key, "ext");
                 assert_eq!(upload_id, 7);
             }
@@ -517,7 +453,7 @@ mod tests {
         assert_eq!(streamed.state, ImageFillState::Loaded);
         assert_eq!((streamed.width, streamed.height), (640, 360));
         match streamed.pixels {
-            ResolvedPixels::External { key, upload_id } => {
+            ResolvedPixels::External { key, upload_id, .. } => {
                 assert_eq!(key, "video:n1");
                 assert_eq!(upload_id, 42);
             }

@@ -277,7 +277,7 @@ impl super::Instance {
             extensions.push(khr::get_display_properties2::NAME);
         }
 
-        if flags.contains(wgt::InstanceFlags::DEBUG) {
+        if flags.contains(wgt::InstanceFlags::DEBUG) || super::fault::requested() {
             // VK_EXT_debug_utils
             extensions.push(ext::debug_utils::NAME);
         }

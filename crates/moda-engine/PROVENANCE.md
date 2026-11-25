@@ -19,7 +19,7 @@ second one, and keeps the rest of Moda's text planning (`text_draw.rs`'s plan si
 - `src/paint/draw.rs`, `src/frame.rs`: immutable image uploads can share ownership
   between engines on one device/working colour. Pixel identity changes replace
   entries; shared textures are never rewritten or explicitly destroyed by another
-  cache. Weak publication does not pin residency; mutable surfaces/streams stay local.
+  cache. Weak publication does not pin residency; mutable streams stay local.
 - `src/gpu_profile.rs`: disjoint worker/handoff recordings combine on the same GPU
   clock, retaining every pass and the complete first-to-last span.
 
@@ -55,8 +55,7 @@ second one, and keeps the rest of Moda's text planning (`text_draw.rs`'s plan si
   - `build_degraded_batch` keeps its signature and builds the raster batch with moda-text-draw's
     `build_degraded_batch` (the same code, ported there, taking the degraded engine) on Moda's process-wide
     degraded engine; its camera-build branch (screen-sized rasters and the zoom-limited notes) goes, as there.
-  - `patch_cached_batch` no longer sets `fill_shader`; `dump_batches_json` drops the `fillShader` entry; `greek_font_px` no longer reads `mask` and
-    `fill_shader`.
+  - `patch_cached_batch` updates placement and clipping for cached text.
   - `TextBuilder`, the `TEXT_BUILDER` thread local and `install_text_builder` are added: a host that lays out its
     own text installs a builder, and `build_richtext_item` hands it every richtext node with the model matrix it
     computes (`richtext_model_matrix`), z, effective clip and render scale. vork's canvas installs one: its text
@@ -83,15 +82,13 @@ second one, and keeps the rest of Moda's text planning (`text_draw.rs`'s plan si
 - `src/camera_slot.rs`: `group_has_masks`, `item_mask_id`, `set_item_mask_id` and the plan digest read no text
   batch mask. The slot holds no between-segment warnings; a splice that leaves a drawing unit past
   `depth::MAX_RENDER_Z` falls back to a full build (which refuses it).
-- `src/residency.rs`: `batch_bytes` counts no text shader fill; `items_use_shader_time` and
-  `items_shader_time_rethreadable` treat a text batch as reading no clock; `drawitem_mask` reads no text mask.
+- `src/residency.rs`: `batch_bytes` accounts for vector and raster text batches. `drawitem_mask` reads masks from bodies and layer composites.
 - Comments only, for vork's public-source export checks: `external_texture.rs` (a test comment names Moda's agent
-  instructions rather than their file), `export_job.rs` and `residency.rs` (the export caches' study is not named),
-  `gpu_profile.rs` and `tess/tessellator.rs` (their references to Moda's examples, which are not ported, say so).
+  instructions rather than their file), `gpu_profile.rs` and `tess/tessellator.rs` (their references to Moda's examples, which are not ported, say so).
 - Not ported: integration test targets in `tests/`, `examples/`, `SEAMS.md`; the unit-test fixtures below are restored.
-- Every `create_render_pipeline` and `create_compute_pipeline` call (23 sites: `src/frame.rs`, `src/isolated.rs`,
+- Every `create_render_pipeline` and `create_compute_pipeline` call (in `src/frame.rs`, `src/isolated.rs`,
   `src/convert.rs`, `src/surface.rs`, `src/nv12.rs`, `src/motion_cache.rs`, `src/backdrop/{blend,exec}.rs`,
-  `src/layer_blur/exec.rs`, `src/pixel/pass.rs`, `src/solid/render.rs`, `src/effects/{mask,mask_filter}.rs`) goes
+  `src/layer_blur/exec.rs`, `src/solid/render.rs`, `src/effects/{mask,mask_filter}.rs`) goes
   through `moda_text_draw::device::create_render_pipeline` / `create_compute_pipeline`, so the host's pipeline
   creation (vork's persistent pipeline cache) serves them. The descriptors are unchanged.
 

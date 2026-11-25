@@ -28,9 +28,7 @@ pub(crate) fn validate_ffmpeg_rate(fps: Time, path: &Path) -> Result<()> {
 fn validate_rate(fps: Time, path: &Path, max_denominator: i64) -> Result<()> {
     ensure!(fps > Time::ZERO, "fps must be positive; use fps 24");
     if fps.numerator() > MAX_NUMERATOR || fps.denominator() > max_denominator {
-        let format = if path
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("mov"))
+        let format = if crate::is_prores(&path)
         {
             "MOV"
         } else {

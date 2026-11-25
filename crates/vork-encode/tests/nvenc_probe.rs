@@ -10,7 +10,7 @@ use std::process::Command;
 fn nvenc_probe_preserves_driver_diagnosis() {
     const CHILD: &str = "VORK_TEST_NVENC_PROBE";
     if std::env::var_os(CHILD).is_some() {
-        let error = vork_encode::probe_ffmpeg_nvenc(1920, 1080).unwrap_err();
+        let error = vork_encode::probe_ffmpeg_nvenc(7680, 4320).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("Driver does not support the required nvenc API version"), "{message}");
         assert!(message.contains("Required: 13.0 Found: 12.2"), "{message}");
@@ -19,7 +19,7 @@ fn nvenc_probe_preserves_driver_diagnosis() {
     let root = std::env::temp_dir().join(format!("vork-probe-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let ffmpeg = root.join("ffmpeg");
-    test_support::write_executable(&ffmpeg, b"#!/bin/sh\nprintf '%s\\n' 'Driver does not support the required nvenc API version. Required: 13.0 Found: 12.2' >&2\nexit 1\n").unwrap();
+    test_support::write_executable(&ffmpeg, b"#!/bin/sh\nfor arg do [ \"$arg\" = color=size=7680x4320 ] && break; done\n[ \"$arg\" = color=size=7680x4320 ] || exit 0\nprintf '%s\\n' 'Driver does not support the required nvenc API version. Required: 13.0 Found: 12.2' >&2\nexit 1\n").unwrap();
     let result = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "nvenc_probe_preserves_driver_diagnosis", "--nocapture"])
         .env(CHILD, "1").env("PATH", &root).output().unwrap();

@@ -258,21 +258,20 @@ pub fn round_path_corners(
 }
 
 /// `roundPathCorners(points, closed, radius, style)` with the points' own settings in `corners.points`.
-pub fn round_path_corners_with(
-    points: &[BlendPathPoint],
-    closed: bool,
+pub fn round_path_corners_with<'a>(
+    points: &'a [BlendPathPoint],
+    closure: impl Into<crate::path_points::PathClosure<'a>>,
     corners: &PathCorners,
 ) -> Vec<BlendPathPoint> {
-    if !corners.rounds_anything() {
-        return points.to_vec();
-    }
-    if points.len() < 2 {
+    if !corners.rounds_anything() || points.len() < 2 {
         return points.to_vec();
     }
 
-    let mut out: Vec<BlendPathPoint> = Vec::new();
-    for (offset, subpath) in split_into_subpaths(points) {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for (subpath, closed) in closure.into().contours(points, |p| matches!(p, BlendPathPoint::Move { .. })) {
         out.extend(round_subpath(subpath, offset, closed, corners));
+        offset += subpath.len();
     }
     out
 }
@@ -289,7 +288,9 @@ pub fn max_uniform_corner_radius(points: &[BlendPathPoint], closed: bool) -> f64
         return f64::INFINITY;
     }
     let mut best = f64::NEG_INFINITY;
-    for (_, subpath) in split_into_subpaths(points) {
+    for (subpath, closed) in crate::path_points::PathClosure::Uniform(closed)
+        .contours(points, |p| matches!(p, BlendPathPoint::Move { .. }))
+    {
         let Some((segs, _, ring)) = ring_segments(subpath, closed) else {
             continue;
         };
@@ -311,26 +312,6 @@ pub fn max_uniform_corner_radius(points: &[BlendPathPoint], closed: bool) -> f64
     } else {
         best
     }
-}
-
-/// `splitPathIntoSubpaths` (`core/geometry/pathHitTest.ts:30-50`): a `move`
-/// starts a new run; a leading non-move is kept in the first run regardless.
-/// Each run comes with the index of its first point.
-fn split_into_subpaths(points: &[BlendPathPoint]) -> Vec<(usize, &[BlendPathPoint])> {
-    let mut out: Vec<(usize, &[BlendPathPoint])> = Vec::new();
-    let mut start = 0usize;
-    for (i, p) in points.iter().enumerate() {
-        if matches!(p, BlendPathPoint::Move { .. }) {
-            if i > start {
-                out.push((start, &points[start..i]));
-            }
-            start = i;
-        }
-    }
-    if start < points.len() {
-        out.push((start, &points[start..]));
-    }
-    out
 }
 
 /// Normalized segments plus, for each, the subpath index of the anchor it ends

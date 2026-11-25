@@ -21,6 +21,26 @@ static_assertions::assert_impl_all!(Texture: Send, Sync);
 crate::cmp::impl_eq_ord_hash_proxy!(Texture => .inner);
 
 impl Texture {
+    /// Actual backing size, when exposed by the native resource.
+    pub fn binding_size(&self) -> Option<u64> {
+        #[cfg(all(wgpu_core, std))]
+        if let Some(texture) = self.inner.as_core_opt() {
+            return *texture.binding_size.get_or_init(|| self.native_binding_size());
+        }
+        self.native_binding_size()
+    }
+
+    fn native_binding_size(&self) -> Option<u64> {
+        // SAFETY: queries read immutable allocation metadata and never destroy the handle.
+        #[cfg(vulkan)]
+        if let Some(t) = unsafe { self.as_hal::<hal::api::Vulkan>() } { return t.binding_size(); }
+        #[cfg(metal)]
+        if let Some(t) = unsafe { self.as_hal::<hal::api::Metal>() } { return Some(t.binding_size()); }
+        #[cfg(dx12)]
+        if let Some(t) = unsafe { self.as_hal::<hal::api::Dx12>() } { return Some(t.binding_size()); }
+        None
+    }
+
     /// Get the [`wgpu_hal`] texture from this `Texture`.
     ///
     /// Find the Api struct corresponding to the active backend in [`wgpu_hal::api`],

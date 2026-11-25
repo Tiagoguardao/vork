@@ -1204,7 +1204,7 @@ impl TextMeasurer for VectorMeasurer<'_> {
             let mut width = 0.0;
             for (i, chunk) in text.split(crate::runs::EMOJI_PLACEHOLDER).enumerate() {
                 if i > 0 {
-                    width += style.font_size + style.letter_spacing;
+                    width += style.emoji.as_ref().map_or(1., |s| s.advance_em) * style.font_size + style.letter_spacing;
                 }
                 width += self.measure(chunk, style);
             }

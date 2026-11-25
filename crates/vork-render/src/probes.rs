@@ -117,8 +117,6 @@ pub(crate) struct Volume {
     pub(crate) grid: Grid,
     #[cfg(test)]
     layout: Vec<Grid>,
-    #[cfg(test)]
-    placement_ms:f64,
     bounces: u32,
     /// Time-dependent geometry or materials (deformation, compute, programs,
     /// material tracks): every new sample time re-traces the volume.
@@ -389,8 +387,6 @@ impl Volume {
             grid,
             #[cfg(test)]
             layout: Vec::new(),
-            #[cfg(test)]
-            placement_ms:field.placement_ms,
             demand,
             bounces,
             timed,

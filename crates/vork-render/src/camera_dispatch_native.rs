@@ -6,11 +6,12 @@ pub(crate) struct Native {
     pub modules: Vec<(String,String)>,
     pub include: Vec<PathBuf>,
     pub standard_camera: bool,
+    pub inputs: Vec<vork_slang::InputIdentity>,
 }
 
 pub(crate) fn generate<'a>(abi: &vork_slang::Abi, instances: impl IntoIterator<Item=(u32,&'a vork_slang::CameraProgram)>) -> Native {
     use std::fmt::Write;
-    let mut native=Native {modules:abi.native_modules(),include:Vec::new(),standard_camera:false};
+    let mut native=Native {modules:abi.native_modules(),..Default::default()};
     let mut imports="import vork;\n".to_owned();
     let mut cameras=String::new();let mut sensors=String::new();
     for (id,program) in instances {
@@ -19,7 +20,7 @@ pub(crate) fn generate<'a>(abi: &vork_slang::Abi, instances: impl IntoIterator<I
             writeln!(imports,"import {name};").unwrap();
             let mut source=program.native.clone();
             for dependency in &program.dependencies {
-                if let Ok(bytes)=std::fs::read(dependency) {writeln!(source,"// dependency {}",blake3::hash(&bytes)).unwrap();}
+                if let Ok(bytes)=vork_slang::RevisionFiles::read(dependency) {writeln!(source,"// dependency {}",blake3::hash(&bytes)).unwrap();}
             }
             native.modules.push((name,source));
             native.include.extend(program.include.clone());

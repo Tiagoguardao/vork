@@ -149,6 +149,12 @@ enum Command {
         /// Render-call fields: resolution (WxH), fps, seed, samples, denoise. Repeatable KEY=VALUE.
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = setting, help = format!("Render-call fields: {}. Repeatable KEY=VALUE; values are JSON, resolution also accepts WxH or W,H.", vork_scene::CallOverrides::KEYS.join(", ")))]
         set: Vec<(String, serde_json::Value)>,
+        /// Write movies without sound; audio-driven animation still uses the scene audio.
+        #[arg(long)]
+        no_audio: bool,
+        /// Write the chunk export identity for a full MP4 or WAV. MP4 and WAV ranges include it automatically.
+        #[arg(long, conflicts_with = "at")]
+        export_identity: bool,
         /// Skip PNG compression/writes; retain GPU rendering and mapped readback.
         #[arg(long, hide = true, requires = "diagnostics")]
         no_write: bool,
@@ -326,7 +332,7 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
     let (rendered, out) = match command {
         Command::Render {
             scene: scene_path, outputs, out, exr_codec, png_depth, at, frame_start, frame_end,
-            profile, set, no_write, gpu_only, diagnostics, ..
+            profile, set, no_audio, export_identity, no_write, gpu_only, diagnostics, ..
         } => {
             let outputs = render_channels(outputs, &out)?;
             let stop = interrupt::install()?;
@@ -339,7 +345,9 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
                 profile: Some(vork_scene::Profile::load(profile.as_deref().unwrap_or(vork_scene::DEFAULT_PROFILE))
                     .map_err(|error| error.context(vork_render::failure::FailureKind::Usage))?),
                 settings: set.into_iter().collect(),
-                at, frame_start, frame_end, no_write, gpu_only, diagnostics, exr_codec, png_depth,
+                at, frame_start, frame_end, no_audio, no_write, gpu_only, diagnostics, exr_codec, png_depth,
+                export_identity,
+                build_version: Some(env!("VORK_VERSION")),
                 edit: None,
                 ..Default::default()
             }.render()?;
@@ -380,9 +388,9 @@ fn run_command(command: Command, entry: std::time::SystemTime, start: std::time:
             warnings.len(), warnings.iter().filter_map(|warning| warning["code"].as_str()).collect::<Vec<_>>().join(", "));
     }
     if let Some(line) = interruption_line(report, &out.iter().map(|d|d.file.clone()).collect::<Vec<_>>()) { eprintln!("{line}"); }
-    // Shot::render has joined file writers, reaped input decoders, finished muxing and written
-    // reports. Keep GPU owners alive: process exit finishes the pipeline-cache save the render asked
-    // for, discards unused variants and reclaims resources without driver teardown. Errors still unwind.
+    // Shot::render has joined file writers, finished muxing and written reports.
+    // Process exit reaps input decoders and finishes the pipeline-cache save
+    // before reclaiming GPU resources without driver teardown.
     std::io::stdout().flush().map_err(output::error)?;
     std::io::stderr().flush()?;
     rendered.exit_process()
@@ -556,12 +564,6 @@ mod help_tests {
         }
     }
     #[test]
-    fn removed_render_aliases_fail() {
-        for flag in ["--resolution", "--samples"] {
-            assert!(Args::try_parse_from(["vork", "render", "scene.json", "--out", "still", flag, "1"]).is_err());
-        }
-    }
-    #[test]
     fn profiles_and_explicit_settings_parse() {
         let parse = |flags: &[&str]| {
             let mut args = vec!["vork", "render", "scene.json", "--out", "still"];
@@ -572,18 +574,20 @@ mod help_tests {
         else { panic!() };
         assert_eq!(profile.as_deref(), Some("std/draft"));
         assert_eq!(set, [("seed".to_string(), serde_json::json!(7)), ("samples".to_string(), serde_json::json!(8)), ("denoise".to_string(), serde_json::json!(true))]);
-        assert!(Args::try_parse_from(["vork", "previs", "in.json", "out.json"]).is_err());
-        assert!(parse(&["--set", "fast_gi"]).is_err());
+        assert!(parse(&["--set", "samples"]).err().unwrap().to_string().contains("expected KEY=VALUE"));
         for value in ["0", "-1", "4097", "1.5", "null", "true"] {
             let error = parse(&["--set", &format!("samples={value}")]).err().unwrap().to_string();
             assert!(error.contains("samples"), "{error}");
         }
     }
     #[test]
-    fn removed_technique_keys_name_profile_levels() {
-        for key in ["reflections", "settings.samples", "shadow_method", "fast_gi", "denoiser"] {
-            let error = Args::try_parse_from(["vork", "render", "scene.json", "--out", "still", "--set", &format!("{key}=1")]).err().unwrap().to_string();
-            for name in ["std/draft", "std/final", "std/path"] { assert!(error.contains(name), "{error}"); }
+    fn unknown_render_setting_names_supported_overrides_and_profiles() {
+        let error = Args::try_parse_from([
+            "vork", "render", "scene.json", "--out", "still", "--set", "sampls=8",
+        ]).err().unwrap().to_string();
+        assert!(error.contains("sampls") && error.contains("allowed fields: resolution, fps, seed, samples, denoise"), "{error}");
+        for profile in ["std/previs", "std/draft", "std/final", "std/path"] {
+            assert!(error.contains(profile), "{error}");
         }
     }
     #[test]

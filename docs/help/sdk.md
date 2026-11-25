@@ -20,6 +20,20 @@ and warnings for omitted effects.
 Session keeps the GPU and installed scene between calls: open installs or replaces
 a whole scene, render returns revision, reuse, installs and provisional with its results,
 and close releases resources. Edit and provisional semantics: vork help render.
+For two looks at the generated starter in one Python process:
+
+    import json
+    from pathlib import Path
+    from vork import Session
+
+    scene = json.loads(Path("scene.json").read_text())
+    with Session() as session:
+        session.open(scene, base=".")
+        session.render("before.png", profile="std/previs")
+        scene["nodes"][0]["translation"][0] += 0.25
+        session.open(scene, base=".")
+        session.render("after.png", profile="std/previs")
+
 VORK_BIN selects the executable. Types: vork.types, TS Scene; schema: sdk/scene.schema.json in the archive (packages/ts/scene.schema.json in source).
 
 SDK render helpers require current completion metadata, including warnings.

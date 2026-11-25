@@ -345,6 +345,7 @@ known_keys! {
     VerticalAlign = "verticalAlign",
     Vertices = "vertices",
     Visible = "visible",
+    VorkPaint = "vorkPaint",
     VorkText = "vorkText",
     Warnings = "warnings",
     Wave = "wave",

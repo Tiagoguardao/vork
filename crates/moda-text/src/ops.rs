@@ -114,12 +114,7 @@ pub struct TextNodeSpec {
     /// fillPriority 'color' + fill → solid override of every run color.
     pub fill_override: Option<String>,
     pub gradient: Option<GradientSpec>,
-    /// fillPriority 'shader' + a text-fill-ELIGIBLE fillShaderId (the caller
-    /// applies `supportsMsdfTextFill` and packs the instance): main-pass
-    /// glyph segments emit `TextOpPipeline::MsdfShaderFill`. Ineligible ids
-    /// leave this false and per-run colors apply (the production fallback,
-    /// `WebGPUTextSystem.ts:599-621`).
-    pub shader_fill: bool,
+
     /// The node's text effects from `effects` (drop shadows, glow, echo,
     /// extrude), pre-resolved exactly like `WebGPUTextSystem.resolveNodeEffects`
     /// (WebGPUTextSystem.ts:551-585): hidden entries, non-drawing drop
@@ -193,7 +188,6 @@ impl TextNodeSpec {
             && self.opacity == other.opacity
             && self.stroke_width == other.stroke_width
             && self.gradient == other.gradient
-            && self.shader_fill == other.shader_fill
             && self.effects == other.effects
             && self.unit_transforms == other.unit_transforms
             && self.unit_groups == other.unit_groups

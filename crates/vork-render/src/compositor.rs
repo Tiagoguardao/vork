@@ -3,7 +3,7 @@ use super::*;
 use vork_slang::{Compiler, CompositeProgram};
 mod images;
 mod canvas;
-pub(crate) use canvas::CanvasGraph;
+pub(crate) use canvas::{CanvasGraph, CanvasGraphPrograms};
 #[derive(Clone, Copy)]
 pub(crate) enum Normalization {
     None,
@@ -16,6 +16,7 @@ impl Normalization {
 }
 pub(crate) struct Program {
     compiled: CompositeProgram,
+    pub(crate) install_identity: vork_slang::InputIdentity,
     words: wgpu::Buffer,
     input_words: Vec<u32>,
     animation: Option<programs::InputAnimation>,
@@ -271,10 +272,13 @@ fn install_instances(
         hash.update(origin.to_string_lossy().as_bytes());
         let key = hash.finalize();
         let tag = key.to_hex();
+        let compiler = Compiler::discover();
+        let install_identity = programs::program_identity(&r.disk_cache, &compiler, &abi, &source, &origin)
+            .with_context(|| format!("{path}: material {name}, program {}", material.program))?;
         let compiled = programs::cached(
             r,
             key,
-            &Compiler::discover(),
+            &compiler.with_identity(&install_identity),
             &abi, &source, &origin,
             |compiler| {
                 compiler.compile_composite_bound(
@@ -319,6 +323,7 @@ fn install_instances(
             name.clone(),
             Program {
                 compiled,
+                install_identity,
                 words,
                 input_words,
                 animation,
@@ -327,6 +332,7 @@ fn install_instances(
             },
         );
     }
+    vork_slang::InputIdentity::verify_all(result.values().map(|program| &program.install_identity))?;
     Ok(result)
 }
 

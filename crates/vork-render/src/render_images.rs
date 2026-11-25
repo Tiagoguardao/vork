@@ -142,9 +142,11 @@ pub(crate) fn plan(
     let (mip_pipelines,mip_sampler)=materials::mip_resources(r);
     order
         .iter()
-        .map(|name| {
+        .zip(&s.image_settings)
+        .map(|(name, installed_settings)| {
             let source = input.images[name].render.as_ref().unwrap();
-            let settings = input.images[name].resolved_render(&s.render).expect("a rendered image");
+            let mut settings = input.images[name].resolved_render(&s.render).expect("a rendered image");
+            settings.settings = installed_settings.clone();
             ensure!(
                 settings
                     .resolution
@@ -520,4 +522,121 @@ pub(crate) fn publication_pipeline(r: &Renderer) -> wgpu::ComputePipeline {
         compilation_options: Default::default(),
         cache: r.cache.as_ref(),
     })
+}
+
+#[cfg(test)]
+mod previs_views {
+    use super::*;
+
+    fn scene(main: &str, captures: &[&str], output: Option<&str>) -> Result<v2::Scene> {
+        let mut value = serde_json::json!({"version":2,
+            "materials":{
+                "source":{"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":683}},
+                "receiver":{"inputs":{"base_color":[0.8,0.8,0.8]}},
+                "screen":{"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":683,"emission_color":[0.2,0.5,0.8]}}},
+            "nodes":[{"name":"camera","type":"camera","translation":[0,0,5]},
+                {"name":"screen_camera","type":"camera","translation":[20,0,5]},
+                {"name":"world","children":[
+                    {"name":"source","type":"mesh","visible_camera":false,"translation":[-1,1,2],"materials":["source"],"geometry":{"std":"rounded_box","size":[2,2,0.1],"radius":0}},
+                    {"name":"receiver","type":"mesh","materials":["receiver"],"geometry":{"std":"rounded_box","size":[4,4,0.1],"radius":0}}]},
+                {"name":"ui","children":[{"name":"screen","type":"mesh","translation":[20,0,0],"materials":["screen"],"geometry":{"std":"rounded_box","size":[4,4,0.1],"radius":0}}]},
+                {"name":"empty"}],
+            "render":{"root":main,"camera":if main=="world" {"camera"} else {"screen_camera"},"resolution":[32,32],"background":[0,0,0]}});
+        if output == Some("world") {
+            value["programs"]["receiver"] = serde_json::json!({"source": "
+                struct Inputs {};
+                Closure surface(ShadingContext ctx, Inputs inputs) {
+                    Closure s = {};
+                    s.base_weight = 1.;
+                    s.base_color = float3(.8);
+                    s.geometry_opacity = 1.;
+                    s.geometry_normal = ctx.NORMAL;
+                    return s;
+                }"});
+            value["materials"]["receiver"] = serde_json::json!({"program":"receiver"});
+        }
+        if !captures.is_empty() {
+            // Tiny, nonzero contributions retain the producers and main beauty
+            // without perceptibly changing the view under comparison.
+            let mut inputs=serde_json::json!({"beauty":{"channel":"color"}});
+            let mut fields="Image beauty;".to_string();
+            let mut expression=format!("compositor_sample(i.beauty,c.uv)*{}",if output.is_some() {"1e-20"} else {"1"});
+            for name in captures {
+                value["images"][name]=serde_json::json!({"render":{"root":name,"camera":if *name=="world" {"camera"} else {"screen_camera"},"resolution":[32,32],"background":[0,0,0]}});
+                inputs[name]=serde_json::json!({"image":name});
+                fields.push_str(&format!("Image {name};"));
+                expression.push_str(&format!("+compositor_sample(i.{name},c.uv)*{}",if output==Some(*name) {"1"} else {"1e-20"}));
+            }
+            value["composition"]=serde_json::json!({"space":"3d","compositor":[{"material":{
+                "program":{"source":format!("struct Inputs {{{fields}}};float4 composite(CompositeContext c,Inputs i){{return {expression};}}")},"inputs":inputs}}]});
+        }
+        let mut scene=crate::test_scene(value,Path::new("."))?;
+        scene.apply_settings(vork_scene::Profile::load("std/previs")?.resolve(&Default::default())?,"std/previs")?;
+        Ok(scene)
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang"]
+    fn emitter_providers_and_passes_are_view_local() -> Result<()> {
+        let r=Renderer::new()?;
+        for main in ["world","ui"] {
+            let mut isolated=r.install(scene(main,&[],None)?,Path::new("."))?;
+            let mut isolated_slot=isolated.create_frame_slot(&r,ReadbackPrecision::Float)?;
+            let expected=isolated.render_frame(&r,&mut isolated_slot,0.)?.linear_rgba.context("isolated pixels")?;
+            let mut mixed=r.install(scene(main,&["world","ui","empty"],None)?,Path::new("."))?;
+            assert_eq!(mixed.render.settings.integrator.indirect().is_some(),main=="world","main {main}");
+            let mut slot=mixed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+            let has_pass=|view:&crate::view::ViewState,pass|view.recording().steps.iter().any(|step|step.pass==pass);
+            let assert_passes=|view:&crate::view::ViewState,needed| {
+                assert_eq!(has_pass(view,crate::graph::Pass::Ao),needed,"GI pass");
+                assert_eq!(has_pass(view,crate::graph::Pass::Reflections),needed,"reflection pass");
+            };
+            assert_passes(&slot.view,main=="world");
+            for (image,capture) in mixed.graph.views.image_renders().zip(&slot.image_views) {
+                let needed=image.name=="world";
+                assert_eq!(image.settings.settings.integrator.indirect().is_some(),needed,"capture {}",image.name);
+                assert_eq!(image.settings.settings.bounded_secondary_compilation,needed,"capture {}",image.name);
+                assert_passes(&capture.view,needed);
+                if !needed {
+                    assert!(!has_pass(&capture.view,crate::graph::Pass::Denoise),"capture {}",image.name);
+                }
+            }
+            // Capture-only emitter lighting still needs the shared source table.
+            assert!(mixed.rays.as_ref().is_some_and(|rays| rays.emitter_weights.is_some()));
+            let actual=mixed.render_frame(&r,&mut slot,0.)?.linear_rgba.context("mixed pixels")?;
+            for c in 0..4 {
+                let max=actual.iter().zip(&expected).map(|(a,b)|(a[c]-b[c]).abs()).fold(0_f32,f32::max);
+                let rmse=(actual.iter().zip(&expected).map(|(a,b)|f64::from(a[c]-b[c]).powi(2)).sum::<f64>()/actual.len() as f64).sqrt();
+                assert!(rmse<=1e-5 && max<=1e-4,"main {main}, channel {c}: RMSE={rmse}, max={max}");
+            }
+            assert!(actual.iter().any(|p|p[0]>0.01),"nonblack {main}");
+        }
+        // The qualifying capture must also preserve its lighting when the
+        // main view changes providers. Exercise the authored receiver in both views.
+        let mut reference: Option<Vec<[f32;4]>>=None;
+        for main in ["world","ui"] {
+            let mut installed=r.install(scene(main,&["world","ui","empty"],Some("world"))?,Path::new("."))?;
+            let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+            let pixels=installed.render_frame(&r,&mut slot,0.)?.linear_rgba.context("capture pixels")?;
+            assert!(pixels.iter().any(|p| p[0] > 0.01), "nonblack authored receiver");
+            for (image,capture) in installed.graph.views.image_renders().zip(&slot.image_views) {
+                let needed=image.name=="world";
+                assert!(!capture.sampled_uniforms.is_empty());
+                for u in &capture.sampled_uniforms {
+                    assert_eq!(u.flags[3],f32::from(needed),"{}: indirect uniform",image.name);
+                    assert_eq!(u.ao[1],f32::from(needed),"{}: GI uniform",image.name);
+                    assert_eq!(u.projection[2],if needed {constants::REFLECTIONS_RAY} else {constants::REFLECTIONS_ENVIRONMENT},"{}: reflection uniform",image.name);
+                }
+            }
+            if let Some(expected)=&reference {
+                for c in 0..4 {
+                    let max=pixels.iter().zip(expected).map(|(a,b)|(a[c]-b[c]).abs()).fold(0_f32,f32::max);
+                    let rmse=(pixels.iter().zip(expected).map(|(a,b)|f64::from(a[c]-b[c]).powi(2)).sum::<f64>()/pixels.len() as f64).sqrt();
+                    assert!(rmse<=1e-5 && max<=1e-4,"capture channel {c}: RMSE={rmse}, max={max}");
+                }
+            }
+            reference=Some(pixels);
+        }
+        Ok(())
+    }
 }

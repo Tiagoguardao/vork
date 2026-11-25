@@ -23,6 +23,8 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
 
     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>);
 
+    fn records_resource_transitions(&self) -> bool;
+
     unsafe fn transition_buffers(&mut self, barriers: &[BufferBarrier<'_, dyn DynBuffer>]);
     unsafe fn transition_textures(&mut self, barriers: &[TextureBarrier<'_, dyn DynTexture>]);
 
@@ -235,6 +237,10 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
 
     unsafe fn reset_all(&mut self, command_buffers: Vec<Box<dyn DynCommandBuffer>>) {
         unsafe { C::reset_all(self, command_buffers.into_iter().map(|cb| cb.unbox())) }
+    }
+
+    fn records_resource_transitions(&self) -> bool {
+        C::RECORDS_RESOURCE_TRANSITIONS
     }
 
     unsafe fn transition_buffers(&mut self, barriers: &[BufferBarrier<'_, dyn DynBuffer>]) {

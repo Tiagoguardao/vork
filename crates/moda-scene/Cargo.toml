@@ -8,6 +8,8 @@ publish = false
 description = "Moda's scene layer: scene JSON to a normalized, expanded display list; paints, strokes, effects and path geometry."
 
 [dependencies]
+rayon = "1.12"
+kurbo = "0.13.1"
 flo_curves = "=0.8.1"
 # Integer-robust polygon booleans: Offset Path (path_geom/offset_path.rs) and the
 # boolean / Pathfinder solver's polygon lane (path_bool/overlay.rs).
@@ -19,10 +21,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = "2"
 # FxHash for the scene's id-keyed indexes (the std SipHash dominated plan building in wasm).
 rustc-hash = "2"
-
-[lints.rust]
-# Moda's `code` feature (live generators through the moda-code sandbox) is not ported; its cfg stays declared.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("code"))'] }
+hashbrown = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }

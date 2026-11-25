@@ -100,10 +100,11 @@ impl Queries {
         let inputs=std::slice::from_ref(&prepared.identity);
         let (identity,prepared_native)=programs::native_input_identity(&cache,&compiler,&modules,"compute_query_main",&[("vork_entry","compute")],&args,&identities,inputs)?;
         let receipt_path=programs::native_input_receipt_path(&cache,&compiler,&modules,"compute_query_main",&[("vork_entry","compute")],&args,&identities,inputs)?;
-        let code=programs::native_code(&identity,prepared_native,inputs,&receipt_path,
+        let (code, identity)=programs::native_code(identity,prepared_native,inputs,&receipt_path,
             |identity|cache(blake3::hash(identity)),
             ||compiler.prepare_identified_modules(&modules,"compute_query_main",&[("vork_entry","compute")],&args,&identities),
             |prepared|prepared.compile())?;
+        crate::programs::session_inputs::record(&identity)?;
         let module=native::module(&r.device,"compute geometric query",Some(&code),None,(0,0,0));
         let entries:Vec<_>=types.iter().map(|(binding,ty)|pipelines::buffer_entry(*binding,wgpu::ShaderStages::COMPUTE,ty.map_or(wgpu::BufferBindingType::Uniform,|read_only|wgpu::BufferBindingType::Storage {read_only}))).collect();
         let compute_layout=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("compute query buffers"),entries:&entries});

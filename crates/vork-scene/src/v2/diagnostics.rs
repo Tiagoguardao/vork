@@ -33,7 +33,7 @@ pub fn member(parent: &str, key: &str) -> String {
 /// one (`render.shutter` finds `render.motion_blur.shutter`).
 pub fn unknown<'a>(kind: &str, name: &str, valid: impl IntoIterator<Item = &'a str>) -> String {
     if kind == "field" && matches!(name, "preservesPitch" | "preserves_pitch") {
-        return format!("unknown field {name:?}; use time.pitch: keep; see `vork help upgrade`");
+        return crate::migration::message("preservesPitch", &[("name", &format!("{name:?}"))]);
     }
     if kind == "program" && let Some(message) = crate::libraries::removed_module(name) {
         return message;
@@ -42,13 +42,11 @@ pub fn unknown<'a>(kind: &str, name: &str, valid: impl IntoIterator<Item = &'a s
     let valid: Vec<&str> = valid.into_iter().collect();
     for (old, new) in [("FRACTION", "FRACT"), ("fraction", "fract")] {
         if matches!(kind, "member" | "token") && name == old && valid.contains(&new) {
-            return format!("unknown {kind} {name:?}; it was renamed {new:?}; see `vork help upgrade`");
+            return crate::migration::message("MathOperation.FRACTION", &[("kind", kind), ("name", &format!("{name:?}")), ("new", &format!("{new:?}"))]);
         }
     }
-    if kind == "program" && matches!(name,
-        "std/fog" | "blender/principled_volume" | "blender.volume" |
-        "post/vignette" | "post/lens_distortion" | "post/glare" | "std/highlight") {
-        return format!("unknown program {name:?}; this program was removed; see `vork help upgrade`");
+    if kind == "program" && let Some(message) = crate::migration::known_message(&format!("program.{name}"), &[]) {
+        return message;
     }
     // Error-only Blender vocabulary; these names are never accepted as aliases.
     const BLENDER_HINTS: &[(&str, &str, &str)] = &[
@@ -62,7 +60,6 @@ pub fn unknown<'a>(kind: &str, name: &str, valid: impl IntoIterator<Item = &'a s
         ("value", "Filmic", "composition.view with the blender/filmic display program"),
         ("value", "ORTHO", "ortho (lowercase)"),
         ("field", "extension", "wrap_s/wrap_t on the image"),
-        ("program", "blender/principled", "std/openpbr"),
     ];
     if let Some((_, _, hint)) = BLENDER_HINTS.iter().find(|(k, n, _)| *k == kind && *n == name) {
         return format!("unknown {kind} {name:?}; use {hint}{}",
@@ -189,7 +186,7 @@ pub(super) fn decode_error(bytes: &[u8], original: serde_json::Error) -> anyhow:
         value.sort_all_objects();
         if value.get("animation").and_then(Value::as_array)
             .is_some_and(|layers| layers.iter().any(|layer| layer.get("blend").and_then(Value::as_str) == Some("add"))) {
-            return anyhow::anyhow!("animation.layer.blend: use \"combine\" instead of \"add\"; see `vork help upgrade`");
+            return anyhow::anyhow!(crate::migration::message("animation.layer.blend.add", &[]));
         }
         // The walker expects shared fields on the parent (see inspect).
         let schema = super::schema::full_schema().to_value();

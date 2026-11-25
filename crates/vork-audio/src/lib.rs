@@ -1,9 +1,9 @@
 //! CPU sound samples and analysis. No rendering device or output-frame clock.
 use anyhow::{Context, Result, ensure};
 use std::{
-    io::Read,
-    path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
+    io::{BufReader, Read},
+    path::Path,
+    process::{ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
 };
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -15,103 +15,217 @@ pub struct Clip {
     pub frames: Vec<Frame>,
 }
 
-/// A sound file decoded front to back, only as far as a mix has needed it. One decoder runs
-/// per source from the file's first frame and is kept where it stopped, so a longer need
-/// continues it: no frame is decoded twice, and a prefix holds the very samples a whole decode
-/// holds. Nothing seeks, so no codec or resampler has to land on the same sample grid twice.
+/// The shared, decoded prefix of a sound file. Readers own the active decoders. The source pins their input revision.
 pub struct Source {
-    path: PathBuf,
+    revision: Arc<vork_media::MediaRevision>,
     pub rate: u32,
     channels: u32,
+    picture: Option<PictureTimeline>,
     /// Sample frames in the file, when its header says: a WAV does, a decoder's stream does not.
     length: Option<usize>,
     decoded: Mutex<Decoded>,
 }
+struct PictureTimeline {
+    origin: f64,
+    duration: Option<f64>,
+    /// Packet timestamps can round by one container tick, plus one output sample on rescaling.
+    tolerance: f64,
+}
 struct Decoded {
     /// The frames decoded so far, from the first.
     clip: Arc<Clip>,
-    /// The decoder, standing after the last frame of `clip`; none before the first read and
-    /// after the end of the file.
-    stream: Option<Stream>,
     whole: bool,
 }
+
+/// Decoding state for one mix, opened only when the mix needs new samples.
+pub struct Reader<'a> {
+    source: &'a Source,
+    stream: Option<Stream>,
+    position: usize,
+}
 enum Stream {
-    Wav(hound::WavReader<std::io::BufReader<std::fs::File>>),
+    Wav(Wav),
     External(External),
 }
+struct Wav {
+    input: BufReader<vork_media::MediaReader>,
+    spec: hound::WavSpec,
+    sample_bytes: usize,
+    length: usize,
+}
+
+impl Wav {
+    fn open(input: vork_media::MediaReader) -> hound::Result<Self> {
+        let reader = hound::WavReader::new(BufReader::new(input))?;
+        let spec = reader.spec();
+        let length = reader.duration() as usize;
+        let samples = reader.len();
+        let mut input = reader.into_inner();
+        // Hound leaves the input at the PCM payload, immediately after its
+        // four-byte chunk length. Recover the stored width, which can include
+        // padding beyond the valid bits reported in the WAV spec.
+        let sample_bytes = if samples > 0 {
+            let mut size = [0; 4];
+            input.seek_relative(-4)?;
+            input.read_exact(&mut size)?;
+            (u32::from_le_bytes(size) / samples) as usize
+        } else {
+            0
+        };
+        Ok(Self {
+            input,
+            spec,
+            sample_bytes,
+            length,
+        })
+    }
+
+    fn frame_bytes(&self) -> usize {
+        self.sample_bytes * usize::from(self.spec.channels)
+    }
+
+    fn append(&mut self, output: &mut Vec<Frame>, wanted: usize) -> Result<()> {
+        use hound::SampleFormat::{Float, Int};
+        if wanted == 0 {
+            return Ok(());
+        }
+        let spec = self.spec;
+        let channels = usize::from(spec.channels);
+        match (spec.sample_format, self.sample_bytes, spec.bits_per_sample) {
+            (Int, 1, 8) => self.read(output, wanted, channels, |[x]| {
+                f32::from(i16::from(x) - 128) * (1. / 128.)
+            }),
+            (Int, 2, 16) => self.read(output, wanted, channels, |bytes| {
+                f32::from(i16::from_le_bytes(bytes)) * (1. / 32_768.)
+            }),
+            (Int, 3, 24) => self.read(output, wanted, channels, |[a, b, c]| pcm24(a, b, c)),
+            (Int, 4, 24) => self.read(output, wanted, channels, |[a, b, c, _]| pcm24(a, b, c)),
+            (Int, 4, 32) => self.read(output, wanted, channels, |bytes| {
+                // Scaling by this power of two commutes with f32 rounding.
+                i32::from_le_bytes(bytes) as f32 * (1. / 2_147_483_648.)
+            }),
+            (Float, 4, 32) => {
+                let first = output.len();
+                self.read(output, wanted, channels, f32::from_le_bytes)?;
+                ensure!(
+                    output[first..].iter().flatten().all(|x| x.is_finite()),
+                    "audio: nonfinite source sample"
+                );
+                Ok(())
+            }
+            _ => Err(hound::Error::Unsupported.into()),
+        }
+    }
+
+    fn read<const N: usize>(
+        &mut self,
+        output: &mut Vec<Frame>,
+        mut wanted: usize,
+        channels: usize,
+        sample: impl Fn([u8; N]) -> f32,
+    ) -> Result<()> {
+        let mut bytes = [0; 32 * 1024];
+        let stride = N * channels;
+        output.reserve(wanted);
+        while wanted > 0 {
+            let count = wanted.min(bytes.len() / stride);
+            let chunk = &mut bytes[..count * stride];
+            self.input.read_exact(chunk)?;
+            if channels == 1 {
+                output.extend(chunk.as_chunks::<N>().0.iter().map(|&raw| [sample(raw); 2]));
+            } else {
+                output.extend(
+                    chunk
+                        .as_chunks::<N>()
+                        .0
+                        .chunks_exact(2)
+                        .map(|pair| [sample(pair[0]), sample(pair[1])]),
+                );
+            }
+            wanted -= count;
+        }
+        Ok(())
+    }
+}
+
+fn pcm24(a: u8, b: u8, c: u8) -> f32 {
+    // The signed sample occupies the low 24 bits, including in the padded layout.
+    i32::from_le_bytes([0, a, b, c]) as f32 * (1. / 2_147_483_648.)
+}
+
 /// The user's decoder, blocked on its output pipe between reads.
 struct External {
-    child: Child,
+    child: vork_media::DecoderProcess,
     stdout: ChildStdout,
     errors: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
-impl Drop for External {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 impl Source {
-    fn wav(path: &Path) -> bool {
-        path.extension()
-            .is_some_and(|x| x.eq_ignore_ascii_case("wav"))
-    }
-    fn new(path: &Path, rate: u32, channels: u32, length: Option<usize>) -> Self {
+    fn new(revision: Arc<vork_media::MediaRevision>, rate: u32, channels: u32, length: Option<usize>) -> Self {
         Self {
-            path: path.to_path_buf(),
+            revision,
             rate,
             channels,
+            picture: None,
             length,
             decoded: Mutex::new(Decoded {
                 clip: Arc::new(Clip {
                     rate,
                     frames: Vec::new(),
                 }),
-                stream: None,
                 whole: false,
             }),
         }
     }
-    /// Read the file's layout and start its decoder: the first frame is decoded here, so a
-    /// file that is missing, has no sound stream or does not decode is refused when it is
-    /// opened, not when it is first mixed. The decoder then waits there for the first mix.
+    /// Read the layout and first sample frame to validate the file at open.
     pub fn open(path: &Path) -> Result<Self> {
-        let source = Self::layout(path)?;
-        source.prefix(1)?;
-        Ok(source)
+        Self::open_optional(path)?.context("audio: file has no audio stream")
     }
-    /// The file's rate, channels and, where its header says, length.
-    fn layout(path: &Path) -> Result<Self> {
-        if Self::wav(path) {
-            let reader = hound::WavReader::open(path)
-                .with_context(|| format!("audio: {}", path.display()))?;
-            let spec = reader.spec();
+    /// An implicit soundtrack is absent when the file has no audio stream.
+    pub fn open_optional(path: &Path) -> Result<Option<Self>> {
+        Self::open_revision(vork_media::MediaRevision::open(path)?)
+    }
+
+    pub fn open_revision(revision: Arc<vork_media::MediaRevision>) -> Result<Option<Self>> {
+        let Some((source, stream)) = Self::layout(revision)? else {
+            return Ok(None);
+        };
+        Reader {
+            source: &source,
+            stream,
+            position: 0,
+        }
+        .prefix(1)?;
+        Ok(Some(source))
+    }
+
+    fn layout(revision: Arc<vork_media::MediaRevision>) -> Result<Option<(Self, Option<Stream>)>> {
+        let path = revision.original();
+        if let Ok(reader) = Wav::open(revision.reader()?) {
+            let spec = reader.spec;
             ensure!(
                 matches!(spec.channels, 1 | 2),
                 "audio: {} channels are not built yet; use mono or stereo",
                 spec.channels
             );
             ensure!(spec.sample_rate > 0, "audio: sample rate must be positive");
-            return Ok(Self::new(
-                path,
+            let source = Self::new(
+                revision,
                 spec.sample_rate,
                 spec.channels.into(),
-                Some(reader.duration() as usize),
-            ));
+                Some(reader.length),
+            );
+            return Ok(Some((source, Some(Stream::Wav(reader)))));
         }
         // The user's decoder is a separate executable, never linked or bundled.
-        let probe = Command::new("ffprobe")
-            .args([
+        let probe = revision
+            .input(Command::new("ffprobe").args([
                 "-v",
                 "error",
-                "-select_streams",
-                "a:0",
                 "-show_entries",
-                "stream=channels",
+                "stream=codec_type,channels,time_base,duration:stream_disposition=attached_pic:format=format_name",
                 "-of",
-                "csv=p=0",
-            ])
-            .arg(path)
+                "json",
+            ]))?
             .output()
             .context("audio: install ffmpeg and ffprobe to decode this file")?;
         ensure!(
@@ -120,15 +234,42 @@ impl Source {
             path.display(),
             String::from_utf8_lossy(&probe.stderr).trim()
         );
-        let channels: u32 = String::from_utf8_lossy(&probe.stdout)
-            .trim()
-            .parse()
-            .context("audio: file has no audio stream")?;
+        let probe: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
+        revision.check_format(probe["format"]["format_name"].as_str().unwrap_or(""))?;
+        let streams = probe["streams"].as_array().context("audio: no streams")?;
+        let Some(audio) = streams.iter().find(|stream| stream["codec_type"] == "audio") else {
+            return Ok(None);
+        };
+        let channels = audio["channels"].as_u64().context("audio: missing channel count")?;
         ensure!(
             matches!(channels, 1 | 2),
             "audio: {channels} channels are not built yet; use mono or stereo"
         );
-        Ok(Self::new(path, SAMPLE_RATE, channels, None))
+        let mut source = Self::new(revision.clone(), SAMPLE_RATE, channels as u32, None);
+        if let Some(video) = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .filter(|stream| stream["disposition"]["attached_pic"].as_u64() != Some(1))
+        {
+            let tick = |stream: &serde_json::Value| -> Result<f64> {
+                let (num, den) = stream["time_base"].as_str().and_then(|base| base.split_once('/'))
+                    .context("audio: missing stream time base")?;
+                let (num, den) = (num.parse::<u32>()?, den.parse::<u32>()?);
+                ensure!(num > 0 && den > 0, "audio: invalid stream time base");
+                Ok(f64::from(num) / f64::from(den))
+            };
+            source.picture = Some(PictureTimeline {
+                origin: vork_media::first_picture_pts(&revision)? as f64 * tick(video)?,
+                duration: video["duration"].as_str().and_then(|duration| duration.parse::<f64>().ok())
+                    .filter(|duration| duration.is_finite() && *duration > 0.),
+                tolerance: tick(audio)? + 1. / f64::from(SAMPLE_RATE),
+            });
+        }
+        Ok(Some((source, None)))
+    }
+    /// The picture stream header's duration, when it declares one.
+    pub fn picture_duration(&self) -> Option<f64> {
+        self.picture.as_ref().and_then(|picture| picture.duration)
     }
     /// The file's length in sample frames at `rate`. Only a decoder's stream end tells the
     /// length of a file without a WAV header, so that file is decoded to its end.
@@ -138,144 +279,67 @@ impl Source {
             None => Ok(self.prefix(usize::MAX)?.frames.len()),
         }
     }
-    /// The file's first `frames` sample frames at least, or all of it when it is shorter.
-    /// Decoding continues from where the last call stopped.
+    pub fn reader(&self) -> Reader<'_> {
+        Reader {
+            source: self,
+            stream: None,
+            position: 0,
+        }
+    }
+
+    /// Read a prefix and close the decoder before returning.
     pub fn prefix(&self, frames: usize) -> Result<Arc<Clip>> {
-        let mut decoded = self.decoded.lock().unwrap();
-        let decoded = &mut *decoded;
-        let have = decoded.clip.frames.len();
-        if decoded.whole || have >= frames {
-            return Ok(decoded.clip.clone());
-        }
-        let wanted = frames - have;
-        let more = match self.read(&mut decoded.stream, wanted) {
-            Ok(more) => more,
-            Err(error) => {
-                // A failed decoder cannot continue: the next read starts the file again.
-                decoded.stream = None;
-                decoded.clip = Arc::new(Clip {
-                    rate: self.rate,
-                    frames: Vec::new(),
-                });
-                return Err(error);
-            }
-        };
-        let ended = more.len() < wanted;
-        // In place unless a mix still holds the shorter prefix.
-        Arc::make_mut(&mut decoded.clip).frames.extend(more);
-        if ended || self.length == Some(decoded.clip.frames.len()) {
-            decoded.whole = true;
-            decoded.stream = None;
-        }
-        Ok(decoded.clip.clone())
+        self.reader().prefix(frames)
     }
-    /// The next `wanted` frames of the stream, fewer only at the end of the file.
-    fn read(&self, stream: &mut Option<Stream>, wanted: usize) -> Result<Vec<Frame>> {
-        if stream.is_none() {
-            *stream = Some(self.start()?);
-        }
-        match stream.as_mut().expect("started above") {
-            Stream::Wav(reader) => {
-                let spec = reader.spec();
-                let channels = spec.channels as usize;
-                let count = wanted.saturating_mul(channels);
-                let samples = match spec.sample_format {
-                    hound::SampleFormat::Float => reader
-                        .samples::<f32>()
-                        .take(count)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    hound::SampleFormat::Int => {
-                        let scale = 2_f64.powi(i32::from(spec.bits_per_sample) - 1);
-                        reader
-                            .samples::<i32>()
-                            .take(count)
-                            .map(|s| s.map(|x| (f64::from(x) / scale) as f32))
-                            .collect::<Result<Vec<_>, _>>()?
-                    }
-                };
-                ensure!(
-                    samples.iter().all(|x| x.is_finite()),
-                    "audio: nonfinite source sample"
-                );
-                Ok(samples
-                    .chunks_exact(channels)
-                    .map(|c| [c[0], c[channels - 1]])
-                    .collect())
-            }
-            Stream::External(decoder) => {
-                // The decoder writes the same stream however it is read: it waits on its
-                // pipe after each read and is stopped when the source is dropped.
-                let limit = (wanted as u64).saturating_mul(8);
-                let mut bytes = Vec::new();
-                (&mut decoder.stdout)
-                    .take(limit)
-                    .read_to_end(&mut bytes)?;
-                if (bytes.len() as u64) < limit {
-                    let status = decoder.child.wait()?;
-                    let errors = decoder
-                        .errors
-                        .take()
-                        .map(|errors| errors.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    ensure!(
-                        status.success(),
-                        "audio: cannot decode {}: {}",
-                        self.path.display(),
-                        String::from_utf8_lossy(&errors).trim()
-                    );
-                    ensure!(
-                        bytes.len() % 8 == 0,
-                        "audio: incomplete decoded sample frame"
-                    );
-                }
-                let frames: Vec<Frame> = bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        [
-                            f32::from_le_bytes(b[..4].try_into().unwrap()),
-                            f32::from_le_bytes(b[4..].try_into().unwrap()),
-                        ]
-                    })
-                    .collect();
-                ensure!(
-                    frames.iter().flatten().all(|x| x.is_finite()),
-                    "audio: nonfinite decoded sample"
-                );
-                Ok(frames)
-            }
-        }
-    }
+
     /// Open the decoder at the file's first frame.
     fn start(&self) -> Result<Stream> {
-        if Self::wav(&self.path) {
-            let reader = hound::WavReader::open(&self.path)
-                .with_context(|| format!("audio: {}", self.path.display()))?;
-            let spec = reader.spec();
+        if self.length.is_some() {
+            let reader = Wav::open(self.revision.reader()?)
+                .with_context(|| format!("audio: {}", self.revision.original().display()))?;
+            let spec = reader.spec;
             ensure!(
-                u32::from(spec.channels) == self.channels && spec.sample_rate == self.rate,
+                u32::from(spec.channels) == self.channels
+                    && spec.sample_rate == self.rate
+                    && Some(reader.length) == self.length,
                 "audio: {} changed while it was open",
-                self.path.display()
+                self.revision.original().display()
             );
             return Ok(Stream::Wav(reader));
         }
         let mut decoder = Command::new("ffmpeg");
-        decoder
-            .args(["-v", "error", "-nostdin", "-i"])
-            .arg(&self.path);
-        if self.channels == 1 {
-            decoder.args(["-af", "pan=stereo|c0=c0|c1=c0"]);
+        decoder.args(["-v", "error", "-nostdin"]);
+        if self.picture.is_some() {
+            decoder.arg("-copyts");
         }
-        let mut child = decoder
+        self.revision.input(decoder.arg("-i"))?;
+        let mono = "pan=stereo|c0=c0|c1=c0";
+        if let Some(picture) = &self.picture {
+            // Preserve packet timing through resampling. first_pts pads/trims at the
+            // picture origin; async fills or cuts later hard timestamp discontinuities.
+            let layout = if self.channels == 1 {
+                format!("{mono},")
+            } else {
+                String::new()
+            };
+            let filter = format!(
+                "{layout}asettb=1/48000,asetpts=PTS-round(({})*48000),aresample=48000:async=1:first_pts=0:min_hard_comp={}",
+                picture.origin, picture.tolerance
+            );
+            decoder.args(["-af", &filter]);
+        } else if self.channels == 1 {
+            decoder.args(["-af", mono]);
+        }
+        decoder
             .args([
                 "-map", "0:a:0", "-f", "f32le", "-ac", "2", "-ar", "48000", "pipe:1",
             ])
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let child = vork_media::DecoderProcess::start(decoder)
             .context("audio: install ffmpeg to decode this file")?;
-        let stdout = child.stdout.take().expect("piped decoder output");
-        let mut stderr = child.stderr.take().expect("piped decoder errors");
+        let stdout = child.stdout();
+        let mut stderr = child.stderr().expect("piped decoder errors");
         // Drained beside the samples so a talkative decoder never blocks on its error pipe.
         let errors = std::thread::spawn(move || {
             let mut text = Vec::new();
@@ -287,6 +351,123 @@ impl Source {
             stdout,
             errors: Some(errors),
         }))
+    }
+}
+
+impl Reader<'_> {
+    /// Read at least this many frames, or all of a shorter file. A live decoder
+    /// continues across batches; a new one advances to the shared prefix first.
+    pub fn prefix(&mut self, frames: usize) -> Result<Arc<Clip>> {
+        let source = self.source;
+        let mut decoded = source.decoded.lock().unwrap();
+        let have = decoded.clip.frames.len();
+        if decoded.whole || have >= frames {
+            if decoded.whole {
+                self.stream = None;
+            }
+            return Ok(decoded.clip.clone());
+        }
+
+        // Take ownership before reading so failures close the decoder without
+        // changing the already published samples.
+        let (mut stream, position) = match self.stream.take() {
+            Some(stream) => (stream, self.position),
+            None => (source.start()?, 0),
+        };
+        if have > position {
+            match &mut stream {
+                Stream::Wav(wav) => {
+                    wav.input
+                        .seek_relative(((have - position) * wav.frame_bytes()) as i64)?;
+                }
+                Stream::External(decoder) => {
+                    // Replay from the origin so codec, timestamps and resampling
+                    // match a continuous decode. Discard the cached PCM in the pipe.
+                    let bytes = (have - position) as u64 * 8;
+                    let skipped = std::io::copy(
+                        &mut (&mut decoder.stdout).take(bytes),
+                        &mut std::io::sink(),
+                    )?;
+                    if skipped != bytes {
+                        decoder.finish(source.revision.original())?;
+                        anyhow::bail!(
+                            "audio: {} ended before the cached prefix",
+                            source.revision.original().display()
+                        );
+                    }
+                }
+            }
+        }
+        let wanted = frames - have;
+        let output = &mut Arc::make_mut(&mut decoded.clip).frames;
+        let append = match &mut stream {
+            Stream::Wav(wav) => wav.append(output, wanted.min(wav.length - have)),
+            Stream::External(decoder) => decoder.append(output, wanted, source.revision.original()),
+        };
+        // Failed reads leave the shared prefix valid and close this decoder.
+        if let Err(error) = append {
+            output.truncate(have);
+            return Err(error);
+        }
+        let end = output.len();
+        decoded.whole = end < frames || source.length == Some(end);
+        self.position = end;
+        if !decoded.whole {
+            self.stream = Some(stream);
+        }
+        Ok(decoded.clip.clone())
+    }
+}
+
+impl External {
+    fn append(&mut self, output: &mut Vec<Frame>, mut wanted: usize, path: &Path) -> Result<()> {
+        let mut bytes = [0; 32 * 1024];
+        let mut partial = 0;
+        let first = output.len();
+        while wanted > 0 {
+            let limit = wanted.min(bytes.len() / 8) * 8;
+            let read = match self.stdout.read(&mut bytes[partial..limit]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                self.finish(path)?;
+                ensure!(partial == 0, "audio: incomplete decoded sample frame");
+                break;
+            }
+            let count = partial + read;
+            let (frames, remainder) = bytes[..count].as_chunks::<8>();
+            output.extend(frames.iter().map(|&[a, b, c, d, e, f, g, h]| {
+                [
+                    f32::from_le_bytes([a, b, c, d]),
+                    f32::from_le_bytes([e, f, g, h]),
+                ]
+            }));
+            wanted -= frames.len();
+            partial = remainder.len();
+            bytes.copy_within(count - partial..count, 0);
+        }
+        ensure!(
+            output[first..].iter().flatten().all(|x| x.is_finite()),
+            "audio: nonfinite decoded sample"
+        );
+        Ok(())
+    }
+
+    fn finish(&mut self, path: &Path) -> Result<()> {
+        let status = self.child.wait()?;
+        let errors = self
+            .errors
+            .take()
+            .and_then(|errors| errors.join().ok())
+            .unwrap_or_default();
+        ensure!(
+            status.success(),
+            "audio: cannot decode {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&errors).trim()
+        );
+        Ok(())
     }
 }
 
@@ -313,6 +494,19 @@ impl Clip {
     }
     fn cutoff(rate: u32, speed: f64) -> f64 {
         (SAMPLE_RATE as f64 / (rate as f64 * speed.abs())).min(1.)
+    }
+
+    /// A run of aligned unit-speed output frames, when every read can use the PCM directly.
+    pub fn aligned_frames(&self, start: i64, count: usize) -> Option<&[Frame]> {
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(count)?;
+        // In this range the rounded seconds and their product with the rate differ
+        // from the exact frame number by less than 2^-25, inside sample's 1e-7 test.
+        // A frame strictly inside the slice also precedes the clip's rounded duration.
+        if self.rate != SAMPLE_RATE || end > 1 << 27 {
+            return None;
+        }
+        self.frames.get(start..end)
     }
 
     /// Windowed sinc reconstruction, with a rate-dependent antialias cutoff.
@@ -471,6 +665,27 @@ mod tests {
     }
     #[test]
     #[ignore = "requires user-installed ffmpeg and ffprobe"]
+    fn short_packet_gap_is_silent_on_the_picture_timeline() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("vork-audio-gap-{}.mkv", std::process::id()));
+        let status = Command::new("ffmpeg").args([
+            "-v", "error", "-y", "-f", "lavfi", "-i", "color=s=16x16:r=24:d=1",
+            "-f", "lavfi", "-i", "aevalsrc=0.25:s=48000:d=1",
+            "-af", "asetnsamples=n=1024,aselect='not(eq(n,10))'",
+            "-c:v", "mpeg4", "-c:a", "pcm_s16le",
+        ]).arg(&path).status()?;
+        ensure!(status.success(), "create packet-gap movie");
+        let clip = Clip::load(&path)?;
+        // Matroska packet timestamps round to milliseconds. Check inside the
+        // missing 1024-sample block, and either side of it.
+        assert_eq!(clip.frames[10_000], [0.25; 2]);
+        assert!(clip.frames[10_300..11_200].iter().all(|frame| *frame == [0.; 2]));
+        assert_eq!(clip.frames[11_500], [0.25; 2]);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires user-installed ffmpeg and ffprobe"]
     fn external_decoder_preserves_mono_amplitude() {
         let path = std::env::temp_dir().join(format!("vork-audio-mono-{}.bin", std::process::id()));
         let mut wav = hound::WavWriter::create(
@@ -493,26 +708,27 @@ mod tests {
         assert!(decoded.frames.iter().all(|f| *f == [0.25; 2]));
     }
     #[test]
-    fn a_source_decodes_each_frame_once_as_far_as_it_is_needed() {
+    fn readers_share_the_prefix_and_resume_at_the_first_missing_frame() {
         let path =
             std::env::temp_dir().join(format!("vork-audio-source-{}.wav", std::process::id()));
         let frames: Vec<Frame> = (0..1000).map(|i| [i as f32, -(i as f32)]).collect();
         write_wav(&path, &frames).unwrap();
         let source = Source::open(&path).unwrap();
         assert_eq!((source.rate, source.frames().unwrap()), (SAMPLE_RATE, 1000));
-        // Opening decoded the first frame and left the decoder there.
+        // Opening cached the first frame. A later reader reuses the prefix.
         assert_eq!(source.decoded.lock().unwrap().clip.frames, frames[..1]);
-        assert!(source.decoded.lock().unwrap().stream.is_some());
         let prefix = source.prefix(100).unwrap();
         assert_eq!(prefix.frames, frames[..100]);
         assert!(Arc::ptr_eq(&prefix, &source.prefix(40).unwrap()));
-        // A longer need continues the same decoder; a mix holding the shorter prefix keeps it.
-        assert_eq!(source.prefix(101).unwrap().frames, frames[..101]);
+        let mut reader = source.reader();
+        assert_eq!(reader.prefix(101).unwrap().frames, frames[..101]);
         assert_eq!(prefix.frames.len(), 100);
-        assert!(source.decoded.lock().unwrap().stream.is_some());
-        let whole = source.prefix(usize::MAX).unwrap();
+        assert!(reader.stream.is_some());
+        // A different reader can extend the prefix while this one is still live.
+        assert_eq!(source.prefix(120).unwrap().frames, frames[..120]);
+        let whole = reader.prefix(usize::MAX).unwrap();
         assert_eq!(whole.frames, frames);
-        assert!(source.decoded.lock().unwrap().stream.is_none());
+        assert!(reader.stream.is_none());
         assert!(Arc::ptr_eq(&whole, &source.prefix(5000).unwrap()));
         drop(source);
         assert_eq!(Clip::load(&path).unwrap().frames, frames);
@@ -532,6 +748,38 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn bulk_wav_matches_hound_for_each_integer_layout() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("vork-audio-layout-{}.wav", std::process::id()));
+        for (bits, bytes) in [(8, 1), (16, 2), (24, 3), (24, 4), (32, 4)] {
+            let half = 1_i64 << (bits - 1);
+            let scale = half as f64;
+            for channels in [1, 2] {
+                let spec = hound::WavSpec { channels, sample_rate: SAMPLE_RATE, bits_per_sample: bits, sample_format: hound::SampleFormat::Int };
+                let mut writer = hound::WavWriter::new_with_spec_ex(
+                    std::io::BufWriter::new(std::fs::File::create(&path)?),
+                    hound::WavSpecEx { spec, bytes_per_sample: bytes },
+                )?;
+                for i in 0..40_000_i64 {
+                    let sample = ((i * 67_108_861) % (2 * half) - half) as i32;
+                    writer.write_sample(sample)?;
+                }
+                writer.finalize()?;
+                let stored = hound::WavReader::open(&path)?.into_samples::<i32>()
+                    .map(|x| x.map(|x| (f64::from(x) / scale) as f32))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let expected: Vec<_> = stored.chunks_exact(channels as usize)
+                    .map(|pair| [pair[0], pair[channels as usize - 1]])
+                    .collect();
+                let source = Source::open(&path)?;
+                assert_eq!(source.prefix(139)?.frames, expected[..139], "{bits} bits, {channels} channels");
+                assert_eq!(source.prefix(usize::MAX)?.frames, expected, "{bits} bits, {channels} channels");
+            }
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[test]
     fn a_file_that_does_not_decode_is_refused_when_it_is_opened() {
         let path =
@@ -566,6 +814,31 @@ mod tests {
         assert!(Source::open(&path).is_err());
         std::fs::remove_file(path).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn wav_content_selects_the_same_reader_through_either_symlink() {
+        let dir = std::env::temp_dir().join(format!("vork-wav-suffix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("a.wav");
+        let pcm = dir.join("b.pcm");
+        let alias = dir.join("voice.wav");
+        let mut writer = hound::WavWriter::create(&wav, hound::WavSpec {
+            channels: 1, sample_rate: 22_050, bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
+        }).unwrap();
+        for i in 0..500 { writer.write_sample(i as i16 * 17).unwrap(); }
+        writer.finalize().unwrap();
+        std::fs::copy(&wav, &pcm).unwrap();
+        let read = |target| {
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            let clip = Clip::load(&alias.canonicalize().unwrap()).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            assert_eq!(clip.rate, 22_050);
+            clip.frames
+        };
+        assert_eq!(read(wav), read(pcm));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn wav_round_trip_retains_unclamped_stereo() {
         let path = std::env::temp_dir().join(format!("vork-audio-test-{}.wav", std::process::id()));

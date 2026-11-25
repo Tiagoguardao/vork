@@ -19,14 +19,14 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use moda_scene::types::RawNode;
 use moda_scene::Scene;
-use moda_text::ops::{parse_gradient_stops, GradientSpec, TextNodeSpec, TextOpPipeline};
+use moda_text::ops::{parse_gradient_stops, GradientSpec, TextNodeSpec};
 use moda_text::TextHost;
 use moda_scene::value::Value;
 
-use crate::seams::{DegradedQuad, DrawItem, TextQuadBatch};
+use crate::seams::{DrawItem, TextQuadBatch};
 
 // ---------------------------------------------------------------------------
 // Font host discovery (Gate 2; M4 replaces with catalog ingest)
@@ -53,7 +53,8 @@ static FONTS_DIR_OVERRIDE: std::sync::RwLock<Option<std::path::PathBuf>> =
 /// Takes effect for text-host loads that happen after it; once a load
 /// succeeds the host is pinned and later sets have no effect. Consulted
 /// before `MODA_FONTS_DIR`.
-pub fn set_fonts_dir(dir: impl Into<std::path::PathBuf>) {
+#[cfg(test)]
+pub(crate) fn set_fonts_dir(dir: impl Into<std::path::PathBuf>) {
     if let Ok(mut guard) = FONTS_DIR_OVERRIDE.write() {
         *guard = Some(dir.into());
     }
@@ -118,38 +119,22 @@ pub fn text_host_generation() -> u64 {
 /// frame.rs `CacheCtx`).
 pub type TextCacheCtx<'a> = (
     &'a mut crate::residency::PlanCaches,
-    &'a crate::residency::HashMap<String, crate::residency::NodeHashes>,
+    &'a dyn crate::residency::NodeHashSource,
 );
 
-/// R4 cache key for one text item: the node's TEXT content hash (deny-list:
-/// full minus transform-only — paint IS baked into quads) ⊕ the plan inputs
-/// that change the built batch ⊕ the text-host generation (font installs
-/// swap atlases/UVs). The shader-fill instance and model matrix are PATCHED
-/// on every hit instead of keyed, so transform moves and the shader clock
-/// keep text residency.
-/// Min real local→screen axis scale of a model matrix — the model half of
-/// `analyticPadScale` (`try_build_vector_batch` bakes `min(sx, sy) ×
-/// render_scale` into every glyph's em_box AA padding). Shared by the pad
-/// computation and [`text_cache_key`] so the two derivations cannot drift.
-pub(crate) fn model_min_axis_scale(model_matrix: &[f32; 16]) -> f64 {
-    let sx = (model_matrix[0] as f64).hypot(model_matrix[1] as f64);
-    let sy = (model_matrix[4] as f64).hypot(model_matrix[5] as f64);
-    sx.min(sy)
-}
-
+/// Geometry with a draw-time AA margin keeps the same content key across model scales.
 #[allow(clippy::too_many_arguments)]
-fn text_cache_key(
+fn text_cache_keys(
     scene: &Scene,
-    hashes: &crate::residency::HashMap<String, crate::residency::NodeHashes>,
+    hashes: &dyn crate::residency::NodeHashSource,
     node: &RawNode,
-    best_effort: bool,
     render_scale: f64,
-    model_min_scale: f64,
+    model_scales: [f64; 2],
     area_key: u64,
-) -> u64 {
+) -> (u64, u64) {
     use std::hash::{Hash, Hasher};
     let text_hash = hashes
-        .get(node.id())
+        .read_hash(scene, node.id())
         .map(|h| h.text)
         .unwrap_or_else(|| crate::residency::node_hashes_in(scene, node).text);
     let mut h = rustc_hash::FxHasher::default();
@@ -164,19 +149,14 @@ fn text_cache_key(
     // mutation_replay scenes (group opacity over text/shape children). Monotonic:
     // it can only ADD cache misses (a re-shape), never reuse a stale batch.
     node.f64("opacity").unwrap_or(1.0).to_bits().hash(&mut h);
-    best_effort.hash(&mut h);
     render_scale.to_bits().hash(&mut h);
-    // The MODEL half of analyticPadScale (node/ancestor scale is
-    // TRANSFORM_ONLY, so the text hash alone cannot re-key it): a batch built
-    // at one effective scale carries that scale's AA padding in every em_box
-    // and must never be served at another — the cache-hit patch only updates
-    // the model matrix (lever 10.5, caught by review on the retained animate
-    // lanes where `scale` tweens hit this every frame).
-    model_min_scale.to_bits().hash(&mut h);
     text_host_generation().hash(&mut h);
     // Area type (E8.14): the shape, thread and wrap objects the node's lines fit (they live on other nodes).
     area_key.hash(&mut h);
-    h.finish()
+    let placement_independent = h.finish();
+    // Baked outline margins use the shorter axis; colour glyph rasters use the longer.
+    model_scales.map(f64::to_bits).hash(&mut h);
+    (placement_independent, h.finish())
 }
 
 /// On-hit patch of the volatile (non-content) batch fields.
@@ -185,13 +165,11 @@ fn patch_cached_batch(
     z: f64,
     model: [f32; 16],
     clip: [f32; 4],
-    fill_shader: Option<crate::seams::TextShaderFill>,
 ) {
     batch.z = z;
     batch.model_matrix = model;
     batch.page_clip_bounds = clip;
     // vork: moda-text-draw's TextQuadBatch has no fill_shader (text shader fills are not ported).
-    let _ = fill_shader;
 }
 
 /// The process-wide text host (vendored catalog + atlases + emoji).
@@ -308,16 +286,13 @@ fn try_build_vector_batch(
     model_matrix: [f32; 16],
     z: f64,
     page_clip: [f32; 4],
-    fill_shader: Option<crate::seams::TextShaderFill>,
     render_scale: f64,
     fall_label: &str,
     placement: moda_text::vector::VectorPlacement,
 ) -> Result<Option<TextBuildOutcome>> {
     // vork: the vector lane's batch is built by moda-text-draw's `try_build_vector_batch` (the same code, ported
     // there with the GPU side); text shader fills are not ported. See PROVENANCE.md.
-    if fill_shader.is_some() {
-        bail!("text shader fills are not ported");
-    }
+
     // One snapshot: store and catalog must come from the SAME host.
     let (store, host) = vector_store_and_host()?;
     // Text in a family this catalog can't draw draws in a stand-in: say so (whichever lane draws it).
@@ -381,6 +356,15 @@ pub(crate) fn repaint_text(scene: &Scene, node_id: &str, old: &TextQuadBatch) ->
 thread_local! {
     static TEXT_PAINTER: RefCell<Option<TextPainter>> = const { RefCell::new(None) };
     static TEXT_BUILDER: RefCell<Option<TextBuilder>> = const { RefCell::new(None) };
+}
+
+/// Host text draws from its revisioned node and occurrence, bypassing native document text flow.
+pub(crate) fn layout_is_local(scene: &Scene, node: &RawNode) -> bool {
+    if TEXT_BUILDER.with(|builder| builder.borrow().is_some()) {
+        node.json_field("vorkText").is_some()
+    } else {
+        !crate::text_area::reads_other_nodes(scene, node)
+    }
 }
 
 /// Bounds supplied by the host's actual drawing, for captures of externally laid-out text.
@@ -642,7 +626,6 @@ fn vector_or_degraded(
     model: [f32; 16],
     z: f64,
     clip: [f32; 4],
-    fill_shader: Option<crate::seams::TextShaderFill>,
     render_scale: f64,
 ) -> Result<TextBuildOutcome> {
     if let Some(out) = try_build_vector_batch(
@@ -650,7 +633,6 @@ fn vector_or_degraded(
         model,
         z,
         clip,
-        fill_shader,
         render_scale,
         moda_assets::report::VECTOR_LANE_LABEL,
         moda_text::vector::VectorPlacement::VectorParity,
@@ -664,8 +646,8 @@ fn vector_or_degraded(
     })
 }
 
-/// M4d: build the Degraded-tier raster batch for a fallback-class node
-/// (`--best-effort-text`). Placement mirrors the Canvas2D display quad
+/// M4d: build the Degraded-tier raster batch for a fallback-class node.
+/// Placement mirrors the Canvas2D display quad
 /// (`richtext/transforms.ts:77-117`): quad = texture logical size, alignment
 /// offsets against the node box, opacity × the raster's uniform-alpha
 /// `fill_alpha`.
@@ -674,7 +656,7 @@ fn vector_or_degraded(
 /// screen and text under about a pixel is skipped (`Empty`). Elsewhere (an export
 /// or capture at `render_scale` px per canvas unit) it is as fine as the output
 /// ([`moda_text::degraded::output_raster_scale`]). The scale it uses, `render_scale`
-/// × the model's MIN axis scale, is what [`text_cache_key`] keys, so a cached raster
+/// × the model's MIN axis scale, is what [`text_cache_keys`] keys, so a cached raster
 /// is never served at another scale.
 fn build_degraded_batch(
     spec: &TextNodeSpec,
@@ -866,7 +848,7 @@ fn apply_fill_wipe(node: &RawNode, spec: &mut TextNodeSpec) {
         return;
     };
     let p = p.clamp(0.0, 1.0);
-    if p >= 1.0 || spec.gradient.is_some() || spec.shader_fill {
+    if p >= 1.0 || spec.gradient.is_some() {
         return;
     }
     let color = spec.fill_override.clone().or_else(|| {
@@ -1055,10 +1037,7 @@ pub fn node_to_text_spec(node: &RawNode) -> TextNodeSpec {
         stroke_width: moda_scene::paint::node_stroke_style(node).width,
         fill_override,
         gradient,
-        // Set by build_richtext_item AFTER the eligibility check + packing
-        // (extract_shader_fill_with); the mask/Degraded consumers never route
-        // through the shader-fill pipeline.
-        shader_fill: false,
+
         effects: extract_node_effects(node),
         unit_transforms: extract_unit_transforms(node).into(),
         unit_groups: extract_unit_groups(node).into(),
@@ -1088,67 +1067,6 @@ pub fn node_to_text_spec(node: &RawNode) -> TextNodeSpec {
     }
 }
 
-/// Vector lane: identical extraction with the VECTOR eligibility predicate
-/// (`supports_vector_text_fill` — the manifest asserts the eligible-id sets
-/// are identical, but each engine consults its own production predicate).
-fn extract_shader_fill_with(
-    scene: &Scene,
-    node: &RawNode,
-    shader_time_s: f64,
-) -> Option<crate::seams::TextShaderFill> {
-    let Some(moda_scene::paint::Paint::Shader(shader)) =
-        moda_scene::paint::node_text_fills(node).pop()
-    else {
-        return None;
-    };
-    let shader_id = shader.shader_id.as_str();
-    let params = Value::Object(shader.params.clone().unwrap_or_default());
-    let packed = if crate::agent_fill::is_code_ref(shader_id) {
-        // An agent shader (a code key): every agent fill draws on text (crate::agent_fill).
-        match crate::agent_fill::pack(scene, node, shader_id, &params, shader_time_s) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("moda-engine: warn: {e}");
-                return None;
-            }
-        }
-    } else {
-        // `supportsVectorTextFill`: the browser predicate as extracted manifest data (descriptor `shade`, no
-        // primaryImage).
-        if !moda_shaders::runtime::supports_vector_text_fill(shader_id) {
-            return None;
-        }
-        moda_shaders::runtime::pack_fill(shader_id, &params.to_json(), shader_time_s).ok()?
-    };
-
-    let node_opacity = node.f64("opacity").unwrap_or(1.0);
-    // strokeCss feeds only the packed strokeColor (ABI parity — the fill
-    // fragment never reads it; stroke is a separate solid pass).
-    let stroke_color: [f32; 4] = text_stroke_color(node)
-        .as_deref()
-        .and_then(moda_text::color::css_color_to_normalized_rgba)
-        .map(|c| {
-            [
-                c[0] as f32,
-                c[1] as f32,
-                c[2] as f32,
-                (c[3] * node_opacity) as f32,
-            ]
-        })
-        .unwrap_or([0.0; 4]);
-    // boxW/boxH exactly as renderWithMsdf computes them
-    // (`WebGPUTextSystem.ts:657-659`); bounds dims clamped >= 1 (zero-size
-    // box NaN guard, textShaderFillData.ts).
-    let box_w = node.f64("width").unwrap_or(400.0).max(0.0);
-    let box_h = node.f64("height").unwrap_or(200.0).max(0.0);
-    Some(crate::seams::TextShaderFill {
-        packed,
-        fill_color: [1.0, 1.0, 1.0, node_opacity as f32],
-        stroke_color,
-        bounds: [0.0, 0.0, box_w.max(1.0) as f32, box_h.max(1.0) as f32],
-    })
-}
-
 /// Plan one richtext node (`renderWithMsdf` orchestration). `page_clip` must
 /// be the EFFECTIVE clip (page ∧ ancestor rect-mask AABBs) — text is NOT
 /// clipped to the node rect (WebGPUTextSystem.ts:890-891). `shader_time_s`
@@ -1159,7 +1077,6 @@ pub fn build_richtext_item(
     node: &RawNode,
     z: f64,
     effective_clip: [f32; 4],
-    best_effort: bool,
     shader_time_s: f64,
     render_scale: f64,
     caches: Option<TextCacheCtx<'_>>,
@@ -1173,18 +1090,22 @@ pub fn build_richtext_item(
         // Use the editor's key, bounded cache and placement patch unchanged for these batches too.
         let mut slot = None;
         if let Some((cache, hashes)) = caches {
-            let key = text_cache_key(scene, hashes, node, best_effort, render_scale, model_min_axis_scale(&model), 0);
-            if let Some(mut batch) = cache.text_get_content(node.id(), key).filter(|b| degraded_hit_serves(b, &model)) {
-                patch_cached_batch(&mut batch, z, model, effective_clip, None);
+            let (plain, scaled) = text_cache_keys(scene, hashes, node, render_scale, moda_text_draw::text_draw::model_axis_scales(&model), 0);
+            let key = if cache.has_text_content(node.id(), plain) { plain } else { scaled };
+            if let Some(mut batch) = cache.text_get(node.id(), key).filter(|b| degraded_hit_serves(b, &model)) {
+                patch_cached_batch(&mut batch, z, model, effective_clip);
                 return Ok(TextBuildOutcome::Item(Box::new(crate::seams::DrawItem::Text(batch.into()))));
             }
-            cache.text_build_begin();
-            slot = Some((cache, key));
+            slot = Some((cache, plain, scaled));
         }
         let mut built = build(node, model, z, effective_clip, render_scale);
-        if let Some((cache, key)) = slot {
+        if let Some((cache, plain, scaled)) = slot {
+            let key = if built_text_batch(&built).is_some_and(|b| b.paint_geometry_key.is_some()
+                && b.vector.as_ref().is_some_and(|v| v.uniform_padding.is_some())) { plain } else { scaled };
             name_built_text(&mut built, key);
-            cache.text_build_end(node.id(), key, built_text_batch(&built));
+            if let Some(batch) = built_text_batch(&built) {
+                cache.text_put(node.id(), key, batch);
+            }
         }
         return built;
     }
@@ -1203,8 +1124,6 @@ pub fn build_richtext_item(
         0
     };
     let threaded = spec.area.as_ref().is_some_and(|a| a.frames.len() > 1);
-    let fill_shader = extract_shader_fill_with(scene, node, shader_time_s);
-    spec.shader_fill = fill_shader.is_some();
     apply_fill_wipe(node, &mut spec);
     let model = richtext_model_matrix(scene, node.id())
         .ok_or_else(|| anyhow!("no canvas affine for richtext {}", node.id()))?;
@@ -1215,47 +1134,23 @@ pub fn build_richtext_item(
     // patched on hit, so moves and shader-time ticks keep the cached layout.
     let mut cache_slot: Option<(&mut crate::residency::PlanCaches, u64)> = None;
     if let Some((cache, hashes)) = caches {
-        let key = text_cache_key(
+        let key = text_cache_keys(
             scene,
             hashes,
             node,
-            best_effort,
             render_scale,
-            model_min_axis_scale(&model),
+            moda_text_draw::text_draw::model_axis_scales(&model),
             area_key,
-        );
+        ).1;
         if let Some(mut batch) = cache
-            .text_get_content(node.id(), key)
+            .text_get(node.id(), key)
             .filter(|b| degraded_hit_serves(b, &model))
         {
-            // NB: this returns BEFORE `try_build_vector_batch`, where the vector-served
-            // and vector→MSDF decline events are recorded: an export job's hit replays
-            // what the build recorded (`text_get_content`); the editor's lanes don't
-            // collect. See the coupling note on `moda_assets::report::record_vector_text_served`.
-            patch_cached_batch(&mut batch, z, model, effective_clip, fill_shader);
+            patch_cached_batch(&mut batch, z, model, effective_clip);
             return Ok(TextBuildOutcome::Item(Box::new(
                 crate::seams::DrawItem::Text(batch.into()),
             )));
         }
-        // A live camera frame lays text out within the frame's refine budget (shared with outlines): past it, a
-        // layer not laid out yet draws nothing this frame and is queued, and the next frames lay the queue out
-        // through the retained plan, a budget's worth each. A page shown for the first time (thousands of text
-        // layers) presents its shapes first and its text over the next frames, instead of blocking on all of it.
-        // The first layout of a frame always runs (an edited text layer never waits). Exports and captures lay
-        // everything out.
-        if cache.text_deferrable() {
-            let bbox = scene
-                .node_canvas_affine(node.id())
-                .map(|a| {
-                    let (w, h) = (node.f64("width").unwrap_or(0.0), node.f64("height").unwrap_or(0.0));
-                    crate::tess::outline::canvas_bbox([0.0, 0.0, w as f32, h as f32], &a, 0.0)
-                })
-                .unwrap_or([f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY]);
-            cache.outline_pending_push(node.id(), bbox);
-            cache.text_prewarm_push(node.id(), best_effort, render_scale);
-            return Ok(TextBuildOutcome::Empty);
-        }
-        cache.text_build_begin();
         cache_slot = Some((cache, key));
     }
     let built = (|| {
@@ -1267,7 +1162,6 @@ pub fn build_richtext_item(
             model,
             z,
             effective_clip,
-            fill_shader.clone(),
             render_scale,
             moda_assets::report::VECTOR_LANE_LABEL,
             moda_text::vector::VectorPlacement::VectorParity,
@@ -1278,7 +1172,6 @@ pub fn build_richtext_item(
             // A later frame of a thread holds the whole story; box text would draw all of it here.
             return Ok(TextBuildOutcome::Empty);
         }
-        let _ = best_effort;
         build_degraded_batch(&spec, model, z, effective_clip, render_scale).or_else(|e| {
             Ok(TextBuildOutcome::Degraded {
                 reason: format!("vector declined; degraded raster failed: {e}"),
@@ -1288,7 +1181,9 @@ pub fn build_richtext_item(
     let mut built = built;
     if let Some((cache, key)) = cache_slot {
         name_built_text(&mut built, key);
-        cache.text_build_end(node.id(), key, built_text_batch(&built));
+        if let Some(batch) = built_text_batch(&built) {
+            cache.text_put(node.id(), key, batch);
+        }
     }
     built
 }
@@ -1370,9 +1265,9 @@ fn text_bounds_from_shape(node: &RawNode, padding: f64) -> Option<(f64, f64, f64
             if points.is_empty() {
                 return None;
             }
-            let pts: Vec<(f64, f64)> = points
+            let pts: Vec<_> = points
                 .iter()
-                .filter_map(|p| Some((p.f64("x")?, p.f64("y")?)))
+                .filter_map(|p| Some((p.f64("x")?, p.f64("y")?, p.kind() == Some("move"))))
                 .collect();
             if pts.is_empty() {
                 return None;
@@ -1382,39 +1277,37 @@ fn text_bounds_from_shape(node: &RawNode, padding: f64) -> Option<(f64, f64, f64
                 node.f64("y").filter(|v| v.is_finite()).unwrap_or(0.0),
             );
             let n = pts.len() as f64;
-            let cx = pts.iter().map(|p| p.0).sum::<f64>() / n + ox;
-            let cy = pts.iter().map(|p| p.1).sum::<f64>() / n + oy;
-            let closed = node.bool("closed").unwrap_or(false);
+            let cx = pts.iter().map(|&(x, _, _)| x).sum::<f64>() / n + ox;
+            let cy = pts.iter().map(|&(_, y, _)| y).sum::<f64>() / n + oy;
+            let closure = node.path_closure();
             let local_c = (cx - ox, cy - oy);
-            let min_dist = if !closed && pts.len() < 3 {
+            let min_dist = if !closure.at(0) && pts.len() < 3 && !pts.iter().skip(1).any(|p| p.2) {
                 let (mut minx, mut miny, mut maxx, mut maxy) = (
                     f64::INFINITY,
                     f64::INFINITY,
                     f64::NEG_INFINITY,
                     f64::NEG_INFINITY,
                 );
-                for p in &pts {
-                    minx = minx.min(p.0);
-                    miny = miny.min(p.1);
-                    maxx = maxx.max(p.0);
-                    maxy = maxy.max(p.1);
+                for &(x, y, _) in &pts {
+                    minx = minx.min(x);
+                    miny = miny.min(y);
+                    maxx = maxx.max(x);
+                    maxy = maxy.max(y);
                 }
                 ((maxx - minx).min(maxy - miny)) / 4.0
             } else {
                 let mut min_d = f64::INFINITY;
-                let np = pts.len();
-                for i in 0..np {
-                    let next = if closed { (i + 1) % np } else { i + 1 };
-                    if next >= np {
-                        continue;
+                let anchor = |&(x, y, _): &(f64, f64, bool)| (x, y);
+                for (contour, closed) in closure.contours(&pts, |p| p.2) {
+                    for edge in contour.windows(2) {
+                        min_d = min_d.min(dist_point_segment(local_c, anchor(&edge[0]), anchor(&edge[1])));
                     }
-                    min_d = min_d.min(dist_point_segment(local_c, pts[i], pts[next]));
+                    if closed {
+                        let end = anchor(contour.last().unwrap());
+                        min_d = min_d.min(dist_point_segment(local_c, end, anchor(&contour[0])));
+                    }
                 }
-                if min_d.is_infinite() {
-                    0.0
-                } else {
-                    min_d
-                }
+                if min_d.is_infinite() { 0.0 } else { min_d }
             };
             let safe_radius = (min_dist - padding).max(0.0);
             let size = safe_radius * 2.0;
@@ -1436,7 +1329,7 @@ fn dist_point_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// `hasTextContent` (textInShapeHelpers.ts:42-53).
-fn has_text_content(node: &RawNode) -> bool {
+pub(crate) fn has_text_content(node: &RawNode) -> bool {
     let Some(content) = node.str("textContent") else {
         return false;
     };
@@ -1470,7 +1363,6 @@ pub fn build_shape_text_item(
     node: &RawNode,
     z: f64,
     page_clip: [f32; 4],
-    best_effort: bool,
     render_scale: f64,
     caches: Option<TextCacheCtx<'_>>,
 ) -> Result<TextBuildOutcome> {
@@ -1563,33 +1455,33 @@ pub fn build_shape_text_item(
     let cache_id = spec.node_id.clone();
     let mut cache_slot: Option<(&mut crate::residency::PlanCaches, u64)> = None;
     if let Some((cache, hashes)) = caches {
-        let key = text_cache_key(
+        let key = text_cache_keys(
             scene,
             hashes,
             node,
-            best_effort,
             render_scale,
-            model_min_axis_scale(&model),
+            moda_text_draw::text_draw::model_axis_scales(&model),
             0,
-        );
+        ).1;
         if let Some(mut batch) = cache
-            .text_get_content(&cache_id, key)
+            .text_get(&cache_id, key)
             .filter(|b| degraded_hit_serves(b, &model))
         {
-            patch_cached_batch(&mut batch, z, model, page_clip, None);
+            patch_cached_batch(&mut batch, z, model, page_clip);
             return Ok(TextBuildOutcome::Item(Box::new(
                 crate::seams::DrawItem::Text(batch.into()),
             )));
         }
-        cache.text_build_begin();
         cache_slot = Some((cache, key));
     }
     // Shape text draws as richtext does (`WebGPUShapeSystem.renderShapeText` pushes a synthetic RichTextNode into
     // the text batch). Shape-text synthetic nodes carry no fillPriority: never a shader fill.
-    let mut built = vector_or_degraded(&spec, model, z, page_clip, None, render_scale);
+    let mut built = vector_or_degraded(&spec, model, z, page_clip, render_scale);
     if let Some((cache, key)) = cache_slot {
         name_built_text(&mut built, key);
-        cache.text_build_end(&cache_id, key, built_text_batch(&built));
+        if let Some(batch) = built_text_batch(&built) {
+            cache.text_put(&cache_id, key, batch);
+        }
     }
     built
 }
@@ -2018,7 +1910,7 @@ pub fn plan_connector_text(
     let cache_id = format!("{}-connector-text", node.id());
     // Hoisted above the cache lookup: the label model bakes trs.scale into
     // its columns, so the key must carry the same min-axis scale the built
-    // batch's AA padding was computed at (see `model_min_axis_scale`).
+    // batch's AA padding was computed at.
     let trs = scene
         .accumulated_affine(node.id())
         .map(|(_, t)| t)
@@ -2027,15 +1919,14 @@ pub fn plan_connector_text(
     let mut cache_slot: Option<(&mut crate::residency::PlanCaches, u64)> = None;
     let mut cached: Option<(Box<crate::seams::TextQuadBatch>, Option<(f64, f64)>)> = None;
     if let Some((cache, hashes)) = caches {
-        let base_key = text_cache_key(
+        let base_key = text_cache_keys(
             scene,
             hashes,
             node,
-            false,
             render_scale,
-            scale_x.abs().min(scale_y.abs()),
+            [scale_x.abs().min(scale_y.abs()), scale_x.abs().max(scale_y.abs())],
             0,
-        );
+        ).1;
         // The cached entry carries the measured GAP, and the gap is a
         // function of the label's tangent angle (`calculate_line_text_gap`
         // reads `text_pos.angle`) — which is transform-derived, so the node
@@ -2134,7 +2025,7 @@ pub fn plan_connector_text(
     };
     // R6 hit: patch the volatile fields and return the cached gap + batch.
     if let Some((mut batch, _)) = cached.filter(|(b, _)| degraded_hit_serves(b, &model)) {
-        patch_cached_batch(&mut batch, z, model, page_clip, None);
+        patch_cached_batch(&mut batch, z, model, page_clip);
         return Ok(ConnectorTextPlan {
             gap,
             outcome: Some(TextBuildOutcome::Item(Box::new(
@@ -2147,7 +2038,7 @@ pub fn plan_connector_text(
     // bug — the rl-curved golden shows a gap with INVISIBLE white text.
     // Connector labels are synthetic RichTextNodes through the same
     // `renderText` routing — vector lane first under the flag.
-    let outcome = vector_or_degraded(&spec_text, model, z, page_clip, None, render_scale);
+    let outcome = vector_or_degraded(&spec_text, model, z, page_clip, render_scale);
     if let (Some((cache, key)), Ok(TextBuildOutcome::Item(item))) = (cache_slot, &outcome) {
         if let crate::seams::DrawItem::Text(batch) = item.as_ref() {
             cache.text_put_with_gap(
@@ -2335,84 +2226,6 @@ pub fn layout_rich_text_json(spec: &moda_text::RichTextNodeSpec) -> Result<serde
 // Gate-1 verification dump (`--dump-text-quads`)
 // ---------------------------------------------------------------------------
 
-/// Serialize text batches as JSON (no GPU). Used by the CLI's
-/// `--dump-text-quads PATH` mode (PLAN §2 / SEAMS §6).
-pub fn dump_batches_json(batches: &[&TextQuadBatch]) -> Value {
-    use moda_scene::value::json;
-    let ops_json = |b: &TextQuadBatch| -> Vec<Value> {
-        b.ops
-            .iter()
-            .map(|o| {
-                let (pipeline, emoji) = match o.pipeline {
-                    TextOpPipeline::Solid => ("text-decoration", None),
-                    TextOpPipeline::Emoji { emoji } => ("text-emoji", Some(emoji)),
-                };
-                json!({
-                    "pipeline": pipeline,
-                    "emoji": emoji,
-                    "color": o.color,
-                    "opacity": o.opacity,
-                    "blurPx": o.blur_px,
-                    "strokePx": o.stroke_px,
-                    "vertexCount": o.verts.len() / 4,
-                    "indexCount": o.indices.len(),
-                    "verts": o.verts,
-                })
-            })
-            .collect()
-    };
-    let vector_json = |v: &moda_text::vector::VectorNodeOps| -> Value {
-        json!({
-            "curveCount": v.curve_points.len() / 6,
-            "ops": v.ops.iter().map(|o| json!({
-                "pipeline": match o.pipeline {
-                    moda_text::vector::VectorOpPipeline::Tess => "vector-text-tess",
-                    moda_text::vector::VectorOpPipeline::Analytic if o.additive => "vector-text-analytic-additive",
-                    moda_text::vector::VectorOpPipeline::Analytic => "vector-text-analytic",
-                    moda_text::vector::VectorOpPipeline::AnalyticGradient => "vector-text-analytic-gradient",
-                    moda_text::vector::VectorOpPipeline::AnalyticShaderFill => "vector-text-fill",
-                },
-                "color": o.color,
-                "opacity": o.opacity,
-                "blurPx": o.blur_px,
-                "strokePx": o.stroke_px,
-                "triangleVerts": o.tris.len() / 2,
-                "gradient": o.gradient.as_ref().map(|g| json!({
-                    "textBounds": g.text_bounds,
-                    "params": g.params,
-                    "config": g.config,
-                    "stops": g.stops,
-                })),
-                "instances": o.records.iter().map(|r| json!({
-                    "pen": [r.pen_x, r.baseline_y],
-                    "fontSizePx": r.font_size_px,
-                    "emBox": r.em_box,
-                    "firstCurve": r.first_curve,
-                    "curveCount": r.curve_count,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        })
-    };
-    json!({
-        "batches": batches.iter().map(|b| json!({
-            "nodeId": b.node_id,
-            "z": b.z,
-            "modelMatrix": b.model_matrix,
-            "pageClipBounds": b.page_clip_bounds,
-            "emojis": b.emojis,
-            "vector": b.vector.as_ref().map(vector_json),
-            "degraded": b.degraded.as_ref().map(|d| json!({
-                "logicalSize": [d.raster.logical_w, d.raster.logical_h],
-                "qualityScale": d.raster.quality_scale,
-                "offset": d.offset,
-                "opacity": d.opacity,
-                "fillAlpha": d.raster.fill_alpha,
-            })),
-            "ops": ops_json(b),
-        })).collect::<Vec<_>>(),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // GPU side
 // ---------------------------------------------------------------------------
@@ -2422,114 +2235,3 @@ pub fn dump_batches_json(batches: &[&TextQuadBatch]) -> Value {
 // ---------------------------------------------------------------------------
 
 pub use moda_text_draw::text_draw::{PreparedText, TextDraw};
-
-// ---------------------------------------------------------------------------
-// Motion greeking ("Simplify small details while moving"): while the canvas moves, a vector text layer whose
-// type is under a few device pixels per em draws each word as one translucent bar instead of its glyphs. Only
-// live motion frames do this (`Engine::set_motion_text_greek_px`); the still frame after motion, exports,
-// thumbnails and snapshots always draw the glyphs.
-// ---------------------------------------------------------------------------
-
-/// The bar's band above the baseline, in em (about Inter's x-height, where most of a word's ink is).
-const GREEK_BAND_EM: f32 = 0.55;
-/// The bar's opacity: about the share of that band a run of lowercase text inks.
-const GREEK_INK: f32 = 0.45;
-/// A gap wider than this (em) between two glyphs' boxes starts a new word.
-const GREEK_WORD_GAP_EM: f32 = 0.18;
-
-/// The largest font size (px, layer-local) of a vector text layer that can be greeked, or `None` when it can't:
-/// not vector text, or drawn with anything but plain solid glyph fills and decorations (gradients, shader fills,
-/// strokes, shadows, glows, emoji, per-glyph transforms, a distort warp or a mask).
-pub fn greek_font_px(b: &crate::seams::TextQuadBatch) -> Option<f32> {
-    let v = b.vector.as_ref()?;
-    if b.distort.is_some() || !v.emojis.is_empty() || v.gradient.is_some() {
-        return None;
-    }
-    let mut max = 0.0f32;
-    for op in &v.ops {
-        match op.pipeline {
-            moda_text::vector::VectorOpPipeline::Tess => {}
-            moda_text::vector::VectorOpPipeline::Analytic
-                if !op.additive && op.blur_px == 0.0 && op.stroke_px == 0.0 && op.gradient.is_none() =>
-            {
-                for r in op.records.iter() {
-                    if r.glyph_lin != [1.0, 0.0, 0.0, 1.0] || r.glyph_off != [0.0, 0.0] {
-                        return None;
-                    }
-                    max = max.max(r.font_size_px);
-                }
-            }
-            _ => return None,
-        }
-    }
-    (max > 0.0).then_some(max)
-}
-
-/// The batch's device px per em at `device_px_per_canvas_px`, when it can be greeked.
-pub fn greek_em_px(b: &crate::seams::TextQuadBatch, device_px_per_canvas_px: f64) -> Option<f64> {
-    let font = greek_font_px(b)? as f64;
-    Some(font * model_min_axis_scale(&b.model_matrix) * device_px_per_canvas_px)
-}
-
-/// The greeked copy of a greekable vector batch ([`greek_font_px`]): each glyph fill op becomes one solid
-/// triangle op of per-word bars (the same colour, `GREEK_INK` of its opacity); decorations stay.
-pub fn greek_batch(b: &crate::seams::TextQuadBatch) -> Option<crate::seams::TextQuadBatch> {
-    greek_font_px(b)?;
-    let v = b.vector.as_ref()?;
-    let mut ops = Vec::with_capacity(v.ops.len());
-    for op in &v.ops {
-        if op.pipeline == moda_text::vector::VectorOpPipeline::Tess {
-            ops.push(op.clone());
-            continue;
-        }
-        let mut tris: Vec<f32> = Vec::new();
-        let mut push_bar = |x0: f32, x1: f32, base: f32, size: f32| {
-            let (y0, y1) = (base - GREEK_BAND_EM * size, base);
-            tris.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
-        };
-        // Current word: (left, right, baseline, size).
-        let mut word: Option<(f32, f32, f32, f32)> = None;
-        for r in op.records.iter() {
-            let s = r.font_size_px;
-            let (l, rt) = (r.pen_x + r.em_box[0] * s, r.pen_x + r.em_box[2] * s);
-            word = match word {
-                Some((wl, wr, base, size))
-                    if base == r.baseline_y && size == s && l - wr <= GREEK_WORD_GAP_EM * s =>
-                {
-                    Some((wl, wr.max(rt), base, size))
-                }
-                Some((wl, wr, base, size)) => {
-                    push_bar(wl, wr, base, size);
-                    Some((l, rt, r.baseline_y, s))
-                }
-                None => Some((l, rt, r.baseline_y, s)),
-            };
-        }
-        if let Some((wl, wr, base, size)) = word {
-            push_bar(wl, wr, base, size);
-        }
-        if tris.is_empty() {
-            continue;
-        }
-        ops.push(moda_text::vector::VectorOp {
-            pipeline: moda_text::vector::VectorOpPipeline::Tess,
-            color: op.color,
-            opacity: op.opacity * GREEK_INK,
-            blur_px: 0.0,
-            stroke_px: 0.0,
-            additive: false,
-            tris: tris.into(),
-            records: Default::default(),
-            gradient: None,
-            paint: None,
-        });
-    }
-    let mut out = b.clone();
-    out.vector = Some(moda_text::vector::VectorNodeOps {
-        ops,
-        curve_points: Default::default(),
-        gradient: None,
-        emojis: Vec::new(),
-    });
-    Some(out)
-}

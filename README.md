@@ -495,6 +495,14 @@ files (`.zshenv` for zsh). Mac packages are signed with Apple Developer ID and n
 
 MP4 uses VideoToolbox without ffmpeg. Install ffmpeg only for video decoding or
 encoding fallbacks, including MOV/ProRes fallback (`brew install ffmpeg`).
+For GPU-resident canvas footage, the Mac release loads FFmpeg 9's
+`libavformat.63.dylib` from `opt/ffmpeg/lib`, `opt/ffmpeg@9/lib`, or `lib` under `/opt/homebrew` or
+`/usr/local`. Keep `ffmpeg` and `ffprobe` on PATH. If the matching library
+is missing, canvas movies resume through the FFmpeg command-line reader.
+Padded sources such as 1920×1080 H.264 stored at 1920×1088 need FFprobe 6.1
+or newer for VideoToolbox. Older probes omit frame crop offsets, so vork uses
+software decoding when it cannot verify where the displayed picture starts.
+The vork package contains no FFmpeg libraries.
 
 ### Windows
 

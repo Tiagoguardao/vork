@@ -74,6 +74,12 @@ pub struct Scene {
     /// Authored locations for diagnostics; never scene content or resource identity.
     #[serde(skip)]
     pub origins: std::collections::BTreeMap<String, Vec<String>>,
+    /// Files consumed while expanding native geometry, before typed admission.
+    #[serde(skip)]
+    pub expansion_files: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Private copies of executable-relative display data for an installed revision.
+    #[serde(skip)]
+    pub library_files: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
     /// Editor JSON Schema address; metadata only, never fetched by the renderer.
     #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-help-path" = "scene.$schema", "x-help" = "string; editor schema URL"))]
@@ -257,12 +263,12 @@ impl Scene {
                 serde_json::Value::Object(fields) => {
                     if let Some(render) = fields.get("render").filter(|render| render.is_object()) {
                         if path.is_empty() {
-                            if render.get("display").is_some() { moved.push("render.display was removed; use composition.view".into()); }
-                            if render.get("view").is_some() { moved.push("render.view: use composition.view".into()); }
+                            if render.get("display").is_some() { moved.push(crate::migration::message("render.display", &[])); }
+                            if render.get("view").is_some() { moved.push(crate::migration::message("render.view", &[])); }
                         }
                         if render.get("compositor").is_some() {
                             let field = |owner: &str| diagnostics::member(&diagnostics::member(path, owner), "compositor");
-                            moved.push(format!("{} was removed; use {}", field("render"), field("composition")));
+                            moved.push(crate::migration::message("render.compositor", &[("old", &field("render")), ("new", &field("composition"))]));
                         }
                     }
                     for (name, field) in fields { moved_fields(field, &diagnostics::member(path, name), moved); }
@@ -279,9 +285,9 @@ impl Scene {
             if moved.is_empty() { return Ok(()); }
             let space = if value.get("render").is_some_and(|render| ["display", "view", "compositor"].iter().any(|field| render.get(field).is_some()))
                 && value.pointer("/composition/space").is_none() {
-                "; composition.space is required too: write \"3d\" (a scene without a composition is a world)"
-            } else { "" };
-            anyhow::bail!("{}{space}; see vork help upgrade", moved.join("; "))
+                crate::migration::message("composition.space.suffix", &[])
+            } else { String::new() };
+            anyhow::bail!("{}", crate::migration::message("moved fields", &[("moved", &moved.join("; ")), ("space", &space)]))
         }
         ensure!(value.get("output").is_none() && value.get("outputs").is_none(),
             "outputs are render-call destinations; use --out with a path or output descriptor");
@@ -299,9 +305,7 @@ impl Scene {
             "material names starting with __vork_ are reserved for the renderer");
         for material in scene.materials.values() {
             ensure!(!matches!(material.program.as_str(), "std/agx" | "std/standard" | "blender/filmic") || !material.inputs.contains_key("dither_intensity"),
-                "{name}: view inputs.dither_intensity was removed; output encoding owns dither: delete the input (1, the default, draws as before; \
-                 0 or more than 1 has no setting: dither scales with the output's bit depth, and grain is a compositor program); see vork help upgrade",
-                name = material.program);
+                "{}", crate::migration::message("view.inputs.dither_intensity", &[("name", &material.program)]));
         }
         scene.origins = origins;
         Ok(scene)
@@ -615,7 +619,8 @@ mod tests {
             (serde_json::json!({"version":2,"nodes":[camera,{"clip-path":"shape"}]}), "scene.nodes[1].clip-path: 2D is not built yet in a 3D world; put it in a canvas (composition {space: \"2d\"})"),
             (serde_json::json!({"version":2,"nodes":[camera,{"mask":"shape"}]}), "scene.nodes[1].mask: 2D is not built yet in a 3D world; put it in a canvas (composition {space: \"2d\"})"),
             (serde_json::json!({"version":2,"nodes":[camera,{"composition":{"space":"3d"}}]}), "scene.nodes[1].composition: a world inside a 3D world is not built yet; its nodes are already in the world"),
-            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[camera]}), "scene.nodes[0]: type \"camera\": a 2D canvas holds group, text and path nodes; camera in a canvas is not built yet; put it in a world (composition {space: \"3d\"})"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"group"}]}), "scene.nodes[0]: type \"group\": use type \"node\" for a canvas group, or omit type"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[camera]}), "scene.nodes[0]: type \"camera\": a 2D canvas accepts node (group), text and path types; camera in a canvas is not built yet; put it in a world (composition {space: \"3d\"})"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":[{"content":"a","fill":{"program":"p"}}],"font":"a.ttf"}]}), "scene.nodes[0].content[0].fill: a program paint is not built yet; write a CSS colour or gradient, or {\"image\": name}"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"background":[0,0,0]},"nodes":[text]}), "render.background: a 2D canvas's background is \"transparent\" or a CSS colour"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"camera":"c"},"nodes":[text]}), "render.camera: not built for a 2D canvas yet; a canvas takes render.resolution, fps, duration and background"),
@@ -676,17 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn retired_technique_intent_is_not_scene_content() {
-        for extra in [serde_json::json!({"requires":["path"]}),serde_json::json!({"materials":{"glass":{"thickness_mode":"slab"}}}),serde_json::json!({"programs":{"p":{"source":"import vork;","passes":[]}}}),serde_json::json!({"render":{"compositor_per_step":[]}})] {
-            let mut scene=serde_json::json!({"version":2,"nodes":[{"type":"camera"}]});
-            scene.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            assert!(Scene::from_json(&serde_json::to_vec(&scene).unwrap()).is_err(),"{scene}");
-        }
-    }
-    #[cfg(all(test, vork_private_tests))]
-    include!("mod_unavailable_path_volume_budget_is_absent_and_rejected_private.rs");
-
-    #[test]
     fn camera_cut_tracks_defer_start_selection_to_animation_evaluation() {
         let text = br#"{"version":2,"nodes":[{"type":"camera","name":"wide"},{"type":"camera","name":"close"}],
             "animation":[{"tracks":[{"path":["render","camera"],"keys":[[0,"close"],[2,"wide"]]}]}]}"#;
@@ -726,13 +720,10 @@ mod tests {
         Ok(scene)
     }
     #[test]
-    fn probe_world_bounds_are_rejected_in_profiles() {
-        for bounds in [serde_json::json!([[-4,-2,-3],[6,5,8]]), serde_json::Value::Null] {
-            let error = Profile::parse("test", &serde_json::to_vec(&serde_json::json!({
-                "version":1,"level":1,"settings":{"probes":{"volume":{"bounds":bounds}}}
-            })).unwrap()).unwrap_err().to_string();
-            assert!(error.contains("probes") && error.contains("unknown field"), "{error}");
-        }
+    fn profile_reports_misspelled_setting() {
+        let error = Profile::parse("test", br#"{"version":1,"level":1,"settings":{"sampls":8}}"#)
+            .unwrap_err().to_string();
+        assert!(error.contains("sampls") && error.contains("unknown field"), "{error}");
     }
     #[test]
     fn names_report_the_specific_failed_rule() {
@@ -766,10 +757,19 @@ mod tests {
         }
     }
     #[test]
-    fn rejects_unimplemented_pass_fields() {
-        let error = parse(serde_json::json!({"version":2,"nodes":[{"type":"camera"}],
-            "render":{"pass_cryptomatte_depth":6}})).unwrap_err().to_string();
-        assert!(error.contains("pass_cryptomatte_depth") && error.contains("unknown"), "{error}");
+    fn authored_scene_reports_misspelled_fields() {
+        for (field, extra) in [
+            ("versoin", serde_json::json!({"versoin": 2})),
+            ("resoluton", serde_json::json!({"render": {"resoluton": [64, 64]}})),
+            ("double_side", serde_json::json!({"materials": {"paint": {"double_side": true}}})),
+            ("soruce", serde_json::json!({"programs": {"shade": {"soruce": "import vork;"}}})),
+        ] {
+            let mut scene = serde_json::json!({"version": 2, "nodes": [{"type": "camera"}]});
+            scene.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let error = Scene::from_json(&serde_json::to_vec(&scene).unwrap())
+                .unwrap_err().to_string();
+            assert!(error.contains(field) && error.contains("unknown field"), "{error}");
+        }
     }
     #[test]
     fn aov_names_never_shadow_built_in_channels() {

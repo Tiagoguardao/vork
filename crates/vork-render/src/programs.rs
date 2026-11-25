@@ -1,5 +1,6 @@
 //! Slang material programs (docs/PROGRAMS.md). Each distinct program compiles
 //! once through the shared disk cache, retaining native modules for raster stages.
+pub(crate) mod session_inputs;
 use crate::{Renderer, disk_cache};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -21,11 +22,14 @@ pub(crate) fn program_source(
     match (&program.file, &program.source) {
         (Some(file), None) => {
             let path = base.join(file);
-            Ok((
-                std::fs::read_to_string(&path)
-                    .with_context(|| format!("program {name}: read {}", path.display()))?,
-                path,
-            ))
+            let bytes = vork_slang::RevisionFiles::read(&path)
+                .with_context(|| format!("program {name}: read {}", path.display()))?;
+            let source = String::from_utf8(bytes)
+                .with_context(|| format!("program {name}: read {}", path.display()))?;
+            if let Some(capture) = session_inputs::current() {
+                capture.lock().unwrap().record_source(&path, source.as_bytes())?;
+            }
+            Ok((source, path))
         }
         (None, Some(source)) => Ok((source.clone(), base.join(program.source_origin.as_deref().map(PathBuf::from).unwrap_or_else(||PathBuf::from(format!("programs.{name}")))))),
         _ => anyhow::bail!("program {name}: exactly one of file/source required"),
@@ -156,6 +160,19 @@ pub(crate) struct Programs {
 impl Programs {
     pub(crate) fn input_layout(&self, id: u32) -> &vork_slang::InputLayout {
         &self.compiled[id as usize - 1].inputs
+    }
+    /// These words reach shading directly. A bound effect proof, geometry or
+    /// resource descriptor requires a new installation when its input changes.
+    pub(crate) fn editable_layout(&self, instance: &Instance) -> Option<&vork_slang::InputLayout> {
+        let key = instance_key(instance);
+        let program = &self.compiled[*self.instances.get(&key)?];
+        let caps = program.capabilities;
+        if self.bound.contains_key(&key) || caps.displacement || caps.hair || caps.emission
+            || caps.opacity || caps.transmission || caps.subsurface || caps.lit || caps.lobes
+            || !program.inputs.fields.iter().all(|field| matches!(field.ty, vork_slang::Type::Float
+                | vork_slang::Type::Vector(_) | vork_slang::Type::Int | vork_slang::Type::Uint | vork_slang::Type::Bool))
+        { return None; }
+        Some(&program.inputs)
     }
     pub(crate) fn dependencies(&self) -> vork_slang::ProgramDependencies {
         self.compiled.iter().fold(vork_slang::ProgramDependencies::default(), |mut d, p| {
@@ -454,7 +471,7 @@ pub(crate) struct Stages {
     pub displacement: bool,
 }
 pub(crate) fn mesh_stages(r: &Renderer, scene: &v2::Scene, base: &Path) -> Result<std::collections::BTreeMap<String, Stages>> {
-    source_mesh_stages(&r.disk_cache, scene, base)
+    discover_mesh_stages(&r.disk_cache, scene, base, Some(&r.device))
 }
 
 fn mesh_material_names(scene: &v2::Scene) -> std::collections::BTreeSet<String> {
@@ -553,6 +570,10 @@ pub(crate) fn needs_fog_admission(scene: &v2::Scene, base: &Path) -> Result<bool
 
 /// AST stage facts are host work and share installation's portable cache.
 pub(crate) fn source_mesh_stages(store: &disk_cache::Store, scene: &v2::Scene, base: &Path) -> Result<std::collections::BTreeMap<String, Stages>> {
+    discover_mesh_stages(store, scene, base, None)
+}
+
+fn discover_mesh_stages(store: &disk_cache::Store, scene: &v2::Scene, base: &Path, device: Option<&wgpu::Device>) -> Result<std::collections::BTreeMap<String, Stages>> {
     let names = mesh_material_names(scene);
     let builtin=Stages {surface:true,medium:false,displacement:false};
     let mut programs=std::collections::BTreeMap::new();
@@ -572,10 +593,29 @@ pub(crate) fn source_mesh_stages(store: &disk_cache::Store, scene: &v2::Scene, b
             groups.entry((source,origin.to_path_buf())).or_default().push(program.to_owned());
         }
         let programs:Vec<_>=groups.into_iter().collect();
-        let probe=|((source,origin),names):&((String,PathBuf),Vec<String>)| -> Result<Vec<(String,Stages)>> {
-            let identity=program_identity(store,&compiler,&abi,source,origin)?;
+        // Inline aliases have distinct diagnostic filenames. Resolve each origin,
+        // then compile once for origins with the same executable and import closure.
+        let receipts = parallel_map(&programs, |((source, origin), _)| {
+            program_identity(store, &compiler, &abi, source, origin)
+        })?;
+        let indices = semantic_indices(receipts.iter().map(|receipt| receipt.identity.as_slice()));
+        let mut unique = Vec::<((String, PathBuf), Vec<String>, vork_slang::InputIdentity)>::new();
+        for (((source, names), receipt), index) in programs.into_iter().zip(receipts).zip(indices) {
+            if index == unique.len() {
+                unique.push((source, names, receipt));
+            } else {
+                unique[index].1.extend(names);
+                unique[index].2.merge_alias(receipt)?;
+            }
+        }
+        let probe=|((source,origin),names,identity):&((String,PathBuf),Vec<String>,vork_slang::InputIdentity)| -> Result<Vec<(String,Stages)>> {
             let stages=cached_proof(store, input_key(b"mesh-stages-v5", &abi, &identity.identity)?.finalize(), &compiler.with_identity(&identity), &abi, source, origin, |compiler| {
-                let (declarations, _) = compiler.stages(&abi, source, origin)?;
+                let start = std::time::Instant::now();
+                let declarations = compiler.stages(&abi, source, origin);
+                if let Some(device) = device {
+                    crate::timing::creation(device, &format!("mesh stages {}", names[0]), "Slang", start.elapsed().as_secs_f64() * 1000., 0.);
+                }
+                let (declarations, _) = declarations?;
                 let stages = Stages {
                     surface: declarations.contains("surface"),
                     medium: declarations.contains("medium"),
@@ -586,7 +626,7 @@ pub(crate) fn source_mesh_stages(store: &disk_cache::Store, scene: &v2::Scene, b
             })?;
             Ok(names.iter().map(|name|(name.clone(),stages)).collect())
         };
-        parallel_map(&programs, probe)?.into_iter().flatten().collect::<std::collections::BTreeMap<_,_>>()
+        parallel_map(&unique, probe)?.into_iter().flatten().collect::<std::collections::BTreeMap<_,_>>()
     };
     Ok(names.into_iter().map(|name| {
         let program=&scene.materials[&name].program;
@@ -617,7 +657,8 @@ pub(crate) fn install<'a>(
     let mut abi = abi();
     abi.aov_count = scene.render.aovs.len();
     let named: Vec<_> = materials.collect();
-    let materials: Vec<_> = named.iter().map(|(_, p)| *p).collect();
+    let mut materials: Vec<_> = named.iter().map(|(_, p)| *p).collect();
+    materials.sort_by(|a, b| a.name.cmp(&b.name));
     let mut sources = Vec::<(String, PathBuf)>::new();
     let mut ids = HashMap::new();
     for p in &materials {
@@ -653,12 +694,22 @@ pub(crate) fn install<'a>(
     // Raw grouping above only avoids duplicate work. Program routing must use
     // compiler identity too: commenting one of two identical aliases must not
     // create another program bin or grow the scene dispatcher.
-    let identities=compiled.iter().map(|p|p.install_identity.as_ref().map(|i|i.identity.as_slice()).context("material input identity")).collect::<Result<Vec<_>>>()?;
-    let remap=semantic_indices(identities.into_iter());
-    let mut unique=Vec::new();
+    let receipts = compiled.iter().map(|program| program.install_identity.as_ref().context("material input identity"))
+        .collect::<Result<Vec<_>>>()?;
+    // Aliases can reach the same executable through different resolver paths.
+    // Check their observations while both receipts are still available.
+    vork_slang::InputIdentity::verify_all(receipts.iter().copied())?;
+    let remap = semantic_indices(receipts.into_iter().map(|receipt| receipt.identity.as_slice()));
+    let mut unique=Vec::<Program>::new();
     let mut unique_sources=Vec::new();
     for (index,(program,source)) in compiled.into_iter().zip(sources).enumerate() {
-        if remap[index]==unique.len() {unique.push(program);unique_sources.push(source);}
+        if remap[index] == unique.len() {
+            unique.push(program);
+            unique_sources.push(source);
+        } else {
+            let representative = unique[remap[index]].install_identity.as_mut().context("material input identity")?;
+            representative.merge_alias(program.install_identity.context("alias input identity")?)?;
+        }
     }
     for index in ids.values_mut() {*index=remap[*index];}
     let mut compiled=unique;
@@ -760,7 +811,7 @@ pub(crate) fn compile(
 
 /// The key `compile` stores a program under; its tests probe the store with it.
 fn compile_key(abi: &Abi, identity: &vork_slang::InputIdentity) -> Result<blake3::Hash> {
-    Ok(input_key(b"program-v9", abi, &identity.identity)?.finalize())
+    Ok(input_key(b"program-v9-reserved-defines", abi, &identity.identity)?.finalize())
 }
 
 // Launch preanalysis defers visible-loss diagnostics to the consuming traversal.
@@ -868,11 +919,15 @@ pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Resu
 }
 
 pub(crate) fn parallel_map_with_limit<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> Result<R> + Sync) -> Result<Vec<R>> {
+    let revision = vork_slang::RevisionFiles::current();
+    let capture = session_inputs::current();
     let warning_collector = crate::warnings::Collector::current();
     let cursor = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let workers = items.len().min(limit).min(std::thread::available_parallelism().map_or(1, usize::from));
         let jobs: Vec<_> = (0..workers).map(|_| scope.spawn(|| {
+            let _revision = revision.enter();
+            let _inputs = session_inputs::enter(capture.clone());
             let _warning_scope = warning_collector.as_ref().map(|c| c.enter());
             let mut results = Vec::new();
             loop {
@@ -943,7 +998,7 @@ pub(crate) fn admit<'c>(cache: &dyn Fn(blake3::Hash)->PathBuf, compiler: &'c Com
     compiler.admit(&Admissions(cache))
 }
 
-fn program_identity(store: &disk_cache::Store, compiler: &Compiler, abi: &Abi, source: &str, origin: &Path) -> Result<vork_slang::InputIdentity> {
+pub(crate) fn program_identity(store: &disk_cache::Store, compiler: &Compiler, abi: &Abi, source: &str, origin: &Path) -> Result<vork_slang::InputIdentity> {
     bound_program_identity(store,compiler,abi,source,origin,"")
 }
 
@@ -1007,24 +1062,24 @@ pub(crate) fn native_input_identity(
 /// A receipt is a lookup hint, never a reason to reject freshly captured inputs.
 /// Return code only under the identity of the snapshot that produced it.
 pub(crate) fn native_code(
-    identity: &vork_slang::InputIdentity,
+    identity: vork_slang::InputIdentity,
     prepared: Option<vork_slang::PreparedModules>,
     inputs: &[vork_slang::InputIdentity],
     receipt_path: &Path,
     artifact: impl Fn(&[u8]) -> PathBuf,
     prepare: impl FnOnce() -> Result<vork_slang::PreparedModules>,
     compile: impl FnOnce(&vork_slang::PreparedModules) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
-    if let Some(code) = disk_cache::read(&artifact(&identity.identity)) { return Ok(code); }
+) -> Result<(Vec<u8>, vork_slang::InputIdentity)> {
+    if let Some(code) = disk_cache::read(&artifact(&identity.identity)) { return Ok((code, identity)); }
     let prepared = match prepared { Some(prepared) => prepared, None => prepare()? };
     let fresh = prepared.receipt();
     for input in inputs { fresh.verify(input)?; }
     if fresh.identity != identity.identity { write_input_receipt(receipt_path, &fresh)?; }
     let path = artifact(prepared.identity());
-    if let Some(code) = disk_cache::read(&path) { return Ok(code); }
+    if let Some(code) = disk_cache::read(&path) { return Ok((code, fresh)); }
     let code = compile(&prepared)?;
     let _ = disk_cache::write(&path, &code);
-    Ok(code)
+    Ok((code, fresh))
 }
 
 /// Scheduling probes never compile: an unknown receipt is a miss. Like every receipt
@@ -1177,6 +1232,7 @@ fn cached_proof<T: serde::Serialize + serde::de::DeserializeOwned>(
         Some(identity)=>identity.clone(),
         None=>program_identity(store,compiler,abi,source,origin)?,
     };
+    session_inputs::record(&identity)?;
     let key=input_key(key.as_bytes(),abi,&identity.identity)?.finalize();
     let path=store.path("slang-program",2,key);
     if identity.valid()
@@ -1266,7 +1322,6 @@ pub(crate) fn native(abi: &Abi, programs: &[Program], physical_hair: bool, cover
     for (i, p) in programs.iter().enumerate() {
         if !retained(p) {continue;}
         if let Some(identity)=&p.install_identity {
-            for previous in &inputs { identity.verify(previous)?; }
             inputs.push(identity.clone());
         }
         let tag = p
@@ -1526,9 +1581,10 @@ mod help_tests {
     #[test]
     #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn camera_programs_deduplicate_and_keep_independent_content() -> Result<()> {
-        let r = crate::test_renderer()?;
-        // Keep the compile-count assertion independent of an earlier test process's disk cache.
-        let source=format!("{}\n// independence test {}", "import vork; struct Inputs {float value=0.25;}; Closure surface(ShadingContext ctx,Inputs i) {Closure c;c.base_color=float3(i.value);return c;}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+        let mut r = crate::test_renderer()?;
+        let cache = tempfile::tempdir()?;
+        r.disk_cache = disk_cache::Store::for_test(cache.path().to_owned());
+        let source = "import vork; struct Inputs {float value=0.25;}; Closure surface(ShadingContext ctx,Inputs i) {Closure c;c.base_color=float3(i.value);return c;}";
         let mut scene:v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,"nodes":[],
             "programs":{"a":{"source":source},"duplicate":{"source":source},"z":{"source":source.replace("i.value)","i.value*0.5)")}},
             "materials":{"a":{"program":"a"},"duplicate":{"program":"duplicate","inputs":{"value":0.75}},"z":{"program":"z"}}
@@ -2244,11 +2300,12 @@ mod bundled_origin_tests {
         std::fs::remove_file(&artifact)?;
         let (lookup, prepared) = native_input_identity(&cache, &compiler, &modules, "main", &entries, &args, &Default::default(), &[])?;
         assert_eq!(lookup.identity, stale.identity);
-        let recovered = native_code(&lookup, prepared, &[], &receipt_path,
+        let (recovered, installed) = native_code(lookup, prepared, &[], &receipt_path,
             |identity| cache(blake3::hash(identity)),
             || compiler.prepare_identified_modules(&modules, "main", &entries, &args, &Default::default()),
             |prepared| prepared.compile())?;
         assert_eq!(recovered, binary);
+        assert_eq!(installed.identity, original.identity);
         assert_eq!(read_native_input_receipt(&receipt_path).unwrap().identity, original.identity);
         assert!(disk_cache::read(&cache(blake3::hash(&stale.identity))).is_none(), "fresh code must never be published under stale identity");
         // Both receipt and native artifact truncation are misses that heal.
@@ -2256,9 +2313,9 @@ mod bundled_origin_tests {
         std::fs::OpenOptions::new().write(true).open(&artifact)?.set_len(17)?;
         let (lookup, prepared) = native_input_identity(&cache, &compiler, &modules, "main", &entries, &args, &Default::default(), &[])?;
         assert!(prepared.is_some());
-        assert_eq!(native_code(&lookup, prepared, &[], &receipt_path,
+        assert_eq!(native_code(lookup, prepared, &[], &receipt_path,
             |identity| cache(blake3::hash(identity)),
-            || anyhow::bail!("captured snapshot must be retained"), |prepared| prepared.compile())?, binary);
+            || anyhow::bail!("captured snapshot must be retained"), |prepared| prepared.compile())?.0, binary);
         std::fs::write(&helper,"// explanatory comment\npublic float value() { return 0.25; }")?;
         assert!(cached_native_input_identity(&cache,&compiler,&modules,"main",&entries,&args,&Default::default(),&[])?.is_none(),"changed resolver input must not be reported stored");
         let (comment,prepared)=native_input_identity(&cache,&compiler,&modules,"main",&entries,&args,&Default::default(),&[])?;

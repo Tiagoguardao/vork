@@ -358,29 +358,4 @@ mod tests {
         out
     }
 
-    #[test]
-    #[ignore = "needs unported Moda fixture tests/fixtures/hyphenation-languages.json"]
-    fn patterns_per_language() {
-        let cases = language_cases();
-        assert!(cases.len() > 30);
-        for (lang, word, want) in cases {
-            assert_eq!(hyphenate_in(&word, lang), want, "{lang:?} {word}");
-        }
-        // A language with no patterns here: only soft and hard hyphens break.
-        assert_eq!(hyphenate_in("hyphenation", HyphLang::None), "hyphenation");
-        assert_eq!(
-            hyphenate_in("self-contained", HyphLang::None),
-            "self-|contained"
-        );
-        // German capitalizes nouns: Hyphenate Capitalized Words off leaves them whole.
-        let no_caps = Hyphenation {
-            capitalized: false,
-            ..Hyphenation::DEFAULT
-        };
-        assert!(word_breaks("Silbentrennung", &no_caps, HyphLang::De)
-            .1
-            .is_empty());
-        // A letter that lowercases to two chars (İ) matches no pattern, in either lane.
-        assert_eq!(pattern_letter('\u{0130}'), '#');
-    }
 }

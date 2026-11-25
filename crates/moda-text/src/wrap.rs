@@ -79,6 +79,9 @@ impl<'a, M: TextMeasurer> CachedMeasurer<'a, M> {
         }
     }
     pub fn measure(&mut self, text: &str, style: &InlineStyle) -> f64 {
+        // The selected glyph already carries its advance. Two identical
+        // placeholders can name different faces in the same paragraph.
+        if style.emoji.is_some() { return self.measurer.measure(text, style); }
         let key = key_of(text, style);
         if let Some(w) = self.cache.get(&key) {
             return *w;

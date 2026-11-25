@@ -19,8 +19,8 @@ Ported from Moda's `moda-shaders` crate: the extracted production WGSL and the p
   render-z slot, `moda_text_draw::depth`) instead of `-0.00001` (5/8 of Moda's slot) in the 53 path modules that
   declare it and in `manifest.json`'s `pinned_constants`; `src/lib.rs`'s `pinned_constants_hold` expects it and
   `stroke_depth_offset_is_the_pinned_one_in_every_module` is added.
-- `wgsl/vector-text-analytic.wgsl`, `wgsl/vector-text-analytic-additive.wgsl`: centre the text stroke's signed-distance
-  band on the glyph outline, with half its width on each side, and test overlapping-contour interior edges across
+- `wgsl/vector-text-analytic.wgsl` serves both ordinary and additive draws. It centres the text stroke's signed-distance
+  band on the glyph outline, with half its width on each side, and tests overlapping-contour interior edges across
   that full radius. Shadow and glow silhouette coverage is unchanged.
 
 - Added by vork: `src/working_color.rs` and `wgsl/include/working-color.wgsl`, an engine's working colour.

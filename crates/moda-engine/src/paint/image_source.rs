@@ -49,21 +49,27 @@ pub struct DecodedImage {
     /// (`moda_assets::PreparedImage::straight`): decoded texels kept for an engine that converts them to its
     /// working colour and associates them itself (`paint::draw`).
     pub straight: bool,
-    /// `Some` → a browser-decoded, GPU-resident raster (wasm editor lane):
-    /// `PatternTextureCache::bind_group` uploads it via the external uploader
-    /// keyed by `key` instead of `write_texture`-ing `rgba_premultiplied`.
+    /// A GPU image publication. Heap bytes are empty when this is present.
     pub external: Option<ExternalTextureRef>,
 }
 
-/// Reference to a browser-decoded image the engine uploads straight to a GPU
-/// texture (wasm editor lane). Carries no pixels: `key` names the source in
-/// the installed [`crate::external_texture::ExternalImageUploader`]'s registry,
-/// and `upload_id` gives the retained texture cache its self-invalidating
-/// identity (the heap lane uses the decoded-pixel `Arc` pointer instead).
+impl DecodedImage {
+    pub(crate) fn same_pixels(&self, other: &Self) -> bool {
+        match (&self.external, &other.external) {
+            (Some(a), Some(b)) => a.key == b.key && a.upload_id == b.upload_id,
+            (None, None) => Arc::ptr_eq(&self.rgba_premultiplied, &other.rgba_premultiplied),
+            _ => false,
+        }
+    }
+}
+
+/// The sampled source and its pixel revision. Device frames retain the published
+/// texture. Browser and registered capture sources resolve their GPU image by key.
 #[derive(Debug, Clone)]
 pub struct ExternalTextureRef {
     pub key: String,
     pub upload_id: u64,
+    pub texture: Option<Arc<wgpu::Texture>>,
 }
 
 /// A resolved pattern texture: either real decoded bytes or a 1×1 placeholder.
@@ -134,11 +140,7 @@ pub fn resolve_pattern_source(src: Option<&str>) -> PatternTexture {
     // exactly as in the goldens. Without a store (engine unit tests,
     // store-less embedding) the inline data-URI fallback below keeps M3b's
     // behavior.
-    // A paint layer's surface (raster spike): its texture, not an asset.
-    if let Some(texture) = crate::surface::pattern_texture(src) {
-        return texture;
-    }
-    if let Some(resolved) = moda_assets::engine_seam::resolve(src) {
+    if let Some(resolved) = moda_assets::engine_seam::resolve_pattern_binding(src) {
         use moda_assets::ImageFillState;
         return match resolved.state {
             ImageFillState::Loaded => loaded_to_pattern_texture(src, resolved),
@@ -162,7 +164,6 @@ pub fn resolve_pattern_source(src: Option<&str>) -> PatternTexture {
                 moda_assets::report::record(moda_assets::report::RuntimeEvent::PlaceholderBaked {
                     src: src.to_string(),
                     state: "failed".into(),
-                    shader_image: false,
                 });
                 one_by_one(PatternTextureState::Failed, "__failed", FAILED_RGBA)
             }
@@ -174,7 +175,6 @@ pub fn resolve_pattern_source(src: Option<&str>) -> PatternTexture {
         moda_assets::report::record(moda_assets::report::RuntimeEvent::PlaceholderBaked {
             src: src.to_string(),
             state: "never-prefetched".into(),
-            shader_image: false,
         });
         one_by_one(PatternTextureState::Loading, "__loading", LOADING_RGBA)
     }
@@ -186,16 +186,16 @@ pub fn resolve_pattern_source(src: Option<&str>) -> PatternTexture {
 /// stays empty and the texture is filled from the external uploader at bind time.
 /// Factored out so the image (`resolve_pattern_source`) and video
 /// streaming (`resolve_video_source`) paths share identical texel handling.
-fn loaded_to_pattern_texture(
+pub(crate) fn loaded_to_pattern_texture(
     key: &str,
     resolved: moda_assets::engine_seam::ResolvedAsset,
 ) -> PatternTexture {
     use moda_assets::engine_seam::ResolvedPixels;
     let (rgba_premultiplied, external) = match resolved.pixels {
         ResolvedPixels::Heap(bytes) => (bytes, None),
-        ResolvedPixels::External { key, upload_id } => (
+        ResolvedPixels::External { key, upload_id, texture } => (
             Arc::new(Vec::new()),
-            Some(ExternalTextureRef { key, upload_id }),
+            Some(ExternalTextureRef { key, upload_id, texture }),
         ),
     };
     PatternTexture {
@@ -224,7 +224,7 @@ fn loaded_to_pattern_texture(
 /// as before — which is what keeps the `mutation_replay` plan byte-exact for any
 /// fixture that doesn't install a live frame.
 pub fn resolve_video_source(stream_key: &str, poster_src: Option<&str>) -> PatternTexture {
-    if let Some(resolved) = moda_assets::engine_seam::resolve_streaming(stream_key) {
+    if let Some(resolved) = moda_assets::engine_seam::resolve_streaming_binding(stream_key) {
         return loaded_to_pattern_texture(stream_key, resolved);
     }
     resolve_pattern_source(poster_src)
@@ -258,19 +258,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Result<DecodedImage, String> {
     })
 }
 
-/// Premultiply straight RGBA8 in place, round-to-nearest (Chromium's
-/// `copyExternalImageToTexture(premultipliedAlpha: true)` conversion).
-pub fn premultiply_in_place(rgba: &mut [u8]) {
-    for px in rgba.chunks_exact_mut(4) {
-        let a = px[3] as u32;
-        if a == 255 {
-            continue;
-        }
-        for c in px.iter_mut().take(3) {
-            *c = ((*c as u32 * a + 127) / 255) as u8;
-        }
-    }
-}
+pub use moda_assets::decode::premultiply_in_place;
 
 /// Tiny RFC-4648 base64 decoder (standard alphabet, '=' padding, whitespace
 /// tolerated) — avoids a new dependency for fixture data URIs.

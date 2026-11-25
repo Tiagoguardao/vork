@@ -10,8 +10,7 @@
 //!   mask, normal blend — mirrored by the TS export gate
 //!   `utils/export/layerBlurEligibility.ts`; a group or a frame with children
 //!   captures its whole subtree, `frame.rs` `finish_subtree_capture`), padded-region math in
-//!   canvas units, and the capture-scale reduction that keeps a uniform
-//!   blur's sigma ≤ SIGMA_CAPTURE_MAX capture px for large radii.
+//!   canvas units, and alignment for area-preserving reduction after rasterization.
 //! - **exec** (`exec.rs`): per-group isolation capture via a recursive mini
 //!   `CoveragePlan` render (transparent clear, sample_count 1), the filter
 //!   passes in a fixed order — texture (`layer-filter-texture`), blur (the
@@ -41,6 +40,8 @@
 //! mid-pass split: it reads nothing from the target, so pages keep their
 //! MSAA sample count and `--transparent` exports work.
 
+pub(crate) mod batch;
+pub(crate) mod coverage;
 pub mod cache;
 pub mod exec;
 pub mod plan;

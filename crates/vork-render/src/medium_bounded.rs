@@ -4,7 +4,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 // Small convex carriers retain their plane fast path; all others use the BVH.
-#[path = "medium_convex_spike.rs"]
+#[path = "medium_convex.rs"]
 mod convex_spike;
 
 pub(crate) struct Installed {

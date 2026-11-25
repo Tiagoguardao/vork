@@ -31,7 +31,7 @@ pub use serde_json::{
 #[doc(hidden)]
 pub use serde_json as __serde_json;
 
-use indexmap::IndexMap;
+use indexmap::IndexSet;
 use rustc_hash::FxBuildHasher;
 use serde::de::{DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1417,145 +1417,239 @@ impl<'de> Deserialize<'de> for Value {
 // ---------------------------------------------------------------------------
 
 /// An object: keys in insertion order, as serde_json's `preserve_order` map keeps them.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct Map {
-    map: IndexMap<Key, Value, FxBuildHasher>,
+    layout: Arc<FieldLayout>,
+    values: Vec<Value>,
 }
 
-/// Up to this many keys a lookup scans in order instead of hashing (every node, most paints).
-const SCAN_MAX: usize = 24;
+#[derive(Default)]
+pub(crate) struct FieldLayout {
+    fields: IndexSet<Key, FxBuildHasher>,
+    /// Compiled when installed, shared by all records of this layout.
+    slots: std::sync::OnceLock<Box<[usize]>>,
+}
 
-pub type Iter<'a> = indexmap::map::Iter<'a, Key, Value>;
-pub type IterMut<'a> = indexmap::map::IterMut<'a, Key, Value>;
-pub type IntoIter = indexmap::map::IntoIter<Key, Value>;
-pub type Keys<'a> = indexmap::map::Keys<'a, Key, Value>;
-pub type Values<'a> = indexmap::map::Values<'a, Key, Value>;
-pub type ValuesMut<'a> = indexmap::map::ValuesMut<'a, Key, Value>;
+/// A fixed ordered schema for rows emitted by a typed producer. Values are stored in that
+/// order and field metadata is shared by every row emitted through this layout.
+pub struct RecordLayout<const WIDTH: usize>(Arc<FieldLayout>);
 
-impl Map {
-    pub fn new() -> Map {
-        Map::default()
+impl<const WIDTH: usize> RecordLayout<WIDTH> {
+    pub fn new(keys: [K; WIDTH]) -> Self {
+        let fields: IndexSet<_, FxBuildHasher> = keys.map(Key::from).into_iter().collect();
+        assert_eq!(fields.len(), WIDTH, "duplicate column in a fixed record layout");
+        Self(Arc::new(FieldLayout { fields, slots: Default::default() }))
     }
 
+    pub fn record(&self, values: [Value; WIDTH]) -> Value {
+        Value::Object(Map { layout: self.0.clone(), values: Vec::from(values) })
+    }
+}
+
+impl Clone for FieldLayout {
+    fn clone(&self) -> Self {
+        Self { fields: self.fields.clone(), slots: Default::default() }
+    }
+}
+
+impl std::ops::Deref for FieldLayout {
+    type Target = IndexSet<Key, FxBuildHasher>;
+    fn deref(&self) -> &Self::Target { &self.fields }
+}
+impl std::ops::DerefMut for FieldLayout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slots.take();
+        &mut self.fields
+    }
+}
+
+pub(crate) type LayoutPool = std::collections::HashMap<u64, Vec<Arc<FieldLayout>>, FxBuildHasher>;
+
+/// A scene's installed records share the index of each distinct ordered set of fields.
+/// Changing a value never copies its layout. Inserting or removing a field detaches it.
+impl Map {
+    pub(crate) fn retained_heap(&self, first: &mut impl FnMut(usize) -> bool) -> usize {
+        use std::mem::size_of;
+        fn value(v: &Value, first: &mut impl FnMut(usize) -> bool) -> usize {
+            match v {
+                Value::String(s) => s.capacity(),
+                Value::Array(a) => a.capacity() * size_of::<Value>() + a.iter().map(|v| value(v, first)).sum::<usize>(),
+                Value::Object(o) => o.retained_heap(first),
+                Value::Number(Number(N::OutOfRange(s))) if first(s.as_ptr() as usize) => s.len() + 2 * size_of::<usize>(),
+                _ => 0,
+            }
+        }
+        let mut bytes = self.values.capacity() * size_of::<Value>() + self.values.iter().map(|v| value(v, first)).sum::<usize>();
+        if first(Arc::as_ptr(&self.layout) as usize) {
+            bytes += size_of::<FieldLayout>() + self.layout.fields.capacity() * (size_of::<Key>() + 2 * size_of::<usize>())
+                + self.layout.slots.get().map_or(0, |slots| std::mem::size_of_val(&**slots));
+            for key in &self.layout.fields {
+                if let KeyRepr::Other(text) = &key.0 {
+                    if first(text.as_ptr() as usize) { bytes += text.len() + 2 * size_of::<usize>(); }
+                }
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn field_slot(&self, key: K) -> usize {
+        if let Some(slots) = self.layout.slots.get() { return slots[key as usize]; }
+        if self.len() <= SCAN_MAX {
+            self.keys().position(|k| k.known() == Some(key)).unwrap_or(usize::MAX)
+        } else {
+            self.layout.get_index_of(key.as_str()).unwrap_or(usize::MAX)
+        }
+    }
+
+    pub(crate) fn share_layout(&mut self, pool: &mut LayoutPool) {
+        let mut hash = rustc_hash::FxHasher::default();
+        for key in self.layout.iter() { key.hash(&mut hash); }
+        let bucket = pool.entry(hash.finish()).or_default();
+        if let Some(held) = bucket.iter().find(|held| held.as_slice() == self.layout.as_slice()) {
+            self.layout = held.clone();
+        } else {
+            self.layout.slots.get_or_init(|| {
+                let mut slots = vec![usize::MAX; K::ALL.len()];
+                for (at, key) in self.keys().enumerate() {
+                    if let Some(k) = key.known() { slots[k as usize] = at; }
+                }
+                slots.into_boxed_slice()
+            });
+            bucket.push(self.layout.clone());
+        }
+    }
+}
+
+impl PartialEq for Map {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.layout, &other.layout) { return self.values == other.values; }
+        self.len() == other.len() && self.iter().all(|(key, value)| other.get(key) == Some(value))
+    }
+}
+impl Eq for Map {}
+
+const SCAN_MAX: usize = 24;
+
+pub type Keys<'a> = indexmap::set::Iter<'a, Key>;
+pub type Values<'a> = std::slice::Iter<'a, Value>;
+pub type ValuesMut<'a> = std::slice::IterMut<'a, Value>;
+pub type Iter<'a> = std::iter::Zip<Keys<'a>, Values<'a>>;
+pub type IterMut<'a> = std::iter::Zip<Keys<'a>, ValuesMut<'a>>;
+pub type IntoIter = std::iter::Zip<indexmap::set::IntoIter<Key>, std::vec::IntoIter<Value>>;
+
+impl Map {
+    pub fn new() -> Map { Map::default() }
+
     pub fn with_capacity(capacity: usize) -> Map {
-        Map { map: IndexMap::with_capacity_and_hasher(capacity, FxBuildHasher) }
+        Map { layout: Arc::new(FieldLayout { fields: IndexSet::with_capacity_and_hasher(capacity, FxBuildHasher), slots: Default::default() }),
+            values: Vec::with_capacity(capacity) }
     }
 
     pub fn clear(&mut self) {
-        self.map.clear()
+        if let Some(layout) = Arc::get_mut(&mut self.layout) { layout.clear(); }
+        else { self.layout = Arc::default(); }
+        self.values.clear();
     }
 
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
+    pub fn len(&self) -> usize { self.values.len() }
+    pub fn is_empty(&self) -> bool { self.values.is_empty() }
 
     fn position(&self, key: &str) -> Option<usize> {
-        if self.map.len() <= SCAN_MAX {
-            self.map.keys().position(|k| k.as_str() == key)
-        } else {
-            self.map.get_index_of(key)
-        }
+        if self.len() <= SCAN_MAX { self.keys().position(|k| k.as_str() == key) }
+        else { self.layout.get_index_of(key) }
     }
 
     pub fn get<Q: ?Sized + AsRef<str>>(&self, key: &Q) -> Option<&Value> {
-        let at = self.position(key.as_ref())?;
-        self.map.get_index(at).map(|(_, value)| value)
+        self.value_at(self.position(key.as_ref())?)
     }
 
-    /// [`Map::get`] of a known name: the scan compares integers.
     pub fn get_known(&self, key: K) -> Option<&Value> {
-        if self.map.len() <= SCAN_MAX {
-            self.map.iter().find(|(k, _)| matches!(&k.0, KeyRepr::Known(known) if *known == key)).map(|(_, value)| value)
-        } else {
-            self.map.get(key.as_str())
-        }
+        self.value_at(self.field_slot(key))
     }
+
+    pub(crate) fn value_at(&self, at: usize) -> Option<&Value> { self.values.get(at) }
+    pub(crate) fn value_at_mut(&mut self, at: usize) -> Option<&mut Value> { self.values.get_mut(at) }
 
     pub fn get_mut<Q: ?Sized + AsRef<str>>(&mut self, key: &Q) -> Option<&mut Value> {
         let at = self.position(key.as_ref())?;
-        self.map.get_index_mut(at).map(|(_, value)| value)
+        self.value_at_mut(at)
     }
 
     pub fn get_key_value<Q: ?Sized + AsRef<str>>(&self, key: &Q) -> Option<(&Key, &Value)> {
         let at = self.position(key.as_ref())?;
-        self.map.get_index(at)
+        Some((&self.layout[at], &self.values[at]))
     }
 
     pub fn contains_key<Q: ?Sized + AsRef<str>>(&self, key: &Q) -> bool {
         self.position(key.as_ref()).is_some()
     }
 
-    /// Insert, or replace the value in place (the key keeps its position). Returns the value replaced.
     pub fn insert(&mut self, key: Key, value: Value) -> Option<Value> {
-        self.map.insert(key, value)
+        if Arc::strong_count(&self.layout) > 1 {
+            if let Some(at) = self.layout.get_index_of(&key) {
+                return Some(std::mem::replace(&mut self.values[at], value));
+            }
+        }
+        let (at, new) = Arc::make_mut(&mut self.layout).insert_full(key);
+        if new { self.values.push(value); None }
+        else { Some(std::mem::replace(&mut self.values[at], value)) }
     }
 
-    /// Remove a key by moving the last entry into its place, as serde_json's ordered map removes.
     pub fn remove<Q: ?Sized + AsRef<str>>(&mut self, key: &Q) -> Option<Value> {
-        self.map.swap_remove(key.as_ref())
+        self.swap_remove(key)
     }
 
     pub fn swap_remove<Q: ?Sized + AsRef<str>>(&mut self, key: &Q) -> Option<Value> {
-        self.map.swap_remove(key.as_ref())
+        self.remove_entry(key).map(|(_, value)| value)
     }
 
-    /// Remove a key, keeping the order of the rest.
     pub fn shift_remove<Q: ?Sized + AsRef<str>>(&mut self, key: &Q) -> Option<Value> {
-        self.map.shift_remove(key.as_ref())
+        let at = self.position(key.as_ref())?;
+        Arc::make_mut(&mut self.layout).shift_remove_index(at);
+        Some(self.values.remove(at))
     }
 
     pub fn remove_entry<Q: ?Sized + AsRef<str>>(&mut self, key: &Q) -> Option<(Key, Value)> {
-        self.map.swap_remove_entry(key.as_ref())
+        let at = self.position(key.as_ref())?;
+        let key = Arc::make_mut(&mut self.layout).swap_remove_index(at)?;
+        Some((key, self.values.swap_remove(at)))
     }
 
-    pub fn append(&mut self, other: &mut Map) {
-        for (key, value) in other.map.drain(..) {
-            self.map.insert(key, value);
-        }
-    }
+    pub fn append(&mut self, other: &mut Map) { self.extend(std::mem::take(other)); }
 
     pub fn entry<S: Into<Key>>(&mut self, key: S) -> Entry<'_> {
-        match self.map.entry(key.into()) {
-            indexmap::map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry(entry)),
-            indexmap::map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry(entry)),
+        let key = key.into();
+        match self.layout.get_index_of(&key) {
+            Some(at) => Entry::Occupied(OccupiedEntry(self, at)),
+            None => Entry::Vacant(VacantEntry(self, key)),
         }
     }
 
-    pub fn retain<F: FnMut(&Key, &mut Value) -> bool>(&mut self, keep: F) {
-        self.map.retain(keep)
+    pub fn retain<F: FnMut(&Key, &mut Value) -> bool>(&mut self, mut keep: F) {
+        let mut kept = Vec::with_capacity(self.len());
+        for (key, value) in self.iter_mut() { kept.push(keep(key, value)); }
+        if kept.iter().all(|&v| v) { return; }
+        let mut keys = kept.iter().copied();
+        Arc::make_mut(&mut self.layout).retain(|_| keys.next().expect("one flag per field"));
+        let mut values = kept.into_iter();
+        self.values.retain(|_| values.next().expect("one flag per value"));
     }
 
     pub fn sort_keys(&mut self) {
-        self.map.sort_keys()
+        if self.keys().is_sorted() { return; }
+        let mut entries: Vec<_> = std::mem::take(self).into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        *self = entries.into_iter().collect();
     }
 
-    pub fn iter(&self) -> Iter<'_> {
-        self.map.iter()
-    }
+    pub fn iter(&self) -> Iter<'_> { self.keys().zip(self.values()) }
+    pub fn iter_mut(&mut self) -> IterMut<'_> { self.layout.iter().zip(self.values.iter_mut()) }
+    pub fn keys(&self) -> Keys<'_> { self.layout.iter() }
+    pub fn values(&self) -> Values<'_> { self.values.iter() }
+    pub fn values_mut(&mut self) -> ValuesMut<'_> { self.values.iter_mut() }
 
-    pub fn iter_mut(&mut self) -> IterMut<'_> {
-        self.map.iter_mut()
-    }
-
-    pub fn keys(&self) -> Keys<'_> {
-        self.map.keys()
-    }
-
-    pub fn values(&self) -> Values<'_> {
-        self.map.values()
-    }
-
-    pub fn values_mut(&mut self) -> ValuesMut<'_> {
-        self.map.values_mut()
-    }
-
-    /// The map as serde_json holds it.
     pub fn to_json(&self) -> serde_json::Map<String, serde_json::Value> {
-        self.map.iter().map(|(key, value)| (key.as_str().to_string(), value.to_json())).collect()
+        self.iter().map(|(key, value)| (key.as_str().to_string(), value.to_json())).collect()
     }
 }
 
@@ -1572,7 +1666,7 @@ impl From<Map> for serde_json::Map<String, serde_json::Value> {
 
 impl fmt::Debug for Map {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.map.iter()).finish()
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -1592,53 +1686,56 @@ impl IntoIterator for Map {
     type Item = (Key, Value);
     type IntoIter = IntoIter;
     fn into_iter(self) -> IntoIter {
-        self.map.into_iter()
+        Arc::unwrap_or_clone(self.layout).fields.into_iter().zip(self.values)
     }
 }
 impl<'a> IntoIterator for &'a Map {
     type Item = (&'a Key, &'a Value);
     type IntoIter = Iter<'a>;
     fn into_iter(self) -> Iter<'a> {
-        self.map.iter()
+        self.iter()
     }
 }
 impl<'a> IntoIterator for &'a mut Map {
     type Item = (&'a Key, &'a mut Value);
     type IntoIter = IterMut<'a>;
     fn into_iter(self) -> IterMut<'a> {
-        self.map.iter_mut()
+        self.iter_mut()
     }
 }
 
 impl FromIterator<(Key, Value)> for Map {
     fn from_iter<I: IntoIterator<Item = (Key, Value)>>(iter: I) -> Map {
-        Map { map: iter.into_iter().collect() }
+        let iter = iter.into_iter();
+        let mut map = Map::with_capacity(iter.size_hint().0);
+        map.extend(iter);
+        map
     }
 }
 impl FromIterator<(String, Value)> for Map {
     fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Map {
-        Map { map: iter.into_iter().map(|(key, value)| (Key::from(key), value)).collect() }
+        iter.into_iter().map(|(key, value)| (Key::from(key), value)).collect()
     }
 }
 impl<'a> FromIterator<(&'a str, Value)> for Map {
     fn from_iter<I: IntoIterator<Item = (&'a str, Value)>>(iter: I) -> Map {
-        Map { map: iter.into_iter().map(|(key, value)| (Key::new(key), value)).collect() }
+        iter.into_iter().map(|(key, value)| (Key::new(key), value)).collect()
     }
 }
 impl Extend<(Key, Value)> for Map {
     fn extend<I: IntoIterator<Item = (Key, Value)>>(&mut self, iter: I) {
-        self.map.extend(iter)
+        for (key, value) in iter { self.insert(key, value); }
     }
 }
 impl Extend<(String, Value)> for Map {
     fn extend<I: IntoIterator<Item = (String, Value)>>(&mut self, iter: I) {
-        self.map.extend(iter.into_iter().map(|(key, value)| (Key::from(key), value)))
+        self.extend(iter.into_iter().map(|(key, value)| (Key::from(key), value)))
     }
 }
 
 impl Serialize for Map {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_map(self.map.iter().map(|(key, value)| (key.as_str(), value)))
+        serializer.collect_map(self.iter().map(|(key, value)| (key.as_str(), value)))
     }
 }
 /// An object, key by key: every key is a field name here, the number-token marker included (only a [`Value`]
@@ -1671,8 +1768,8 @@ pub enum Entry<'a> {
     Vacant(VacantEntry<'a>),
     Occupied(OccupiedEntry<'a>),
 }
-pub struct VacantEntry<'a>(indexmap::map::VacantEntry<'a, Key, Value>);
-pub struct OccupiedEntry<'a>(indexmap::map::OccupiedEntry<'a, Key, Value>);
+pub struct VacantEntry<'a>(&'a mut Map, Key);
+pub struct OccupiedEntry<'a>(&'a mut Map, usize);
 
 impl<'a> Entry<'a> {
     pub fn key(&self) -> &Key {
@@ -1708,36 +1805,26 @@ impl<'a> Entry<'a> {
 }
 
 impl<'a> VacantEntry<'a> {
-    pub fn key(&self) -> &Key {
-        self.0.key()
-    }
+    pub fn key(&self) -> &Key { &self.1 }
     pub fn insert(self, value: Value) -> &'a mut Value {
-        self.0.insert(value)
+        self.0.insert(self.1, value);
+        self.0.values.last_mut().expect("just inserted")
     }
 }
 
 impl<'a> OccupiedEntry<'a> {
-    pub fn key(&self) -> &Key {
-        self.0.key()
-    }
-    pub fn get(&self) -> &Value {
-        self.0.get()
-    }
-    pub fn get_mut(&mut self) -> &mut Value {
-        self.0.get_mut()
-    }
-    pub fn into_mut(self) -> &'a mut Value {
-        self.0.into_mut()
-    }
-    pub fn insert(&mut self, value: Value) -> Value {
-        self.0.insert(value)
-    }
-    /// Remove by moving the last entry into this one's place ([`Map::remove`]).
+    pub fn key(&self) -> &Key { &self.0.layout[self.1] }
+    pub fn get(&self) -> &Value { &self.0.values[self.1] }
+    pub fn get_mut(&mut self) -> &mut Value { &mut self.0.values[self.1] }
+    pub fn into_mut(self) -> &'a mut Value { &mut self.0.values[self.1] }
+    pub fn insert(&mut self, value: Value) -> Value { std::mem::replace(self.get_mut(), value) }
     pub fn remove(self) -> Value {
-        self.0.swap_remove()
+        Arc::make_mut(&mut self.0.layout).swap_remove_index(self.1);
+        self.0.values.swap_remove(self.1)
     }
     pub fn shift_remove(self) -> Value {
-        self.0.shift_remove()
+        Arc::make_mut(&mut self.0.layout).shift_remove_index(self.1);
+        self.0.values.remove(self.1)
     }
 }
 
@@ -1748,6 +1835,27 @@ mod tests {
     /// Whether this build's serde_json keeps number tokens as text (`arbitrary_precision`).
     fn tokens_are_text() -> bool {
         serde_json::Value::from(0.1f32).to_string() == "0.1"
+    }
+
+    #[test]
+    fn installed_rows_share_only_ordered_layouts_and_detach_on_structure() {
+        let map = |pairs: &[(&str, i32)]| pairs.iter().map(|&(k, v)| (k, Value::from(v))).collect::<Map>();
+        let mut a = map(&[("x", 1), ("y", 2)]);
+        let mut b = map(&[("x", 7), ("y", 8)]);
+        let mut reverse = map(&[("y", 2), ("x", 1)]);
+        let mut layouts = LayoutPool::default();
+        for row in [&mut a, &mut b, &mut reverse] { row.share_layout(&mut layouts); }
+        assert!(Arc::ptr_eq(&a.layout, &b.layout));
+        assert!(!Arc::ptr_eq(&a.layout, &reverse.layout));
+        assert_eq!(a, reverse);
+        b.insert(K::X.into(), json!(10));
+        assert!(Arc::ptr_eq(&a.layout, &b.layout));
+        assert_eq!(a.get_known(K::X), Some(&json!(1)));
+        b.shift_remove("x");
+        b.insert(K::X.into(), json!(12));
+        assert_eq!(b.value_at(b.field_slot(K::X)), Some(&json!(12)));
+        assert_eq!(a.value_at(a.field_slot(K::X)), Some(&json!(1)));
+        assert_eq!(b.keys().map(Key::as_str).collect::<Vec<_>>(), ["y", "x"]);
     }
 
     #[test]

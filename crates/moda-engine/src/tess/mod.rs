@@ -51,26 +51,56 @@ mod bounds;
 pub mod connector_text;
 mod dash;
 pub mod line_to_path;
-pub mod network;
-pub mod outline;
+pub mod curve_quality;
+pub(crate) mod paint_order;
 pub mod path_arrows;
-pub mod placed;
 pub mod shape_paths;
 pub mod stroke_param;
 mod tessellator;
 pub mod trim_axis;
 
 pub use bounds::path_bounds;
+pub(crate) use bounds::drawn_node_path_bounds;
 pub use trim_axis::TrimBy;
 pub use tessellator::{
-    tessellate_combined_cached,
-    cut_open_path_ends, is_trim_identity, last_fill_cell_count, last_fill_vertex_peak,
-    open_path_ends, tessellate_combined, tessellate_combined_oracle, tessellate_combined_with_dash,
-    tessellate_combined_with_dash_trim, tessellate_network, tessellate_path,
+    tessellate_combined_cached, Contour, PathClosure, PathContours,
+    is_trim_identity, last_fill_cell_count, last_fill_vertex_peak,
+    tessellate_combined, tessellate_combined_oracle, tessellate_combined_with_dash,
+    tessellate_combined_with_dash_trim, tessellate_path,
     dash_alignment_now, subpath_corners, trim_params_from_fields, with_dash_alignment,
-    with_fill_sweep_budget, with_fill_vertex_cap, with_miter_limit, NetworkStrokeStyle,
+    with_fill_sweep_budget, with_fill_vertex_cap, with_miter_limit,
     OracleGeometry, PathEnd, TrimParams, MAX_FILL_VERTICES, axis_trim_arc_windows,
 };
+
+/// Build a node's visible fill and stroke geometry. Direct path masks use the
+/// same settings and command cache as the body lane.
+pub(crate) fn tessellate_body(
+    node: &moda_scene::types::RawNode,
+    cmds: &[moda_engine_path_types::PathCmd],
+    closure: PathClosure<'_>,
+    stroke_width: f64,
+    fill_rule: moda_engine_path_types::FillRule,
+    style: &moda_scene::paint::StrokeStyle,
+) -> std::sync::Arc<crate::seams::TessellatedGeometry> {
+    use moda_engine_path_types as pt;
+    let trim = curve_quality::trim_params_from_node(node);
+    with_dash_alignment(style.dash_aligned(), || {
+        with_miter_limit(node.miter_limit(), || {
+            tessellate_combined_cached(
+                cmds,
+                stroke_width,
+                closure,
+                trim,
+                style.dash.as_deref().filter(|dash| !dash.is_empty()),
+                style.dash_offset.unwrap_or(0.0),
+                pt::line_cap_from_str(style.cap.as_deref()),
+                pt::line_join_from_str(style.join.as_deref()),
+                fill_rule,
+                pt::stroke_align_from_str(style.align.as_deref()),
+            )
+        })
+    })
+}
 
 /// The single derive point for a `path` node's drawn geometry — never read
 /// `points` directly in a render lane.
@@ -91,9 +121,7 @@ pub fn path_cmds_for_node(
     // A vector network (E7.9) is authoritative: its region loops, then the
     // region-less runs — what the editor derives into `points`, recomputed
     // here so a scene that carries only the network still draws.
-    if let Some(net) = network::node_network(node) {
-        return network::derived_cmds(&net);
-    }
+
     let points = node
         .points()
         .unwrap_or(moda_scene::path_points::PathPoints::Json(&[]));
@@ -108,93 +136,17 @@ pub fn path_cmds_for_node(
         .iter()
         .filter_map(moda_scene::blend::BlendPathPoint::from_ref)
         .collect();
-    let rounded = moda_scene::path_geom::round_corners::round_path_corners_with(
+    moda_scene::path_geom::round_corners::round_path_corners_with(
         &parsed,
-        node.bool("closed").unwrap_or(false),
+        node.path_closure(),
         &corners,
-    );
-    rounded.iter().map(path_cmd_from_blend_point).collect()
-}
-
-/// `BlendPathPoint` → `PathCmd`, the one mapping shared by every consumer of
-/// `moda_scene::path_geom::round_corners` (path bodies here, star/polygon rings
-/// in `shape_paths.rs`).
-pub fn path_cmd_from_blend_point(
-    point: &moda_scene::blend::BlendPathPoint,
-) -> moda_engine_path_types::PathCmd {
-    use moda_engine_path_types::PathCmd;
-    match point {
-        moda_scene::blend::BlendPathPoint::Move { x, y } => PathCmd::Move { x: *x, y: *y },
-        moda_scene::blend::BlendPathPoint::Line { x, y } => PathCmd::Line { x: *x, y: *y },
-        moda_scene::blend::BlendPathPoint::Curve { x, y, cp1, cp2 } => PathCmd::Curve {
-            x: *x,
-            y: *y,
-            cp1: *cp1,
-            cp2: *cp2,
-        },
-        // The rounder normalizes quadratics and arcs to cubics, so these two
-        // arms are unreachable for rounded output; keep them so a future variant
-        // that does survive rounding is a compile error, not a silently dropped
-        // command.
-        moda_scene::blend::BlendPathPoint::Quadratic { x, y, cp } => PathCmd::Quadratic {
-            x: *x,
-            y: *y,
-            cp: *cp,
-        },
-        moda_scene::blend::BlendPathPoint::Arc {
-            x,
-            y,
-            rx,
-            ry,
-            x_axis_rotation,
-            large_arc,
-            sweep,
-        } => PathCmd::Arc {
-            x: *x,
-            y: *y,
-            rx: *rx,
-            ry: *ry,
-            x_axis_rotation: *x_axis_rotation,
-            large_arc: *large_arc,
-            sweep: *sweep,
-        },
-    }
+    )
 }
 
 /// Path-command model the tessellator consumes — mirrors
 /// `core/scene/nodes.ts` PathPoint variants (move/line/curve/quadratic/arc).
 pub mod moda_engine_path_types {
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum PathCmd {
-        Move {
-            x: f64,
-            y: f64,
-        },
-        Line {
-            x: f64,
-            y: f64,
-        },
-        Curve {
-            x: f64,
-            y: f64,
-            cp1: (f64, f64),
-            cp2: (f64, f64),
-        },
-        Quadratic {
-            x: f64,
-            y: f64,
-            cp: (f64, f64),
-        },
-        Arc {
-            x: f64,
-            y: f64,
-            rx: f64,
-            ry: f64,
-            x_axis_rotation: f64,
-            large_arc: bool,
-            sweep: bool,
-        },
-    }
+    pub use moda_scene::blend::BlendPathPoint as PathCmd;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FillRule {
@@ -232,47 +184,7 @@ pub mod moda_engine_path_types {
     /// A node's points ([`moda_scene::types::RawNode::points`]) → commands; exactly
     /// [`cmds_from_node_points`] of their JSON.
     pub fn cmds_from_path_points(points: moda_scene::path_points::PathPoints<'_>) -> Vec<PathCmd> {
-        let pt = |p: &moda_scene::path_points::PathPointRef<'_>, k: &str| -> (f64, f64) {
-            match p.xy(k) {
-                Some((x, y)) => (x.unwrap_or(0.0), y.unwrap_or(0.0)),
-                None => (0.0, 0.0),
-            }
-        };
-        points
-            .iter()
-            .filter_map(|p| {
-                if !p.is_object() {
-                    return None;
-                }
-                let x = p.f64("x").unwrap_or(0.0);
-                let y = p.f64("y").unwrap_or(0.0);
-                match p.kind()? {
-                    "move" => Some(PathCmd::Move { x, y }),
-                    "line" => Some(PathCmd::Line { x, y }),
-                    "curve" => Some(PathCmd::Curve {
-                        x,
-                        y,
-                        cp1: pt(&p, "cp1"),
-                        cp2: pt(&p, "cp2"),
-                    }),
-                    "quadratic" => Some(PathCmd::Quadratic {
-                        x,
-                        y,
-                        cp: pt(&p, "cp"),
-                    }),
-                    "arc" => Some(PathCmd::Arc {
-                        x,
-                        y,
-                        rx: p.f64("rx").unwrap_or(0.0),
-                        ry: p.f64("ry").unwrap_or(0.0),
-                        x_axis_rotation: p.f64("xAxisRotation").unwrap_or(0.0),
-                        large_arc: p.bool("largeArc").unwrap_or(false),
-                        sweep: p.bool("sweep").unwrap_or(false),
-                    }),
-                    _ => None,
-                }
-            })
-            .collect()
+        points.draw_commands().collect()
     }
 
     /// `node.dash` → dash pattern. Non-array values (the WEB-NEXTJS-13T
@@ -316,5 +228,33 @@ pub mod moda_engine_path_types {
             Some("outside") => StrokeAlign::Outside,
             _ => StrokeAlign::Center,
         }
+    }
+}
+
+#[cfg(test)]
+mod contour_tests {
+    use super::*;
+    use moda_scene::types::RawNode;
+    use moda_scene::value::{Value, json};
+
+    #[test]
+    fn rounded_path_rounds_the_closed_seam_and_preserves_open_ends() {
+        let open = json!([
+            {"type":"move","x":0,"y":0}, {"type":"line","x":10,"y":0},
+            {"type":"line","x":10,"y":10}
+        ]);
+        let closed = json!([
+            {"type":"move","x":20,"y":0}, {"type":"line","x":30,"y":0},
+            {"type":"line","x":30,"y":10}
+        ]);
+        let node = |points, closure| RawNode::new(json!({
+            "id":"p","type":"path","points":points,"closed":closure,"cornerRadius":1
+        }).as_object().unwrap().clone());
+        let points = open.as_array().unwrap().iter().chain(closed.as_array().unwrap()).cloned().collect();
+        let compound = path_cmds_for_node(&node(Value::Array(points), json!([false, true])));
+        let mut expected = path_cmds_for_node(&node(open, json!(false)));
+        expected.extend(path_cmds_for_node(&node(closed.clone(), json!(true))));
+        assert_eq!(compound, expected);
+        assert_ne!(expected, path_cmds_for_node(&node(closed, json!(false))));
     }
 }

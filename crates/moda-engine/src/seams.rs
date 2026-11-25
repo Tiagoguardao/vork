@@ -41,16 +41,7 @@ pub const INNER_SHADOW_Z_OFFSET: f64 = 0.5;
 // GPU instance ABIs (bytemuck-mirrored, size-asserted)
 // ---------------------------------------------------------------------------
 
-/// The 656-byte `CustomShaderData` instance ABI used by EVERY procedural-fill
-/// pipeline and the vector-text-fill variants (manifest `instance_abi`;
-/// production packing `defineProceduralShader.ts:237-292`).
-///
-/// Field offsets (floats) are extractor-emitted data
-/// (`manifest.instance_abi.offsets_floats`) and asserted in tests — if the
-/// frontend ever grows this struct the extractor diff + these asserts trip.
-///
-/// M3b/M3f fill `shader_params`/`color_data` via the per-shader packing tables
-/// (`manifest.modules.<id>.packing`); M1 only uses the shared header fields.
+/// Common CPU-side body paint data, converted to each pipeline's GPU instance when packed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct PaintInstance {
@@ -72,19 +63,9 @@ pub struct PaintInstance {
     /// `INFINITE_CLIP` for floating nodes (`renderers/webgpu/utils/
     /// transientOrigin.ts:4-9` — sentinel 9_999_999).
     pub page_clip_bounds: [f32; 4],
-    /// offset 36 floats — per-shader params, packed per manifest tables.
-    pub shader_params: [f32; 64],
-    /// offset 100 floats — per-shader colors, packed per manifest tables.
-    pub color_data: [f32; 64],
 }
 
-// M4e FIX (SEAMS.md change log): 164 floats / 656 bytes — the stride the
-// production storage buffers are sized AND written with
-// (`BUFFER_SIZES.CUSTOM_SHADER`, `WebGPUStorageBufferManager.ts:1307-1311`)
-// and the WGSL `CustomShaderData` struct stride. The freeze-time 672 came
-// from `ShaderBufferLayout.INSTANCE_SIZE` (a dead prod constant); the extra
-// `_pad` sheared every instance >= 1 in multi-instance shader buffers.
-const _: () = assert!(core::mem::size_of::<PaintInstance>() == 656);
+const _: () = assert!(core::mem::size_of::<PaintInstance>() == 144);
 
 /// The 128-byte `PathData` instance of the path-solid pipeline (WGSL struct in
 /// `wgsl/path-solid.wgsl`; packing `WebGPUPathRenderer.ts:1471-1485`).
@@ -150,8 +131,7 @@ pub struct ShadowInstance {
     /// [x, y, showBehindNode, opaqueSdfCoversShadow] — world-space offset (drop)
     /// / in-SDF inset offset (inner, CSS inset convention).
     pub shadow_offset: [f32; 4],
-    /// PLAIN page clip (NOT the mask-intersected effective clip —
-    /// `prepareShadowInstanceData` uses `calculatePageClipBounds`).
+    /// Effective page clip, including clipping frames inside the current capture.
     pub page_clip_bounds: [f32; 4],
     /// [isInner, spread, 0, 0].
     pub inner_params: [f32; 4],
@@ -276,7 +256,7 @@ pub struct MaskPlan {
     /// Node-local coverage vertices (tessellated fill+stroke positions, or
     /// the full-quad fallback) — `arrayStride` 8, float32x2. `draws` index
     /// into it.
-    pub positions: Vec<f32>,
+    pub positions: std::sync::Arc<Vec<f32>>,
     /// The mask node's `maskType` (E7.18): alpha, vector or luminance. A
     /// clipping container is always `Vector`.
     pub mask_type: MaskType,
@@ -284,7 +264,7 @@ pub struct MaskPlan {
     /// one per fill and stroke layer of an alpha / luminance mask (fills
     /// bottom to top, then strokes), one white draw of the whole geometry for
     /// a vector mask.
-    pub draws: Vec<MaskDraw>,
+    pub draws: std::sync::Arc<Vec<MaskDraw>>,
     /// 0 = geometry, 1 = text (M4d), 2 = image, 3 = rendered layer: the source texture bound
     /// for [`MaskPaint::Source`] draws.
     pub mode: u32,
@@ -382,7 +362,7 @@ pub enum MaskPaint {
 #[derive(Clone, PartialEq)]
 pub struct MaskImage {
     /// Straight (non-premultiplied) RGBA8 — only `.a` is sampled.
-    pub rgba: Vec<u8>,
+    pub rgba: std::sync::Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     /// fillPatternOffset (shape-local px).
@@ -393,24 +373,33 @@ pub struct MaskImage {
     pub scale: [f32; 2],
     /// fillPatternRotation in radians.
     pub rotation_rad: f32,
-    /// A paint layer's surface (`paint-surface:` src), or a graph-pixel unit kept on the GPU (a registered
-    /// `external_texture::CaptureTexture`): `rgba` is empty and the mask samples the GPU texture (its pixels live
-    /// outside the engine; `MaskAtlas::build*` take the views).
+    /// Key of a rendered mask or registered capture sampled from a GPU view instead of `rgba`.
     pub surface: Option<String>,
     pub rendered: Option<std::sync::Arc<RenderedMask>>,
 }
 
-#[derive(Clone)]
+/// The planner can evict the capture document while keeping the executor's observed inputs.
+pub(crate) type MaskAssetReads = std::sync::Arc<MaskObservation>;
+
+#[derive(Default)]
+pub(crate) struct MaskObservation {
+    pub reads: std::sync::Mutex<Option<std::sync::Arc<moda_assets::engine_seam::AssetReads>>>,
+    /// A deferred plan can acquire or release allocations after the parent was weighed.
+    pub preparation_revision: std::sync::atomic::AtomicU64,
+}
+
 pub struct RenderedMask {
     pub document: std::sync::Arc<moda_scene::types::SceneDocument>,
+    pub(crate) prepared: std::sync::Mutex<Option<crate::residency::PublishedPlan>>,
     pub node_id: String,
     pub shader_time_s: f64,
     pub source_fingerprint: u64,
-    /// Self-contained host text/path subtree eligible for exact retained capture reuse.
+    /// Key of the isolated source and its camera inputs.
     pub cache_key: Option<u64>,
     /// A fact of this immutable capture, established by its ordinary prepared plan. Unknown means
     /// clock-dependent until the executor proves otherwise; preparing a new source starts unknown.
     pub(crate) shader_clock: std::sync::OnceLock<bool>,
+    pub(crate) asset_reads: std::sync::OnceLock<MaskAssetReads>,
 }
 
 impl std::fmt::Debug for RenderedMask {
@@ -423,7 +412,7 @@ impl std::fmt::Debug for RenderedMask {
 
 impl PartialEq for RenderedMask {
     fn eq(&self, other: &Self) -> bool {
-        self.node_id == other.node_id && self.source_fingerprint == other.source_fingerprint
+        self.node_id == other.node_id && self.source_fingerprint == other.source_fingerprint && self.cache_key == other.cache_key
     }
 }
 
@@ -478,29 +467,6 @@ pub use moda_text::ops::{TextGradientUniforms, TextOp, TextOpPipeline};
 /// vork: the batch is moda-text-draw's, where the text GPU side is ported (without the `mask` and `fill_shader`
 /// fields, which belong to text masks and text shader fills that are not ported). See PROVENANCE.md.
 pub use moda_text_draw::seams::TextQuadBatch;
-
-/// Text shader fill (M4 "richtext shader fills"): everything
-/// the executor needs to pack ONE 656-byte `CustomShaderData` instance for
-/// the `<id>.vector-text-fill` pipeline. The engine owns the remaining header
-/// fields at prepare time: `model` = batch `model_matrix`, `pathInfo` =
-/// `[0, 0, 0, linear_depth(z)]`, `pageClipBounds` = batch
-/// `page_clip_bounds` (`buildTextShaderFillCommonData`,
-/// `renderers/webgpu/text/msdf/textShaderFillData.ts`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct TextShaderFill {
-    /// Packed shaderParams/colorData tail + resolved module id
-    /// (`packInstanceData` over the manifest packing tables).
-    pub packed: moda_shaders::runtime::PackedFill,
-    /// `[1, 1, 1, nodeOpacity]` — the shader supplies RGB; node opacity is
-    /// applied once by the fragment via `fillColor.a`.
-    pub fill_color: [f32; 4],
-    /// Node stroke (alpha × opacity) or transparent — ABI parity only, the
-    /// fill fragment never reads it (stroke is a separate solid pass).
-    pub stroke_color: [f32; 4],
-    /// `[0, 0, max(1, boxW), max(1, boxH)]` — text-box-local coordinate
-    /// field, zero-size-box NaN guard included.
-    pub bounds: [f32; 4],
-}
 
 /// A progressive background blur's ramp, in TARGET px: the radius runs from
 /// `start_radius_px` at `start_px` to the op's `radius_px` at `end_px`
@@ -729,56 +695,13 @@ pub enum BodyPaint {
     /// gradient stroke, or stroke-only overlay over a PATTERN fill — pattern
     /// overlays draw in the regular gradient slot, before custom shaders).
     Gradient(Box<crate::paint::GradientInstance>),
-    /// path-gradient module (Q-116): a SHADER-fill body's stroke-only
-    /// gradient overlay. Identical packing to `Gradient`, but drawn in its
-    /// own slot AFTER custom shaders within the bucket
-    /// (`postShaderGradientStrokePaths`, `WebGPUPathRenderer.ts:1016,
-    /// 1190-1194`) — the shader body would otherwise paint over the inner
-    /// half of the centered stroke band (~half-width strokes).
-    PostShaderGradientStroke(Box<crate::paint::GradientInstance>),
+
     /// path-pattern module (M3b): packed `PathPatternData` + decoded texture
     /// + sampler choice (texture bind group rides group 2; mask group 3).
     Pattern(Box<crate::paint::PatternBody>),
-    /// procedural fill (M3f); instance = `PaintInstance`. M4e
-    /// interface-change note (SEAMS.md change log): the variant now carries
-    /// `ShaderFillBody` — module id + the OPTIONAL preprocessed shader-image
-    /// texture for image-backed shaders (texture bind group rides group 2,
-    /// mask moves to group 3 — `manifest.packing.mask_bind_group_index`).
-    /// Payload is GPU-free: the `CoveragePlan` CPU-backend invariant holds.
-    Shader(Box<ShaderFillBody>),
 }
 
-/// M4e: a routed procedural fill.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShaderFillBody {
-    /// Alias-resolved module id (keys WGSL module + pipeline descriptors).
-    pub module_id: String,
-    /// Preprocessed shader image (image-backed shaders only; `None` for
-    /// self-contained fills). Fallback entries are a 1×1 transparent texture
-    /// (`ShaderImageResourceManager.createFallbackEntry`).
-    pub image: Option<ShaderImageTexture>,
-    /// Shader playback: the `shader_params` float offsets carrying
-    /// the renderer clock (`moda_shaders::runtime::clock_param_offsets`), so the
-    /// live camera present path can re-apply a new clock to this CACHED fill's
-    /// instance without rebuilding the plan. `Some([])` = no clock (static
-    /// fill); `Some([..])` = patch these slots with `shader_time_s as f32` at
-    /// present; `None` = a non-direct-copy clock use that must NOT be re-threaded
-    /// (the plan then keeps the clock in its cache key — see
-    /// `residency::plan_shader_time_rethreadable`).
-    pub clock_offsets: Option<Vec<u16>>,
-}
 
-/// M4e: CPU-side shader-image texture (straight-alpha sRGB RGBA8 — the
-/// production upload is `copyExternalImageToTexture` with `premultipliedAlpha`
-/// unset). Keyed for GPU texture/bind-group dedup by the production resource
-/// key (`createImageResourceKey`) or `fallback:<processing-key>`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShaderImageTexture {
-    pub key: String,
-    pub width: u32,
-    pub height: u32,
-    pub rgba_straight: std::sync::Arc<Vec<u8>>,
-}
 
 /// One item in the per-page draw stream, in render-z order.
 ///
@@ -929,11 +852,7 @@ pub struct LayerBlurGroup {
     /// follows the target, where the picture's bounds and anything placed by them do not.
     pub extent_canvas: [f64; 4],
     /// Offscreen capture size in physical px = region_canvas × capture scale.
-    /// The capture scale is the canvas→target scale REDUCED for large uniform
-    /// radii so the per-pass sigma stays within the shared 31-tap kernel's
-    /// exact range (σ ≤ 5); the composite's bilinear upsample supplies the
-    /// rest — the Skia-style downsampled-Gaussian scheme (layer-blur-spec.md
-    /// §6.3).
+    /// Uniform blur reduces the rasterized capture in the filter passes.
     pub width_px: u32,
     pub height_px: u32,
     /// How far (canvas units) a texel of the filtered result reads the capture: its filters' reach. A result shown
@@ -946,11 +865,6 @@ pub struct LayerBlurGroup {
     /// result across frames (`layer_blur::cache`) instead of re-rendering it.
     /// `None` = render every time (exports, shader-clock content).
     pub cache_key: Option<u64>,
-    /// The capture's content without its geometry (`residency::capture_key`):
-    /// what it draws, not at which zoom step or window. The live lane composites
-    /// an earlier step's result with this key while the new one waits for the
-    /// frame's capture budget (`Engine::set_capture_frame_budget`).
-    pub identity_key: Option<u64>,
     /// The node's shape silhouette (at its opacity), captured like `items`
     /// into a second texture that clips the noise: grain covers the shape
     /// even where its paint is transparent or absent, as in Figma. Empty = the
@@ -962,7 +876,7 @@ pub struct LayerBlurGroup {
     /// whose children are clipped BEFORE the filter (`frame.rs`
     /// `divert_subtree_filter`). `items` mask ids index this table, not the
     /// page plan's. Empty for every other capture (their items carry no mask).
-    pub masks: Vec<MaskPlan>,
+    pub masks: std::sync::Arc<Vec<MaskPlan>>,
 }
 
 /// Debug leaves out derived execution metadata: `cache_key` (retained lanes
@@ -984,12 +898,21 @@ impl std::fmt::Debug for LayerBlurGroup {
     }
 }
 
+/// Target-pixel lattice used to integrate coverage into a size-limited filter grid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaptureRaster {
+    pub scale: f64,
+    /// Position of the filter grid's top-left edge within a target pixel.
+    pub phase: [f64; 2],
+}
+
 /// The layer filters over one capture, in CAPTURE pixels, run in a fixed
 /// order: filter shadows, texture, blur, every noise in list order, then
-/// feather (the TS `effect.ts` doc). At least one is set, but for a motion
-/// capture.
+/// feather (the TS `effect.ts` doc). Identity mask captures may have none.
 #[derive(Clone, PartialEq, Default)]
 pub struct LayerFilters {
+    /// Four RGBA coefficient rows followed by four offsets, in CSS sRGB.
+    pub color_matrices: Vec<[f32; 20]>,
     /// The node's canvas AABB origin in capture px: the grain lattice anchor.
     pub origin_px: [f32; 2],
     /// Filter shadows (`moda_scene::effect::FilterShadow`, CSS `filter:
@@ -1008,6 +931,9 @@ pub struct LayerFilters {
     pub shadows_alone: bool,
     pub texture: Option<TextureFilter>,
     pub blur: Option<BlurFilter>,
+    /// Transparent border supplied after reduction, in reduced texels.
+    pub blur_border: u32,
+    pub source_raster: Option<Box<CaptureRaster>>,
     pub noise: Vec<NoiseFilter>,
     /// Illustrator's Feather, last: the edges fade inside the outline.
     pub feather: Option<FeatherFilter>,
@@ -1020,37 +946,7 @@ pub struct LayerFilters {
     /// fixed-function state writes it exactly there (`backdrop::blend::filter_composite_fixed_blend`),
     /// instead of a blend split around the composite. Source-over otherwise.
     pub composite_blend: CaptureBlend,
-    /// A motion capture (`crate::motion_capture`): no filter runs, the capture is the result. Only the live
-    /// camera lane's moving frames plan one; a still frame, an export or a snapshot never does.
-    pub motion: bool,
-    /// Agent shaders (`moda_scene::effect::agent_shader_effects`), last, in list order.
-    pub shaders: Vec<AgentShaderFilter>,
-}
 
-/// One agent shader layer effect, compiled for its capture (docs/design/effects-code-first.md §4.3): the moda-wgsl
-/// effect module and its header slots (host values in capture px, then the parameters).
-#[derive(Clone, PartialEq)]
-pub struct AgentShaderFilter {
-    /// The code key (`b3:…`): names it in errors and warnings.
-    pub code: String,
-    /// The node it's on.
-    pub node_id: String,
-    pub wgsl: std::sync::Arc<str>,
-    pub slots: Vec<[f32; 4]>,
-    /// Output px of the capture the 1080p time budget is scaled by.
-    pub area_px: f64,
-}
-
-/// The module prints as its length: plans print (and fingerprint) the code key and the slots, which hold the clock.
-impl std::fmt::Debug for AgentShaderFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentShaderFilter")
-            .field("code", &self.code)
-            .field("node_id", &self.node_id)
-            .field("wgsl_len", &self.wgsl.len())
-            .field("slots", &self.slots)
-            .finish()
-    }
 }
 
 /// The derived Debug's output, with `motion` and `drop_shadows` printed only when set: plans print (and
@@ -1065,18 +961,17 @@ impl std::fmt::Debug for LayerFilters {
             .field("feather", &self.feather)
             .field("shadow", &self.shadow)
             .field("composite_blend", &self.composite_blend);
-        if self.motion {
-            d.field("motion", &self.motion);
-        }
+
+        if let Some(grid) = &self.source_raster { d.field("source_raster", &grid); }
+        if self.blur_border != 0 { d.field("blur_border", &self.blur_border); }
+        if !self.color_matrices.is_empty() { d.field("color_matrices", &self.color_matrices); }
         if !self.drop_shadows.is_empty() {
             d.field("drop_shadows", &self.drop_shadows);
         }
         if self.shadows_alone {
             d.field("shadows_alone", &self.shadows_alone);
         }
-        if !self.shaders.is_empty() {
-            d.field("shaders", &self.shaders);
-        }
+
         d.finish()
     }
 }
@@ -1164,6 +1059,8 @@ pub struct ShadowPass {
 pub enum BlurFilter {
     /// The shared separable kernel (`backdrop-blur`).
     Uniform { radius_px: f32 },
+    /// Separable Gaussian along the projected principal axes.
+    Elliptical { major: [f32; 2], reaches: [f32; 2] },
     /// The radius ramps from `start_radius_px` at `start_px` to
     /// `end_radius_px` at `end_px` (`progressive-blur`).
     Progressive {
@@ -1426,7 +1323,7 @@ pub struct CoveragePlan {
     /// M3d interface-change note (SEAMS.md change log; additive): per-owner
     /// mask coverage plans, indexed by `MaskRef::mask_id`. Ancestor masks
     /// always precede descendants. Empty when the page has no mask owners.
-    pub masks: Vec<MaskPlan>,
+    pub masks: std::sync::Arc<Vec<MaskPlan>>,
     /// Live-viewport: when `Some`, the wgpu executor
     /// projects the whole plan with this editor camera (N visible pages under
     /// ONE view-projection matrix into a screen-sized target) instead of the
@@ -1445,6 +1342,15 @@ pub struct CoveragePlan {
 }
 
 impl CoveragePlan {
+    pub(crate) fn with_items(&self, items: Vec<DrawItem>) -> Self {
+        Self {
+            page_id: self.page_id.clone(), page_index: self.page_index,
+            width_px: self.width_px, height_px: self.height_px, page_size: self.page_size,
+            scale: self.scale, transparent: self.transparent, sample_count: self.sample_count,
+            camera: self.camera, items, item_order: self.item_order.clone(), masks: self.masks.clone(),
+            camera_frame: self.camera_frame.clone(), clear_rgba: self.clear_rgba, region_viewport: self.region_viewport,
+        }
+    }
     pub(crate) fn indexed_items(&self) -> crate::plan_items::PlanItems<'_> { crate::plan_items::PlanItems::new(self) }
     pub(crate) fn ordered_items(&self) -> impl ExactSizeIterator<Item = &DrawItem> { self.indexed_items().map(|(_, item)| item) }
 }
@@ -1562,37 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn instance_abis_match_manifest() {
-        let abi = &moda_shaders::manifest().instance_abi;
-        assert_eq!(
-            abi.size_bytes as usize,
-            core::mem::size_of::<PaintInstance>()
-        );
-        let off = &abi.offsets_floats;
-        assert_eq!(off["modelMatrix"], 0);
-        assert_eq!(off["fillColor"], 16);
-        assert_eq!(off["strokeColor"], 20);
-        assert_eq!(off["pathInfo"], 24);
-        assert_eq!(off["bounds"], 28);
-        assert_eq!(off["pageClipBounds"], 32);
-        assert_eq!(off["shaderParams"], 36);
-        assert_eq!(off["colorData"], 100);
-        assert_eq!(abi.shader_params_capacity_floats, 64);
-        assert_eq!(abi.color_data_capacity_floats, 64);
-        // Rust-side field offsets agree with the manifest float offsets.
-        assert_eq!(core::mem::offset_of!(PaintInstance, fill_color), 16 * 4);
-        assert_eq!(core::mem::offset_of!(PaintInstance, stroke_color), 20 * 4);
-        assert_eq!(core::mem::offset_of!(PaintInstance, path_info), 24 * 4);
-        assert_eq!(core::mem::offset_of!(PaintInstance, bounds), 28 * 4);
-        assert_eq!(
-            core::mem::offset_of!(PaintInstance, page_clip_bounds),
-            32 * 4
-        );
-        assert_eq!(core::mem::offset_of!(PaintInstance, shader_params), 36 * 4);
-        assert_eq!(core::mem::offset_of!(PaintInstance, color_data), 100 * 4);
-    }
-
-    #[test]
     fn mask_bind_group_indices_match_manifest() {
         let c = &moda_shaders::manifest().pinned_constants;
         assert_eq!(c.mask_bind_group_index.default, MASK_BIND_GROUP_INDEX);
@@ -1621,5 +1496,22 @@ mod tests {
         assert_eq!(BlendMode::from_node_value(None), BlendMode::Normal);
         // The S10/DECISION catch: overlay is NOT normal.
         assert_eq!(m.blend_modes["overlay"].color.src_factor, "src-alpha");
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+
+    #[test]
+    fn native_paint_header_offsets() {
+        // The retained CPU paint header keeps its existing native packing prefix.
+        assert_eq!(core::mem::size_of::<PaintInstance>(), 144);
+        assert_eq!(core::mem::offset_of!(PaintInstance, model_matrix), 0);
+        assert_eq!(core::mem::offset_of!(PaintInstance, fill_color), 16 * 4);
+        assert_eq!(core::mem::offset_of!(PaintInstance, stroke_color), 20 * 4);
+        assert_eq!(core::mem::offset_of!(PaintInstance, path_info), 24 * 4);
+        assert_eq!(core::mem::offset_of!(PaintInstance, bounds), 28 * 4);
+        assert_eq!(core::mem::offset_of!(PaintInstance, page_clip_bounds), 32 * 4);
     }
 }

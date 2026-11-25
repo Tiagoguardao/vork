@@ -24,7 +24,7 @@ use moda_scene::paint::{self as sp, Fill, Paint, SolidPaint, Stroke};
 use moda_scene::types::RawNode;
 use moda_scene::value::{Map, Value};
 
-use crate::color::{color_to_normalized_rgba, parse_color, Rgba};
+use crate::color::{color_to_normalized_rgba, Rgba};
 use crate::seams::BlendMode;
 
 /// Node types whose fills / strokes the body lanes draw (`line` has strokes only).
@@ -75,19 +75,11 @@ fn layer_blend(mode: Option<&str>) -> BlendMode {
     BlendMode::from_node_value(mode)
 }
 
-/// A solid paint's colour (a resolved CSS string the path renderer parses).
-fn solid_rgba(paint: &Paint) -> Option<Rgba> {
-    match paint {
-        Paint::Solid(s) => parse_color(s.color.as_str()),
-        _ => None,
-    }
-}
-
 /// Whether a fill paints every pixel of its geometry opaquely: an opaque solid, or a gradient whose stops are
 /// all opaque (a gradient pads its end stops, so it has no gaps).
 fn paint_is_opaque(paint: &Paint) -> bool {
     match paint {
-        Paint::Solid(_) => solid_rgba(paint).is_some_and(|c| c.a >= 1.0),
+        Paint::Solid(_) => paint.solid_rgba().is_some_and(|c| c.a >= 1.0),
         Paint::Linear(_) | Paint::Radial(_) | Paint::Conic(_) => sp::paint_stops(paint)
             .is_some_and(|stops| {
                 !stops.is_empty()
@@ -120,19 +112,14 @@ fn is_plain(opacity: Option<f64>, blend: Option<&str>) -> bool {
 /// alpha 0 is the backdrop, exactly). A layer opacity of 0 is already hidden (`shown`).
 fn paints_nothing(fill: &Fill) -> bool {
     layer_blend(fill.blend_mode.as_deref()) == BlendMode::Normal
-        && solid_rgba(&fill.paint).is_some_and(|c| c.a <= 0.0)
+        && fill.paint.solid_rgba().is_some_and(|c| c.a <= 0.0)
 }
 
-/// A stroke that tessellates as one plain band: no brush, width profile, taper, wave, dynamics, dash or
+/// A stroke that tessellates as one plain band: no dash or
 /// arrowhead (each of those draws pieces that may overlap one another).
 fn plain_stroke_body(s: &Stroke) -> bool {
     let arrow = |a: &Option<String>| a.as_deref().is_some_and(|v| v != "none");
-    s.brush.as_ref().is_none_or(Value::is_null)
-        && s.profile.as_ref().is_none_or(Value::is_null)
-        && s.taper.as_ref().is_none_or(Value::is_null)
-        && s.wave.as_ref().is_none_or(Value::is_null)
-        && s.dynamic.as_ref().is_none_or(Value::is_null)
-        && s.dash.as_ref().is_none_or(|d| d.iter().all(|v| *v <= 0.0))
+    s.dash.as_ref().is_none_or(|d| d.iter().all(|v| *v <= 0.0))
         && !arrow(&s.start_arrow)
         && !arrow(&s.end_arrow)
 }
@@ -147,7 +134,7 @@ fn mergeable(fill: &Fill) -> Option<Rgba> {
     if layer_blend(fill.blend_mode.as_deref()) != BlendMode::Normal {
         return None;
     }
-    let mut c = solid_rgba(&fill.paint)?;
+    let mut c = fill.paint.solid_rgba()?;
     c.a *= layer_opacity(fill.opacity);
     Some(c)
 }
@@ -198,9 +185,7 @@ fn fold_fills(fills: Vec<Fill>, changed: &mut bool) -> Vec<Fill> {
             last.id = f.id.clone();
             last.opacity = None;
             last.blend_mode = None;
-            last.paint = Paint::Solid(SolidPaint {
-                color: Value::String(css(merged)),
-            });
+            last.paint = Paint::Solid(SolidPaint::new(Value::String(css(merged))));
             *changed = true;
             continue;
         }
@@ -235,7 +220,7 @@ fn appearance_is_grouped(node: &RawNode, opacity: f64) -> bool {
 /// with the backdrop. A single body fades or blends the fill and the stroke separately, so the fill shows through
 /// (`stack-fill-stroke-object-50`: 46/255 on the stroke's inner half), or the stroke blends with the fill.
 pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
-    if !LAYERED_TYPES.contains(&node.node_type()) {
+    if !LAYERED_TYPES.contains(&node.node_type()) || node.plain_solid_fill() {
         return LayerPlan::Single(None);
     }
     // Illustrator's Appearance (E8.2): an interleaved order or an entry effect draws every visible layer as
@@ -246,7 +231,8 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
         }
     }
     let mut changed = false;
-    let all_fills = sp::node_fills(node);
+    let all_fills = sp::node_fills_shared(node);
+    let all_strokes = sp::node_strokes_shared(node);
     // On a translucent or blending node whose strokes are plain, a fill that paints nothing (a fully transparent
     // solid with normal blending: source-over of alpha 0 leaves the backdrop as it is) is dropped like a hidden
     // one, so the stroke over it draws as one body instead of a transparency group (a split pair per node, two
@@ -256,7 +242,7 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
     // dashes), which the group composites as one.
     let drop_clear_fills = appearance_is_grouped(node, opacity)
         && node.array("effects").is_none_or(|e| e.is_empty())
-        && sp::node_strokes_shared(node).iter().all(plain_stroke_body);
+        && all_strokes.iter().all(plain_stroke_body);
     let fills: Vec<Fill> = if node.node_type() == "line" {
         Vec::new()
     } else {
@@ -269,17 +255,10 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
     if fills.len() != all_fills.iter().filter(|f| shows(f.visible, f.opacity)).count() {
         changed = true;
     }
-    let fill_count = fills.len();
     // A renderable source-mask shader effect replaces the fill (`paint::classify_fill`): it paints once, in the
     // top fill's slot.
-    let effect_fill = crate::paint::classify_fill_is_effect(node);
-    let fills: Vec<Fill> = if effect_fill {
-        changed |= fill_count > 1;
-        fills.into_iter().last().into_iter().collect()
-    } else {
-        fold_fills(fills, &mut changed)
-    };
-    let strokes: Vec<Stroke> = sp::node_strokes_shared(node)
+    let fills = fold_fills(fills, &mut changed);
+    let strokes: Vec<Stroke> = all_strokes
         .iter()
         .filter(|s| shows(s.visible, s.opacity))
         .cloned()
@@ -287,19 +266,11 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
 
     // A vector network whose regions carry their own fills (Figma's region
     // `fills`) draws each region group as its own fill layers.
-    if let Some(groups) = region_fill_groups(node, &fills) {
-        return region_stack(node, groups, strokes);
-    }
 
     let plain_fill = |f: &Fill| is_plain(f.opacity, f.blend_mode.as_deref());
     let plain_stroke = |s: &Stroke| is_plain(s.opacity, s.blend_mode.as_deref());
-    // E8.5: a vector pattern layer draws in its own lane (`frame::build_pattern_layer_items`), so a node with one
-    // always draws as a stack.
-    let has_pattern = crate::pattern_paint::enabled()
-        && (fills.iter().any(|f| matches!(f.paint, Paint::Pattern(_)))
-            || strokes.iter().any(|s| matches!(s.paint, Paint::Pattern(_))));
-    let single = !has_pattern
-        && fills.len() <= 1
+
+    let single = fills.len() <= 1
         && strokes.len() <= 1
         && fills.iter().all(plain_fill)
         && strokes.iter().all(plain_stroke)
@@ -311,9 +282,8 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
         // E6.1: an open path's arrowed stroke draws as its own layer (its ends cut back under the arrowheads,
         // which the fill must not follow).
         && !(node.node_type() == "path"
-            && !node.bool("closed").unwrap_or(false)
-            && node.json_field("vectorNetwork").is_none_or(Value::is_null)
-            && strokes.iter().any(crate::tess::path_arrows::stroke_has_arrows));
+            && strokes.iter().any(crate::tess::path_arrows::stroke_has_arrows)
+            && node.path_has_open_contours());
     if single {
         // Unchanged when the fold kept exactly what the node draws as stored (its top fill and top stroke).
         let as_stored = !changed
@@ -342,7 +312,7 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
             overprint: None,
             ..f
         };
-        let mut m = layer_base(node, layers.len(), effect_fill && i == 0);
+        let mut m = layer_base(node, layers.len());
         if top_video == Some(i) {
             let stream = node.str(VIDEO_STREAM_KEY).unwrap_or(node.id()).to_string();
             m.insert(VIDEO_STREAM_KEY.into(), Value::String(stream));
@@ -368,7 +338,7 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
             overprint: None,
             ..s
         };
-        let mut m = layer_base(node, layers.len(), false);
+        let mut m = layer_base(node, layers.len());
         sp::set_strokes(&mut m, vec![bare]);
         layers.push(PaintLayer {
             node: node.with_fields(m),
@@ -410,11 +380,7 @@ fn appearance_stack(node: &RawNode) -> Option<LayerPlan> {
         .filter(|f| shows(f.visible, f.opacity))
         .cloned()
         .collect();
-    if region_fill_groups(node, &visible_fills).is_some() {
-        return None;
-    }
-    let effect_fill = crate::paint::classify_fill_is_effect(node);
-    let top_fill = fills.iter().rposition(|f| shows(f.visible, f.opacity));
+
     let top_video = fills
         .iter()
         .rposition(|f| shows(f.visible, f.opacity) && matches!(f.paint, Paint::Video(_)));
@@ -427,9 +393,7 @@ fn appearance_stack(node: &RawNode) -> Option<LayerPlan> {
                     continue;
                 }
                 // A source-mask shader effect replaces the fill: it paints once, in the top fill's slot.
-                if effect_fill && Some(i) != top_fill {
-                    continue;
-                }
+
                 let effects = ap::fill_effects(f);
                 let bare = Fill {
                     visible: None,
@@ -439,7 +403,7 @@ fn appearance_stack(node: &RawNode) -> Option<LayerPlan> {
                     effects: None,
                     ..f.clone()
                 };
-                let mut m = layer_base(node, layers.len(), effect_fill && Some(i) == top_fill);
+                let mut m = layer_base(node, layers.len());
                 if top_video == Some(i) {
                     let stream = node.str(VIDEO_STREAM_KEY).unwrap_or(node.id()).to_string();
                     m.insert(VIDEO_STREAM_KEY.into(), Value::String(stream));
@@ -467,7 +431,7 @@ fn appearance_stack(node: &RawNode) -> Option<LayerPlan> {
                     effects: None,
                     ..s.clone()
                 };
-                let mut m = layer_base(node, layers.len(), false);
+                let mut m = layer_base(node, layers.len());
                 sp::set_strokes(&mut m, vec![bare]);
                 layers.push(PaintLayer {
                     node: node.with_fields(m),
@@ -481,122 +445,6 @@ fn appearance_stack(node: &RawNode) -> Option<LayerPlan> {
         }
     }
     Some(LayerPlan::Stack(layers))
-}
-
-/// The fill groups of a network path whose regions override the node's fills: the regions without an override
-/// with the node's (visible, folded) `fills`, then each overriding region with its own. `None` when no region
-/// overrides (the node draws as any path).
-fn region_fill_groups(node: &RawNode, node_fills: &[Fill]) -> Option<Vec<(Vec<usize>, Vec<Fill>)>> {
-    if node.node_type() != "path" {
-        return None;
-    }
-    let regions = node.json_field("vectorNetwork")?.get("regions")?.as_array()?;
-    fn own(r: &Value) -> Option<&Value> {
-        r.get("fills").filter(|f| f.is_array())
-    }
-    if !regions.iter().any(|r| own(r).is_some()) {
-        return None;
-    }
-    let mut base = Vec::new();
-    let mut groups = Vec::new();
-    for (i, r) in regions.iter().enumerate() {
-        match own(r) {
-            Some(f) => {
-                let fills: Vec<Fill> = sp::parse_fills(Some(f))
-                    .into_iter()
-                    .filter(|f| shows(f.visible, f.opacity))
-                    .collect();
-                let mut changed = false;
-                groups.push((vec![i], fold_fills(fills, &mut changed)));
-            }
-            None => base.push(i),
-        }
-    }
-    let mut out = Vec::with_capacity(groups.len() + 1);
-    if !base.is_empty() {
-        out.push((base, node_fills.to_vec()));
-    }
-    out.extend(groups);
-    Some(out)
-}
-
-/// A clone's network keeps only `keep` of its regions (their own `fills` stripped: the layer's fill paints them).
-fn keep_regions(m: &mut Map, keep: &[usize]) {
-    let Some(Value::Object(net)) = m.get_mut("vectorNetwork") else {
-        return;
-    };
-    let Some(Value::Array(regions)) = net.get("regions") else {
-        return;
-    };
-    let kept: Vec<Value> = keep
-        .iter()
-        .filter_map(|&i| regions.get(i).cloned())
-        .map(|mut r| {
-            if let Value::Object(o) = &mut r {
-                o.remove("fills");
-            }
-            r
-        })
-        .collect();
-    net.insert("regions".into(), Value::Array(kept));
-}
-
-/// The layers of a network path with region fills: each group's fills over its regions, bottom to top in region
-/// order, then the strokes (over the whole network).
-fn region_stack(
-    node: &RawNode,
-    groups: Vec<(Vec<usize>, Vec<Fill>)>,
-    strokes: Vec<Stroke>,
-) -> LayerPlan {
-    let mut layers = Vec::new();
-    for (regions, fills) in groups {
-        for f in fills {
-            let (opacity, blend) = (
-                layer_opacity(f.opacity),
-                layer_blend(f.blend_mode.as_deref()),
-            );
-            let bare = Fill {
-                visible: None,
-                opacity: None,
-                blend_mode: None,
-                overprint: None,
-                ..f
-            };
-            let mut m = layer_base(node, layers.len(), false);
-            keep_regions(&mut m, &regions);
-            sp::set_fills(&mut m, vec![bare]);
-            layers.push(PaintLayer {
-                node: node.with_fields(m),
-                opacity,
-                blend,
-                is_stroke: false,
-                effects: Vec::new(),
-            });
-        }
-    }
-    for s in strokes {
-        let (opacity, blend) = (
-            layer_opacity(s.opacity),
-            layer_blend(s.blend_mode.as_deref()),
-        );
-        let bare = Stroke {
-            visible: None,
-            opacity: None,
-            blend_mode: None,
-            overprint: None,
-            ..s
-        };
-        let mut m = layer_base(node, layers.len(), false);
-        sp::set_strokes(&mut m, vec![bare]);
-        layers.push(PaintLayer {
-            node: node.with_fields(m),
-            opacity,
-            blend,
-            is_stroke: true,
-            effects: Vec::new(),
-        });
-    }
-    LayerPlan::Stack(layers)
 }
 
 /// Whether a stack draws as a transparency group: the node's opacity or blend mode applies to its layers
@@ -623,7 +471,11 @@ pub fn effective_blend(node_blend: BlendMode, layer: &PaintLayer) -> BlendMode {
 /// Whether the node's paint stack needs blend splits (a group, or a layer blend that reads the backdrop) on a
 /// target that may be `transparent`: its page then plans them (`backdrop::blend::page_has_split_blend_over`).
 pub fn stack_needs_split(node: &RawNode, ancestor_opacity: f64, transparent: bool) -> bool {
-    let opacity = node.f64("opacity").unwrap_or(1.0) * ancestor_opacity;
+    stack_needs_split_at(node, node.f64("opacity").unwrap_or(1.0) * ancestor_opacity, transparent)
+}
+
+/// The same decision at a known effective opacity, including a capture that strips ancestor opacity.
+pub(crate) fn stack_needs_split_at(node: &RawNode, opacity: f64, transparent: bool) -> bool {
     let LayerPlan::Stack(layers) = plan_at(node, opacity) else {
         return false;
     };
@@ -652,9 +504,7 @@ pub fn text_fill_paint(node: &RawNode) -> Option<Paint> {
     let top = folded.pop()?;
     // A lone translucent solid: its opacity is its colour's alpha.
     match (&top.paint, mergeable(&top)) {
-        (Paint::Solid(_), Some(c)) if top.opacity.is_some() => Some(Paint::Solid(SolidPaint {
-            color: Value::String(css(c)),
-        })),
+        (Paint::Solid(_), Some(c)) if top.opacity.is_some() => Some(Paint::Solid(SolidPaint::new(Value::String(css(c))))),
         _ => Some(top.paint),
     }
 }
@@ -686,14 +536,13 @@ pub fn layer_owner_id(item_id: &str) -> &str {
 
 /// A layer clone without paints: the node's own fields, a synthetic id, the transform redirect, no drop or
 /// inner shadow effects (the node draws its shadows once) and no shader effect unless `keep_effect`.
-fn layer_base(node: &RawNode, k: usize, keep_effect: bool) -> Map {
+fn layer_base(node: &RawNode, k: usize) -> Map {
     let mut m = node.fields().clone();
     m.remove("fills");
     m.remove("strokes");
     if let Some(Value::Array(effects)) = m.get_mut("effects") {
         effects.retain(|e| match e.get("type").and_then(Value::as_str) {
             Some("drop-shadow" | "inner-shadow") => false,
-            Some("shader") => keep_effect,
             _ => true,
         });
         if effects.is_empty() {
@@ -735,47 +584,6 @@ mod tests {
             LayerPlan::Stack(l) => l,
             LayerPlan::Single(_) => panic!("expected a stack, got {p:?}"),
         }
-    }
-
-    #[test]
-    fn network_region_fills_draw_as_their_own_layers() {
-        let n = raw(json!({
-            "id": "v", "type": "path", "points": [],
-            "fills": [{"id": "f", "paint": {"type": "solid", "color": "#ff0000"}}],
-            "strokes": [{"id": "s", "paint": {"type": "solid", "color": "#000000"}, "width": 2.0}],
-            "vectorNetwork": {
-                "vertices": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}, {"x": 0, "y": 10}, {"x": 20, "y": 0}],
-                "segments": [{"start": 0, "end": 1}, {"start": 1, "end": 2}, {"start": 2, "end": 3}, {"start": 3, "end": 0},
-                             {"start": 1, "end": 4}, {"start": 4, "end": 2}],
-                "regions": [
-                    {"windingRule": "NONZERO", "loops": [[0, 1, 2, 3]]},
-                    {"windingRule": "NONZERO", "loops": [[4, 5, 1]],
-                     "fills": [{"id": "g", "paint": {"type": "solid", "color": "#00ff00"}}]}
-                ]
-            }
-        }));
-        let planned = plan(&n);
-        let layers = stack(&planned);
-        assert_eq!(layers.len(), 3);
-        let regions = |l: &PaintLayer| {
-            l.node.json_field("vectorNetwork").unwrap()["regions"]
-                .as_array()
-                .unwrap()
-                .len()
-        };
-        assert_eq!(regions(&layers[0]), 1);
-        assert_eq!(regions(&layers[1]), 1);
-        assert!(layers[1].node.json_field("vectorNetwork").unwrap()["regions"][0]
-            .get("fills")
-            .is_none());
-        let color = |l: &PaintLayer| {
-            sp::top_fill(&l.node)
-                .map(|f| format!("{:?}", f.paint))
-                .unwrap_or_default()
-        };
-        assert!(color(&layers[0]).contains("ff0000"));
-        assert!(color(&layers[1]).contains("00ff00"));
-        assert!(layers[2].is_stroke);
     }
 
     #[test]

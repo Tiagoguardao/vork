@@ -128,6 +128,15 @@ impl Plan {
             Some(&node) => samples.clocks.get(node).cloned().flatten().map_or(FootageClock::Absent, FootageClock::Node),
         }
     }
+    /// Source time shared by picture selection, soundtrack remaps and field readback.
+    pub(crate) fn footage_time(&self, samples: &Samples, scene: &Germ, image: &str, time: Option<&vork_time::Clock>) -> Result<Option<Germ>> {
+        let base = match self.footage_clock(samples, image) {
+            FootageClock::Absent => return Ok(None),
+            FootageClock::Node(clock) => clock,
+            FootageClock::Scene => time.map_or_else(|| scene.clone(), |t| Germ::point(t.exact())),
+        };
+        self.image_time_exact(samples, scene, image, base).map(Some)
+    }
     /// Every node's local instant at scene instant `scene`, parents before children;
     /// `None` is an absent node (rule 1), its subtree included.
     pub(crate) fn clocks(&self, scene: &Germ) -> Result<Vec<Option<Germ>>> {
@@ -724,7 +733,7 @@ pub(super) fn scene_tables(scene: &v2::Scene, base: &std::path::Path, opened: &c
             }
             if node.has_clock() && node.time.as_ref().is_none_or(|time| time.duration.is_none()) {
                 let sources = media.media_sources(node);
-                if sources.len() == 1 && scene.audio_sources(node).is_empty() {
+                if sources.len() == 1 && media.separate_audio_sources(node, &sources).is_empty() {
                     let name = sources.into_iter().next().unwrap();
                     let file = base.join(scene.images[&name].file.as_deref().unwrap());
                     lengths.insert(path.clone(), source_length(&file, scene.render.fps, opened)?);
@@ -739,7 +748,7 @@ pub(super) fn scene_tables(scene: &v2::Scene, base: &std::path::Path, opened: &c
             {
                 let sources = scene.audio_sources(node);
                 if sources.len() == 1 {
-                    let source = crate::audio::load(&base.join(sources.first().unwrap()))?;
+                    let source = opened.audio(&base.join(sources.first().unwrap()))?;
                     lengths.insert(
                         path.clone(),
                         Rational::new(source.frames()?.into(), source.rate.into()),

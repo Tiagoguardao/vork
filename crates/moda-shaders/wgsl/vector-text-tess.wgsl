@@ -27,27 +27,23 @@ fn vectorWarpLocal(local: vec2<f32>) -> vec3<f32> {
   let p = vec3<f32>(local, 1.0);
   return vec3<f32>(dot(draw.distort0.xyz, p), dot(draw.distort1.xyz, p), dot(draw.distort2.xyz, p));
 }
-@group(0) @binding(0) var<uniform> frame: mat4x4<f32>;
+// #include "rect-clip.wgsl"
 @group(0) @binding(1) var<uniform> draw: DrawUniforms;
 
-// world is the true (post-divide) world position — affine in SCREEN space — so it
-// must interpolate WITHOUT perspective correction or page-clip edges bend on warped
-// geometry (identical to default interpolation when the warp is disabled, w == 1).
-struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(linear) world: vec2<f32> };
+struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) clip: vec4<f32> };
 
 @vertex fn vs(@location(0) pos: vec2<f32>) -> VSOut {
   var o: VSOut;
   let h = vectorWarpLocal(pos);
   let world = draw.model * vec4<f32>(h.xy, 0.0, h.z);
-  o.pos = frame * world;
+  o.pos = frameUniforms.viewProjection * world;
   o.pos.z = draw.params.x * h.z; // hardware divide restores params.x
-  o.world = world.xy / h.z;
+  o.clip = projectRectClip(draw.pageClip);
   return o;
 }
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4<f32> {
-  let b = draw.pageClip;
-  if (in.world.x < b.x || in.world.x > b.x + b.z || in.world.y < b.y || in.world.y > b.y + b.w) {
+  if (outsideRectClip(in.pos.xy, in.clip)) {
     discard;
   }
   let a = draw.color.a * draw.params.y;

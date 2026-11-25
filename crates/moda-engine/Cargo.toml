@@ -20,8 +20,9 @@ png = "0.18"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 rustc-hash = "2"
+hashbrown = { version = "0.16", default-features = false }
+rayon = "1.12"
 half = "2"
-moda-wgsl = { path = "../moda-wgsl" }
 # Path FILL tessellation: sweep-line fill with nonzero/evenodd on self-intersecting outlines.
 lyon_tessellation = "1"
 # Aligned (inside / outside) dashed or trimmed strokes: the centred stroke clipped

@@ -16,3 +16,6 @@ wgpu = "29"
 moda-text = { path = "../moda-text" }
 moda-shaders = { path = "../moda-shaders" }
 rustc-hash = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"

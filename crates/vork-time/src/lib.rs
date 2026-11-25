@@ -56,6 +56,9 @@ impl Time {
     pub fn denominator(self) -> i64 {
         self.den
     }
+    pub fn exact(self) -> exact::Rational {
+        exact::Rational::new_raw(self.num.into(), self.den.into())
+    }
     pub fn as_f64(self) -> f64 {
         self.num as f64 / self.den as f64
     }

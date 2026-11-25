@@ -10,6 +10,7 @@
 //! `trimPathOffset` and `trimPathMode` do not apply (every subpath is cut by the one shared window). A path with no
 //! extent on the axis (a vertical line trimmed by x) is trimmed by length instead.
 
+use moda_scene::path_geom::bounds::AxisBezier;
 use super::dash::{
     cubic_arc_length, quadratic_arc_length, subdivide_cubic, subdivide_quadratic, PathSegment, Pt, Seg,
 };
@@ -59,50 +60,16 @@ const MIN_EXTENT: f64 = 1e-6;
 /// Pieces shorter than this in parameter are dropped (a window edge grazing a segment end).
 const MIN_PIECE: f64 = 1e-9;
 
-fn coord(seg: &Seg, axis: usize, t: f64) -> f64 {
-    let u = 1.0 - t;
+fn axis_bezier(seg: &Seg, axis: usize) -> AxisBezier {
     match seg {
-        Seg::Line { p0, p1 } => p0[axis] + (p1[axis] - p0[axis]) * t,
-        Seg::Quadratic { p0, p1, cp } => u * u * p0[axis] + 2.0 * u * t * cp[axis] + t * t * p1[axis],
-        Seg::Cubic { p0, p1, cp1, cp2 } => {
-            u * u * u * p0[axis] + 3.0 * u * u * t * cp1[axis] + 3.0 * u * t * t * cp2[axis] + t * t * t * p1[axis]
-        }
+        Seg::Line { p0, p1 } => AxisBezier::Line([p0[axis], p1[axis]]),
+        Seg::Quadratic { p0, p1, cp } => AxisBezier::Quadratic([p0[axis], cp[axis], p1[axis]]),
+        Seg::Cubic { p0, p1, cp1, cp2 } => AxisBezier::Cubic([p0[axis], cp1[axis], cp2[axis], p1[axis]]),
     }
 }
 
-/// The parameters in (0, 1) where the segment's coordinate turns (its derivative's roots).
-fn turning_points(seg: &Seg, axis: usize) -> Vec<f64> {
-    let mut ts = Vec::new();
-    match seg {
-        Seg::Line { .. } => {}
-        Seg::Quadratic { p0, p1, cp } => {
-            let d = p0[axis] - 2.0 * cp[axis] + p1[axis];
-            if d.abs() > 1e-12 {
-                ts.push((p0[axis] - cp[axis]) / d);
-            }
-        }
-        Seg::Cubic { p0, p1, cp1, cp2 } => {
-            // The derivative / 3: a t² + b t + c.
-            let a = -p0[axis] + 3.0 * cp1[axis] - 3.0 * cp2[axis] + p1[axis];
-            let b = 2.0 * (p0[axis] - 2.0 * cp1[axis] + cp2[axis]);
-            let c = cp1[axis] - p0[axis];
-            if a.abs() < 1e-12 {
-                if b.abs() > 1e-12 {
-                    ts.push(-c / b);
-                }
-            } else {
-                let disc = b * b - 4.0 * a * c;
-                if disc >= 0.0 {
-                    let r = disc.sqrt();
-                    ts.push((-b + r) / (2.0 * a));
-                    ts.push((-b - r) / (2.0 * a));
-                }
-            }
-        }
-    }
-    ts.retain(|t| *t > 0.0 && *t < 1.0);
-    ts.sort_by(f64::total_cmp);
-    ts
+fn coord(seg: &Seg, axis: usize, t: f64) -> f64 {
+    axis_bezier(seg, axis).at(t)
 }
 
 /// Where the segment's coordinate equals `v`: every parameter in [0, 1]. Straight segments are solved exactly; curves
@@ -117,7 +84,7 @@ fn crossings(seg: &Seg, axis: usize, v: f64) -> Vec<f64> {
         return if (0.0..=1.0).contains(&t) { vec![t] } else { Vec::new() };
     }
     let mut knots = vec![0.0];
-    knots.extend(turning_points(seg, axis));
+    knots.extend(axis_bezier(seg, axis).extrema());
     knots.push(1.0);
     let mut out = Vec::new();
     for w in knots.windows(2) {
@@ -155,17 +122,9 @@ pub fn extent<'a>(subpaths: impl IntoIterator<Item = &'a [PathSegment]>, axis: u
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for segs in subpaths {
         for s in segs {
-            let mut add = |c: f64| {
-                if c.is_finite() {
-                    lo = lo.min(c);
-                    hi = hi.max(c);
-                }
-            };
-            add(coord(&s.seg, axis, 0.0));
-            add(coord(&s.seg, axis, 1.0));
-            for t in turning_points(&s.seg, axis) {
-                add(coord(&s.seg, axis, t));
-            }
+            let (min, max) = axis_bezier(&s.seg, axis).bounds()?;
+            lo = lo.min(min);
+            hi = hi.max(max);
         }
     }
     lo.is_finite().then_some((lo, hi))

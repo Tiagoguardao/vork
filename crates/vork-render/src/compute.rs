@@ -28,6 +28,7 @@ pub(crate) struct PreparedProgram {
     implicit:Vec<GeometryInputBinding>,
 }
 pub(crate) type Prepared=std::collections::BTreeMap<(String,Option<String>),PreparedProgram>;
+#[cfg(test)]
 pub(crate) fn prepare(r:&Renderer,source:&v2::Scene,base:&std::path::Path,attributes:Option<&ProgramBuffers>,sources:&[Option<&v2::Node>])->Result<Prepared> {
     prepare_with_packed(r,source,base,attributes,sources,&BTreeSet::new())
 }
@@ -351,7 +352,7 @@ pub(crate) struct Compute {
     timestamp_period: f32,
     simulation: Option<v2::Simulation>,
     simulation_ranges: Vec<(usize, u64, u64)>,
-    frame_ranges: Vec<(usize, u64, u64)>,
+    frame_ranges: Vec<FrameRange>,
     frame_sources: Vec<String>,
     checkpoint_store: disk_cache::Store,
     gpu_only_checkpoints: bool,
@@ -363,8 +364,8 @@ pub(crate) struct Compute {
     pub(crate) cursor: Mutex<Cursor>,
     instances: Vec<Instance>,
     /// Installed copies from retained source ranges to object-owned material rows.
-    material_attributes: Vec<(usize, u64, u64, u64)>,
-    material_attribute_sources: Vec<String>,
+    material_attributes: Vec<AttributeColumn>,
+    attribute_pipeline: Option<wgpu::ComputePipeline>,
     bridge: Option<(
         wgpu::ComputePipeline,
         u32,
@@ -424,7 +425,7 @@ impl ReplayCost {
         if let Self::Pending {buffer,ready,period}=self {
             match ready.try_recv() {
                 Ok(Ok(()))=>{
-                    let data=buffer.get_mapped_range(..);let values:&[u64]=bytemuck::cast_slice(&data);
+                    let data=buffer.get_mapped_range(..);let values:Vec<u64>=data.chunks_exact(8).map(|b|u64::from_ne_bytes(b.try_into().expect("8-byte chunk"))).collect();
                     let cost=crate::timing::elapsed_ms(values[0],values[1],*period)
                         .map(|ms|ms.max(f64::from(*period)/1e6));
                     drop(data);buffer.unmap();*self=Self::Measured(cost);
@@ -543,12 +544,32 @@ fn simulation_tick(sim:&v2::Simulation,time:impl Into<vork_time::Request>)->Resu
     Ok(tick)
 }
 
+struct FrameRange {
+    page: usize,
+    offset: u64,
+    bytes: u64,
+    installed: Option<wgpu::Buffer>,
+}
+
+struct AttributeColumn {
+    source: String,
+    count: Option<String>,
+    page: usize,
+    count_page: usize,
+    mapping: wgpu::Buffer,
+    parameters: wgpu::Buffer,
+    groups: u32,
+    #[cfg(test)]
+    rows: Vec<[u32; 3]>,
+    #[cfg(test)]
+    width: u32,
+}
+
 struct Instance {
     draw: usize,
     trs: [Option<AttributeBinding>; 3],
     capacity: u32,
     count: Option<AttributeBinding>,
-    bounds: (Vec3, Vec3),
     indices: Vec<u32>,
 }
 pub(crate) struct Slot {
@@ -879,22 +900,11 @@ impl Compute {
                         count.as_ref().is_none_or(|b| b.count == 1 && b.width == 1),
                         "instance count requires exactly one u32"
                     );
-                    let bounds = draw.instances.clone().fold(
-                        (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
-                        |(lo, hi), object| {
-                            let (a, b) = crate::shadow_envelope::transformed(
-                                roots[object as usize].local,
-                                draw.bounds,
-                            );
-                            (lo.min(a), hi.max(b))
-                        },
-                    );
                     instances.push(Instance {
                         draw: i,
                         trs,
                         capacity,
                         count,
-                        bounds,
                         indices: draw
                             .instances
                             .clone()
@@ -927,26 +937,39 @@ impl Compute {
         // Geometry adds immutable retained columns to these pages. Only producer-
         // owned ranges reset and publish on seeks; sharing a page is not a write.
         let frame_sources: Vec<String> = dispatches.iter()
-            .filter(|d| d.schedule != ComputeSchedule::Simulation)
+            .filter(|d| d.schedule == ComputeSchedule::Frame)
             .flat_map(|d| d.writes.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect();
         let mut simulation_ranges = Vec::new();
-        let mut frame_ranges = Vec::new();
+        let install_sources: BTreeSet<_> = dispatches.iter().filter(|d| d.schedule == ComputeSchedule::Install)
+            .flat_map(|d| &d.writes).collect();
+        let mut frame_ranges = std::collections::BTreeMap::<_, bool>::new();
         for (attributes, page_map) in std::iter::once((attributes, None))
             .chain(geometry_scopes.iter().map(|scope| (&scope.buffers, Some(&scope.pages)))) {
             for (name, binding) in &attributes.bindings {
-                let ranges = if source.simulation.as_ref().is_some_and(|s| s.state.contains(name)) {
-                    &mut simulation_ranges
-                } else if frame_sources.contains(name) { &mut frame_ranges } else { continue };
+                let simulated = source.simulation.as_ref().is_some_and(|s| s.state.contains(name));
+                if !simulated && !frame_sources.contains(name) { continue; }
                 for span in &binding.spans {
                     let page = page_map.map_or(span.page as usize, |pages| pages[span.page as usize]);
-                    ranges.push((page, u64::from(span.offset) * 4, u64::from(span.count) * u64::from(binding.width) * 4));
+                    let range = (page, u64::from(span.offset) * 4, u64::from(span.count) * u64::from(binding.width) * 4);
+                    if simulated {
+                        simulation_ranges.push(range);
+                    } else {
+                        *frame_ranges.entry(range).or_default() |= install_sources.contains(name);
+                    }
                 }
             }
         }
         simulation_ranges.sort_unstable();
         simulation_ranges.dedup();
-        frame_ranges.sort_unstable();
-        frame_ranges.dedup();
+        // Only overlapping install and frame outputs need a replay seed. Each
+        // seed fits the same binding limit as the source span it snapshots.
+        let frame_ranges = frame_ranges.into_iter().map(|((page, offset, bytes), written_at_install)| {
+            let installed = written_at_install.then(|| crate::gpu_memory::buffer(&r.device, &wgpu::BufferDescriptor {
+                label: Some("installed frame replay seed"), size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            }));
+            FrameRange { page, offset, bytes, installed }
+        }).collect();
         let result = Self {
             geometry_inputs,
             trace,
@@ -974,7 +997,7 @@ impl Compute {
             cursor: Mutex::new(Cursor::default()),
             instances,
             material_attributes: Vec::new(),
-            material_attribute_sources: Vec::new(),
+            attribute_pipeline: None,
             bridge: None,
         };
         // Install dispatches run now; seeks replay them from the same initial bytes.
@@ -988,6 +1011,11 @@ impl Compute {
             }
         }
         result.run(&mut encoder, &mut cursor, ComputeSchedule::Install, 0);
+        for range in &result.frame_ranges {
+            if let Some(seed) = &range.installed {
+                encoder.copy_buffer_to_buffer(&result.pages[range.page], range.offset, seed, 0, range.bytes);
+            }
+        }
         if let Some(sim) = &result.simulation {
             if let Some(inputs) = &result.geometry_inputs {
                 inputs.sample(&mut encoder, &vork_time::Request::Tick(0, sim.t0.clone(), sim.dt.clone()))?;
@@ -1004,12 +1032,6 @@ impl Compute {
     }
     pub(crate) fn geometry_buffers(&self, object: u32) -> Option<&ProgramBuffers> {
         self.geometry_scopes.iter().find(|scope| scope.objects.contains(&object)).map(|scope| &scope.buffers)
-    }
-    pub(crate) fn bounds(&self, draw: usize) -> Option<(Vec3, Vec3)> {
-        self.instances
-            .iter()
-            .find(|i| i.draw == draw)
-            .map(|i| i.bounds)
     }
     pub(crate) fn varying(&self, sources: &BTreeSet<String>) -> bool {
         self.dispatches.iter().any(|d|d.schedule != ComputeSchedule::Install && d.writes.iter().any(|n|sources.contains(n)))
@@ -1041,33 +1063,55 @@ impl Compute {
         }
         Ok(())
     }
-    pub(crate) fn bind_material_attributes(&mut self, buffers: &ProgramBuffers, rows: Vec<(String, u32, u32)>) -> Result<()> {
-        for (source, index, destination) in rows {
-            let mut owners=self.geometry_scopes.iter().filter(|scope|scope.outputs.contains(&source));
-            let owner=owners.next().filter(|_|owners.next().is_none());
-            let binding = &owner.map_or(buffers,|scope| &scope.buffers).bindings[&source];
-            ensure!(index < binding.count, "material attribute row exceeds source capacity");
-            let span = binding.spans.iter().find(|span| index >= span.first && index < span.first + span.count)
+    pub(crate) fn bind_material_attributes(&mut self, r: &Renderer, buffers: &ProgramBuffers,
+        rows: Vec<(String, Option<String>, u32, u32)>) -> Result<()> {
+        if rows.is_empty() { return Ok(()); }
+        let mut columns = std::collections::BTreeMap::new();
+        for (source, count, index, destination) in rows {
+            let mut owners = self.geometry_scopes.iter().filter(|scope| scope.outputs.contains(&source));
+            let owner = owners.next().filter(|_| owners.next().is_none());
+            let binding = &owner.map_or(buffers, |scope| &scope.buffers).bindings[&source];
+            let span = binding.spans.iter().find(|span| index >= span.first && index - span.first < span.count)
                 .context("material attribute row has no installed range")?;
-            let page=owner.map_or(span.page as usize,|scope|scope.pages[span.page as usize]);
-            self.material_attributes.push((page,
-                u64::from(span.offset + (index - span.first) * binding.width) * 4,
-                u64::from(destination) * 4, u64::from(binding.width) * 4));
-            self.material_attribute_sources.push(source);
+            let page = owner.map_or(span.page as usize, |scope| scope.pages[span.page as usize]);
+            columns.entry((source, count, page, binding.width)).or_insert_with(Vec::new)
+                .push([index, span.offset + (index - span.first) * binding.width, destination]);
         }
-        self.material_attribute_sources.sort();
-        self.material_attribute_sources.dedup();
+        self.attribute_pipeline = Some(pipeline_layout(r, include_str!("attribute_publication.wgsl"),
+            "publish instance column", &[Some(true), Some(true), Some(true), Some(false), None], "publish"));
+        for ((source, count, page, width), mut rows) in columns {
+            rows.sort_unstable();
+            let live = count.as_ref().map(|name| &buffers.bindings[name].spans[0]);
+            let count_page = live.map_or(page, |s| s.page as usize);
+            let groups = u32::try_from(rows.len())?.div_ceil(64).min(256);
+            let params = [width, live.map_or(u32::MAX, |s| s.offset), groups * 64, rows.len() as u32];
+            self.material_attributes.push(AttributeColumn { source, count, page, count_page, groups,
+                mapping: init(&r.device, "attribute destinations", bytemuck::cast_slice(&rows), wgpu::BufferUsages::STORAGE),
+                parameters: init(&r.device, "attribute column extent", bytemuck::cast_slice(&params), wgpu::BufferUsages::UNIFORM),
+                #[cfg(test)] rows, #[cfg(test)] width,
+            });
+        }
         Ok(())
     }
     pub(crate) fn has_material_attributes(&self) -> bool { !self.material_attributes.is_empty() }
     pub(crate) fn publish_material_attributes(&self, encoder: &mut wgpu::CommandEncoder,
         cursor: &Cursor, changes: &mut values::ChangeTracker, records: &wgpu::Buffer) {
-        let versions: Vec<u64> = self.material_attribute_sources.iter()
-            .map(|source| cursor.publications.get(source).copied().unwrap_or(0)).collect();
-        if changes.changed(values::ChangeKey::MaterialAttributes, bytemuck::cast_slice(&versions)) {
-            for &(page, source, destination, size) in &self.material_attributes {
-                encoder.copy_buffer_to_buffer(&self.pages[page], source, records, destination, size);
-            }
+        let Some(pipeline) = &self.attribute_pipeline else { return };
+        for (index, column) in self.material_attributes.iter().enumerate() {
+            let revisions = [cursor.publications.get(&column.source).copied().unwrap_or(0),
+                column.count.as_ref().and_then(|name| cursor.publications.get(name)).copied().unwrap_or(0)];
+            if !changes.changed(values::ChangeKey::MaterialColumn(index), bytemuck::cast_slice(&revisions)) { continue; }
+            changes.publish(values::ChangeKey::MaterialAttributes);
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("publish instance column"), layout: &pipeline.get_bind_group_layout(0),
+                entries: &[entry(0,self.pages[column.page].as_entire_binding()),
+                    entry(1,self.pages[column.count_page].as_entire_binding()), entry(2,column.mapping.as_entire_binding()),
+                    entry(3,records.as_entire_binding()), entry(4,column.parameters.as_entire_binding())],
+            });
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(column.groups, 1, 1);
         }
     }
     pub(crate) fn publish_queries(&self,r:&Renderer,encoder:&mut wgpu::CommandEncoder,destination:&wgpu::Buffer) {
@@ -1493,19 +1537,14 @@ impl Compute {
         let frame=nominal_frame(&time,self.rate,self.frames)?;
 
         if cursor.frame.is_some_and(|last| frame < last) {
-            if let Some(inputs) = &self.geometry_inputs {
-                inputs.sample(encoder, &vork_time::Request::Frame(0, self.rate))?;
-            }
-            if let Some(sample) = sample.as_mut() {
-                sample(encoder, ComputeSchedule::Install, &vork_time::Request::Frame(0, self.rate))?;
-            }
-            for &(page, offset, bytes) in &self.frame_ranges {
-                encoder.copy_buffer_to_buffer(&self.initial[page], offset, &self.pages[page], offset, bytes);
+            for range in &self.frame_ranges {
+                let (source, start) = range.installed.as_ref().map_or((&self.initial[range.page], range.offset), |seed| (seed, 0));
+                encoder.copy_buffer_to_buffer(source, start, &self.pages[range.page], range.offset, range.bytes);
             }
             for name in &self.frame_sources { cursor.publish_source(name); }
-            if self.dispatches.iter().any(|d| d.schedule != ComputeSchedule::Simulation && d.writes_placement) { cursor.publish_placement(); }
-            self.set_tick(encoder,0,0.,0.,0);
-            self.run(encoder, cursor, ComputeSchedule::Install, 0);
+            if self.dispatches.iter().any(|d| d.schedule == ComputeSchedule::Frame && d.writes_placement) {
+                cursor.publish_placement();
+            }
             cursor.frame = None;
         }
         let start = cursor.frame.map_or(0, |f| f + 1);
@@ -1952,47 +1991,6 @@ fn typed_element_accessors(header: &mut String, binding: &str, kind: v2::BufferT
 
 #[cfg(all(test, vork_private_tests))]
 include!("compute_tests_private.rs");
-
-#[cfg(test)]
-#[test]
-#[ignore = "water4 phase timing on a real GPU; VORK_WATER_SCENE names the frozen scene"]
-fn water_simulation_and_reconstruction_timing() -> Result<()> {
-    let path=std::env::var_os("VORK_WATER_SCENE").map(PathBuf::from)
-        .unwrap_or_else(||Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/water/scene.json"));
-    let mut scene=Scene::from_json(&std::fs::read(&path)?)?;
-    scene.render.resolution=[32,32];
-    let r=Renderer::new()?;
-    let s=r.install(scene,path.parent().unwrap())?;
-    let compute=s.compute.as_ref().context("water simulation")?;
-    let sim=compute.simulation.as_ref().context("water clock")?;
-    // This example's tick first advances the fluid/markers, then reconstructs
-    // their display and pressure fields. Keep the actual ordered programs.
-    let split=sim.steps.iter().position(|name|name=="marker_advect").context("water marker advancement")?+1;
-    let mut cursor=compute.cursor.lock().unwrap();
-    r.wait(None)?;
-    let mut totals=[0.;3];
-    for tick in 0..6 {
-        for (phase,names) in [&sim.steps[..split],&sim.steps[split..]].into_iter().enumerate() {
-            let start=std::time::Instant::now();
-            let mut encoder=r.device.create_command_encoder(&Default::default());
-            compute.set_tick(&mut encoder,tick,sim.t0.as_f64()+f64::from(tick)*sim.dt.as_f64(),sim.dt.as_f64(),sim.seed);
-            compute.run_named(&mut encoder,&mut cursor,names,(sim.t0.as_f64()+f64::from(tick)*sim.dt.as_f64()) as f32);
-            let submission=r.queue.submit([encoder.finish()]);r.wait(Some(submission))?;
-            let seconds=start.elapsed().as_secs_f64();
-            eprintln!("water phase tick={tick} phase={} wall_s={seconds:.6}",if phase==0 {"simulation"} else {"reconstruction"});
-            if tick>0 {totals[phase]+=seconds;}
-        }
-        let start=std::time::Instant::now();
-        let mut encoder=r.device.create_command_encoder(&Default::default());
-        for draw in &s.draws {if let Some(field)=&draw.implicit {field.acceleration.encode(&mut encoder);}}
-        let submission=r.queue.submit([encoder.finish()]);r.wait(Some(submission))?;
-        let seconds=start.elapsed().as_secs_f64();
-        eprintln!("water phase tick={tick} phase=occupancy wall_s={seconds:.6}");
-        if tick>0 {totals[2]+=seconds;}
-    }
-    eprintln!("water warm five-tick frame (48 fps): simulation_wall_s={:.6} reconstruction_wall_s={:.6} occupancy_five_publications_wall_s={:.6}",totals[0],totals[1],totals[2]);
-    Ok(())
-}
 
 #[cfg(test)]
 #[test]

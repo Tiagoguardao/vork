@@ -67,8 +67,7 @@ fn valueNoise(q: vec2<f32>, salt: u32) -> f32 {
   return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
 }
 
-@fragment
-fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn shade_fs(frag: vec4<f32>, tex: TextureUniforms, inputSampler: sampler, inputTexture: texture_2d<f32>) -> vec4<f32> {
   let size = tex.frame.xy;
   let p = frag.xy;
   let q = (p - tex.frame.zw) / max(tex.params.x, 1e-3);
@@ -86,4 +85,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(colour * own.a, own.a);
   }
   return displaced;
+}
+
+@fragment
+fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  return shade_fs(frag, tex, inputSampler, inputTexture);
 }

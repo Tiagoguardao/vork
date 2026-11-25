@@ -14,8 +14,7 @@ p.add_argument('--reference', type=Path)
 a = p.parse_args()
 a.output.mkdir(parents=True, exist_ok=True)
 samples = [('scripts/toolchains/address-space-dedup.slang', 'main')]
-samples += [('crates/vork-render/shaders/present.slang', 'fs'),
-            ('crates/vork-render/shaders/mip.slang', 'vs'),
+samples += [('crates/vork-render/shaders/mip.slang', 'vs'),
             ('crates/vork-render/shaders/mip.slang', 'fs')]
 rows = {}
 for source, entry in samples:

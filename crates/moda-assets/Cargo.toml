@@ -11,6 +11,7 @@ description = "Moda's asset layer: local source resolution, decode, ICC, SVG ras
 doctest = false
 
 [dependencies]
+wgpu = { version = "29", default-features = false }
 # vork reads PNG and JPEG into a canvas; the image crate's other default formats (AVIF and its encoder among them) are
 # left out.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -30,11 +31,6 @@ blake3 = { version = "1", optional = true }
 default = ["native-io"]
 # Native local-source prefetch (files / data: URIs, decoded on a thread pool).
 native-io = ["dep:blake3"]
-
-[lints.rust]
-# Moda's `jpeg-parity` feature (libjpeg-turbo decode through mozjpeg's C build) is not ported; JPEG decodes through
-# the image crate, as Moda's builds without the feature do. Its cfg stays declared.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("jpeg-parity"))'] }
 
 [dev-dependencies]
 png = "0.18"

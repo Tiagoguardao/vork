@@ -11,6 +11,6 @@ the 2D canvas engine's own shader modules (its pipelines are) and denoiser setup
 Environment: VORK_CACHE_DIR, VORK_CACHE_BYTES (default 16 GiB; 0 = no disk cache), VORK_SLANGC,
 VORK_OIDN, VORK_BIN (SDK executable), VORK_GPU (hardware GPU index or cpu, as --gpu; CPU rendering is explicit, see limits).
 
-Diagnostics JSON uses version 3 and numeric evaluation seconds for frame times;
-output FPS remains number/rational string. See vork help outputs for completion
-metadata and overwrite ownership.
+World and canvas timing reports use version 4 and record frame times as numeric evaluation seconds.
+WAV timing reports use version 1. Completion metadata records FPS as a number or rational string.
+See vork help outputs for completion metadata and overwrite ownership.

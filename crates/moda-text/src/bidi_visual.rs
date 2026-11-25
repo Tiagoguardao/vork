@@ -176,7 +176,8 @@ pub fn visual_line<M: TextMeasurer>(
     let mut width_extra: Vec<f64> = Vec::with_capacity(line.segments.len());
     let mut piece_of_byte: Vec<Option<usize>> = vec![None; line_end - line_start];
     for (seg, range) in line.segments.iter().zip(ranges) {
-        if seg.tab.is_some() {
+        if seg.style.emoji.is_some() || seg.tab.is_some() {
+            // A shaped colour cluster stays together across level changes.
             // A resolved tab (`crate::tab_stops`) stays one piece with its fill: its advance and leader.
             pieces.push(seg.clone());
             width_extra.push(0.0);

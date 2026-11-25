@@ -20,7 +20,9 @@ with tempfile.TemporaryDirectory(prefix='vork-release-') as tmp:
     root = Path(tmp)
     archive = root / a.archive.name
     shutil.copy2(a.archive.resolve(), archive)
-    (root / 'SHA256SUMS').write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
+    with archive.open('rb') as stream:
+        archive_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    (root / 'SHA256SUMS').write_text(archive_digest + '  ' + archive.name + '\n')
     version = archive.name.removeprefix('vork-').rsplit('-', 2)[0]
     env = os.environ.copy()
     for key in ('VORK_SLANGC', 'VORK_OIDN'):

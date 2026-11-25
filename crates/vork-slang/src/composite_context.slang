@@ -35,7 +35,7 @@ public CompositeContext vork_composite_context(float2 uv, float2 size, float tim
     ctx.frame_size=extent.xy;ctx.output_size=extent.zw;
     ctx.aperture_radius=optics.x;ctx.focus_distance=optics.z;ctx.projective=optics.w!=0.;
     ctx.aperture_blades=uint(aperture.x);ctx.aperture_rotation=aperture.y;ctx.aperture_ratio=aperture.z;
-    ctx.clip=clip.xy;ctx.frame=uint(sampling.x);ctx.samples=uint(sampling.y);
+    ctx.clip=clip.xy;ctx.frame=uint(sampling.x) | (uint(sampling.z)<<16);ctx.samples=uint(sampling.y);
     ctx.shutter=shutter.xy;
     return ctx;
 }

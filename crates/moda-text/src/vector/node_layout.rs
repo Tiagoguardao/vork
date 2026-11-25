@@ -317,17 +317,7 @@ pub(crate) fn resolve_vector_runs_with(
                 family: None,
                 diag: FallbackDiagnostics {
                     cause: "emoji-run".to_string(),
-                    // The node's OWN families, not the emoji's: one emoji declines
-                    // the whole node, so these are the families whose text just lost
-                    // the primary engine. In practice the most frequent decline of
-                    // all, and it was reporting `families: []` — the gap this
-                    // closes.
-                    //
-                    // Read from the node's TEXT runs, never from `run` itself: an
-                    // emoji run is built with `font_family: String::new()`
-                    // (`runs.rs`, where only the text segments receive the resolved
-                    // `render_fam`), so keying on the declining run reproduced the
-                    // exact `families: []` this is here to close.
+                    // Report every text family affected by the node falling back.
                     families: emoji_decline_families(runs),
                     detail: None,
                 },

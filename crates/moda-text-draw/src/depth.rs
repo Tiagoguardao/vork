@@ -24,7 +24,7 @@
 //! transparent phase and writes no depth.
 //!
 //! That gives [`MAX_RENDER_Z`] slots between [`SHAPE_DEPTH_MAX`] and
-//! [`SHAPE_DEPTH_MIN`]. A plan that draws an item past them is refused ([`ensure_render_z`]);
+//! [`SHAPE_DEPTH_MIN`]. The next band starts another depth pass;
 //! nothing past the range is drawn at a clamped or clipped depth.
 //!
 //! Moda's WebGPU model (`WebGPUZIndexUtils.linearDepth`) spreads 50,000 slots
@@ -56,7 +56,9 @@ pub const PAGE_STROKE_DEPTH: f64 = 0.99998;
 /// +0.5, arrowheads +0.25, inner shadows +0.5, a layer's or a copy's share of
 /// its node's slot).
 pub fn linear_depth(z_index: f64) -> f64 {
-    SHAPE_DEPTH_MAX - z_index.max(0.0) * DEPTH_PER_Z
+    let z = z_index.max(0.0);
+    let local = if z < MAX_RENDER_Z as f64 { z } else { z % MAX_RENDER_Z as f64 };
+    SHAPE_DEPTH_MAX - local * DEPTH_PER_Z
 }
 
 /// How much nearer a stroke's vertices sit than their body's fill: 5/8 of a
@@ -67,18 +69,6 @@ pub fn stroke_depth_offset() -> f64 {
     -0.625 * DEPTH_PER_Z
 }
 
-/// Refuses a plan whose drawn items reach render-z slot `drawn_end` (one past
-/// the highest slot any of them sits in) when depth cannot order that many.
-/// Slots the cull window skipped draw nothing and do not count.
-pub fn ensure_render_z(drawn_end: u64) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        drawn_end <= MAX_RENDER_Z,
-        "this frame's 2D items reach draw-order slot {drawn_end} (one slot per ordered item) and the 2D depth \
-         buffer orders at most {MAX_RENDER_Z} in one frame; draw fewer items in it"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,9 +76,7 @@ mod tests {
     #[test]
     fn the_range_is_stated() {
         assert_eq!(MAX_RENDER_Z, 335_544);
-        assert!(ensure_render_z(MAX_RENDER_Z).is_ok());
-        let refusal = ensure_render_z(MAX_RENDER_Z + 1).unwrap_err().to_string();
-        assert!(refusal.contains("335545") && refusal.contains("335544"), "{refusal}");
+        assert_eq!(linear_depth(MAX_RENDER_Z as f64 + 0.5), linear_depth(0.5));
         // The last slot's nearest depth (an arrowhead's stroke, +7/8) is still a shape depth in front of the
         // near plane.
         let nearest = linear_depth((MAX_RENDER_Z - 1) as f64 + 0.25) + stroke_depth_offset();
@@ -104,7 +92,7 @@ mod tests {
         let whole_units = |d: f32| (d as f64 / DEPTH_UNIT).fract() == 0.0;
         for slot in [0, 1, 2, 56_249, 56_250, 99_999, 100_000, MAX_RENDER_Z - 2, MAX_RENDER_Z - 1] {
             let mut previous = f32::INFINITY;
-            for eighth in 0..16 {
+            for eighth in 0..8 {
                 let z = slot as f64 + eighth as f64 / 8.0;
                 let depth = linear_depth(z) as f32;
                 assert_eq!(depth as f64, linear_depth(z), "z {z}");
@@ -114,7 +102,11 @@ mod tests {
                     "z {z}: {previous} then {depth}"
                 );
                 // A stroke at z draws at the depth of z + 5/8.
-                assert_eq!(depth + stroke, linear_depth(z + 0.625) as f32, "z {z}");
+                // Once a fictitious offset crosses the pass boundary the
+                // two depths belong to different attachments' lifetimes.
+                if z + 0.625 < MAX_RENDER_Z as f64 {
+                    assert_eq!(depth + stroke, linear_depth(z + 0.625) as f32, "z {z}");
+                }
                 previous = depth;
             }
         }

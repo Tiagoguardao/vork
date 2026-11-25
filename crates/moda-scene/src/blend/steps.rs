@@ -164,7 +164,12 @@ impl BlendStep {
             "points".into(),
             Value::Array(self.shape.translated(-origin.0, -origin.1).to_points()),
         );
-        m.insert("closed".into(), json!(self.shape.is_closed()));
+        m.insert(
+            "closed".into(),
+            crate::path_points::PathClosure::to_field(
+                self.shape.contours.iter().map(|contour| contour.closed).collect(),
+            ),
+        );
         m.insert(
             "fillRule".into(),
             json!(self.fill_rule.clone().unwrap_or_else(|| "nonzero".into())),

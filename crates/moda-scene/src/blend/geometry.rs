@@ -20,8 +20,10 @@
 //! Interpolation is then a lerp of every anchor and control point. A segment stays a line when it is a line in
 //! both outlines, so a blend between polygons expands to polygons.
 
-use super::points::{arc_endpoint_to_center, BlendPathPoint};
-use crate::value::{json, Value};
+use super::points::BlendPathPoint;
+use crate::path_geom::arc::{arc_to_beziers, ArcParams};
+use crate::path_points::PathClosure;
+use crate::value::Value;
 
 pub type Pt = (f64, f64);
 
@@ -274,29 +276,7 @@ pub struct Shape {
     pub contours: Vec<Contour>,
 }
 
-/// An axis-aligned box.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bounds {
-    pub min_x: f64,
-    pub min_y: f64,
-    pub max_x: f64,
-    pub max_y: f64,
-}
-
-impl Bounds {
-    pub fn center(&self) -> Pt {
-        (
-            (self.min_x + self.max_x) / 2.0,
-            (self.min_y + self.max_y) / 2.0,
-        )
-    }
-    pub fn width(&self) -> f64 {
-        self.max_x - self.min_x
-    }
-    pub fn height(&self) -> f64 {
-        self.max_y - self.min_y
-    }
-}
+pub use crate::path_geom::bounds::Bounds;
 
 /// The cubics of an SVG arc from `p0` (one per quarter turn or less); a degenerate arc is a line.
 #[allow(clippy::too_many_arguments)]
@@ -310,127 +290,78 @@ fn arc_to_segs(
     p3: Pt,
     out: &mut Vec<Seg>,
 ) {
-    let Some((cx, cy, rx, ry, theta1, dtheta, phi)) = arc_endpoint_to_center(
-        p0.0,
-        p0.1,
-        rx,
-        ry,
-        rotation_deg,
-        large_arc,
-        sweep,
-        p3.0,
-        p3.1,
-    ) else {
+    let arc = ArcParams { rx, ry, x_axis_rotation: rotation_deg, large_arc, sweep, x: p3.0, y: p3.1 };
+    let curves = arc_to_beziers(p0.0, p0.1, &arc);
+    if curves.is_empty() {
         out.push(Seg::line(p0, p3));
-        return;
-    };
-    let pieces = (dtheta.abs() / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
-    let delta = dtheta / pieces as f64;
-    let k = 4.0 / 3.0 * (delta / 4.0).tan();
-    let (cp, sp) = (phi.cos(), phi.sin());
-    let at = |th: f64| -> Pt {
-        let (c, s) = (th.cos(), th.sin());
-        (
-            cx + rx * c * cp - ry * s * sp,
-            cy + rx * c * sp + ry * s * cp,
-        )
-    };
-    let deriv = |th: f64| -> Pt {
-        let (c, s) = (th.cos(), th.sin());
-        (-rx * s * cp - ry * c * sp, -rx * s * sp + ry * c * cp)
-    };
+    }
     let mut start = p0;
-    for i in 0..pieces {
-        let a = theta1 + delta * i as f64;
-        let b = a + delta;
-        let end = if i + 1 == pieces { p3 } else { at(b) };
-        let (da, db) = (deriv(a), deriv(b));
-        out.push(Seg::curve(
-            start,
-            (start.0 + k * da.0, start.1 + k * da.1),
-            (end.0 - k * db.0, end.1 - k * db.1),
-            end,
-        ));
+    for (i, curve) in curves.iter().enumerate() {
+        // Keep the authored final anchor so the next segment joins exactly.
+        let end = if i + 1 == curves.len() { p3 } else { (curve.end[0], curve.end[1]) };
+        out.push(Seg::curve(start, curve.cp1.into(), curve.cp2.into(), end));
         start = end;
     }
 }
 
 impl Shape {
-    /// Parse PathNode points. `closed` closes every contour (a PathNode's `closed` applies to all its subpaths).
+    /// Parse PathNode points with their authored contour closure.
     /// Zero-length segments are dropped: they carry no outline and would skew the correspondence.
-    pub fn from_points(points: &[BlendPathPoint], closed: bool) -> Shape {
-        let mut contours: Vec<Contour> = Vec::new();
-        let mut segs: Vec<Seg> = Vec::new();
-        let mut start: Option<Pt> = None;
-        let mut cur: Option<Pt> = None;
-        let mut flush = |segs: &mut Vec<Seg>, start: Option<Pt>| {
-            if segs.is_empty() {
-                return;
-            }
-            if closed {
-                if let (Some(s), Some(last)) = (start, segs.last().map(|g| g.p3)) {
-                    if dist(s, last) > 1e-9 {
-                        segs.push(Seg::line(last, s));
-                    }
-                }
-            }
-            contours.push(Contour {
-                segs: std::mem::take(segs),
-                closed,
-            });
+    pub fn from_points<'a>(points: &'a [BlendPathPoint], closure: impl Into<PathClosure<'a>>) -> Shape {
+        let anchor = |p: &BlendPathPoint| match p {
+            BlendPathPoint::Move { x, y }
+            | BlendPathPoint::Line { x, y }
+            | BlendPathPoint::Curve { x, y, .. }
+            | BlendPathPoint::Quadratic { x, y, .. }
+            | BlendPathPoint::Arc { x, y, .. } => (*x, *y),
         };
-        for p in points {
-            let (x, y) = match p {
-                BlendPathPoint::Move { x, y }
-                | BlendPathPoint::Line { x, y }
-                | BlendPathPoint::Curve { x, y, .. }
-                | BlendPathPoint::Quadratic { x, y, .. }
-                | BlendPathPoint::Arc { x, y, .. } => (*x, *y),
-            };
-            let end = (x, y);
-            let Some(p0) = cur.filter(|_| !matches!(p, BlendPathPoint::Move { .. })) else {
-                flush(&mut segs, start);
-                start = Some(end);
-                cur = Some(end);
-                continue;
-            };
-            match p {
-                BlendPathPoint::Move { .. } => unreachable!(),
-                BlendPathPoint::Line { .. } => segs.push(Seg::line(p0, end)),
-                BlendPathPoint::Curve { cp1, cp2, .. } => {
-                    segs.push(Seg::curve(p0, *cp1, *cp2, end))
+        let mut contours = Vec::new();
+        for (points, closed) in closure.into().contours(points, |p| matches!(p, BlendPathPoint::Move { .. })) {
+            let start = anchor(&points[0]);
+            let mut p0 = start;
+            let mut segs = Vec::new();
+            for p in &points[1..] {
+                let end = anchor(p);
+                match p {
+                    BlendPathPoint::Move { .. } => unreachable!(),
+                    BlendPathPoint::Line { .. } => segs.push(Seg::line(p0, end)),
+                    BlendPathPoint::Curve { cp1, cp2, .. } => {
+                        segs.push(Seg::curve(p0, *cp1, *cp2, end))
+                    }
+                    BlendPathPoint::Quadratic { cp, .. } => segs.push(Seg::curve(
+                        p0,
+                        lerp_pt(p0, *cp, 2.0 / 3.0),
+                        lerp_pt(end, *cp, 2.0 / 3.0),
+                        end,
+                    )),
+                    BlendPathPoint::Arc {
+                        rx,
+                        ry,
+                        x_axis_rotation,
+                        large_arc,
+                        sweep,
+                        ..
+                    } => arc_to_segs(
+                        p0,
+                        *rx,
+                        *ry,
+                        *x_axis_rotation,
+                        *large_arc,
+                        *sweep,
+                        end,
+                        &mut segs,
+                    ),
                 }
-                BlendPathPoint::Quadratic { cp, .. } => segs.push(Seg::curve(
-                    p0,
-                    lerp_pt(p0, *cp, 2.0 / 3.0),
-                    lerp_pt(end, *cp, 2.0 / 3.0),
-                    end,
-                )),
-                BlendPathPoint::Arc {
-                    rx,
-                    ry,
-                    x_axis_rotation,
-                    large_arc,
-                    sweep,
-                    ..
-                } => arc_to_segs(
-                    p0,
-                    *rx,
-                    *ry,
-                    *x_axis_rotation,
-                    *large_arc,
-                    *sweep,
-                    end,
-                    &mut segs,
-                ),
+                p0 = end;
             }
-            cur = Some(end);
+            if closed && dist(start, p0) > 1e-9 {
+                segs.push(Seg::line(p0, start));
+            }
+            segs.retain(|s| s.approx_len() > 1e-9);
+            if !segs.is_empty() {
+                contours.push(Contour { segs, closed });
+            }
         }
-        flush(&mut segs, start);
-        for c in &mut contours {
-            c.segs.retain(|s| s.approx_len() > 1e-9);
-        }
-        contours.retain(|c| !c.segs.is_empty());
         Shape { contours }
     }
 
@@ -442,38 +373,9 @@ impl Shape {
         !self.contours.is_empty() && self.contours.iter().all(|c| c.closed)
     }
 
-    /// Bounds of the curve itself (each segment sampled), not of its control points.
+    /// Local bounds of the blended outline.
     pub fn bounds(&self) -> Option<Bounds> {
-        let mut b: Option<Bounds> = None;
-        let mut add = |p: Pt| {
-            b = Some(match b {
-                None => Bounds {
-                    min_x: p.0,
-                    min_y: p.1,
-                    max_x: p.0,
-                    max_y: p.1,
-                },
-                Some(b) => Bounds {
-                    min_x: b.min_x.min(p.0),
-                    min_y: b.min_y.min(p.1),
-                    max_x: b.max_x.max(p.0),
-                    max_y: b.max_y.max(p.1),
-                },
-            })
-        };
-        for c in &self.contours {
-            for s in &c.segs {
-                if s.line {
-                    add(s.p0);
-                    add(s.p3);
-                } else {
-                    for i in 0..=16 {
-                        add(s.point_at(i as f64 / 16.0));
-                    }
-                }
-            }
-        }
-        b
+        crate::path_geom::bounds::path_bounds(self.commands())
     }
 
     pub fn center(&self) -> Option<Pt> {
@@ -526,31 +428,22 @@ impl Shape {
         }
     }
 
-    /// PathNode points. A closed contour's final line back to its start is left to `closed`.
+    /// A closed contour leaves its final straight edge to the closure flag.
+    fn commands(&self) -> impl Iterator<Item = BlendPathPoint> + '_ {
+        self.contours.iter().flat_map(|c| {
+            let start = c.segs.first().map(|s| BlendPathPoint::Move { x: s.p0.0, y: s.p0.1 });
+            let implicit_close = c.closed && c.segs.len() > 1 && c.segs.last().is_some_and(|s| s.line);
+            let count = c.segs.len() - usize::from(implicit_close);
+            start.into_iter().chain(c.segs[..count].iter().map(|s| {
+                let (x, y) = s.p3;
+                if s.line { BlendPathPoint::Line { x, y } }
+                else { BlendPathPoint::Curve { x, y, cp1: s.c1, cp2: s.c2 } }
+            }))
+        })
+    }
+
     pub fn to_points(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        for c in &self.contours {
-            let Some(first) = c.segs.first() else {
-                continue;
-            };
-            out.push(json!({"type": "move", "x": first.p0.0, "y": first.p0.1}));
-            let n = c.segs.len();
-            for (i, s) in c.segs.iter().enumerate() {
-                if c.closed && i + 1 == n && s.line && n > 1 {
-                    break;
-                }
-                if s.line {
-                    out.push(json!({"type": "line", "x": s.p3.0, "y": s.p3.1}));
-                } else {
-                    out.push(json!({
-                        "type": "curve", "x": s.p3.0, "y": s.p3.1,
-                        "cp1": {"x": s.c1.0, "y": s.c1.1},
-                        "cp2": {"x": s.c2.0, "y": s.c2.1},
-                    }));
-                }
-            }
-        }
-        out
+        self.commands().map(|p| p.to_json()).collect()
     }
 
     /// Sample the outline as a polyline (for spines): `per_curve` points per curved segment.
@@ -821,18 +714,6 @@ fn correspond_contours(a: &Contour, b: &Contour) -> (Contour, Contour) {
 /// counts, lined up, so [`Shape::lerp`] morphs one into the other. A closed and an open outline blend as open ones
 /// (the closed one opens at its start).
 pub fn correspond(a: &Shape, b: &Shape) -> (Shape, Shape) {
-    let closed = a.is_closed() && b.is_closed();
-    let open = |s: &Shape| Shape {
-        contours: s
-            .contours
-            .iter()
-            .map(|c| Contour {
-                segs: c.segs.clone(),
-                closed,
-            })
-            .collect(),
-    };
-    let (a, b) = (open(a), open(b));
     let ca = a.center().unwrap_or((0.0, 0.0));
     let cb = b.center().unwrap_or((0.0, 0.0));
     let n = a.contours.len().max(b.contours.len());
@@ -840,19 +721,26 @@ pub fn correspond(a: &Shape, b: &Shape) -> (Shape, Shape) {
     let mut out_b = Shape::default();
     for i in 0..n {
         let (x, y) = match (a.contours.get(i), b.contours.get(i)) {
-            (Some(x), Some(y)) => correspond_contours(x, y),
+            (Some(x), Some(y)) => {
+                let mut x = x.clone();
+                let mut y = y.clone();
+                let closed = x.closed && y.closed;
+                x.closed = closed;
+                y.closed = closed;
+                correspond_contours(&x, &y)
+            }
             (Some(x), None) => {
                 // Shrinks to a point at its place relative to the centre.
                 let p = x.anchor_centroid();
                 let at = (cb.0 + p.0 - ca.0, cb.1 + p.1 - ca.1);
                 let line = x.segs.iter().all(|s| s.line);
-                (x.clone(), Contour::point(at, x.segs.len(), closed, line))
+                (x.clone(), Contour::point(at, x.segs.len(), x.closed, line))
             }
             (None, Some(y)) => {
                 let p = y.anchor_centroid();
                 let at = (ca.0 + p.0 - cb.0, ca.1 + p.1 - cb.1);
                 let line = y.segs.iter().all(|s| s.line);
-                (Contour::point(at, y.segs.len(), closed, line), y.clone())
+                (Contour::point(at, y.segs.len(), y.closed, line), y.clone())
             }
             (None, None) => unreachable!(),
         };

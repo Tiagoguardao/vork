@@ -15,164 +15,6 @@
 
 use anyhow::{Context, Result};
 
-/// Reusable staging storage for at most two in-flight readbacks, each capped at 32 MiB.
-#[derive(Default, Clone)]
-pub struct ReadbackPool(std::rc::Rc<std::cell::RefCell<ReadbackBuffers>>);
-
-#[derive(Default)]
-struct ReadbackBuffers {
-    free: Vec<wgpu::Buffer>,
-    active: usize,
-    spent: RgbaRecycler,
-}
-
-impl ReadbackPool {
-    /// Where a finished readback's consumer hands its spent pixels back ([`RgbaRecycler`]).
-    pub fn recycler(&self) -> RgbaRecycler {
-        self.0.borrow().spent.clone()
-    }
-}
-
-/// Spent RGBA frame buffers, handed back by the code that consumed a finished readback (an export's frame writer,
-/// once the frame is in the pipe or the PNG), so the next readback of the same size writes into memory that is
-/// already mapped instead of a fresh 8 MB (1080p) allocation's zeroed pages. It holds no pixels anyone reads: a
-/// buffer is taken only at exactly the readback's size, and the readback overwrites every byte of it. At most
-/// [`RgbaRecycler::KEEP`] buffers are held.
-#[derive(Default, Clone)]
-pub struct RgbaRecycler(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-impl RgbaRecycler {
-    /// The frames an export can have in flight at once (two queued for the writer, one being written, one being
-    /// read back), so a steady export allocates no frame after its first few.
-    const KEEP: usize = 4;
-
-    /// Hand a spent buffer back. Its contents are never read again.
-    pub fn give(&self, buffer: Vec<u8>) {
-        let Ok(mut spent) = self.0.lock() else { return };
-        if spent.len() < Self::KEEP && !buffer.is_empty() {
-            spent.push(buffer);
-        }
-    }
-
-    /// A buffer of exactly `len` bytes whose contents are unspecified (a spent frame's, or zeros): the caller
-    /// overwrites all of it.
-    fn take(&self, len: usize) -> Vec<u8> {
-        let reused = self.0.lock().ok().and_then(|mut spent| {
-            spent.retain(|buffer| buffer.len() == len);
-            spent.pop()
-        });
-        reused.unwrap_or_else(|| vec![0; len])
-    }
-}
-
-/// A submitted RGBA readback. Dropping it cancels mapping and returns its staging buffer.
-pub struct PendingRgba {
-    buffer: Option<wgpu::Buffer>,
-    pool: ReadbackPool,
-    completion: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
-    submission: Option<wgpu::SubmissionIndex>,
-    ready: Option<Vec<u8>>,
-    width: u32,
-    height: u32,
-    bgra: bool,
-    transparent: bool,
-    retries: u32,
-}
-
-impl PendingRgba {
-    pub fn finish(mut self, device: &wgpu::Device) -> Result<Vec<u8>> {
-        let _readback = crate::prof::span("gpu.readback");
-        let mut out = if let Some(ready) = self.ready.take() {
-            ready
-        } else {
-            let wait = crate::prof::span("gpu.readback.wait");
-            poll_submission_with_budget(device, self.submission.take().expect("submitted"), self.retries)?;
-            self.completion.take().expect("mapping").recv().context("map_async channel")??;
-            drop(wait);
-            let _copy = crate::prof::span("gpu.readback.copy");
-            let buffer = self.buffer.as_ref().expect("staging buffer");
-            let data = buffer.slice(..).get_mapped_range();
-            // Every byte is written below: the tightly packed rows of the whole image.
-            let mut out = self.pool.recycler().take(self.width as usize * self.height as usize * 4);
-            assemble_band(&mut out, &data, padded_bytes_per_row(self.width) as usize, self.width as usize * 4, 0, self.height as usize);
-            if self.bgra {
-                bgra8_to_rgba8_in_place(&mut out);
-            }
-            out
-        };
-        if self.transparent {
-            unpremultiply_in_place(&mut out);
-        }
-        Ok(out)
-    }
-}
-
-impl Drop for PendingRgba {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            buffer.unmap();
-            let mut buffers = self.pool.0.borrow_mut();
-            buffers.active -= 1;
-            buffers.free.push(buffer);
-        }
-    }
-}
-
-pub(crate) fn read_texture_rgba_start(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    pool: &ReadbackPool,
-    transparent: bool,
-    retries: u32,
-) -> Result<PendingRgba> {
-    let (width, height) = (texture.width(), texture.height());
-    let stride = padded_bytes_per_row(width);
-    let size = u64::from(stride) * u64::from(height);
-    let mut pending = PendingRgba {
-        buffer: None, pool: pool.clone(), completion: None, submission: None, ready: None,
-        width, height, bgra: texture.format() == wgpu::TextureFormat::Bgra8Unorm, transparent, retries,
-    };
-    if size > device.limits().max_buffer_size.min(32 * 1024 * 1024) {
-        pending.ready = Some(read_texture_rgba_with_budget(device, queue, texture, width, height, retries)?);
-        return Ok(pending);
-    }
-    let buffer = {
-        let mut buffers = pool.0.borrow_mut();
-        anyhow::ensure!(buffers.active < 2, "export readback: at most two frames may be in flight");
-        buffers.free.retain(|buffer| buffer.size() == size);
-        buffers.active += 1;
-        buffers.free.pop()
-    }.unwrap_or_else(|| device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Pipelined Export Read Buffer"), size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    }));
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Pipelined Export Copy") });
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(height) } },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
-    crate::scratch::flush();
-    pending.submission = Some(queue.submit([encoder.finish()]));
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
-    pending.buffer = Some(buffer);
-    pending.completion = Some(rx);
-    Ok(pending)
-}
-
-pub fn padded_bytes_per_row(width: u32) -> u32 {
-    padded_bytes_per_row_bpp(width, 4)
-}
-
-/// [`padded_bytes_per_row`] for `bytes_per_pixel`-byte texels (8 for `Rgba16Float`).
-pub fn padded_bytes_per_row_bpp(width: u32, bytes_per_pixel: u32) -> u32 {
-    (width * bytes_per_pixel).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-}
-
-/// Read an `Rgba16Float` texture (sample_count 1) back as tightly packed RGBA half floats, as stored
 /// (premultiplied; whatever encoding the texels hold). The same banded copy-out as the 8-bit readback.
 pub fn read_texture_rgba16f(
     device: &wgpu::Device,
@@ -283,6 +125,7 @@ pub(crate) const READBACK_POLL_TIMEOUT_RETRIES: u32 = 8;
 /// The first readback gets a larger ceiling so the cold compile completes;
 /// every subsequent readback drops back to the steady-state budget so a
 /// genuinely wedged submission still surfaces promptly. Still bounded.
+#[cfg(test)]
 pub(crate) const READBACK_POLL_TIMEOUT_RETRIES_FIRST: u32 = 24;
 
 /// Poll the device until the most recent submission completes, tolerating a
@@ -292,38 +135,12 @@ pub(crate) const READBACK_POLL_TIMEOUT_RETRIES_FIRST: u32 = 24;
 /// `u64::MAX` Vulkan fence wait, so each individual poll already blocks as long
 /// as the driver allows; the retries exist only for drivers whose watchdog cuts
 /// that wait short with `VK_TIMEOUT` rather than letting it run to completion.
-/// The first cold readback passes [`READBACK_POLL_TIMEOUT_RETRIES_FIRST`];
+/// The first cold readback passes `READBACK_POLL_TIMEOUT_RETRIES_FIRST`;
 /// steady state passes [`READBACK_POLL_TIMEOUT_RETRIES`].
 pub(crate) fn poll_until_complete_with_budget(device: &wgpu::Device, retries: u32) -> Result<()> {
     let mut timeouts = 0u32;
     loop {
         match device.poll(wgpu::PollType::wait_indefinitely()) {
-            Ok(_) => return Ok(()),
-            Err(wgpu::PollError::Timeout) if timeouts < retries => {
-                timeouts += 1;
-                eprintln!(
-                    "moda-engine: warn: readback poll timed out (slow frame); \
-                     retry {timeouts}/{retries}"
-                );
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
-/// [`poll_until_complete_with_budget`] for one submission: waits until `index` has executed (and its map
-/// callbacks ran), not for work submitted after it.
-pub(crate) fn poll_submission_with_budget(
-    device: &wgpu::Device,
-    index: wgpu::SubmissionIndex,
-    retries: u32,
-) -> Result<()> {
-    let mut timeouts = 0u32;
-    loop {
-        match device.poll(wgpu::PollType::Wait {
-            submission_index: Some(index.clone()),
-            timeout: None,
-        }) {
             Ok(_) => return Ok(()),
             Err(wgpu::PollError::Timeout) if timeouts < retries => {
                 timeouts += 1;
@@ -360,7 +177,7 @@ pub fn read_texture_rgba(
 
 /// As [`read_texture_rgba`] but with an explicit timeout-retry budget for the
 /// map-completion poll (the cold first readback passes the larger first-render
-/// budget; see [`READBACK_POLL_TIMEOUT_RETRIES_FIRST`]).
+/// budget; see `READBACK_POLL_TIMEOUT_RETRIES_FIRST`).
 pub(crate) fn read_texture_rgba_with_budget(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -415,11 +232,6 @@ pub(crate) fn read_texture_rgba_with_budget(
 ///
 /// Peak staging memory DROPS (one band mapped at a time instead of the whole
 /// image); the tightly-packed output `Vec` is unchanged at `w * h * 4`.
-///
-/// This does NOT lift the per-axis texture limit, nor the encode/RSS ceilings
-/// above it — `export_scale::clamp_export_scale` remains the backstop for
-/// those. It removes the readback buffer as the binding constraint, which at
-/// the default 256 MB it always was (~67 MP vs the axis cap's ~268 MP).
 pub(crate) fn read_texture_rgba_staged(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -437,7 +249,7 @@ pub(crate) fn read_texture_rgba_staged(
     if width == 0 || height == 0 {
         return Ok(Vec::new());
     }
-    // 4 bytes for the 8-bit frame formats, 8 for `Rgba16Float` (the pixel graph's captures).
+    // 4 bytes for the 8-bit frame formats, 8 for `Rgba16Float` captures.
     let bpp = texture.format().block_copy_size(None).unwrap_or(4);
     let bytes_per_row = padded_bytes_per_row_bpp(width, bpp);
     let rows_per_band = readback_rows_per_band(bytes_per_row, max_staging_bytes, height);
@@ -535,7 +347,7 @@ pub(crate) fn read_texture_rgba_staged(
 /// physically-BGRA readback bytes to RGBA. Alpha-independent, so
 /// ordering against un-premultiplication is a documentation contract
 /// (canonicalize FIRST), not a numeric one.
-pub fn bgra8_to_rgba8_in_place(px: &mut [u8]) {
+pub(crate) fn bgra8_to_rgba8_in_place(px: &mut [u8]) {
     debug_assert_eq!(px.len() % 4, 0);
     for p in px.chunks_exact_mut(4) {
         p.swap(0, 2);
@@ -557,7 +369,7 @@ fn unpremultiply_channel(premultiplied: u8, alpha: u8) -> u8 {
 
 /// In-place straight-alpha conversion for transparent exports
 /// (pixelFormat.ts:50-62: a==0 → rgb zeroed).
-pub fn unpremultiply_in_place(rgba: &mut [u8]) {
+pub(crate) fn unpremultiply_in_place(rgba: &mut [u8]) {
     for px in rgba.chunks_exact_mut(4) {
         let a = px[3];
         if a == 0 {
@@ -575,33 +387,6 @@ pub fn unpremultiply_in_place(rgba: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_recycled_buffer_is_taken_only_at_its_exact_size_and_few_are_kept() {
-        let spent = RgbaRecycler::default();
-        // Nothing spent yet: a fresh buffer of the size asked for.
-        assert_eq!(spent.take(16), vec![0; 16]);
-        let a = vec![7u8; 16];
-        let ptr = a.as_ptr();
-        spent.give(a);
-        // Same size: that very buffer (its old bytes are the caller's to overwrite).
-        let again = spent.take(16);
-        assert_eq!(again.as_ptr(), ptr);
-        assert_eq!(again.len(), 16);
-        // Another size: never handed out, and dropped rather than kept.
-        spent.give(vec![1u8; 32]);
-        assert_eq!(spent.take(16), vec![0; 16]);
-        assert!(spent.0.lock().unwrap().is_empty());
-        // At most KEEP buffers are held.
-        for _ in 0..RgbaRecycler::KEEP + 3 {
-            spent.give(vec![0u8; 8]);
-        }
-        assert_eq!(spent.0.lock().unwrap().len(), RgbaRecycler::KEEP);
-        // An empty buffer is not kept.
-        let empty = RgbaRecycler::default();
-        empty.give(Vec::new());
-        assert!(empty.0.lock().unwrap().is_empty());
-    }
 
     #[test]
     fn round_half_up_matches_ts() {
@@ -943,48 +728,13 @@ mod tests {
             assert!(empty.is_empty(), "{w}x{h} readback must be empty");
         }
 
-        for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Bgra8Unorm] {
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("pipelined readback parity"),
-                size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                format, usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let pool = ReadbackPool::default();
-            let mut pending = std::collections::VecDeque::new();
-            for frame in 0..7u8 {
-                let mut bytes = src.clone();
-                for pixel in bytes.chunks_exact_mut(4) {
-                    pixel[0] = pixel[0].wrapping_add(frame * 17);
-                    pixel[3] = frame * 37;
-                }
-                gpu.queue.write_texture(texture.as_image_copy(), &bytes,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
-                    wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 });
-                let straight = frame % 2 == 0;
-                let read = read_texture_rgba_start(&gpu.device, &gpu.queue, &texture, &pool, straight, READBACK_POLL_TIMEOUT_RETRIES).unwrap();
-                if format == wgpu::TextureFormat::Bgra8Unorm {
-                    bgra8_to_rgba8_in_place(&mut bytes);
-                }
-                if straight {
-                    unpremultiply_in_place(&mut bytes);
-                }
-                pending.push_back((read, bytes));
-                if pending.len() == 2 {
-                    assert!(read_texture_rgba_start(&gpu.device, &gpu.queue, &texture, &pool, false, READBACK_POLL_TIMEOUT_RETRIES).is_err(), "a third staging buffer must not be allocated");
-                    let (read, expected) = pending.pop_front().unwrap();
-                    assert_eq!(read.finish(&gpu.device).unwrap(), expected, "frame {frame}: copy must precede the next upload");
-                }
-            }
-            for (read, expected) in pending {
-                assert_eq!(read.finish(&gpu.device).unwrap(), expected);
-            }
-            assert_eq!(pool.0.borrow().free.len(), 2, "both staging buffers are reusable");
-            let cancelled = read_texture_rgba_start(&gpu.device, &gpu.queue, &texture, &pool, false, READBACK_POLL_TIMEOUT_RETRIES).unwrap();
-            drop(cancelled);
-            let retried = read_texture_rgba_start(&gpu.device, &gpu.queue, &texture, &pool, false, READBACK_POLL_TIMEOUT_RETRIES).unwrap();
-            assert_eq!(retried.finish(&gpu.device).unwrap(), read_texture_rgba(&gpu.device, &gpu.queue, &texture, W, H).unwrap());
-        }
     }
+}
+
+pub fn padded_bytes_per_row(width: u32) -> u32 {
+    padded_bytes_per_row_bpp(width, 4)
+}
+
+pub fn padded_bytes_per_row_bpp(width: u32, bytes_per_pixel: u32) -> u32 {
+    (width * bytes_per_pixel).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
 }

@@ -996,6 +996,10 @@ pub trait Device: WasmNotSendSync {
     where
         I: Iterator<Item = MemoryRange>;
 
+    /// Native binding requirement of a validated descriptor, where the backend exposes it.
+    /// This query never binds or allocates backing memory.
+    fn texture_binding_size(&self, _desc: &TextureDescriptor) -> Option<u64> { None }
+
     /// Creates a new texture.
     ///
     /// The initial usage for all subresources is `wgt::TextureUses::UNINITIALIZED`.
@@ -1386,6 +1390,10 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
     unsafe fn reset_all<I>(&mut self, command_buffers: I)
     where
         I: Iterator<Item = <Self::A as Api>::CommandBuffer>;
+
+    /// Whether buffer or texture transitions can require a recorded command.
+    /// False permits callers to omit both calls after updating their trackers.
+    const RECORDS_RESOURCE_TRANSITIONS: bool = true;
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
     where

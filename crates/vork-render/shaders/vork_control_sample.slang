@@ -2,13 +2,6 @@
 import vork_constants;
 import vork_visibility;
 public struct RasterControls { public float4 depth; public uint4 ids; public float4 normals; public float4 ambient; public float4 motion; };
-// Standard four-sample raster locations, in pixel coordinates (Y down).
-// Controls use either one centre sample or MSAA4.
-public float2 control_sample_offset(uint sample) {
-    if (sample==0u) {return float2(0.);}
-    let offsets=float2[4](float2(-.125,-.375),float2(.375,-.125),float2(-.375,.125),float2(.125,.375));
-    return offsets[sample-1u];
-}
 // Slang emits the Load coordinate of a multisampled texture as int2 on Metal, whose
 // texture2d_ms::read takes uint2. Metal calls the member with the cast.
 #ifdef VORK_METAL

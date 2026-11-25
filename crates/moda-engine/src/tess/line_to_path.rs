@@ -108,15 +108,7 @@ pub struct LineSpec {
     pub pointer_length: Option<f64>,
     pub pointer_width: Option<f64>,
     pub corner_radius: Option<f64>,
-    /// The body is drawn as a width-model outline (brushes.md §4.9), not a
-    /// uniform stroke: the arrowhead set-back allows for the cap by the
-    /// outline's own half-width at that end (`outlined_cap_reach`), not half
-    /// the weight, so a body tapering to a point meets its head and a full
-    /// round end stops at it. Not JSON fields; the renderer sets them.
-    pub body_outlined: bool,
-    /// Half-width of the outlined body at its start and end (round / square
-    /// caps reach this far past the end); 0 = no allowance.
-    pub outlined_cap_reach: [f64; 2],
+
 }
 
 impl LineSpec {
@@ -172,8 +164,7 @@ impl LineSpec {
             pointer_width: pointer("pointerWidth"),
 
             corner_radius: get("cornerRadius").and_then(Value::as_f64),
-            body_outlined: false,
-            outlined_cap_reach: [0.0, 0.0],
+
         }
     }
 
@@ -559,16 +550,8 @@ pub fn convert_line_body_with_gap(spec: &LineSpec, text_gap: Option<TextGap>) ->
     // An outlined body's cap reaches only as far as the outline's half-width
     // at that end (none where it tapers to a point), so it is set back as if
     // butt-capped plus that reach.
-    let set_back = |shape: ArrowShape, end: usize| {
-        if spec.body_outlined {
-            let capped = matches!(spec.line_cap.as_deref(), Some("round" | "square"));
-            arrow_trim_distance(shape, p_len, p_wid, None, sw)
-                + if capped {
-                    spec.outlined_cap_reach[end].max(0.0)
-                } else {
-                    0.0
-                }
-        } else {
+    let set_back = |shape: ArrowShape, _end: usize| {
+        {
             arrow_trim_distance(shape, p_len, p_wid, spec.line_cap.as_deref(), sw)
         }
     };

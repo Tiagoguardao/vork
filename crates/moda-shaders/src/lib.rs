@@ -10,7 +10,6 @@
 //! exposes them plus a typed view of the manifest (bind layouts, vertex
 //! layouts, blend/depth state, packing tables, pinned constants).
 
-pub mod runtime;
 pub mod working_color;
 pub use working_color::WorkingColor;
 
@@ -22,10 +21,9 @@ use serde::Deserialize;
 /// One extracted WGSL module, embedded byte-for-byte at compile time.
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderSource {
-    /// Extraction module id (= file stem), e.g. `mesh-gradient`,
-    /// `mesh-gradient.vector-text-fill`, `path-solid`, `backdrop-blur`.
+    /// Extraction module id (= file stem), e.g. `path-solid` or `backdrop-blur`.
     pub id: &'static str,
-    /// Path relative to the crate root, e.g. `wgsl/mesh-gradient.wgsl`.
+    /// Path relative to the crate root, e.g. `wgsl/path-solid.wgsl`.
     pub file: &'static str,
     /// The composed production WGSL.
     pub source: &'static str,
@@ -37,8 +35,18 @@ include!(concat!(env!("OUT_DIR"), "/modules_gen.rs"));
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
 
 pub fn module_source(id: &str) -> Option<&'static ShaderSource> {
-    MODULES.iter().find(|m| m.id == id)
+    let file = &manifest().modules.get(id)?.file;
+    MODULES.iter().find(|m| m.file == file)
 }
+
+/// Vertex entry for a layered page containing one path. The page draws the
+/// instance at its destination view index. Its own path storage starts at zero.
+pub const LAYERED_PATH_VERTEX: &str = concat!(
+    "\n@vertex fn layeredVertex(vertex: VertexInput, @builtin(instance_index) layer: u32, ",
+    "@builtin(view_index) view: u32) -> VertexOutput {\nlet instanceIndex = 0u;\n",
+    include_str!("../wgsl/include/path-solid-vertex.wgsl"),
+    "if view != layer { output.position = vec4f(0.,0.,-1.,1.); }\nreturn output;\n}\n",
+);
 
 // ---------------------------------------------------------------------------
 // Typed manifest
@@ -52,15 +60,7 @@ pub struct Manifest {
     /// `WebGPUBlendModeRenderer.getBlendStateForMode` (DECISION §1.3 — note
     /// overlay's `src-alpha` color factor; it is *not* literally "normal").
     pub blend_modes: BTreeMap<String, BlendState>,
-    pub shader_id_aliases: BTreeMap<String, String>,
-    pub instance_abi: InstanceAbi,
     pub modules: BTreeMap<String, ModuleMeta>,
-    /// Text shader fills: the production eligibility predicate
-    /// (`isTextShaderFillEligible` — descriptor `shade` shader with no
-    /// `primaryImage` resource, `defineProceduralShader.ts:326-328`), spliced
-    /// with the vector header/footer — one `<id>.vector-text-fill` module per
-    /// eligible shader.
-    pub vector_text_fill: VectorTextFill,
     /// Vector text engine pinned constants (instance ABI, curve extraction
     /// tolerances, AA pad, effect defaults) — `vectorTextShaders.ts`,
     /// `glyphCurves.ts`, `VectorTextRenderer.ts`, `vectorTextEffects.ts`.
@@ -68,17 +68,10 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VectorTextFill {
-    /// Post-alias canonical shader ids eligible for the text fill (39 of 49 —
-    /// image-backed shaders are excluded by the production predicate).
-    pub eligible_shader_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct VectorTextConstants {
-    /// 16 floats / 64 bytes per glyph instance: pen(2) + fontSizePx(1) +
+    /// 17 words / 68 bytes per glyph instance: pen(2) + fontSizePx(1) +
     /// emBox(4) + firstCurve/curveCount as raw u32(2), then the KineticText
-    /// per-glyph transform glyphLin(4) + glyphOff(2) + glyphOpacity(1).
+    /// per-glyph transform glyphLin(4) + glyphOff(2) + glyphOpacity(1) + localAaPx(1).
     #[serde(rename = "ANALYTIC_INSTANCE_FLOATS")]
     pub analytic_instance_floats: u32,
     #[serde(rename = "ANALYTIC_INSTANCE_BYTES")]
@@ -109,8 +102,6 @@ pub struct VectorTextConstants {
 
 #[derive(Debug, Deserialize)]
 pub struct Counts {
-    pub procedural: usize,
-    pub vector_text_fill_variants: usize,
     pub total_modules: usize,
 }
 
@@ -139,28 +130,16 @@ pub struct MaskBindGroupIndex {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct InstanceAbi {
-    pub size_floats: u32,
-    pub size_bytes: u32,
-    pub shader_params_capacity_floats: u32,
-    pub color_data_capacity_floats: u32,
-    pub offsets_floats: BTreeMap<String, u32>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct ModuleMeta {
     pub file: String,
     pub label: String,
-    /// `procedural-fill` | `procedural-vector-text-fill` | `backdrop` |
-    /// `system`
+    /// `backdrop` | `system`
     pub class: String,
     /// `render` | `compute` | `fragment-library`
     pub kind: String,
     #[serde(default)]
     pub pipelines: Vec<PipelineDesc>,
-    /// Param/color offset packing tables for procedural fills.
-    #[serde(default)]
-    pub packing: Option<serde_json::Value>,
+
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -300,7 +279,6 @@ mod tests {
         // M4e FIX: 656 (= BUFFER_SIZES.CUSTOM_SHADER, the stride the
         // production storage buffers are written with); the extraction
         // previously emitted the dead 672-byte ShaderBufferLayout constant.
-        assert_eq!(manifest().instance_abi.size_bytes, 656);
     }
 
     /// Every module that offsets a stroke's depth declares the pinned offset.
@@ -333,126 +311,11 @@ mod tests {
     }
 
     #[test]
-    fn vector_text_coverage_core_is_one_shared_copy() {
-        // Every vector text module gets its coverage core (the Slug-classified
-        // winding along a ray, #571) spliced from wgsl/include by build.rs, so
-        // a fix lands everywhere at once: no module may carry its own copy,
-        // and no include line may reach the GPU unexpanded.
-        let core = include_str!("../wgsl/include/vector-text-coverage.wgsl");
-        let core = core.trim_end_matches('\n');
-        let mut sharing = 0;
-        for m in MODULES {
-            assert!(
-                !m.source.contains("// #include \""),
-                "{}: unexpanded include",
-                m.id
-            );
-            let copies = m.source.matches("fn vectorWindingAlongRay(").count();
-            if copies == 0 {
-                continue;
-            }
-            assert_eq!(copies, 1, "{}: duplicate vectorWindingAlongRay", m.id);
-            assert!(
-                m.source.contains(core),
-                "{}: vector text coverage must come from wgsl/include/vector-text-coverage.wgsl",
-                m.id
-            );
-            sharing += 1;
-        }
-        // analytic, -additive, -gradient + one fill module per eligible shader.
-        assert_eq!(sharing, 3 + manifest().counts.vector_text_fill_variants);
-    }
-
-    /// The modules that put an authored colour into the frame, or read a blended picture back as one, splice
-    /// the working colour; an engine in another encoding than sRGB replaces its two definitions in each.
-    #[test]
-    fn working_colour_is_spliced_where_authored_colour_meets_the_frame() {
-        use super::working_color::{specialize, Conversion, WorkingColor};
-        let spliced: std::collections::BTreeSet<&str> =
-            MODULES.iter().filter(|m| m.source.contains("// working-color begin")).map(|m| m.id).collect();
-        let expected: std::collections::BTreeSet<&str> = [
-            "layer-filter-shadow", "mask-coverage", "page-fill", "path-gradient", "path-pattern", "path-shadow", "path-solid",
-            "shape-gradient", "shape-solid", "text-decoration",
-            "vector-text-analytic", "vector-text-analytic-additive", "vector-text-analytic-gradient", "vector-text-tess",
-        ].into_iter().collect();
-        assert_eq!(spliced, expected);
-        // Display P3: every step of both conversions (columns of linear Rec.709 to P3, and back).
-        let p3 = WorkingColor {
-            from_srgb: Conversion { decode: true, matrix: Some([[0.82246196, 0.03319418, 0.01708263], [0.17753806, 0.96680583, 0.07239744], [0., 0., 0.9105199]]), encode: true },
-            to_srgb: Conversion { decode: true, matrix: Some([[1.22494018, -0.04205693, -0.01963755], [-0.22494021, 1.04205692, -0.07863605], [0., 0., 1.09827363]]), encode: true },
-        };
-        let identity = "fn workingRgb(c: vec3<f32>) -> vec3<f32> { return c; }";
-        let first_column = format!("mat3x3<f32>(vec3<f32>({:?}, {:?}, {:?})", 0.82246196f32, 0.03319418f32, 0.01708263f32);
-        for m in MODULES {
-            let default = specialize(None, m.source.into());
-            assert_eq!(default.as_ref(), m.source, "{}: an sRGB engine compiles the module as it is", m.id);
-            let converted = specialize(Some(&p3), m.source.into());
-            if !spliced.contains(m.id) {
-                assert_eq!(converted.as_ref(), m.source, "{}", m.id);
-                continue;
-            }
-            assert!(m.source.contains(identity), "{}", m.id);
-            assert!(!converted.contains(identity), "{}: the sRGB definitions are replaced", m.id);
-            assert_eq!(converted.matches("fn workingRgb(").count(), 1, "{}", m.id);
-            assert_eq!(converted.matches("fn workingToSrgb(").count(), 1, "{}", m.id);
-            assert!(converted.contains(&first_column), "{}: {first_column}", m.id);
-        }
-        // The conversion on the CPU is the same arithmetic: sRGB red as Display P3 code values, and back.
-        let red = p3.rgba([1., 0., 0., 0.5]);
-        for (a, b) in red.into_iter().zip([0.9174876, 0.2002867, 0.1385606, 0.5]) { assert!((a - b).abs() < 2e-5, "{red:?}"); }
-        let back = p3.to_srgb.apply([red[0], red[1], red[2]]);
-        for (a, b) in back.into_iter().zip([1., 0., 0.]) { assert!((a - b).abs() < 2e-5, "{back:?}"); }
-        // A linear working space decodes authored colour and encodes on the way back; equal primaries have no matrix.
-        let linear = WorkingColor { from_srgb: Conversion { decode: true, matrix: None, encode: false }, to_srgb: Conversion { decode: false, matrix: None, encode: true } };
-        assert!((linear.rgba([0.5, 0.5, 0.5, 1.])[0] - 0.21404114).abs() < 1e-6);
-        assert_eq!(linear.from_srgb.wgsl("f").matches(" v = ").count(), 2);
-        // Extended range: the transfer is linear below zero and its power curve continues above one.
-        assert!((linear.from_srgb.apply([-0.1292, 0., 2.])[0] + 0.01).abs() < 1e-7);
-        assert!((linear.to_srgb.apply(linear.from_srgb.apply([0., 0., 2.]))[2] - 2.).abs() < 1e-4);
-    }
-
-    #[test]
-    fn vector_text_fill_eligibility_matches_extracted_variants() {
-        // The eligibility set IS the extracted-variant set: one
-        // `<id>.vector-text-fill` module per eligible shader, counts agree,
-        // and image-backed shaders (the only shaders failing
-        // `isTextShaderFillEligible`) are excluded.
-        let m = manifest();
-        let eligible = &m.vector_text_fill.eligible_shader_ids;
-        assert_eq!(eligible.len(), m.counts.vector_text_fill_variants);
-        let variant_modules: Vec<&String> = m
-            .modules
-            .iter()
-            .filter(|(_, meta)| meta.class == "procedural-vector-text-fill")
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(variant_modules.len(), m.counts.vector_text_fill_variants);
-        for id in eligible {
-            let module_id = runtime::vector_text_fill_module_id(id);
-            assert!(
-                m.modules.get(&module_id).map(|meta| meta.class.as_str())
-                    == Some("procedural-vector-text-fill"),
-                "eligible shader '{id}' lacks its vector text-fill module"
-            );
-            assert!(
-                module_source(&module_id).is_some(),
-                "no embedded WGSL for '{module_id}'"
-            );
-            assert!(runtime::supports_vector_text_fill(id));
-        }
-        assert!(runtime::supports_vector_text_fill("mesh-spot"));
-        for id in ["dither-image", "heatmap-image", "liquid-metal-image"] {
-            assert!(!runtime::supports_vector_text_fill(id), "image-backed '{id}' must be text-fill ineligible");
-        }
-        assert!(!runtime::supports_vector_text_fill("not-a-shader"));
-    }
-
-    #[test]
     fn vector_text_system_modules_and_constants() {
         // The four vector-engine system modules ship with render pipelines
         // (incl. the glow additive-blend variant, task #142), and the
-        // CPU-side pinned constants hold (instance ABI = 64 bytes after the
-        // KineticText per-glyph transform, cubic subdivision tolerance 0.001 em
+        // CPU-side pinned constants hold (instance ABI includes the
+        // per-glyph transform and local AA margin, cubic subdivision tolerance 0.001 em
         // — glyphCurves.ts).
         let m = manifest();
         for id in [
@@ -492,10 +355,8 @@ mod tests {
         assert_eq!(blend.alpha.src_factor, "one");
         assert_eq!(blend.alpha.dst_factor, "one");
         let v = &m.vector_text;
-        // KineticText: the analytic instance widened 9 → 16 floats
-        // (base 9 + per-glyph transform glyphLin.4 + glyphOff.2 + glyphOpacity.1).
-        assert_eq!(v.analytic_instance_floats, 16);
-        assert_eq!(v.analytic_instance_bytes, 64);
+        assert_eq!(v.analytic_instance_floats, 17);
+        assert_eq!(v.analytic_instance_bytes, 68);
         assert_eq!(v.text_gradient_uniform_floats, 12 + 8 * 4);
         assert_eq!(v.text_gradient_uniform_bytes, (12 + 8 * 4) * 4);
         assert_eq!(v.cubic_tolerance_em, 0.001);
@@ -506,5 +367,87 @@ mod tests {
         assert_eq!(v.default_shadow_opacity, 0.3);
         assert_eq!(v.floats_per_curve, 6);
         assert!(v.degenerate_epsilon_sq > 0.0 && v.degenerate_epsilon_sq < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod retained_native_regressions {
+    use super::*;
+
+    #[test]
+    fn vector_text_coverage_core_is_one_shared_copy() {
+        // Every vector text module gets its coverage core (the Slug-classified
+        // winding along a ray, #571) spliced from wgsl/include by build.rs, so
+        // a fix lands everywhere at once: no module may carry its own copy,
+        // and no include line may reach the GPU unexpanded.
+        let core = include_str!("../wgsl/include/vector-text-coverage.wgsl");
+        let core = core.trim_end_matches('\n');
+        let mut sharing = 0;
+        for m in MODULES {
+            assert!(
+                !m.source.contains("// #include \""),
+                "{}: unexpanded include",
+                m.id
+            );
+            let copies = m.source.matches("fn vectorWindingAlongRay(").count();
+            if copies == 0 {
+                continue;
+            }
+            assert_eq!(copies, 1, "{}: duplicate vectorWindingAlongRay", m.id);
+            assert!(
+                m.source.contains(core),
+                "{}: vector text coverage must come from wgsl/include/vector-text-coverage.wgsl",
+                m.id
+            );
+            sharing += 1;
+        }
+        // The retained analytic and gradient modules share the coverage core.
+        assert_eq!(sharing, 2);
+    }
+
+    #[test]
+    fn working_colour_is_spliced_where_authored_colour_meets_the_frame() {
+        use super::working_color::{specialize, Conversion, WorkingColor};
+        let spliced: std::collections::BTreeSet<&str> =
+            MODULES.iter().filter(|m| m.source.contains("// working-color begin")).map(|m| m.id).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "layer-filter-shadow", "mask-coverage", "page-fill", "path-gradient", "path-pattern", "path-shadow", "path-solid",
+            "shape-gradient", "shape-solid", "text-decoration",
+            "vector-text-analytic", "vector-text-analytic-gradient", "vector-text-tess",
+        ].into_iter().collect();
+        assert_eq!(spliced, expected);
+        // Display P3: every step of both conversions (columns of linear Rec.709 to P3, and back).
+        let p3 = WorkingColor {
+            from_srgb: Conversion { decode: true, matrix: Some([[0.82246196, 0.03319418, 0.01708263], [0.17753806, 0.96680583, 0.07239744], [0., 0., 0.9105199]]), encode: true },
+            to_srgb: Conversion { decode: true, matrix: Some([[1.22494018, -0.04205693, -0.01963755], [-0.22494021, 1.04205692, -0.07863605], [0., 0., 1.09827363]]), encode: true },
+        };
+        let identity = "fn workingRgb(c: vec3<f32>) -> vec3<f32> { return c; }";
+        let first_column = format!("mat3x3<f32>(vec3<f32>({:?}, {:?}, {:?})", 0.82246196f32, 0.03319418f32, 0.01708263f32);
+        for m in MODULES {
+            let default = specialize(None, m.source.into());
+            assert_eq!(default.as_ref(), m.source, "{}: an sRGB engine compiles the module as it is", m.id);
+            let converted = specialize(Some(&p3), m.source.into());
+            if !spliced.contains(m.id) {
+                assert_eq!(converted.as_ref(), m.source, "{}", m.id);
+                continue;
+            }
+            assert!(m.source.contains(identity), "{}", m.id);
+            assert!(!converted.contains(identity), "{}: the sRGB definitions are replaced", m.id);
+            assert_eq!(converted.matches("fn workingRgb(").count(), 1, "{}", m.id);
+            assert_eq!(converted.matches("fn workingToSrgb(").count(), 1, "{}", m.id);
+            assert!(converted.contains(&first_column), "{}: {first_column}", m.id);
+        }
+        // The conversion on the CPU is the same arithmetic: sRGB red as Display P3 code values, and back.
+        let red = p3.rgba([1., 0., 0., 0.5]);
+        for (a, b) in red.into_iter().zip([0.9174876, 0.2002867, 0.1385606, 0.5]) { assert!((a - b).abs() < 2e-5, "{red:?}"); }
+        let back = p3.to_srgb.apply([red[0], red[1], red[2]]);
+        for (a, b) in back.into_iter().zip([1., 0., 0.]) { assert!((a - b).abs() < 2e-5, "{back:?}"); }
+        // A linear working space decodes authored colour and encodes on the way back; equal primaries have no matrix.
+        let linear = WorkingColor { from_srgb: Conversion { decode: true, matrix: None, encode: false }, to_srgb: Conversion { decode: false, matrix: None, encode: true } };
+        assert!((linear.rgba([0.5, 0.5, 0.5, 1.])[0] - 0.21404114).abs() < 1e-6);
+        assert_eq!(linear.from_srgb.wgsl("f").matches(" v = ").count(), 2);
+        // Extended range: the transfer is linear below zero and its power curve continues above one.
+        assert!((linear.from_srgb.apply([-0.1292, 0., 2.])[0] + 0.01).abs() < 1e-7);
+        assert!((linear.to_srgb.apply(linear.from_srgb.apply([0., 0., 2.]))[2] - 2.).abs() < 1e-4);
     }
 }

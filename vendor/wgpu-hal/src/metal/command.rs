@@ -586,6 +586,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
         //do nothing
     }
 
+    const RECORDS_RESOURCE_TRANSITIONS: bool = false;
+
     unsafe fn transition_buffers<'a, T>(&mut self, _barriers: T)
     where
         T: Iterator<Item = crate::BufferBarrier<'a, super::Buffer>>,

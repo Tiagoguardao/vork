@@ -22,6 +22,7 @@
 //! carry zeros.
 
 use super::moda_engine_path_types::PathCmd;
+use super::{Contour, PathClosure, PathContours};
 use crate::seams::TessellatedGeometry;
 
 /// One flattened sub-path of the centreline.
@@ -72,42 +73,21 @@ fn cubic(
     }
 }
 
-/// Flatten `cmds` (the drawn outline, node-local px) to within `tol`. A
-/// sub-path closes when `closed` is set (every sub-path of a closed shape
-/// closes, as the tessellator strokes it).
-pub fn centerline(cmds: &[PathCmd], closed: bool, tol: f64) -> Centerline {
-    let mut subs: Vec<Sub> = Vec::new();
+/// Flatten each contour of the drawn outline (in node-local pixels) to within
+/// `tol`, retaining its own length and seam for the stroke gradient.
+pub fn centerline<'a>(cmds: &'a [PathCmd], closure: impl Into<PathClosure<'a>>, tol: f64) -> Centerline {
+    let subs = PathContours::new(cmds, closure).iter()
+        .filter_map(|contour| flatten_contour(contour, tol))
+        .collect();
+    Centerline { subs }
+}
+
+fn flatten_contour(Contour { points, closed }: Contour<'_>, tol: f64) -> Option<Sub> {
     let mut pts: Vec<[f64; 2]> = Vec::new();
-    let flush = |pts: &mut Vec<[f64; 2]>, subs: &mut Vec<Sub>| {
-        if pts.len() >= 2 {
-            let mut p = std::mem::take(pts);
-            if closed && p.first() != p.last() {
-                p.push(p[0]);
-            }
-            let mut cum = Vec::with_capacity(p.len());
-            let mut acc = 0.0;
-            for (i, q) in p.iter().enumerate() {
-                if i > 0 {
-                    acc += (q[0] - p[i - 1][0]).hypot(q[1] - p[i - 1][1]);
-                }
-                cum.push(acc);
-            }
-            subs.push(Sub {
-                pts: p,
-                cum,
-                closed,
-            });
-        }
-        pts.clear();
-    };
-    for cmd in cmds {
+    for cmd in points {
         let last = pts.last().copied();
         match *cmd {
-            PathCmd::Move { x, y } => {
-                flush(&mut pts, &mut subs);
-                pts.push([x, y]);
-            }
-            PathCmd::Line { x, y } => pts.push([x, y]),
+            PathCmd::Move { x, y } | PathCmd::Line { x, y } => pts.push([x, y]),
             PathCmd::Curve { x, y, cp1, cp2 } => match last {
                 Some(p0) => cubic(p0, [cp1.0, cp1.1], [cp2.0, cp2.1], [x, y], tol, &mut pts),
                 None => pts.push([x, y]),
@@ -156,8 +136,20 @@ pub fn centerline(cmds: &[PathCmd], closed: bool, tol: f64) -> Centerline {
             },
         }
     }
-    flush(&mut pts, &mut subs);
-    Centerline { subs }
+    if pts.len() < 2 {
+        return None;
+    }
+    if closed && pts.first() != pts.last() {
+        pts.push(pts[0]);
+    }
+    let mut cum = Vec::with_capacity(pts.len());
+    cum.push(0.0);
+    let mut acc = 0.0;
+    for pair in pts.windows(2) {
+        acc += (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
+        cum.push(acc);
+    }
+    Some(Sub { pts, cum, closed })
 }
 
 /// One centreline segment, for the nearest-point search.

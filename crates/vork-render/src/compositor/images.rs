@@ -275,8 +275,12 @@ pub(super) fn pass(
     let shutter = word(std::mem::offset_of!(Uniform, composite_shutter));
     let step = word(std::mem::offset_of!(Uniform, composite_step));
     let display = word(std::mem::offset_of!(Uniform, display));
+    let frame_hi = match sources {
+        Sources::Canvas(_) => format!("frame.words[{scene}].z"),
+        Sources::World(..) => "0.".to_owned(),
+    };
     let context = format!(
-        "fn vork_compositor_context(i:u32)->vec4<f32>{{if i<4u{{return frame.words[{view}u+i];}}if i<8u{{return frame.words[{projection}u+i-4u];}}switch i{{case 8u:{{return frame.words[{optics}];}}case 9u:{{return frame.words[{sensor}];}}case 10u:{{return frame.words[{aperture}];}}case 11u:{{return frame.words[{clip}];}}case 12u:{{return vec4(frame.words[{scene}].y,frame.words[{step}].z,0.,0.);}}case 13u:{{return frame.words[{shutter}];}}case 14u:{{return frame.words[{step}];}}default:{{return vec4(vec2<f32>(image_sizes[1].xy),frame.words[{display}].yz);}}}}}}"
+        "fn vork_compositor_context(i:u32)->vec4<f32>{{if i<4u{{return frame.words[{view}u+i];}}if i<8u{{return frame.words[{projection}u+i-4u];}}switch i{{case 8u:{{return frame.words[{optics}];}}case 9u:{{return frame.words[{sensor}];}}case 10u:{{return frame.words[{aperture}];}}case 11u:{{return frame.words[{clip}];}}case 12u:{{return vec4(frame.words[{scene}].y,frame.words[{step}].z,{frame_hi},0.);}}case 13u:{{return frame.words[{shutter}];}}case 14u:{{return frame.words[{step}];}}default:{{return vec4(vec2<f32>(image_sizes[1].xy),frame.words[{display}].yz);}}}}}}"
     );
     let call = format!(
             "let sizes=image_sizes[0];if gid.x>=sizes.x||gid.y>=sizes.y{{return;}}var result:array<vec4<f32>,1>;{entry_name}((vec2<f32>(gid.xy)+.5)/vec2<f32>(sizes.xy),vec2<f32>(sizes.zw),frame.words[{scene}].x,0u,&result);{store}"

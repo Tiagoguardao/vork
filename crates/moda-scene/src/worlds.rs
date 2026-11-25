@@ -22,6 +22,7 @@
 use crate::scene::{is_parent_node, HashMap, Scene};
 use crate::stamps::{Group, Stamps, Subscription};
 use crate::transform::{self, compose};
+use crate::types::PlacementField;
 use crate::types::{Affine, NodeId, RawNode, Transform2D};
 
 /// A transform with what [`Transform2D`] accumulates beside the matrix (the rotations summed, the scales
@@ -46,8 +47,8 @@ impl Placed {
     /// canonical node is a group-like transform parent (E7.1).
     pub(crate) fn parent(node: &RawNode, boolean_source: bool) -> Placed {
         let (scale_x, scale_y) = if node.node_type() == "group" || boolean_source {
-            let sx = node.f64("scaleX").unwrap_or(1.0);
-            let sy = node.f64("scaleY").unwrap_or(1.0);
+            let sx = node.placement_number(PlacementField::ScaleX).unwrap_or(1.0);
+            let sy = node.placement_number(PlacementField::ScaleY).unwrap_or(1.0);
             (if sx == 0.0 { 1.0 } else { sx }, if sy == 0.0 { 1.0 } else { sy })
         } else {
             let s = node.scale();
@@ -57,7 +58,7 @@ impl Placed {
     }
 
     fn local(node: &RawNode, scale_x: f64, scale_y: f64) -> Placed {
-        let [x, y] = [node.f64("x").unwrap_or(0.0), node.f64("y").unwrap_or(0.0)];
+        let [x, y] = [node.placement_number(PlacementField::X).unwrap_or(0.0), node.placement_number(PlacementField::Y).unwrap_or(0.0)];
         let rotation = node.rotation();
         Placed {
             affine: transform::from_trsk(Transform2D { x, y, rotation, scale_x, scale_y }, node.skew_x()),
@@ -151,8 +152,35 @@ impl Worlds {
     }
 
     /// Whether the columns stand for the scene at `clock`.
-    fn current(&self, clock: u64) -> bool {
+    pub(crate) fn current(&self, clock: u64) -> bool {
         self.current_at == Some(clock)
+    }
+
+    /// Leaves have no dependent world rows. A translation changes only
+    /// the origin of their affine, including when their local basis is skewed.
+    pub(crate) fn translate_leaf(&mut self, row: usize, xy: [f64; 2]) -> bool {
+        if !self.plain[row] || self.frame_of[row] != NONE
+            || self.end[row] - self.at[row] != 1 {
+            return false;
+        }
+        let [x, y] = xy;
+        let (e, f) = match self.link[row] {
+            NONE => (x, y),
+            parent => {
+                let a = self.frames[self.frame_of[parent as usize] as usize].affine;
+                (a.a * x + a.c * y + a.e, a.b * x + a.d * y + a.f)
+            }
+        };
+        self.own[row].affine.e = e;
+        self.own[row].affine.f = f;
+        true
+    }
+
+    pub(crate) fn finish_placements(&mut self, stamps: &mut Stamps) {
+        self.current_at = Some(stamps.clock());
+        for list in self.lists.iter().flatten() {
+            stamps.clear(*list);
+        }
     }
 
     /// The accumulated transform of the node at `row` in its page, when the columns are current at `clock` and
@@ -526,6 +554,28 @@ mod tests {
     }
 
     #[test]
+    fn a_fading_body_keeps_current_world_rows_until_visibility_changes() {
+        let mut scene = Scene::load(&json!({
+            "nodes": [{"id":"p","type":"path","x":17,"y":3}],
+            "pages": [{"id":"page","width":32,"height":32,"nodeIds":["p"]}]
+        })).unwrap();
+        let row = scene.row_of("p").unwrap();
+        scene.refresh_worlds();
+        let transform = bits(&scene.row_canvas_affine(row).unwrap());
+        let moved = scene.stamps.subscribe(Group::Placement);
+        for (opacity, current) in [(0.5, true), (0.7, true), (0.0, false), (0.2, false)] {
+            let mut edits = vec![crate::scene::PlacementEdit::new(row, opacity)];
+            assert!(scene.write_placements(&mut edits, |n| (None, crate::value::Number::from_f64(*n))));
+            assert_eq!(scene.stamps.dirty(moved), &[row]);
+            scene.stamps.clear(moved);
+            assert_eq!(scene.world_rows().is_some(), current);
+            scene.refresh_worlds();
+            assert_eq!(scene.hidden_from_paint_order("p"), opacity == 0.0);
+            assert_eq!(bits(&scene.row_canvas_affine(row).unwrap()), transform);
+        }
+    }
+
+    #[test]
     fn the_columns_hold_what_the_walk_by_name_composes() {
         let d = json!({"nodes": [
             {"id": "g", "type": "group", "x": 10.5, "y": -3.25, "rotation": 30, "scaleX": 1.5, "scaleY": 0.75, "children": ["h", "a"]},
@@ -564,16 +614,41 @@ mod tests {
         let hierarchy = scene.world_rows().unwrap().hierarchy();
         let number = |v: f64| crate::value::Number::from_f64(v).unwrap();
         let g = scene.row_of("g").unwrap();
-        scene.write_placement(g, Some(NodePlacement { x: number(40.25), y: number(1.0), rotation: number(77.0), scale_x: number(0.5), scale_y: number(3.0) }), None);
+        scene.write_placement(g, Some(NodePlacement { translation: Some([number(40.25), number(1.0)]), rotation: Some(number(77.0)), scale: Some([number(0.5), number(3.0)]) }), None);
         check(&mut scene, &all);
         // So does a rotation written as a field, and a write to a leaf alone.
         let h = scene.row_of("h").unwrap();
         scene.write_row(h, |node| node.set("rotation", json!(33.5))).unwrap();
         check(&mut scene, &all);
         let b = scene.row_of("b").unwrap();
-        scene.write_placement(b, Some(NodePlacement { x: number(-7.125), y: number(0.5), rotation: number(3.0), scale_x: number(1.0), scale_y: number(1.0) }), None);
+        scene.write_placement(b, Some(NodePlacement { translation: Some([number(-7.125), number(0.5)]), rotation: Some(number(3.0)), scale: Some([number(1.0), number(1.0)]) }), None);
         check(&mut scene, &all);
         assert_eq!(scene.world_rows().unwrap().hierarchy(), hierarchy, "writes to rows do not read the hierarchy again");
+        // A repeated leaf edit can update the world column in place. Compare it
+        // against an independent scene which recomposes the entire ancestor chain.
+        let mut reference = Scene::load(&d).unwrap();
+        let mut batched = Scene::load(&d).unwrap();
+        batched.refresh_worlds();
+        for ids in [["b", "b", "c"], ["b", "g", "a"]] {
+            let mut edits = Vec::new();
+            for (i, id) in ids.iter().enumerate() {
+                let row = reference.row_of(id).unwrap();
+                let placement = NodePlacement {
+                    translation: Some([number(i as f64 - 2.5), number(i as f64 * 1.75)]),
+                    rotation: None, scale: None,
+                };
+                reference.write_placement(row, Some(placement.clone()), None);
+                edits.push(crate::scene::PlacementEdit::new(row, placement));
+            }
+            batched.write_placements(&mut edits, |t| (Some(t.clone()), None));
+            assert_eq!(batched.world_rows().is_some(), ids[1] != "g");
+            batched.refresh_worlds();
+            for id in all {
+                let row = reference.row_of(id).unwrap();
+                assert_eq!(bits(&batched.row_canvas_affine(row).unwrap()),
+                    bits(&reference.node_canvas_affine_and_transform(id).unwrap().0));
+            }
+        }
         // After a whole-node edit too, nothing answers until the next refresh.
         let mut moved = scene.node("a").unwrap().clone();
         moved.set("x", json!(-55.5));

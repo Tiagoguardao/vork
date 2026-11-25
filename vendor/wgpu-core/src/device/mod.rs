@@ -328,6 +328,8 @@ impl WebGpuError for DeviceMismatch {
 pub enum DeviceError {
     #[error("Parent device is lost")]
     Lost,
+    #[error("Driver failed to create pipeline state")]
+    PipelineInternal,
     #[error("Not enough memory left.")]
     OutOfMemory,
     #[error(transparent)]
@@ -343,6 +345,7 @@ impl WebGpuError for DeviceError {
             Self::DeviceMismatch(e) => e.webgpu_error_type(),
             Self::Lost => ErrorType::DeviceLost,
             Self::OutOfMemory => ErrorType::OutOfMemory,
+            Self::PipelineInternal => ErrorType::Internal,
             Self::ResourceLimit(_) => ErrorType::Validation,
         }
     }

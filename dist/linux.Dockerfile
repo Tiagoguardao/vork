@@ -1,5 +1,10 @@
 FROM rust:1.96.0-slim AS rust
+# Compile the optional reader against the same libav ABI as the L4 workers.
+# Only headers and pkg-config metadata enter the older glibc build environment.
+FROM ubuntu:24.04 AS avheaders
+RUN apt-get update && apt-get install -y --no-install-recommends libavformat-dev && mkdir /headers && cd / && cp -a --parents usr/include/*/libav* usr/lib/*/pkgconfig/libav*.pc usr/lib/*/pkgconfig/libswresample.pc /headers/
 FROM ubuntu:22.04 AS build
+COPY --from=avheaders /headers/ /
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates pkg-config clang libclang-dev python3 && rm -rf /var/lib/apt/lists/*
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
@@ -20,6 +25,7 @@ ARG VORK_SHADER_CACHE=dist/empty-shader-cache
 COPY ${VORK_SHADER_CACHE} /shader-cache
 ARG VORK_BUILD_COMMIT
 RUN test -n "$VORK_BUILD_COMMIT" && VORK_BUILD_COMMIT="$VORK_BUILD_COMMIT" python3 scripts/build-with-shader-cache --cache /shader-cache -- cargo build --locked --release -p vork-cli
+RUN grep -qx "cargo:rustc-cfg=vork_nvdecode" /target/release/build/vork-render-*/output
 RUN objcopy --only-keep-debug /target/release/vork /target/release/vork.debug && strip --strip-unneeded /target/release/vork
 RUN /target/release/vork --version && objdump -T /target/release/vork | sed -n 's/.*(GLIBC_\([0-9.]*\)).*/\1/p' | sort -Vu | tail -1
 FROM ubuntu:22.04 AS smoke

@@ -12,6 +12,8 @@ bench = false
 doctest = false
 
 [dependencies]
+moda-scene = { path = "../moda-scene" }
+blake3 = "1"
 serde_json = "1"
 # The canonical plain text (unit-transform indexing).
 moda-plain-text = { path = "../moda-plain-text" }
@@ -29,6 +31,3 @@ unicode-properties = { version = "0.1", features = ["general-category"] }
 icu_segmenter = { version = "=2.3.0", default-features = false, features = ["compiled_data"] }
 icu_provider = "2"
 rustc-hash = "2"
-
-[dev-dependencies]
-moda-scene = { path = "../moda-scene" }

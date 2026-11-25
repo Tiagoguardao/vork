@@ -9,17 +9,8 @@ use moda_scene::Scene;
 use crate::backdrop::plan::{node_canvas_aabb, node_local_rect, PlanCtx, Rect};
 use crate::seams::{BlurFilter, FeatherFilter, LayerFilters, NoiseFilter, ShadowPass, TextureFilter};
 
-/// Supported zoom-scaled blur reach (3σ), in target pixels. Larger layer blurs
-/// report a planning diagnostic instead of silently reducing the requested sigma.
-const MAX_BLUR_RADIUS_PX: f64 = 300.0;
-/// Largest blur sigma, in capture px, a uniform blur runs at; a larger one
-/// reduces the capture scale. The blur itself takes any sigma (backdrop's
-/// ladder of separable passes, `backdrop::kernel::backdrop_blur_passes`, into
-/// float targets); this bounds how far the composite's bilinear read magnifies
-/// the result. It was 5 (the single 31-tap kernel's range), which shrank a
-/// σ = 100 px blur 20× into an 8-bit capture: the faint tail came back as
-/// 20 px blocks and a large blur looked boxy (tests/layer_blur_large.rs).
-const SIGMA_CAPTURE_MAX: f64 = 25.0;
+/// Maximum texture-effect sampling radius in target pixels.
+const MAX_TEXTURE_RADIUS_PX: f64 = 300.0;
 /// How close to a whole target pixel a capture edge must be to count as on
 /// it (the f32 view-projection's rounding).
 const SNAP_PX: f64 = 1e-3;
@@ -50,28 +41,8 @@ fn is_layer_blur_capable(node_type: &str) -> bool {
 /// (`effect::has_active_layer_filter`). A zero radius / density is a valid
 /// stored-but-inert state; a hidden entry (`visible: false`) renders as if
 /// absent.
-///
-/// While the camera moves, a motion unit (`crate::motion_capture`) counts too: it renders through an identity
-/// capture (`LayerFilters::motion`) that the capture cache keeps across the moving frames.
 pub fn has_active_layer_filter(node: &RawNode) -> bool {
-    (is_layer_blur_capable(node.node_type())
-        && (moda_scene::effect::has_active_layer_filter(node) || crate::motion_capture::is_unit(node.id())))
-        || (is_agent_effect_capable(node.node_type()) && !moda_scene::effect::agent_shader_effects(node).is_empty())
-}
-
-/// Node kinds an agent shader layer effect runs on (docs/design/effects-code-first.md §4.3: every layer type, text
-/// included): the layer filters' kinds (text among them), and lines (a kind a capture shadow already captures).
-fn is_agent_effect_capable(node_type: &str) -> bool {
-    is_layer_blur_capable(node_type) || node_type == "line"
-}
-
-/// Whether a leaf can render through a capture at all (`is_node_layer_blur_eligible` without its filter): a
-/// capable type, no distort warp. `motion_capture::units` picks only such leaves. Text is not a
-/// motion unit: it draws through a moving camera as before.
-pub(crate) fn capture_capable(node: &RawNode) -> bool {
-    is_layer_blur_capable(node.node_type())
-        && node.node_type() != "richtext"
-        && crate::paint::node_distort(node).is_none()
+    is_layer_blur_capable(node.node_type()) && moda_scene::effect::has_active_layer_filter(node)
 }
 
 /// Whether the node renders through a layer capture: an active layer filter,
@@ -112,8 +83,7 @@ fn cuts_cleanly(node: &RawNode) -> bool {
         && effect::texture(node).is_none()
         && effect::noise_effects(node).is_empty()
         && effect::feather(node).is_none()
-        && !(is_agent_effect_capable(node.node_type()) && !effect::agent_shader_effects(node).is_empty())
-        && !crate::motion_capture::is_unit(node.id())
+
 }
 
 /// How far past a pixel it writes a node's uniform blur and filter shadows read, in canvas units
@@ -134,7 +104,7 @@ fn filter_read_reach(scene: &Scene, node: &RawNode, ctx: &PlanCtx) -> Option<f64
     // not matter.
     let at = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     let scales = node_projected_scales(scene, node, ctx, &at)
-        .unwrap_or(ProjectedScales { axis_min: canvas_scale, min: canvas_scale, max: canvas_scale });
+        .unwrap_or(ProjectedScales { major: [1.0, 0.0], axis_min: canvas_scale, min: canvas_scale, max: canvas_scale });
     let kernel = |radius: f64, scale: f64| 2.0 * radius.abs() * effect::BLUR_REACH_PER_RADIUS * scale;
     let mut px: f64 = 0.0;
     if let Some(b) = effect::layer_blur(node).filter(|b| b.is_active()) {
@@ -199,6 +169,33 @@ fn readable_window(scene: &Scene, node: &RawNode, ctx: &PlanCtx, identity: bool)
     let (w_px, h_px) = (window.w * canvas_scale + CUT_ROUNDING_PX, window.h * canvas_scale + CUT_ROUNDING_PX);
     let fits = w_px.max(h_px) <= MAX_TEXTURE_DIM && w_px * h_px <= MAX_CAPTURE_AREA_PX;
     (window.finite() && fits).then_some(window)
+}
+
+/// Keep the source pixels that can contribute to the output and the output pixels
+/// that can be read. The missing transparent Gaussian surround can be supplied
+/// after reduction if both this raster and the padded filter grid fit.
+fn uniform_capture_window(region: Rect, body: Rect, window: Rect, scale: f64, pad: f64, reach: f64) -> Option<(Rect, u32)> {
+    let expand = |r: Rect, d: f64| Rect {
+        x: r.x - d, y: r.y - d, w: r.w + 2.0 * d, h: r.h + 2.0 * d,
+    };
+    let output = region.intersect(&window)?;
+    let source = expand(body, (pad - reach / scale).max(1.0));
+    let input = source.intersect(&expand(window, (2.0 * reach + 2.0) / scale))?;
+    let x = output.x.min(input.x);
+    let y = output.y.min(input.y);
+    let compact = Rect { x, y, w: (output.x + output.w).max(input.x + input.w) - x,
+        h: (output.y + output.h).max(input.y + input.h) - y };
+    let block = crate::layer_blur::exec::uniform_blur_block(reach as f32) as f64;
+    // Allow one pixel for snapping, then round to complete pyramid blocks.
+    let size = [compact.w, compact.h].map(|v| ((v * scale + 1.0) / block).ceil() * block);
+    let fits = |[w, h]: [f64; 2]| w.max(h) <= MAX_TEXTURE_DIM && w * h <= MAX_CAPTURE_AREA_PX;
+    let coarse_reach = reach / block;
+    if !fits(size) || coarse_reach > MAX_TEXTURE_DIM {
+        return None;
+    }
+    let passes = crate::backdrop::kernel::backdrop_blur_passes(coarse_reach);
+    let border = 1.0 + passes.iter().map(|p| p.offsets.last().copied().unwrap_or(0.0).ceil() as f64).sum::<f64>();
+    fits(size.map(|v| v / block + 2.0 * border)).then_some((compact, border as u32))
 }
 
 /// The canvas rect the plan's target shows, with the target pixels per canvas unit on each axis, read from the
@@ -381,39 +378,30 @@ pub struct LayerBlurParams {
 /// Callers must preserve `diagnostics`, including refusals for unsupported blur reaches.
 ///
 /// - Each filter is measured in TARGET px first (canvas px × the node's
-///   effective scale; blur reaches beyond MAX_BLUR_RADIUS_PX refuse). A filter too small
+///   effective scale). A filter too small
 ///   to see is dropped (a blur ≤ 0.5 px, a texture moving ≤ 0.5 px); with no
 ///   filter left the node renders plainly.
 /// - The padded region is the node's canvas AABB expanded by the blur bleed
 ///   (3σ = the target-px radius, back-converted to canvas units), the
 ///   texture's displacement, the drop-shadow reach (`offset + 2×blur`, the
 ///   shadow quad's own vertex expansion) and the stroke width.
-/// - The capture scale starts at the viewport's canvas→target scale and is
-///   reduced for large uniform blurs (σ ≤ SIGMA_CAPTURE_MAX at capture
-///   resolution) and to fit MAX_TEXTURE_DIM — the composite's bilinear upsample
-///   supplies the remaining magnification. With noise the capture stays at full
-///   scale so the grain stays crisp (the blur's pass ladder takes any radius).
+/// - Rasterize at target resolution before Gaussian reduction, subject to device limits.
 pub fn compute_layer_blur_params(
     scene: &Scene,
     node: &RawNode,
     ctx: &PlanCtx,
     diagnostics: &mut Vec<String>,
 ) -> Option<LayerBlurParams> {
-    compute_layer_blur_params_over(scene, node, ctx, None, diagnostics)
+    compute_layer_blur_params_over(scene, node, ctx, || None, diagnostics)
 }
 
-/// [`compute_layer_blur_params`] for a leaf whose `drawn` items (their canvas
-/// AABB) may reach past its box: the capture covers both. Text passes its
-/// glyphs' bounds, since glyphs can overflow the text box (descenders,
-/// italics, a box narrower than its line, path text) and a capture of the box
-/// alone would cut them off. A leaf with a filter shadow passes its drawn
-/// bounds too: the shadow is cast by what it draws, stroke included, box or
-/// no box. `None`: the box alone.
+/// Include the leaf's drawn canvas bounds in its capture, once eligible. A stroke or a glyph
+/// can extend beyond the geometry box, and a flat stroked path has area only in its draw.
 pub(crate) fn compute_layer_blur_params_over(
     scene: &Scene,
     node: &RawNode,
     ctx: &PlanCtx,
-    drawn: Option<Rect>,
+    drawn: impl FnOnce() -> Option<Rect>,
     diagnostics: &mut Vec<String>,
 ) -> Option<LayerBlurParams> {
     if !is_node_layer_blur_eligible(node) {
@@ -422,27 +410,20 @@ pub(crate) fn compute_layer_blur_params_over(
 
     // A shape without a box (a horizontal or vertical line as a path: no width or no height) still draws its
     // stroke: its drawn items are then its bounds.
-    let drawn = drawn.filter(|d| d.finite());
-    let mut node_bounds = match (node_canvas_aabb(scene, node), drawn) {
-        (Some(bounds), _) => bounds,
-        (None, Some(d)) => d,
-        (None, None) => return None,
-    };
-    if let Some(d) = drawn {
-        let (x0, y0) = (node_bounds.x.min(d.x), node_bounds.y.min(d.y));
-        let x1 = (node_bounds.x + node_bounds.w).max(d.x + d.w);
-        let y1 = (node_bounds.y + node_bounds.h).max(d.y + d.h);
-        node_bounds = Rect {
-            x: x0,
-            y: y0,
-            w: x1 - x0,
-            h: y1 - y0,
-        };
-    }
+    let use_drawn = node.node_type() == "richtext" || moda_scene::paint::strokes_visibly(node)
+        || !moda_scene::effect::filter_shadows(node).is_empty();
+    let drawn = use_drawn.then(drawn).flatten().filter(Rect::finite);
+    let geometry = node_canvas_aabb(scene, node);
+    let node_bounds = super::shadow::union_canvas_bounds(geometry, drawn)?;
     if !node_bounds.finite() {
         return None;
     }
-    params_for_bounds(scene, node, ctx, node_bounds, true, false, diagnostics)
+    let source = if let Some(drawn) = drawn {
+        CaptureSource::DrawnLeaf { geometry: geometry.unwrap_or(drawn), drawn }
+    } else {
+        CaptureSource::Geometry
+    };
+    params_for_bounds(scene, node, ctx, node_bounds, source, false, diagnostics)
 }
 
 /// Layer-filter parameters for a SUBTREE capture (a group's, or a frame's
@@ -458,10 +439,8 @@ pub(crate) fn compute_subtree_layer_blur_params(
     diagnostics: &mut Vec<String>,
 ) -> Option<LayerBlurParams> {
     // Under a clip-mask group the composite takes the group's mask.
-    if !has_active_layer_filter(node) || !bounds.finite() {
-        return None;
-    }
-    params_for_bounds(scene, node, ctx, bounds, false, false, diagnostics)
+    if !has_active_layer_filter(node) || !bounds.finite() { return None; }
+    params_for_bounds(scene, node, ctx, bounds, CaptureSource::Subtree, false, diagnostics)
 }
 
 /// Capture parameters for a text under a mask it can't honour
@@ -478,19 +457,26 @@ pub(crate) fn compute_mask_capture_params(
     if !needs_mask_capture(scene, node) || !bounds.finite() {
         return None;
     }
-    params_for_bounds(scene, node, ctx, bounds, false, true, diagnostics)
+    params_for_bounds(scene, node, ctx, bounds, CaptureSource::Subtree, true, diagnostics)
 }
 
-/// The region / scale / filter math of [`compute_layer_blur_params`] for a
-/// node drawn over `node_bounds`. `leaf`: the bounds are the node's geometry
-/// box (pad by its stroke and shadows; decline past a clipping frame).
+#[derive(Clone, Copy)]
+enum CaptureSource {
+    /// No draw bounds available. Estimate stroke and shadow reach from the node.
+    Geometry,
+    /// The draw already includes strokes and shadows. Grain stays on the geometry.
+    DrawnLeaf { geometry: Rect, drawn: Rect },
+    Subtree,
+}
+
+/// The region, scale and filters of the picture over `node_bounds`.
 /// `identity`: capture with no filter (a mask capture), the capture is the result.
 fn params_for_bounds(
     scene: &Scene,
     node: &RawNode,
     ctx: &PlanCtx,
     node_bounds: Rect,
-    leaf: bool,
+    source: CaptureSource,
     identity: bool,
     diagnostics: &mut Vec<String>,
 ) -> Option<LayerBlurParams> {
@@ -499,28 +485,35 @@ fn params_for_bounds(
     // needs both principal stretches before it can choose an isotropic kernel.
     let canvas_scale = ctx.canvas_target_scale().max(0.0001);
     let scales = node_projected_scales(scene, node, ctx, &node_bounds)
-        .unwrap_or(ProjectedScales { axis_min: canvas_scale, min: canvas_scale, max: canvas_scale });
+        .unwrap_or(ProjectedScales { major: [1.0, 0.0], axis_min: canvas_scale, min: canvas_scale, max: canvas_scale });
     let effective_scale = scales.axis_min;
-    let to_target = |canvas_px: f64| (canvas_px * effective_scale).min(MAX_BLUR_RADIUS_PX);
+    let to_target = |canvas_px: f64| (canvas_px * effective_scale).min(MAX_TEXTURE_RADIUS_PX);
     // A blur radius (σ = R / 2) as the kernels' 3σ reach, in target px.
     let blur_to_target =
         |radius: f64| radius * moda_scene::effect::BLUR_REACH_PER_RADIUS * scales.max;
 
     // Check the requested reach before any capture sizing or kernel construction. The
     // projection uses f32 matrices; SNAP_PX admits their rounding at the exact limit.
+    // The synthetic mask-content group carries a single identity capture effect.
+    let effects = moda_scene::effect::node_effects_shared(node);
+    let identity = identity || effects.iter().any(|e| e.is_visible()
+        && matches!(e.kind, moda_scene::effect::EffectKind::MaskCapture));
     if !identity {
         if let Some(b) = moda_scene::effect::layer_blur(node).filter(|b| b.is_active()) {
             let radius = b.progressive.map_or(b.radius, |p| b.radius.max(p.start_radius));
             let reach = blur_to_target(radius);
-            if !reach.is_finite() || reach > MAX_BLUR_RADIUS_PX + SNAP_PX {
-                diagnostics.push(format!("{}: layer blur sigma exceeds {} target pixels after transforms; reduce blur or scale", node.id(), MAX_BLUR_RADIUS_PX / 3.0));
+            if !reach.is_finite() {
+                diagnostics.push(format!("{}: layer blur reach is non-finite after transforms", node.id()));
                 return None;
             }
             // The capture kernel is isotropic. A minimum-axis scalar can hide
             // a visible blur on the other axis; maximum alone would render the
             // wrong isotropic blur. Only projection-rounding differences fit.
             let min_reach = radius * moda_scene::effect::BLUR_REACH_PER_RADIUS * scales.min;
-            if reach > 0.5 && reach - min_reach > SNAP_PX {
+            // The projection is f32. At very large sigma a rounding error
+            // between equal stretches can exceed the absolute pixel tolerance.
+            let tolerance = SNAP_PX.max(reach * f32::EPSILON as f64);
+            if b.progressive.is_some() && reach > 0.5 && reach - min_reach > tolerance {
                 diagnostics.push(format!("{}: layer blur requires uniform projected scale; use uniform scale on the filtered node and its ancestors", node.id()));
                 return None;
             }
@@ -560,38 +553,22 @@ fn params_for_bounds(
     let feather = moda_scene::effect::feather(node)
         .map(|f| f.radius * moda_scene::effect::BLUR_REACH_PER_RADIUS * effective_scale)
         .filter(|r| r.is_finite() && *r > 0.5);
-    // Agent shaders (effects-code-first.md §4.3), each checked for the effect placement; one that fails is left
-    // out with a render warning naming why.
-    let agents: Vec<(moda_scene::effect::AgentShaderEffect, String, moda_wgsl::Schema)> =
-        if is_agent_effect_capable(node.node_type()) && !identity {
-            moda_scene::effect::agent_shader_effects(node)
-                .into_iter()
-                .filter_map(|e| match crate::agent_fill::checked_code(scene, &e.code, moda_wgsl::Placement::Effect) {
-                    Ok((source, schema)) => Some((e, source, schema)),
-                    Err(err) => {
-                        moda_assets::report::record(moda_assets::report::RuntimeEvent::RenderQuality {
-                            code: "shader_invalid".into(),
-                            node_id: node.id().to_string(),
-                            message: format!("layer effect left out: {err}"),
-                        });
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+
     // Filter shadows (CSS `filter: drop-shadow()`): the capture's own alpha, moved, blurred and tinted under it.
     let shadows = moda_scene::effect::filter_shadows(node);
     // An identity (mask) capture runs none of them: its node's own filters take the layer capture.
-    let (blur, texture, noises, feather, agents, shadows) = if identity {
-        (None, None, Vec::new(), None, Vec::new(), Vec::new())
+    let (blur, texture, noises, feather, shadows) = if identity {
+        (None, None, Vec::new(), None, Vec::new())
     } else {
-        (blur, texture, noises, feather, agents, shadows)
+        (blur, texture, noises, feather, shadows)
     };
-    // A motion unit (`crate::motion_capture`) captures with no filter: its capture is the result.
-    let motion = crate::motion_capture::is_unit(node.id());
-    if blur.is_none() && texture.is_none() && noises.is_empty() && feather.is_none() && agents.is_empty() && shadows.is_empty() && !motion && !identity {
+    use moda_scene::effect::EffectKind;
+    let color_matrices: Vec<_> = effects.iter().filter(|e| e.is_visible())
+        .filter_map(|e| match e.kind {
+            EffectKind::ColorMatrix { values } => Some(values),
+            _ => None,
+        }).collect();
+    if color_matrices.is_empty() && blur.is_none() && texture.is_none() && noises.is_empty() && feather.is_none() && shadows.is_empty() && !identity {
         return None;
     }
     // A filter shadow's blur reach (3σ, σ = blur / 2) in target px: node-local, so it scales with the node, as a
@@ -606,76 +583,15 @@ fn params_for_bounds(
     if !filter_shadow_px.is_finite() {
         return None;
     }
-    let agent_pad_px = agents.iter().map(|(e, _, _)| e.pad * effective_scale).fold(0.0, f64::max);
     let blur_reach_px = blur.map_or(0.0, |(_, s, e)| s.max(e));
     let texture_reach_px = texture.map_or(0.0, |(_, _, r)| r);
 
-    // Padding in canvas units: blur bleed (3σ = radius_px_target) + texture
-    // displacement + shadow reach + stroke width, measured in target px then
-    // back-converted. Spaces
-    // differ per component: the shadow OFFSET applies in world space after the
-    // model transform (`path-shadow.wgsl` adds it to worldPos), so it scales
-    // with the viewport only; the shadow's 2×blur quad expansion and the
-    // stroke width are node-local, so they scale with the node's accumulated
-    // transform. The shadow terms count ONLY when a drop-shadow quad actually
-    // renders (`drop_shadow_quads` — the same shadows the item builder
-    // emits): a stale offset on a non-drawing shadow must not inflate the
-    // region (an extreme value would crush the capture scale until the node
-    // itself became sub-pixel — see the footprint guard below). With several
-    // shadows the pad is the widest one's reach.
-    // (Kept as a (blur, offset) pair summed in the original order so a
-    // single-shadow node pads bit-identically.)
-    // Capture shadows (a star's, a path's) reach no further than an SDF one.
-    let (shadow_blur_px, shadow_offset_px) = crate::effects::shadow::drop_shadow_quads(node)
-        .into_iter()
-        .chain(crate::layer_blur::shadow::capture_drop_shadows(node))
-        .collect::<Vec<_>>()
-        .iter()
-        .map(|shadow| {
-            (
-                // The quad grows by 1.5 × blur and a positive spread per side
-                // (`path-shadow.wgsl`); 2 × blur covers both for the blur.
-                (shadow.blur.max(0.0) * 2.0 + shadow.spread().max(0.0)) * effective_scale,
-                shadow_offset_reach(shadow) * canvas_scale,
-            )
-        })
-        .fold((0.0, 0.0), |widest: (f64, f64), s| {
-            if s.0 + s.1 > widest.0 + widest.1 {
-                s
-            } else {
-                widest
-            }
-        });
-    // Capture glows reach as far as a shadow of blur = radius.
-    let glow_px = crate::layer_blur::shadow::capture_glows(node)
-        .iter()
-        .map(|g| g.radius * 2.0 * effective_scale)
-        .fold(0.0, f64::max);
-    let (shadow_blur_px, shadow_offset_px) = if glow_px > shadow_blur_px + shadow_offset_px {
-        (glow_px, 0.0)
-    } else {
-        (shadow_blur_px, shadow_offset_px)
+    let paint_reach_px = match source {
+        CaptureSource::Geometry => estimated_paint_reach(node, effective_scale, canvas_scale),
+        CaptureSource::DrawnLeaf { .. } | CaptureSource::Subtree => 0.,
     };
-    let stroke_px = moda_scene::paint::node_stroke_style(node)
-        .width
-        .unwrap_or(0.0)
-        .max(0.0)
-        * effective_scale;
-    let feather_reach_px = feather.unwrap_or(0.0);
-    let pad_canvas = if leaf {
-        (blur_reach_px
-            + texture_reach_px
-            + feather_reach_px
-            + agent_pad_px
-            + filter_shadow_px
-            + shadow_blur_px
-            + shadow_offset_px
-            + stroke_px)
-            / canvas_scale
-            + 1.0
-    } else {
-        (blur_reach_px + texture_reach_px + feather_reach_px + agent_pad_px + filter_shadow_px) / canvas_scale + 1.0
-    };
+    let pad_canvas = (blur_reach_px + texture_reach_px + feather.unwrap_or(0.) + filter_shadow_px
+        + paint_reach_px) / canvas_scale + 1.0;
 
     let mut region = Rect {
         x: node_bounds.x - pad_canvas,
@@ -688,34 +604,14 @@ fn params_for_bounds(
     }
     // Inside clipping containers: only when the composite can be clipped as
     // the body is (see the fn doc).
-    if leaf && !clipping_containers_clip_the_composite(scene, node.id(), &region) {
+    if !matches!(source, CaptureSource::Subtree) && !clipping_containers_clip_the_composite(scene, node.id(), &region) {
         return None;
     }
-    // A motion capture covers what the capture window shows of it (the window holds the view): a unit as large as
-    // the page, at 400 %, would otherwise capture the whole page at that zoom.
-    let mut motion_scale = 1.0;
-    if motion {
-        let whole = region;
-        region = region.intersect(&ctx_window(ctx, canvas_scale)?)?;
-        // Cut to the window, it is captured again whenever a pan leaves the window: at a reduced scale.
-        if region.w < whole.w || region.h < whole.h {
-            motion_scale = crate::motion_capture::windowed_scale();
-        }
-    }
-
-    // Capture scale: direct up to σ = SIGMA_CAPTURE_MAX, reduced beyond it
-    // (a uniform blur without noise only — see the fn doc);
-    // then further reduced to fit the texture-dimension ceiling and the area
-    // budget (which bounds the worst-case transient GPU memory of the
-    // capture + temp + result textures for a huge node — the capture is not
-    // viewport-intersected in MVP, spec §7.1).
     let uniform_blur = blur.is_some_and(|(b, _, _)| b.progressive.is_none());
-    let mut capture_zoom = canvas_scale * motion_scale;
-    // With noise or an agent shader the capture stays at full scale (their pixels are the point).
-    if uniform_blur && noises.is_empty() && agents.is_empty() {
-        let sigma_target = (blur_reach_px / 3.0).max(0.5);
-        capture_zoom *= (SIGMA_CAPTURE_MAX / sigma_target).min(1.0);
-    }
+    // Resolving an elliptical filter at a scale chosen from its long axis
+    // would discard detail along the short axis before the convolution.
+    let elliptical = uniform_blur && blur_reach_px * (1.0 - scales.min / scales.max) > SNAP_PX.max(blur_reach_px * f32::EPSILON as f64);
+    let mut capture_zoom = canvas_scale;
     // A capture over the size limits first leaves out what nothing can read (`readable_window`): content far
     // off the target (a credit roll, a pan across a wide picture) then costs no resolution. A capture under the
     // limits is not cut: its region, and so its pixels and its content key, do not depend on where the target
@@ -751,6 +647,19 @@ fn params_for_bounds(
                 None if !identity && !needs_mask_capture(scene, node) => return None,
                 None => {}
             }
+        }
+    }
+    // The capture and the convolution need different bounds. Empty Gaussian
+    // padding must not lower the rasterization scale. When it would, capture
+    // the contributing source and the readable output. Supply the omitted
+    // transparent surround on the reduced grid, where the Gaussian reads it.
+    let mut blur_border = 0;
+    if over_limits(&region) && uniform_blur && !elliptical && cuttable && shadows.is_empty() {
+        if let Some((compact, border)) = readable_window(scene, node, ctx, true).and_then(|window|
+            uniform_capture_window(region, node_bounds, window, canvas_scale, pad_canvas, blur_reach_px)) {
+            uncut.get_or_insert(region);
+            region = compact;
+            blur_border = border;
         }
     }
     let max_dim_canvas = region.w.max(region.h);
@@ -802,10 +711,13 @@ fn params_for_bounds(
     // shadow's is (`shadow::plan_shadow_group`).
     let block = {
         let mut reach = shadows.iter().map(|s| shadow_blur_reach_px(s) * k).fold(0.0, f64::max);
-        let mut block = 1.0;
+        let mut block: f64 = 1.0;
         while reach > crate::layer_blur::exec::PROGRESSIVE_BLUR_MAX_TAPS as f64 {
             reach /= 2.0;
             block *= 2.0;
+        }
+        if uniform_blur && !elliptical {
+            block = block.max(crate::layer_blur::exec::uniform_blur_block((blur_reach_px * k) as f32) as f64);
         }
         block
     };
@@ -827,7 +739,7 @@ fn params_for_bounds(
     // texel) — blurring 1px of data is indistinguishable from the node's own
     // render; decline. A filter shadow never declines for size: declining would
     // draw the node without its shadow, and a hairline casts one.
-    let must_capture = identity || !shadows.is_empty();
+    let must_capture = identity || uniform_blur || !shadows.is_empty();
     if !must_capture && (width_px < 2 || height_px < 2) {
         return None;
     }
@@ -852,7 +764,12 @@ fn params_for_bounds(
             ((y - region.y) * capture_zoom) as f32,
         ]
     };
-    let origin_px = to_capture(node_bounds.x, node_bounds.y);
+    let anchor = if texture.is_some() || !noises.is_empty() {
+        grain_anchor(scene, node, source, node_bounds, !shadows.is_empty())
+    } else {
+        node_bounds
+    };
+    let origin_px = to_capture(anchor.x, anchor.y);
 
     let blur = blur.map(|(b, start, end)| match b.progressive {
         Some(p) => {
@@ -879,6 +796,10 @@ fn params_for_bounds(
         }
         // With noise the capture stays at full scale (see the fn doc); the
         // separable ladder takes any radius there, sampling every texel.
+        None if elliptical => BlurFilter::Elliptical {
+            major: scales.major,
+            reaches: [(end * k) as f32, (end * k * scales.min / scales.max) as f32],
+        },
         None => BlurFilter::Uniform {
             radius_px: (end * k) as f32,
         },
@@ -903,13 +824,13 @@ fn params_for_bounds(
         })
         .collect();
     // Only shadows: they composite before the layer's own items, which draw directly (`LayerFilters::shadows_alone`).
-    let shadows_alone = !shadows.is_empty()
+    let shadows_alone = color_matrices.is_empty() && !shadows.is_empty()
         && blur.is_none()
         && texture.is_none()
         && noises.is_empty()
         && feather.is_none()
-        && agents.is_empty()
-        && !motion;
+
+       ;
     let texture = texture.map(|(t, size, radius)| TextureFilter {
         size_px: (size * k) as f32,
         radius_px: (radius * k) as f32,
@@ -937,49 +858,6 @@ fn params_for_bounds(
         })
         .collect();
 
-    // Agent shaders: `p` is the node's local px (its box's top-left 0, 0; a group or a frame without a box: its
-    // canvas bounds'), mapped through its canvas affine into capture px.
-    let (affine, local) = match (scene.node_canvas_affine(node.id()), node_local_rect(node).filter(|r| r.w > 0.0 && r.h > 0.0)) {
-        (Some(a), Some(l)) => ([a.a, a.b, a.c, a.d, a.e, a.f], l),
-        _ => ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], node_bounds),
-    };
-    let z = capture_zoom;
-    let to_out = [
-        z * affine[0],
-        z * affine[1],
-        z * affine[2],
-        z * affine[3],
-        z * (affine[0] * local.x + affine[2] * local.y + affine[4] - region.x),
-        z * (affine[1] * local.x + affine[3] * local.y + affine[5] - region.y),
-    ];
-    let px_scale = z * (affine[0] * affine[3] - affine[1] * affine[2]).abs().sqrt();
-    let frame_size = crate::agent_fill::frame_size(scene, node);
-    let shaders = agents
-        .into_iter()
-        .filter_map(|(e, source, schema)| {
-            let seed = e.params.get("seed").and_then(moda_scene::value::Value::as_f64).unwrap_or(0.0).max(0.0) as u32;
-            let host = moda_wgsl::HostSlots {
-                frame_size,
-                time: ctx.shader_time_s as f32,
-                px_scale: px_scale as f32,
-                seed: moda_wgsl::mix_seed(seed, &e.code),
-                progress: 0.0,
-                bounds: [0.0, 0.0, local.w as f32, local.h as f32],
-                to_out,
-            };
-            let mut slots = host.encode()?.to_vec();
-            slots.extend(moda_wgsl::encode_params(&schema, &|n| e.params.get(n).map(moda_scene::value::Value::to_json), &crate::agent_fill::css_color));
-            let module = moda_wgsl::module(&source, &schema, moda_wgsl::Placement::Effect);
-            Some(crate::seams::AgentShaderFilter {
-                code: e.code,
-                node_id: node.id().to_string(),
-                wgsl: module.wgsl.into(),
-                slots,
-                area_px: width_px as f64 * height_px as f64,
-            })
-        })
-        .collect();
-
     Some(LayerBlurParams {
         region_canvas: [region.x, region.y, region.w, region.h],
         extent_canvas: uncut.map_or([region.x, region.y, region.w, region.h], |r| [r.x, r.y, r.w, r.h]),
@@ -987,35 +865,88 @@ fn params_for_bounds(
         height_px,
         reach_canvas: pad_canvas,
         filters: LayerFilters {
-            shaders,
+            color_matrices,
             origin_px,
             drop_shadows,
             shadows_alone,
             texture,
             blur,
+            blur_border,
+            source_raster: (uniform_blur && k < 1.0).then(|| {
+                let (x, y) = ctx.project_point(region.x, region.y).unwrap_or((0., 0.));
+                let phase = |p: f64| if (p - p.round()).abs() < SNAP_PX { 0.0 } else { p - p.floor() };
+                Box::new(crate::seams::CaptureRaster { scale: canvas_scale, phase: [phase(x), phase(y)] })
+            }),
             noise,
             feather: feather.map(|r| FeatherFilter {
                 radius_px: (r * k) as f32,
             }),
             shadow: None,
             composite_blend: crate::seams::CaptureBlend::Normal,
-            motion,
         },
     })
 }
 
-/// The canvas rect a plan context's target covers (its capture window, for the camera lane's capture context),
-/// for an axis-aligned projection at `scale` target px per canvas unit.
-fn ctx_window(ctx: &PlanCtx, scale: f64) -> Option<Rect> {
-    let (px, py) = ctx.project_point(0.0, 0.0)?;
-    let (x0, y0) = (-px / scale, -py / scale);
-    let r = Rect {
-        x: x0,
-        y: y0,
-        w: ctx.width_px as f64 / scale,
-        h: ctx.height_px as f64 / scale,
+/// Grain is attached to the original geometry. Text and filter shadows already
+/// used the union with the ink before ordinary strokes got bigger captures.
+fn grain_anchor(scene: &Scene, node: &RawNode, source: CaptureSource, bounds: Rect, filter_shadow: bool) -> Rect {
+    let (mut geometry, drawn) = match source {
+        CaptureSource::Subtree => return bounds,
+        CaptureSource::Geometry => (bounds, None),
+        CaptureSource::DrawnLeaf { geometry, drawn } => (geometry, Some(drawn)),
     };
-    r.finite().then_some(r)
+    if node.node_type() == "path" && moda_scene::path_geom::round_corners::PathCorners::read(node).rounds_anything() {
+        // The path lattice was placed by the authored anchors even when the paint rounded its corners.
+        if let Some(raw) = node.points().and_then(|p| moda_scene::path_geom::bounds::drawn_path_bounds(p.draw_commands())) {
+            let rect = Rect { x: raw.min_x, y: raw.min_y, w: raw.max_x - raw.min_x, h: raw.max_y - raw.min_y };
+            geometry = crate::backdrop::plan::local_rect_canvas_aabb(scene, node, rect).unwrap_or(geometry);
+        }
+    }
+    if !node.truthy(moda_scene::appearance::ENTRY_PROBE_KEY) && (node.node_type() == "richtext" || filter_shadow) {
+        super::shadow::union_canvas_bounds(Some(geometry), drawn).unwrap_or(geometry)
+    } else {
+        geometry
+    }
+}
+
+/// Paint reach in target pixels when only the leaf geometry is available.
+fn estimated_paint_reach(node: &RawNode, effective_scale: f64, canvas_scale: f64) -> f64 {
+    let (shadow_blur_px, shadow_offset_px) = crate::effects::shadow::drop_shadow_quads(node)
+        .into_iter()
+        .chain(crate::layer_blur::shadow::capture_drop_shadows(node))
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|shadow| {
+            (
+                // The quad grows by 1.5 × blur and a positive spread per side
+                // (`path-shadow.wgsl`); 2 × blur covers both for the blur.
+                (shadow.blur.max(0.0) * 2.0 + shadow.spread().max(0.0)) * effective_scale,
+                shadow_offset_reach(shadow) * canvas_scale,
+            )
+        })
+        .fold((0.0, 0.0), |widest: (f64, f64), s| {
+            if s.0 + s.1 > widest.0 + widest.1 {
+                s
+            } else {
+                widest
+            }
+        });
+    // Capture glows reach as far as a shadow of blur = radius.
+    let glow_px = crate::layer_blur::shadow::capture_glows(node)
+        .iter()
+        .map(|g| g.radius * 2.0 * effective_scale)
+        .fold(0.0, f64::max);
+    let (shadow_blur_px, shadow_offset_px) = if glow_px > shadow_blur_px + shadow_offset_px {
+        (glow_px, 0.0)
+    } else {
+        (shadow_blur_px, shadow_offset_px)
+    };
+    let stroke_px = moda_scene::paint::node_stroke_style(node)
+        .width
+        .unwrap_or(0.0)
+        .max(0.0)
+        * effective_scale;
+    shadow_blur_px + shadow_offset_px + stroke_px
 }
 
 /// An effect colour (a CSS string; variable references are resolved before
@@ -1034,6 +965,7 @@ fn shadow_offset_reach(shadow: &moda_scene::effect::DropShadow) -> f64 {
 }
 
 struct ProjectedScales {
+    major: [f32; 2],
     /// Preserve the existing scale for effects other than layer blur.
     axis_min: f64,
     /// Principal stretches of the blur, including nonorthogonal (sheared) axes.
@@ -1061,7 +993,10 @@ fn node_projected_scales(
     // small singular value for extremely unequal scales; rank one stays zero.
     let max = ((a + d).hypot(b - c) + (a - d).hypot(b + c)) * 0.5;
     let min = (a * d - b * c).abs() / max;
+    // The principal eigenvector of A Aᵀ is the long axis of the projected Gaussian.
+    let angle = 0.5 * (2.0 * (a*b + c*d)).atan2(a*a + c*c - b*b - d*d);
     (max.is_finite() && max > 0.0 && min.is_finite()).then_some(ProjectedScales {
+        major: [angle.cos() as f32, angle.sin() as f32],
         axis_min: if axis_min > 0.0 { axis_min } else { ctx.canvas_target_scale().max(0.0001) },
         min,
         max,
@@ -1149,8 +1084,7 @@ mod tests {
 
     #[test]
     fn arc_and_bezier_paths_blur_over_their_drawn_bounds() {
-        // An arc path blurs (it rendered un-blurred, silently): its capture is taken over the arc's own Béziers, so
-        // the half ellipse bulging 80 past its endpoints is in it, not cut at the endpoint hull.
+        // Both curves bulge beyond their endpoints. The capture follows the segments used by tessellation.
         let blur = moda_scene::value::json!([{"id": "layer-blur-0", "type": "layer-blur", "radius": 10}]);
         let doc = moda_scene::value::json!({
             "nodes": [
@@ -1185,6 +1119,33 @@ mod tests {
             is_node_layer_blur_eligible(scene.effective_node("curved").unwrap()),
             "bezier paths have true extrema bounds and stay eligible"
         );
+    }
+
+    #[test]
+    fn capture_includes_the_cubic_outside_an_ideal_circle() {
+        let radius = 1920.;
+        let at = |degrees: f64| (radius * degrees.to_radians().cos(), radius * degrees.to_radians().sin());
+        let (x0, y0) = at(-19.);
+        let (x1, y1) = at(70.99);
+        let n = raw(moda_scene::value::json!({"id":"p","type":"path","points":[
+            {"type":"move","x":x0,"y":y0},
+            {"type":"arc","rx":radius,"ry":radius,"sweep":true,"x":x1,"y":y1}
+        ]}));
+        let r = crate::backdrop::plan::node_local_rect(&n).unwrap();
+        assert!(r.x + r.w > radius + 0.52, "right edge {}", r.x + r.w);
+    }
+
+    #[test]
+    fn fill_rect_preserves_subpixel_height_and_flat_strokes_supply_their_own_area() {
+        let capture = |h: f64| {
+            let node = raw(moda_scene::value::json!({"id":"p", "type":"path", "points":[
+                {"type":"move", "x":0, "y":0},
+                {"type":"quadratic", "x":2, "y":0, "cp":{"x":1, "y":h}}
+            ]}));
+            crate::backdrop::plan::node_local_rect(&node)
+        };
+        assert!(capture(0.0).is_none());
+        assert_eq!(capture(1e-11).unwrap().h, 5e-12);
     }
 
     #[test]

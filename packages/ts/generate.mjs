@@ -9,9 +9,11 @@ execFileSync(process.execPath, ['packages/ts/generate-std.mjs', ...(process.argv
   cwd: new URL('../..', import.meta.url), stdio:'inherit',
 });
 
-const schemaText = execFileSync('cargo', ['run', '--quiet', '-p', 'vork-scene', '--example', 'generate-docs', '--', '--schema'], {
-  cwd: new URL('../..', import.meta.url), encoding: 'utf8',
+// Rust is the single writer of the schema and scene documentation.
+execFileSync('cargo', ['run', '--quiet', '-p', 'vork-scene', '--example', 'generate-docs', ...(process.argv.includes('--check') ? ['--', '--check'] : [])], {
+  cwd: new URL('../..', import.meta.url), stdio: 'inherit',
 });
+const schemaText = readFileSync(new URL('scene.schema.json', import.meta.url), 'utf8');
 const schema = JSON.parse(schemaText);
 // Defaults and help annotations on a reference are not distinct TypeScript types
 // (they would emit Visibility1, Render1, ...).
@@ -30,7 +32,7 @@ types += '\n' + await compile({ ...typeSchema.$defs.Profile, $defs: typeSchema.$
 // Output descriptors share WorkingColorSpace with composition; reference that declaration once.
 const outputTypes = await compile({ ...typeSchema.$defs.OutputDestination, $defs: typeSchema.$defs }, 'OutputDestination', {bannerComment:'', additionalProperties:false});
 types += '\n' + (types.includes('export type WorkingColorSpace =') ? outputTypes.replace(/export type WorkingColorSpace = [^;]+;\n/, '') : outputTypes);
-for (const [file, value] of [['scene.schema.json', schemaText], ['src/schema.ts', types]]) {
+for (const [file, value] of [['src/schema.ts', types]]) {
   if (process.argv.includes('--check')) {
     if (readFileSync(new URL(file, import.meta.url), 'utf8') !== value) {
       throw new Error(`${file} is stale; run npm run generate`);
@@ -39,10 +41,5 @@ for (const [file, value] of [['scene.schema.json', schemaText], ['src/schema.ts'
 }
 
 execFileSync(process.execPath, ['packages/ts/generate-resource-slots.mjs', ...(process.argv.includes('--check') ? ['--check'] : [])], {cwd: new URL('../..', import.meta.url), stdio: 'inherit'});
-
-// Rust owns field documentation and defaults as well as the input schema.
-execFileSync('cargo', ['run', '--quiet', '-p', 'vork-scene', '--example', 'generate-docs', ...(process.argv.includes('--check') ? ['--', '--check'] : [])], {
-  cwd: new URL('../..', import.meta.url), stdio: 'inherit',
-});
 
 execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['packages/python/generate.py', ...(process.argv.includes('--check') ? ['--check'] : [])], {cwd: new URL('../..', import.meta.url), stdio:'inherit'});

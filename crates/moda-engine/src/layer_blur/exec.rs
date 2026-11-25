@@ -6,23 +6,24 @@
 //! pre-pass, BEFORE the main scene pass — the mask-atlas slot):
 //!   1. `build_capture_plan` → a mini `CoveragePlan` holding just the node's
 //!      diverted items; the caller renders it through the ordinary plan
-//!      executor (own encoder + submit), which handles pattern/text/shader
+//!      executor, which handles pattern/text/shader
 //!      resources exactly like any page render.
 //!   2. `filter_capture` → the group's `LayerFilters` in order, each pass
 //!      reading the previous one's output: texture (`layer-filter-texture`),
 //!      blur (`backdrop-blur` passes — backdrop's ladder past σ = 5 — or two
 //!      `progressive-blur` passes, H then V),
 //!      then every noise (`layer-filter-noise`), then the feather
-//!      (`layer-filter-shadow` `fs_feather`). Own encoder + submit; queue
-//!      submission order makes the capture-read safe even though the capture
-//!      target is a size-keyed shared texture.
+//!      (`layer-filter-shadow` `fs_feather`). The frame encoder records these
+//!      passes after the source draw and before the composite.
 //!   3. The main pass binds the result through `composite_bind_group` and
 //!      draws one quad via `composite_pipeline` in the node's z bucket.
 
 use anyhow::{anyhow, Result};
 
-use crate::backdrop::kernel::{backdrop_blur_passes, BlurPass, MAX_BLUR_KERNEL_SIZE};
+use crate::backdrop::kernel::{backdrop_blur_passes, blur_pass_uniform, MAX_BLUR_KERNEL_SIZE};
 use crate::scratch::Bound;
+use super::batch::{FilterDraw, FilterPipeline, FilterSurface};
+use std::sync::Arc;
 use crate::seams::{
     BlurFilter, CaptureBlend, ClipRRect, CoveragePlan, LayerBlurGroup, NoiseFilter,
     ShadowPass, TextureFilter,
@@ -39,6 +40,18 @@ const BLUR_FLOAT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// `MAX_TAPS` of `progressive-blur.wgsl`: taps per side, so a reach (3σ) up to
 /// this many px samples every texel.
 pub(crate) const PROGRESSIVE_BLUR_MAX_TAPS: f32 = 32.0;
+
+/// Keep the reduced Gaussian well sampled (at least 12.5 texels per sigma
+/// after a halving). Each level integrates a whole 2×2 source footprint.
+pub(super) fn uniform_blur_block(mut reach: f32) -> u32 {
+    let mut block = 1;
+    while reach > 75.0 && block < 8192 {
+        reach *= 0.5;
+        block *= 2;
+    }
+    block
+}
+
 
 fn shader(device: &wgpu::Device, id: &str) -> Result<wgpu::ShaderModule> {
     let src = moda_shaders::module_source(id)
@@ -73,6 +86,111 @@ pub fn enter_supersampled_capture() -> SupersampledGuard {
 pub fn supersampled_capture() -> bool {
     SUPERSAMPLED.with(std::cell::Cell::get)
 }
+
+/// Unfiltered solid pixels depend on the actual capture projection and draw inputs.
+pub(crate) fn solid_capture_source_key(
+    group: &LayerBlurGroup,
+    plan: &CoveragePlan,
+    source_offset: [u32; 2],
+    clip: Option<[u32; 4]>,
+) -> Option<u64> {
+    use crate::seams::{BodyPaint, DrawItem};
+    use std::hash::{Hash, Hasher};
+
+    if !group.masks.is_empty() || !group.coverage.is_empty() {
+        return None;
+    }
+    let local = super::translation::eligible(group);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b"unfiltered-solid-source".hash(&mut h);
+    (group.width_px, group.height_px, plan.sample_count, clip, local, source_offset,
+        plan.width_px, plan.height_px, plan.page_size.map(f64::to_bits), plan.camera.map(f64::to_bits)).hash(&mut h);
+    if !local {
+        group.region_canvas.map(f64::to_bits).hash(&mut h);
+    }
+    for item in &group.items {
+        let DrawItem::Body {
+            geometry,
+            instance,
+            paint: BodyPaint::Solid,
+            phase,
+            blend_mode,
+            z,
+            mask: None,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        let mut instance = if local {
+            super::translation::instance(instance, group.region_canvas)
+        } else {
+            **instance
+        };
+        // A lone, fill-only path has no depth competitor. Every triangle has
+        // the same depth. Keep both clipping planes and the clear depth well
+        // outside the range where Depth24Plus quantization could change a test.
+        let independent_depth = group.items.len() == 1
+            && (0.01..0.99).contains(&instance.path_info[3])
+            && geometry.vertex_types.iter().all(|&kind| kind == 0.);
+        if independent_depth {
+            instance.path_info[3] = 0.5;
+        }
+        let order = if independent_depth { 0 } else { z.to_bits() };
+        h.write(bytemuck::bytes_of(&instance));
+        (order, *phase as u8, *blend_mode as u8, geometry.vertex_count).hash(&mut h);
+        bytemuck::cast_slice::<f32, u8>(&geometry.positions).hash(&mut h);
+        bytemuck::cast_slice::<f32, u8>(&geometry.vertex_types).hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+fn capture_samples(group: &LayerBlurGroup) -> u32 {
+    let gaussian_coverage = matches!(group.filters.blur, Some(BlurFilter::Uniform { .. } | BlurFilter::Elliptical { .. }))
+        && group.items.iter().any(|item| !matches!(item, crate::seams::DrawItem::Vacant
+            | crate::seams::DrawItem::LayerBlurComposite { clip_rrect: None, mask: None, .. }));
+    if gaussian_coverage || group.filters.shadow.is_some() || !group.filters.drop_shadows.is_empty() { 4 } else { 1 }
+}
+
+/// Crop only the source raster. The first Gaussian or reduction pass restores
+/// its placement on the original grid. A clear guard texel makes the existing
+/// clamp sampler equivalent to transparent extension at each new edge.
+pub(crate) fn crop_gaussian_source(plan: &mut CoveragePlan, group: &LayerBlurGroup) -> [u32; 2] {
+    let f = &group.filters;
+    if !matches!(f.blur, Some(BlurFilter::Uniform { .. })) || f.blur_border != 0
+        || f.texture.is_some() || !f.drop_shadows.is_empty() || f.shadow.is_some()
+        || !plan.items.iter().all(|item| match item {
+            crate::seams::DrawItem::Body { mask: None, paint, .. } => match paint {
+                crate::seams::BodyPaint::Solid => true,
+                // Dither hashes the framebuffer position. Preserve its origin.
+                crate::seams::BodyPaint::Gradient(g) => {
+                    let stroke_flags = (g.stroke_gradient_meta[3].round() as u32) / 4;
+                    (g.gradient_flags.round() as u32 | stroke_flags) & 8 == 0
+                }
+                crate::seams::BodyPaint::Pattern(_) => false,
+            },
+            _ => false,
+        })
+    {
+        return [0, 0];
+    }
+    let Some(bounds) = super::shadow::items_canvas_bounds(&plan.items) else { return [0, 0] };
+    let mut offset = [0; 2];
+    let mut size = [plan.width_px, plan.height_px];
+    for (axis, (lo, extent)) in [(bounds.x, bounds.w), (bounds.y, bounds.h)].into_iter().enumerate() {
+        let px = plan.page_size[axis] / f64::from(size[axis]);
+        let start = ((lo - plan.camera[axis]) / px).floor() - 1.0;
+        let end = ((lo + extent - plan.camera[axis]) / px).ceil() + 1.0;
+        offset[axis] = start.clamp(0.0, f64::from(size[axis] - 1)) as u32;
+        let end = end.clamp(f64::from(offset[axis] + 1), f64::from(size[axis])) as u32;
+        size[axis] = end - offset[axis];
+        plan.camera[axis] += f64::from(offset[axis]) * px;
+        plan.page_size[axis] = f64::from(size[axis]) * px;
+    }
+    [plan.width_px, plan.height_px] = size;
+    offset
+}
+
 
 /// Build the isolation-capture mini plan for one group. The plan maps the
 /// padded canvas region 1:1 onto a `width_px × height_px` transparent target
@@ -110,13 +228,7 @@ pub fn build_capture_plan(node_id: &str, group: &LayerBlurGroup) -> CoveragePlan
         // A motion capture stands in for the layer's own antialiased draw.
         // A filter shadow's capture is coverage too: the shadows' edges are the layer's antialiased edges, and
         // under another filter the capture is drawn back as the layer itself.
-        sample_count: if group.filters.shadow.is_some() || !group.filters.drop_shadows.is_empty() {
-            4
-        } else if group.filters.motion {
-            crate::motion_capture::capture_samples()
-        } else {
-            1
-        },
+        sample_count: capture_samples(group),
         camera: if local { [0.0, 0.0] } else { [rx, ry] },
         items,
         item_order: None,
@@ -132,38 +244,98 @@ pub fn build_capture_plan(node_id: &str, group: &LayerBlurGroup) -> CoveragePlan
 /// the same per-call posture as `BackdropRenderer`.
 pub struct LayerBlurRenderer {
     /// The uniform blur's passes, into [`BLUR_FLOAT_FORMAT`] targets.
-    blur: wgpu::RenderPipeline,
-    progressive_blur: wgpu::RenderPipeline,
-    texture: wgpu::RenderPipeline,
-    noise: wgpu::RenderPipeline,
-    shadow_prepare: wgpu::RenderPipeline,
-    shadow_composite: wgpu::RenderPipeline,
+    blur: Arc<FilterPipeline>,
+    border: Arc<FilterPipeline>,
+    integrate: Arc<FilterPipeline>,
+    color_matrix: Arc<FilterPipeline>,
+    progressive_blur: Arc<FilterPipeline>,
+    texture: Arc<FilterPipeline>,
+    noise: Arc<FilterPipeline>,
+    shadow_prepare: Arc<FilterPipeline>,
+    shadow_composite: Arc<FilterPipeline>,
     /// The capture drawn source-over on its filter shadows (`layer-filter-shadow` `fs_source`, the filter
     /// layout).
-    shadow_source: wgpu::RenderPipeline,
+    shadow_source: Arc<FilterPipeline>,
     /// Feather: the layer's hard alpha (`layer-filter-shadow`
     /// `fs_feather_source`, the filter layout), then the layer scaled by its
     /// blur (`fs_feather`, the shadow layout: the blur at binding 2, the layer
     /// at 3).
-    feather_source: wgpu::RenderPipeline,
-    feather: wgpu::RenderPipeline,
-    shadow_bgl: wgpu::BindGroupLayout,
-    effect_bgl: wgpu::BindGroupLayout,
-    composite: wgpu::RenderPipeline,
-    /// The glow composites: the same quad with the mode's colour blend
-    /// (`CaptureBlend`; normal is `composite`).
-    screen_composite: wgpu::RenderPipeline,
-    multiply_composite: wgpu::RenderPipeline,
-    additive_composite: wgpu::RenderPipeline,
+    feather_source: Arc<FilterPipeline>,
+    feather: Arc<FilterPipeline>,
+    device: wgpu::Device,
+    // Capture and glow blends share a layout. Compile only blends a page actually draws.
+    composites: [std::sync::OnceLock<wgpu::RenderPipeline>; 4],
+    composite_layout: wgpu::PipelineLayout,
+    frame_bgl: wgpu::BindGroupLayout,
+    mask_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
+    composite_module: wgpu::ShaderModule,
+    sample_count: u32,
+    layer_composite: crate::device::OptionalPipeline<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
     sampler_linear: wgpu::Sampler,
     /// The owning engine's immutable frame color format — the filter passes'
     /// textures and color targets use it, except the uniform blur's (float,
     /// [`BLUR_FLOAT_FORMAT`]); the capture source is the shared frame target,
     /// and the composite draws into the main-pass frame attachment.
     frame_format: wgpu::TextureFormat,
-    /// Agent shader layer effects (`LayerFilters::shaders`) run as pixel passes, made on first use.
-    agent: std::sync::OnceLock<std::sync::Mutex<crate::pixel::Passes>>,
+
+}
+
+fn premultiplied_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }
+}
+
+fn make_composite_pipeline(device: &wgpu::Device, module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout,
+    frame_format: wgpu::TextureFormat, sample_count: u32, blend: wgpu::BlendState,
+    vertex: &str, fragment: &str, label: &str, creation: moda_text_draw::device::PipelineCreation) -> wgpu::RenderPipeline {
+    creation.render(device, &wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("{label} s{sample_count}")),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: module,
+                    entry_point: Some(vertex),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: module,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: frame_format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
 }
 
 impl LayerBlurRenderer {
@@ -174,13 +346,19 @@ impl LayerBlurRenderer {
     /// quad draws into (the blur passes themselves are always single-sample).
     /// `frame_format` is the owning engine's immutable frame color format
     /// — see the field doc.
-    pub fn new(
+    pub fn new(device: &wgpu::Device, frame_bgl: &wgpu::BindGroupLayout, mask_bgl: &wgpu::BindGroupLayout,
+        sample_count: u32, frame_format: wgpu::TextureFormat, working: Option<&moda_shaders::WorkingColor>) -> Result<Self> {
+        Self::with_variants(device, frame_bgl, mask_bgl, sample_count, frame_format, working, &Default::default())
+    }
+
+    pub(crate) fn with_variants(
         device: &wgpu::Device,
         frame_bgl: &wgpu::BindGroupLayout,
         mask_bgl: &wgpu::BindGroupLayout,
         sample_count: u32,
         frame_format: wgpu::TextureFormat,
         working: Option<&moda_shaders::WorkingColor>,
+        library: &super::batch::FilterLibrary,
     ) -> Result<LayerBlurRenderer> {
         let frag = wgpu::ShaderStages::FRAGMENT;
         let uniform_entry = |binding: u32, vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -217,85 +395,6 @@ impl LayerBlurRenderer {
             label: Some("Layer Blur Effect BGL"),
             entries: &[uniform_entry(0, frag), sampler_entry(1), texture_entry(2)],
         });
-        let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Layer Blur Pipeline Layout"),
-            bind_group_layouts: &[Some(&effect_bgl)],
-            ..Default::default()
-        });
-        let blur_mod = shader(device, "backdrop-blur")?;
-        let blur = moda_text_draw::device::create_render_pipeline(device, &wgpu::RenderPipelineDescriptor {
-            label: Some("Layer Blur Gaussian Pipeline"),
-            layout: Some(&blur_layout),
-            vertex: wgpu::VertexState {
-                module: &blur_mod,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &blur_mod,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: BLUR_FLOAT_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // The other filter passes: same bind-group shape, same single-sample
-        // target, a fullscreen triangle each.
-        let filter_pipeline = |id: &str,
-                               layout: &wgpu::PipelineLayout|
-         -> Result<wgpu::RenderPipeline> {
-            let module = shader(device, id)?;
-            Ok(
-                moda_text_draw::device::create_render_pipeline(device, &wgpu::RenderPipelineDescriptor {
-                    label: Some(id),
-                    layout: Some(layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("vs"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some("fs"),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: frame_format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                }),
-            )
-        };
-        let progressive_blur = filter_pipeline("progressive-blur", &blur_layout)?;
-        let texture = filter_pipeline("layer-filter-texture", &blur_layout)?;
-
-        // Capture shadows (`layer-filter-shadow`): `fs_prepare` on the filter
-        // layout; `fs_composite` reads the blurred source AND the capture
-        // (binding 3) and draws source-over into the result, one shadow after
-        // another.
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Layer Shadow BGL"),
             entries: &[
@@ -305,85 +404,33 @@ impl LayerBlurRenderer {
                 texture_entry(3),
             ],
         });
-        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Layer Shadow Pipeline Layout"),
-            bind_group_layouts: &[Some(&shadow_bgl)],
-            ..Default::default()
-        });
-        // Noise reads the layer's shape coverage too (binding 3).
-        let noise = filter_pipeline("layer-filter-noise", &shadow_layout)?;
-        // A filter shadow's tint is an authored colour: the module converts it to the engine's working colour.
-        let shadow_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("layer-filter-shadow"),
-            source: wgpu::ShaderSource::Wgsl(moda_shaders::working_color::specialize(
-                working,
-                moda_shaders::module_source("layer-filter-shadow")
-                    .ok_or_else(|| anyhow!("missing extracted WGSL module 'layer-filter-shadow'"))?
-                    .source
-                    .into(),
-            )),
-        });
-        let shadow_pipeline = |label: &str,
-                               layout: &wgpu::PipelineLayout,
-                               entry: &str,
-                               blend: Option<wgpu::BlendState>| {
-            moda_text_draw::device::create_render_pipeline(device, &wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module: &shadow_mod,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shadow_mod,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: frame_format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
+        let filter = |id: &'static str, entry, auxiliary: Option<&'static str>, blend, format| -> Result<_> {
+            let source = if id == "css-color-matrix" {
+                include_str!("color_matrix.wgsl")
+            } else if id == "capture-coverage" {
+                include_str!("coverage.wgsl")
+            } else {
+                moda_shaders::module_source(id).ok_or_else(|| anyhow!("missing filter {id}"))?.source
+            };
+            let source = moda_shaders::working_color::specialize(working, source.into());
+            Ok(FilterPipeline::new(id, entry, source, if auxiliary.is_some() { &shadow_bgl } else { &effect_bgl }, format, auxiliary, blend, library))
         };
-        let shadow_prepare =
-            shadow_pipeline("Layer Shadow Prepare", &blur_layout, "fs_prepare", None);
-        let feather_source =
-            shadow_pipeline("Layer Feather Source", &blur_layout, "fs_feather_source", None);
-        let feather = shadow_pipeline("Layer Feather", &shadow_layout, "fs_feather", None);
-        let shadow_over = wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        };
-        let shadow_composite = shadow_pipeline(
-            "Layer Shadow Composite",
-            &shadow_layout,
-            "fs_composite",
-            Some(wgpu::BlendState {
-                color: shadow_over,
-                alpha: shadow_over,
-            }),
-        );
-        let shadow_source = shadow_pipeline(
-            "Layer Shadow Source",
-            &blur_layout,
-            "fs_source",
-            Some(wgpu::BlendState {
-                color: shadow_over,
-                alpha: shadow_over,
-            }),
-        );
+        let blur = filter("backdrop-blur", "fs", None, None, BLUR_FLOAT_FORMAT)?;
+        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add };
+        let integrate = filter("capture-coverage", "fs", None, Some(wgpu::BlendState { color: add, alpha: add }), BLUR_FLOAT_FORMAT)?;
+        let border = filter("backdrop-blur", "fs_border", None, None, BLUR_FLOAT_FORMAT)?;
+        let progressive_blur = filter("progressive-blur", "fs", None, None, frame_format)?;
+        let texture = filter("layer-filter-texture", "fs", None, None, frame_format)?;
+        let noise = filter("layer-filter-noise", "fs", Some("coverageTexture"), None, frame_format)?;
+        let color_matrix = filter("css-color-matrix", "fs", None, None, frame_format)?;
+        let shadow = |entry, auxiliary, blend| filter("layer-filter-shadow", entry, auxiliary, blend, frame_format);
+        let over = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let shadow_prepare = shadow("fs_prepare", None, None)?;
+        let shadow_composite = shadow("fs_composite", Some("captureTexture"), over)?;
+        let shadow_source = shadow("fs_source", None, over)?;
+        let feather_source = shadow("fs_feather_source", None, None)?;
+        let feather = shadow("fs_feather", Some("captureTexture"), None)?;
 
         // Composite pipeline — engine-owned (manifest entry
         // `layer-blur-composite` carries `pipelines: []` like `shape-solid`):
@@ -403,91 +450,6 @@ impl LayerBlurRenderer {
             ..Default::default()
         });
         let composite_mod = shader(device, "layer-blur-composite")?;
-        let premul = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-        let composite_pipeline = |label: &str, blend: wgpu::BlendState| {
-            moda_text_draw::device::create_render_pipeline(device, &wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("{label} s{sample_count}")),
-                layout: Some(&composite_layout),
-                vertex: wgpu::VertexState {
-                    module: &composite_mod,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &composite_mod,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: frame_format,
-                        blend: Some(blend),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24Plus,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    ..Default::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let composite = composite_pipeline("Layer Blur Composite Pipeline", premul);
-        // Glow modes (`CaptureBlend`) other than normal: only the colour's
-        // blend changes; coverage unions like source-over, so a transparent
-        // export keeps the halo's alpha. The halo is premultiplied (S).
-        let glow_composite = |label: &str, src: wgpu::BlendFactor, dst: wgpu::BlendFactor| {
-            composite_pipeline(
-                label,
-                wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: src,
-                        dst_factor: dst,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: premul.alpha,
-                },
-            )
-        };
-        use wgpu::BlendFactor as F;
-        // Screen: S + D (1 - S).
-        let screen_composite = glow_composite(
-            "Layer Glow Screen Composite Pipeline",
-            F::One,
-            F::OneMinusSrc,
-        );
-        // Multiply: S D + D (1 - αS).
-        let multiply_composite = glow_composite(
-            "Layer Glow Multiply Composite Pipeline",
-            F::Dst,
-            F::OneMinusSrcAlpha,
-        );
-        // Linear dodge: S + D (emitted light).
-        let additive_composite =
-            glow_composite("Layer Glow Add Composite Pipeline", F::One, F::One);
-
         let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Layer Blur Linear Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -499,8 +461,11 @@ impl LayerBlurRenderer {
 
         Ok(LayerBlurRenderer {
             frame_format,
-            agent: std::sync::OnceLock::new(),
+
             blur,
+            integrate,
+            border,
+            color_matrix,
             progressive_blur,
             texture,
             noise,
@@ -509,169 +474,197 @@ impl LayerBlurRenderer {
             shadow_source,
             feather_source,
             feather,
-            shadow_bgl,
-            effect_bgl,
-            composite,
-            screen_composite,
-            multiply_composite,
-            additive_composite,
+            device: device.clone(),
+            composites: Default::default(),
+            composite_layout,
+            frame_bgl: frame_bgl.clone(),
+            mask_bgl: mask_bgl.clone(),
             composite_bgl,
+            composite_module: composite_mod,
+            sample_count,
+            layer_composite: Default::default(),
             sampler_linear,
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn prepare_filters(self: &Arc<Self>, device: &wgpu::Device, compiler: &moda_text_draw::device::OptionalCompiler) {
+        if device.limits().max_storage_textures_per_shader_stage > 0 {
+            for filter in [&self.blur, &self.progressive_blur, &self.shadow_prepare, &self.shadow_composite,
+                &self.shadow_source, &self.feather_source, &self.feather] {
+                if filter.seen(compiler, 0) { filter.request_array(device); }
+            }
+        }
+        let max = FilterPipeline::max_targets(device);
+        for width in (2..=max).rev() {
+            for filter in [&self.blur, &self.border, &self.color_matrix, &self.progressive_blur, &self.texture,
+                &self.noise, &self.shadow_prepare, &self.shadow_composite, &self.shadow_source, &self.feather_source, &self.feather] {
+                if filter.seen(compiler, width) { filter.raster_width(device, width, max); }
+            }
+        }
+    }
+
+    pub(crate) fn layer_composite(self: &Arc<Self>, device: &wgpu::Device) -> Option<&(wgpu::BindGroupLayout, wgpu::RenderPipeline)> {
+        let renderer = self.clone();
+        let samples = self.sample_count;
+        self.layer_composite.request(device, "packed composite", move || (samples != 4).then(|| format!("canvas/composite/{samples}")), move |device, cache| {
+            let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry { binding, visibility, ty, count: None };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("layer array composites"),
+                entries: &[
+                    entry(1, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                    entry(3, wgpu::ShaderStages::VERTEX_FRAGMENT, wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }),
+                    entry(4, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }),
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("layer array composites"), bind_group_layouts: &[Some(&renderer.frame_bgl),
+                    Some(&layout), Some(&renderer.mask_bgl)], ..Default::default()
+            });
+            let pipeline = make_composite_pipeline(device, &renderer.composite_module, &pipeline_layout, renderer.frame_format,
+                renderer.sample_count, premultiplied_blend(), "vs_layers", "fs_layers", "layer array composites",
+                moda_text_draw::device::PipelineCreation::Optional(cache));
+            Ok((layout, pipeline))
+        });
+        self.layer_composite.ready()
+    }
+
+    pub(crate) fn layer_composite_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, records: &Bound, layers: &wgpu::TextureView) -> wgpu::BindGroup {
+        let buffer = match records {
+            Bound::Range(buffer, offset, size) => wgpu::BufferBinding { buffer, offset: *offset, size: Some(*size) },
+            Bound::Buffer(buffer) => buffer.as_entire_buffer_binding(),
+            _ => unreachable!(),
+        };
+        device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("layer array composites"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(buffer) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(layers) },
+            ],
+        })
+    }
+
     pub fn composite_pipeline(&self) -> &wgpu::RenderPipeline {
-        &self.composite
+        self.blend_composite_pipeline(CaptureBlend::Normal)
     }
 
     /// The composite of a capture group with this blend (`ShadowFilter::blend`;
     /// every non-shadow group composites source-over).
     pub fn blend_composite_pipeline(&self, blend: CaptureBlend) -> &wgpu::RenderPipeline {
-        match blend {
-            CaptureBlend::Normal => &self.composite,
-            CaptureBlend::Screen => &self.screen_composite,
-            CaptureBlend::Multiply => &self.multiply_composite,
-            CaptureBlend::Add => &self.additive_composite,
-        }
-    }
-
-    /// A copy of a rendered capture (`group`'s size) in a fresh texture: the
-    /// capture target is shared, and the next capture overwrites it.
-    pub fn copy_capture(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
-        capture: &wgpu::Texture,
-        group: &LayerBlurGroup,
-    ) -> wgpu::TextureView {
-        let size = wgpu::Extent3d {
-            width: group.width_px,
-            height: group.height_px,
-            depth_or_array_layers: 1,
+        use wgpu::BlendFactor as F;
+        // All modes union alpha like source-over. Only their colour factors differ.
+        let (slot, label, src, dst) = match blend {
+            CaptureBlend::Normal => (0, "Layer Blur Composite Pipeline", F::One, F::OneMinusSrcAlpha),
+            CaptureBlend::Screen => (1, "Layer Glow Screen Composite Pipeline", F::One, F::OneMinusSrc),
+            CaptureBlend::Multiply => (2, "Layer Glow Multiply Composite Pipeline", F::Dst, F::OneMinusSrcAlpha),
+            CaptureBlend::Add => (3, "Layer Glow Add Composite Pipeline", F::One, F::One),
         };
-        let copy = scratch.texture(device, &wgpu::TextureDescriptor {
-            label: Some("Layer Filter Coverage"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.frame_format,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Layer Filter Coverage Copy"),
-        });
-        encoder.copy_texture_to_texture(
-            capture.as_image_copy(),
-            copy.as_image_copy(),
-            size,
-        );
-        crate::scratch::submit(queue, [encoder.finish()]);
-        scratch.view(&copy)
+        self.composites[slot].get_or_init(|| {
+            let mut state = premultiplied_blend();
+            state.color.src_factor = src;
+            state.color.dst_factor = dst;
+            make_composite_pipeline(&self.device, &self.composite_module, &self.composite_layout,
+                self.frame_format, self.sample_count, state, "vs", "fs", label, moda_text_draw::device::PipelineCreation::Required)
+        })
     }
 
-    /// Run the group's filters over an already-rendered capture into a fresh
-    /// per-node result texture; submits its own encoder. The capture texture
-    /// may be the shared size-keyed frame target — the result is what
-    /// survives into the main pass. `coverage`: the node's shape coverage
-    /// (a render of `group.coverage`) the noise is clipped to; `None` clips
-    /// it to the capture's own alpha.
-    pub fn filter_capture(
+    /// Add only this tile's intersection with each reduced texel. A separate
+    /// recording per tile lets the next raster reuse its resolved attachment.
+    pub(crate) fn integrate_tile(&self, queue: &wgpu::Queue, scratch: &crate::scratch::ScratchPool,
+        source: wgpu::TextureView, target: &FilterSurface, tile: &super::coverage::Tile, load: bool) {
+        let source = FilterSurface::external(source);
+        let mut draws = Vec::new();
+        self.run_pass(Some(tile.scissor), &mut draws, &self.integrate,
+            &[tile.first_edge[0], tile.first_edge[1], tile.step[0], tile.step[1],
+              tile.scissor[0] as f32, tile.scissor[1] as f32, 0., 0.], &source, target);
+        draws[0].load = load;
+        let mut batch = super::batch::FilterBatch::default();
+        batch.add(draws);
+        batch.record(&self.device, queue, scratch, std::slice::from_ref(&source),
+            std::slice::from_ref(target), || 0, Default::default());
+    }
+
+    /// Append the filter stages that consume this source. The batch selects their storage before recording.
+    pub(crate) fn filter_capture(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
         scissor: Option<[u32; 4]>,
-        capture: &wgpu::Texture,
+        draws: &mut Vec<FilterDraw>,
+        capture: &FilterSurface,
         group: &LayerBlurGroup,
-        coverage: Option<&wgpu::TextureView>,
-    ) -> Result<wgpu::TextureView> {
+        source_offset: [u32; 2],
+        coverage: Option<&FilterSurface>,
+    ) -> Result<FilterSurface> {
+        let _filter = crate::prof::span("fx.filter");
         let (width, height) = (group.width_px, group.height_px);
         if let Some(shadow) = &group.filters.shadow {
-            let capture = scratch.view(capture);
-            return Ok(self.shadows_of(device, queue, scratch, scissor, &capture, [width, height], &shadow.shadows, shadow.inner, false));
+            return Ok(self.shadows_of(
+                scissor,
+                draws,
+                capture,
+                [width, height],
+                &shadow.shadows,
+                shadow.inner,
+                false,
+            ));
         }
         let filters = &group.filters;
         // Filter shadows alone: the result is the shadows, and the layer's own items draw over the composite.
         if filters.shadows_alone {
-            let capture = scratch.view(capture);
-            return Ok(self.shadows_of(device, queue, scratch, scissor, &capture, [width, height], &filters.drop_shadows, false, false));
+            return Ok(self.shadows_of(
+                scissor,
+                draws,
+                capture,
+                [width, height],
+                &filters.drop_shadows,
+                false,
+                false,
+            ));
         }
-        // A motion capture runs no filter: its result is a copy of the capture (the target is shared).
-        if filters.drop_shadows.is_empty()
+        // Motion captures sample the resolved source, which belongs to this frame generation.
+        if filters.color_matrices.is_empty()
+            && filters.drop_shadows.is_empty()
             && filters.texture.is_none()
             && filters.blur.is_none()
             && filters.noise.is_empty()
             && filters.feather.is_none()
-            && filters.shaders.is_empty()
         {
-            return Ok(self.copy_capture(device, queue, scratch, capture, group));
+            return Ok(capture.clone());
         }
-        let mk_tex_as = |label: &str, format: wgpu::TextureFormat| {
-            scratch.texture(device, &wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        };
-        let mk_tex = |label: &str| mk_tex_as(label, self.frame_format);
-        // The capture may come from the shared frame-target cache, whose
-        // texture matches the engine frame format; a plain default view is
-        // correct.
-        let mut current = scratch.view(capture);
-        // Filter shadows first, under another filter (their own encoder, submitted before the passes below):
+        let mk_tex = || FilterSurface::new([width, height], self.frame_format);
+        let mut current = capture.clone();
+
+        // Filter shadows first, under another filter (their own draws, submitted before the passes below):
         // the capture's alpha casts them and the capture is drawn over them, so every later filter runs over
         // the picture with its shadows.
         if !filters.drop_shadows.is_empty() {
-            current = self.shadows_of(device, queue, scratch, scissor, &current, [width, height], &filters.drop_shadows, false, true);
+            current = self.shadows_of(
+                scissor,
+                draws,
+                &current,
+                [width, height],
+                &filters.drop_shadows,
+                false,
+                true,
+            );
         }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Layer Filter Encoder"),
-        });
         // Each pass writes a fresh texture: the final one outlives this call
         // as the composite's source, and no pass reads what it writes.
-        let mut step_as = |label: &str,
-                           format: wgpu::TextureFormat,
-                           pipeline: &wgpu::RenderPipeline,
+        let mut step_as = |extent: [u32; 2], format: wgpu::TextureFormat,
+                           pipeline: &Arc<FilterPipeline>,
                            uniform: &[f32],
-                           input: &wgpu::TextureView| {
-            let out = mk_tex_as(label, format);
-            self.run_pass(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                label,
-                pipeline,
-                uniform,
-                input,
-                &out,
-            );
-            scratch.view(&out)
+                           input: &FilterSurface| {
+            let out = FilterSurface::new(extent, format);
+            self.run_pass(scaled(scissor, [width, height], extent), draws, pipeline, uniform, input, &out);
+            out
         };
         let frame_format = self.frame_format;
-        let mut step = |label: &str,
-                        pipeline: &wgpu::RenderPipeline,
-                        uniform: &[f32],
-                        input: &wgpu::TextureView| {
-            step_as(label, frame_format, pipeline, uniform, input)
-        };
         let size = [width as f32, height as f32];
 
         if let Some(t) = &filters.texture {
-            current = step(
-                "Layer Filter Texture",
+            current = step_as([width, height], frame_format,
                 &self.texture,
                 &texture_uniform(t, size, filters.origin_px),
                 &current,
@@ -679,38 +672,69 @@ impl LayerBlurRenderer {
         }
         match filters.blur {
             Some(BlurFilter::Uniform { radius_px }) => {
-                // Past σ = 5 capture px the blur runs as backdrop's ladder of
-                // separable passes (`backdrop_blur_passes`), so the plan can
-                // keep the capture close to full resolution (plan.rs
-                // `SIGMA_CAPTURE_MAX`). The passes write float: the result is
-                // magnified by the composite's bilinear read, and 8-bit steps
-                // would come back as blocks of capture texels in the faint
-                // tail (a boxy glow).
-                let passes = backdrop_blur_passes((radius_px as f64).max(0.5));
+                let mut cropped = (capture.width(), capture.height()) != (width, height);
+                let mut place_source = |mut uniform: Vec<f32>| {
+                    if std::mem::take(&mut cropped) {
+                        uniform[5] = 1.0;
+                        uniform[6..8].copy_from_slice(&source_offset.map(|x| x as f32));
+                    }
+                    uniform
+                };
+                let mut extent = [width, height];
+                let mut block = uniform_blur_block(radius_px);
+                let mut reach = radius_px;
+                while block > 1 && extent.iter().all(|n| n % 2 == 0) {
+                    extent = extent.map(|n| n / 2);
+                    let uniform = place_source(bilinear_copy_uniform(extent));
+                    current = step_as(extent, BLUR_FLOAT_FORMAT, &self.blur, &uniform, &current);
+                    reach *= 0.5;
+                    block /= 2;
+                }
+                let border = filters.blur_border;
+                let padded = extent.map(|n| n + 2 * border);
+                if border > 0 {
+                    current = step_as(padded, BLUR_FLOAT_FORMAT,
+                        &self.border, &border_uniform(-(border as f32)), &current);
+                }
+                let size = padded.map(|n| n as f32);
+                let passes = backdrop_blur_passes((reach as f64).max(0.5));
                 for direction in 0..2 {
                     for pass in &passes {
-                        current = step_as(
-                            if direction == 0 {
-                                "Layer Blur Horizontal Pass"
-                            } else {
-                                "Layer Blur Vertical Pass"
-                            },
+                        let uniform = place_source(blur_pass_uniform(pass, direction, size));
+                        current = step_as(padded,
                             BLUR_FLOAT_FORMAT,
                             &self.blur,
-                            &blur_pass_uniform(pass, direction, size),
+                            &uniform,
                             &current,
                         );
+                    }
+                }
+                if border > 0 {
+                    current = step_as(extent, BLUR_FLOAT_FORMAT,
+                        &self.border, &border_uniform(border as f32), &current);
+                }
+                // Following effects address the source in full capture pixels.
+                if extent != [width, height] && (!filters.color_matrices.is_empty()
+                    || !filters.noise.is_empty() || filters.feather.is_some()) {
+                    current = step_as([width, height], BLUR_FLOAT_FORMAT,
+                        &self.blur, &bilinear_copy_uniform([width, height]), &current);
+                }
+            }
+            Some(BlurFilter::Elliptical { major, reaches }) => {
+                for (axis, reach) in [major, [-major[1], major[0]]].into_iter().zip(reaches) {
+                    if reach <= 0.5 {
+                        continue;
+                    }
+                    for pass in backdrop_blur_passes(reach as f64) {
+                        let mut uniform = blur_pass_uniform(&pass, 2, size);
+                        uniform[6..8].copy_from_slice(&axis);
+                        current = step_as([width, height], BLUR_FLOAT_FORMAT, &self.blur, &uniform, &current);
                     }
                 }
             }
             Some(blur @ BlurFilter::Progressive { .. }) => {
                 for direction in 0..2 {
-                    current = step(
-                        if direction == 0 {
-                            "Layer Progressive Blur Horizontal Pass"
-                        } else {
-                            "Layer Progressive Blur Vertical Pass"
-                        },
+                    current = step_as([width, height], frame_format,
                         &self.progressive_blur,
                         &progressive_blur_uniform(&blur, direction, size),
                         &current,
@@ -719,141 +743,49 @@ impl LayerBlurRenderer {
             }
             None => {}
         }
+        for matrix in &filters.color_matrices {
+            current = step_as([width, height], frame_format, &self.color_matrix, matrix, &current);
+        }
         for n in &filters.noise {
-            let out = mk_tex("Layer Filter Noise");
+            let out = mk_tex();
             self.run_pass_with(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                "Layer Filter Noise",
+                scissor,
+                draws,
                 &self.noise,
                 &noise_uniform(n, size, filters.origin_px),
                 &current,
                 Some(coverage.unwrap_or(&current)),
                 &out,
             );
-            current = scratch.view(&out);
+            current = out;
         }
         if let Some(f) = &filters.feather {
             // The layer's hard alpha, blurred, then the layer scaled by the
             // remapped blur.
-            let source = mk_tex("Layer Feather Source");
+            let source = mk_tex();
             self.run_pass(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                "Layer Feather Source",
+                scissor,
+                draws,
                 &self.feather_source,
                 &feather_uniform(size),
                 &current,
                 &source,
             );
-            let blurred = self.blur_alpha(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                scratch.view(&source),
-                [width, height],
-                f.radius_px,
-            );
-            let out = mk_tex("Layer Filter Feather");
+            let blurred = self.blur_alpha(scissor, draws, source, [width, height], f.radius_px);
+            let out = mk_tex();
             self.run_pass_with(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                "Layer Filter Feather",
+                scissor,
+                draws,
                 &self.feather,
                 &feather_uniform(size),
                 &blurred,
                 Some(&current),
                 &out,
             );
-            current = scratch.view(&out);
+            current = out;
         }
-        crate::scratch::submit(queue, [encoder.finish()]);
-        for shader in &filters.shaders {
-            current = self.agent_shader(device, queue, scratch, shader, &current, [width, height])?;
-        }
-        Ok(current)
-    }
 
-    /// One agent shader layer effect over `input` (the capture so far): a pixel pass of its moda-wgsl effect module,
-    /// tiled and timed. Past the time budget an export fails (`shader_budget_exceeded`) and a preview draws a
-    /// magenta checker and warns; a NaN or infinity is a magenta checker and a `shader_nan` warning.
-    fn agent_shader(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _scratch: &crate::scratch::ScratchPool,
-        shader: &crate::seams::AgentShaderFilter,
-        input: &wgpu::TextureView,
-        [width, height]: [u32; 2],
-    ) -> Result<wgpu::TextureView> {
-        // A timed pass (its time budget): what this render holds goes first.
-        crate::scratch::flush();
-        let passes = self
-            .agent
-            .get_or_init(|| std::sync::Mutex::new(crate::pixel::Passes::new(device, queue)))
-            .lock()
-            .map_err(|_| anyhow::anyhow!("agent shader passes poisoned"))?;
-        let out = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Layer Agent Shader"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.frame_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = out.create_view(&Default::default());
-        let domain = crate::pixel::Domain::new(0, 0, width, height);
-        let budget = crate::pixel::agent_budget_per_1080p() * (shader.area_px / (1920.0 * 1080.0)).max(1.0);
-        let warn = |code: &str, message: String| {
-            eprintln!("moda-engine: warning: {code}: {message}");
-            moda_assets::report::record(moda_assets::report::RuntimeEvent::RenderQuality {
-                code: code.to_string(),
-                node_id: shader.node_id.clone(),
-                message,
-            });
-        };
-        match passes.run_agent_on(&shader.code, &shader.wgsl, &[(input, domain)], &shader.slots, &view, self.frame_format, domain, budget) {
-            Ok((nan, _ms)) => {
-                if let Some((x, y)) = nan {
-                    // The report is in capture px: back to the layer's px (header slots 3–4: capture → p).
-                    let (m, t) = (shader.slots[3], shader.slots[4]);
-                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                    let (lx, ly) = (m[0] * px + m[2] * py + t[0], m[1] * px + m[3] * py + t[1]);
-                    warn(
-                        "shader_nan",
-                        format!(
-                            "layer effect `{}` on `{}` returned NaN or infinity at layer px ({lx:.0}, {ly:.0}): drawn as a magenta checker",
-                            shader.code, shader.node_id
-                        ),
-                    );
-                }
-                Ok(view)
-            }
-            Err(e @ crate::pixel::PixelError::Shader { code: "shader_budget_exceeded", .. }) if crate::pixel::is_preview() => {
-                warn("shader_budget_exceeded", format!("layer effect on `{}`: {e} (drawn as a magenta checker; an export fails)", shader.node_id));
-                let magenta = moda_wgsl::module(
-                    "fn shade(p: vec2<f32>) -> vec4<f32> {\n  let k = (i32(floor(p.x / 8.0)) + i32(floor(p.y / 8.0))) & 1;\n  return select(vec4<f32>(1.0, 0.0, 1.0, 1.0), vec4<f32>(0.1, 0.0, 0.1, 1.0), k == 1);\n}",
-                    &moda_wgsl::Schema::default(),
-                    moda_wgsl::Placement::Effect,
-                );
-                passes
-                    .run_agent_on("magenta", &magenta.wgsl, &[], &shader.slots[..moda_wgsl::RESERVED_SLOTS], &view, self.frame_format, domain, f64::INFINITY)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(view)
-            }
-            Err(e) => Err(anyhow::anyhow!(crate::pixel::PixelError::Shader {
-                code: match &e {
-                    crate::pixel::PixelError::Shader { code, .. } => code,
-                    _ => "shader_invalid",
-                },
-                message: format!("layer effect `{}` on `{}`: {e}", shader.code, shader.node_id),
-            })),
-        }
+        Ok(current)
     }
 
     /// The shadows of a capture, drawn back to front into a fresh texture.
@@ -867,144 +799,53 @@ impl LayerBlurRenderer {
     #[allow(clippy::too_many_arguments)]
     fn shadows_of(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
         scissor: Option<[u32; 4]>,
-        capture_view: &wgpu::TextureView,
+        draws: &mut Vec<FilterDraw>,
+        capture_view: &FilterSurface,
         [width, height]: [u32; 2],
         shadows: &[ShadowPass],
         inner: bool,
         under_source: bool,
-    ) -> wgpu::TextureView {
+    ) -> FilterSurface {
         let size = [width as f32, height as f32];
-        let mk_tex = |label: &str| {
-            scratch.texture(device, &wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.frame_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        };
-        let result = mk_tex("Layer Shadow Result");
-        let result_view = scratch.view(&result);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Layer Shadow Encoder"),
-        });
+        let mk_tex = || FilterSurface::new([width, height], self.frame_format);
+        let result_view = mk_tex();
         for (i, pass) in shadows.iter().enumerate() {
             let uniform = shadow_uniform(pass, inner, size);
-            let prepared = mk_tex("Layer Shadow Source");
+            let prepared = mk_tex();
             self.run_pass(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                "Layer Shadow Prepare",
+                scissor,
+                draws,
                 &self.shadow_prepare,
                 &uniform,
                 capture_view,
                 &prepared,
             );
-            let source = self.blur_alpha(
-                device,
-                queue, scratch, scissor,
-                &mut encoder,
-                scratch.view(&prepared),
-                [width, height],
-                pass.radius_px,
-            );
-            let ubuf = scratch.buffer(device, &wgpu::BufferDescriptor {
-                label: Some("Layer Shadow Composite Uniform"),
-                size: (uniform.len() * 4) as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+            let source = self.blur_alpha(scissor, draws, prepared, [width, height], pass.radius_px);
+            draws.push(FilterDraw {
+                pipeline: self.shadow_composite.clone(),
+                parameters: uniform.to_vec(),
+                sampler: self.sampler_linear.clone(),
+                input: source,
+                second: Some(capture_view.clone()),
+                scissor,
+                target: result_view.clone(),
+                load: i > 0,
             });
-            crate::scratch::write_buffer(device, queue, &ubuf, 0, bytemuck::cast_slice(&uniform));
-            let bind_group = scratch.bind(device, "Layer Shadow Composite", &self.shadow_bgl, &[
-                Bound::Buffer(ubuf),
-                Bound::Sampler(self.sampler_linear.clone()),
-                Bound::View(source),
-                Bound::View(capture_view.clone()),
-            ]);
-            let profile_ts = crate::gpu_profile::pass_timestamps();
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Layer Shadow Composite"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &result_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if i == 0 {
-                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                        } else {
-                            wgpu::LoadOp::Load
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: crate::gpu_profile::render_writes(&profile_ts),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some([x, y, w, h]) = scissor.and_then(|r| fit(r, width, height)) {
-                rp.set_scissor_rect(x, y, w, h);
-            }
-            rp.set_pipeline(&self.shadow_composite);
-            rp.set_bind_group(0, &bind_group, &[]);
-            rp.draw(0..3, 0..1);
         }
         if under_source {
             let uniform = feather_uniform(size);
-            let ubuf = scratch.buffer(device, &wgpu::BufferDescriptor {
-                label: Some("Layer Shadow Source Uniform"),
-                size: (uniform.len() * 4) as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+            draws.push(FilterDraw {
+                pipeline: self.shadow_source.clone(),
+                parameters: uniform.to_vec(),
+                sampler: self.sampler_linear.clone(),
+                input: capture_view.clone(),
+                second: None,
+                scissor,
+                target: result_view.clone(),
+                load: !shadows.is_empty(),
             });
-            crate::scratch::write_buffer(device, queue, &ubuf, 0, bytemuck::cast_slice(&uniform));
-            let bind_group = scratch.bind(device, "Layer Shadow Source", &self.effect_bgl, &[
-                Bound::Buffer(ubuf),
-                Bound::Sampler(self.sampler_linear.clone()),
-                Bound::View(capture_view.clone()),
-            ]);
-            let profile_ts = crate::gpu_profile::pass_timestamps();
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Layer Shadow Source"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &result_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if shadows.is_empty() {
-                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                        } else {
-                            wgpu::LoadOp::Load
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: crate::gpu_profile::render_writes(&profile_ts),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some([x, y, w, h]) = scissor.and_then(|r| fit(r, width, height)) {
-                rp.set_scissor_rect(x, y, w, h);
-            }
-            rp.set_pipeline(&self.shadow_source);
-            rp.set_bind_group(0, &bind_group, &[]);
-            rp.draw(0..3, 0..1);
         }
-        crate::scratch::submit(queue, [encoder.finish()]);
         result_view
     }
 
@@ -1015,15 +856,12 @@ impl LayerBlurRenderer {
     #[allow(clippy::too_many_arguments)]
     fn blur_alpha(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
         scissor: Option<[u32; 4]>,
-        encoder: &mut wgpu::CommandEncoder,
-        mut source: wgpu::TextureView,
+        draws: &mut Vec<FilterDraw>,
+        mut source: FilterSurface,
         size: [u32; 2],
         radius_px: f32,
-    ) -> wgpu::TextureView {
+    ) -> FilterSurface {
         if radius_px < 0.6 {
             return source;
         }
@@ -1039,40 +877,22 @@ impl LayerBlurRenderer {
         // result back up.
         let (mut bw, mut bh) = (width, height);
         let mut radius_px = radius_px;
-        let mk_blur_tex = |label: &str, w: u32, h: u32| {
-            scratch.texture(device, &wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.frame_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        };
+        let mk_blur_tex = |w, h| FilterSurface::new([w, h], self.frame_format);
         while radius_px > PROGRESSIVE_BLUR_MAX_TAPS && bw > 2 && bh > 2 {
             let (hw, hh) = (bw.div_ceil(2), bh.div_ceil(2));
             radius_px *= hw as f32 / bw as f32;
             (bw, bh) = (hw, hh);
-            let out = mk_blur_tex("Layer Shadow Downsample", bw, bh);
+            let out = mk_blur_tex(bw, bh);
             let copy = BlurFilter::Uniform { radius_px: 0.0 };
             self.run_pass(
-                device,
-                queue, scratch, scaled(scissor, [width, height], [bw, bh]),
-                encoder,
-                "Layer Shadow Downsample",
+                scaled(scissor, [width, height], [bw, bh]),
+                draws,
                 &self.progressive_blur,
                 &progressive_blur_uniform(&copy, 0, [bw as f32, bh as f32]),
                 &source,
                 &out,
             );
-            source = scratch.view(&out);
+            source = out;
         }
         let blur = BlurFilter::Progressive {
             start_radius_px: radius_px,
@@ -1081,18 +901,16 @@ impl LayerBlurRenderer {
             end_px: [0.0; 2],
         };
         for direction in 0..2 {
-            let out = mk_blur_tex("Layer Shadow Blur", bw, bh);
+            let out = mk_blur_tex(bw, bh);
             self.run_pass(
-                device,
-                queue, scratch, scaled(scissor, [width, height], [bw, bh]),
-                encoder,
-                "Layer Shadow Blur",
+                scaled(scissor, [width, height], [bw, bh]),
+                draws,
                 &self.progressive_blur,
                 &progressive_blur_uniform(&blur, direction, [bw as f32, bh as f32]),
                 &source,
                 &out,
             );
-            source = scratch.view(&out);
+            source = out;
         }
         source
     }
@@ -1102,20 +920,14 @@ impl LayerBlurRenderer {
     #[allow(clippy::too_many_arguments)]
     fn run_pass(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
         scissor: Option<[u32; 4]>,
-        encoder: &mut wgpu::CommandEncoder,
-        label: &str,
-        pipeline: &wgpu::RenderPipeline,
+        draws: &mut Vec<FilterDraw>,
+        pipeline: &Arc<FilterPipeline>,
         uniform: &[f32],
-        input: &wgpu::TextureView,
-        output: &wgpu::Texture,
+        input: &FilterSurface,
+        output: &FilterSurface,
     ) {
-        self.run_pass_with(
-            device, queue, scratch, scissor, encoder, label, pipeline, uniform, input, None, output,
-        );
+        self.run_pass_with(scissor, draws, pipeline, uniform, input, None, output);
     }
 
     /// [`Self::run_pass`] with a second input at binding 3 (the shadow layout,
@@ -1123,59 +935,25 @@ impl LayerBlurRenderer {
     #[allow(clippy::too_many_arguments)]
     fn run_pass_with(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scratch: &crate::scratch::ScratchPool,
         scissor: Option<[u32; 4]>,
-        encoder: &mut wgpu::CommandEncoder,
-        label: &str,
-        pipeline: &wgpu::RenderPipeline,
+        draws: &mut Vec<FilterDraw>,
+        pipeline: &Arc<FilterPipeline>,
         uniform: &[f32],
-        input: &wgpu::TextureView,
-        second: Option<&wgpu::TextureView>,
-        output: &wgpu::Texture,
+        input: &FilterSurface,
+        second: Option<&FilterSurface>,
+        output: &FilterSurface,
     ) {
-        let ubuf = scratch.buffer(device, &wgpu::BufferDescriptor {
-            label: Some(label),
-            size: (uniform.len() * 4) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let out_view = output.clone();
+        draws.push(FilterDraw {
+            pipeline: pipeline.clone(),
+            parameters: uniform.to_vec(),
+            sampler: self.sampler_linear.clone(),
+            input: input.clone(),
+            second: second.cloned(),
+            scissor,
+            target: out_view,
+            load: false,
         });
-        crate::scratch::write_buffer(device, queue, &ubuf, 0, bytemuck::cast_slice(uniform));
-        let mut bound = vec![
-            Bound::Buffer(ubuf),
-            Bound::Sampler(self.sampler_linear.clone()),
-            Bound::View(input.clone()),
-        ];
-        if let Some(second) = second {
-            bound.push(Bound::View(second.clone()));
-        }
-        let layout = if second.is_some() { &self.shadow_bgl } else { &self.effect_bgl };
-        let bind_group = scratch.bind(device, label, layout, &bound);
-        let out_view = scratch.view(output);
-        let profile_ts = crate::gpu_profile::pass_timestamps();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some(label),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &out_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: crate::gpu_profile::render_writes(&profile_ts),
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if let Some([x, y, w, h]) = scissor.and_then(|r| fit(r, output.width(), output.height())) {
-            pass.set_scissor_rect(x, y, w, h);
-        }
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..1);
     }
 
     /// Uniform data for one composite quad — must match
@@ -1229,35 +1007,27 @@ impl LayerBlurRenderer {
         uniform_data: &[f32; COMPOSITE_UNIFORM_FLOATS],
         capture: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        let desc = wgpu::BufferDescriptor {
-            label: Some("Layer Blur Composite Uniform"),
-            size: (COMPOSITE_UNIFORM_FLOATS * 4) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        };
-        let ubuf = if lasting { device.create_buffer(&desc) } else { scratch.buffer(device, &desc) };
-        crate::scratch::write_buffer(device, queue, &ubuf, 0, bytemuck::cast_slice(uniform_data));
+        let uniform_binding = scratch.uniform(device, queue, "Layer Blur Composite Uniform", uniform_data, lasting);
         scratch.bind(device, "Layer Blur Composite Bind Group", &self.composite_bgl, &[
-            Bound::Buffer(ubuf),
+            uniform_binding,
             Bound::Sampler(self.sampler_linear.clone()),
             Bound::View(capture.clone()),
         ])
     }
 }
 
-/// `BlurUniforms` of `backdrop-blur.wgsl` for one pass in one direction — the
-/// same packing as backdrop's `run_blur_pass`.
-fn blur_pass_uniform(kernel: &BlurPass, direction: u32, size: [f32; 2]) -> Vec<f32> {
-    let kernel_size = kernel.size.min(MAX_BLUR_KERNEL_SIZE);
-    let mut uniform = vec![0f32; 4 + MAX_BLUR_KERNEL_SIZE * 4];
-    uniform[0] = direction as f32;
-    uniform[1] = kernel_size as f32;
-    uniform[2] = size[0];
-    uniform[3] = size[1];
-    for i in 0..kernel_size {
-        uniform[4 + i * 4] = kernel.weights.get(i).copied().unwrap_or(0.0);
-        uniform[4 + i * 4 + 1] = kernel.offsets.get(i).copied().unwrap_or(0.0);
-    }
+/// Copy on the texel grid, with transparent extension outside the input.
+fn border_uniform(offset: f32) -> Vec<f32> {
+    let mut uniform = vec![0.0; 4 + MAX_BLUR_KERNEL_SIZE * 4];
+    uniform[1] = offset;
+    uniform
+}
+
+/// A unit centre tap addressed by destination pixel position. On halving,
+/// bilinear sampling integrates the four source texels with equal weights.
+fn bilinear_copy_uniform(extent: [u32; 2]) -> Vec<f32> {
+    let mut uniform = vec![0.0; 4 + MAX_BLUR_KERNEL_SIZE * 4];
+    uniform[..5].copy_from_slice(&[2.0, 1.0, extent[0] as f32, extent[1] as f32, 1.0]);
     uniform
 }
 
@@ -1274,6 +1044,7 @@ pub(crate) fn progressive_blur_uniform(
             start_px,
             end_px,
         } => (start_radius_px, end_radius_px, start_px, end_px),
+        BlurFilter::Elliptical { .. } => unreachable!("elliptical blur uses the Gaussian pass ladder"),
         BlurFilter::Uniform { radius_px } => (radius_px, radius_px, [0.0; 2], [0.0; 2]),
     };
     [
@@ -1391,7 +1162,7 @@ pub fn noise_cell_hash(x: i32, y: i32, salt: u32) -> f32 {
 }
 
 /// `r` (texels of a `w × h` texture) cut to the texture; `None` when nothing is left.
-fn fit(r: [u32; 4], w: u32, h: u32) -> Option<[u32; 4]> {
+pub(super) fn fit(r: [u32; 4], w: u32, h: u32) -> Option<[u32; 4]> {
     let (x0, y0) = (r[0].min(w), r[1].min(h));
     let (x1, y1) = (r[0].saturating_add(r[2]).min(w), r[1].saturating_add(r[3]).min(h));
     (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])

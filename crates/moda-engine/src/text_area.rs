@@ -38,6 +38,12 @@ fn wraps(node: &RawNode) -> bool {
         && node.json_field("textPath").is_none()
 }
 
+/// Whether isolating this occurrence would remove a possible text-flow input.
+pub(crate) fn reads_other_nodes(scene: &Scene, node: &RawNode) -> bool {
+    (is_area(node) && node.str("threadPrev").is_some_and(|id| !id.is_empty()))
+        || (wraps(node) && !scene.text_flow().wrap_ids.is_empty())
+}
+
 /// The thread up to and including `node`, head first. A frame whose `threadPrev` is missing, not area type or a
 /// loop starts its own story.
 pub fn thread_chain<'s>(scene: &'s Scene, node: &'s RawNode) -> Vec<&'s RawNode> {
@@ -270,7 +276,7 @@ fn canvas_rings(scene: &Scene, id: &str, depth: usize) -> Vec<Ring> {
         return Vec::new();
     };
     let local: Vec<Ring> = match moda_scene::shape_outline::node_outline(node) {
-        Some((points, _)) if points.len() >= 2 => {
+        Some(points) if points.len() >= 2 => {
             use moda_scene::blend::BlendPathPoint as B;
             let cmds: Vec<PathCmd> = points
                 .iter()

@@ -42,6 +42,10 @@ pub struct Subscription {
 #[derive(Clone, Debug)]
 pub struct Stamps {
     clock: u64,
+    /// Last write that could change page effects or paint-stack ownership.
+    /// Empty until the first such row write, including unrestricted writes.
+    composition: Vec<u64>,
+    last_composition: u64,
     /// Per row, the clock of the last write to each group.
     rows: Vec<[u64; GROUPS]>,
     /// The clock of the last write to each group, in any row.
@@ -61,7 +65,7 @@ impl Default for Stamps {
 impl Stamps {
     /// Stamps for `rows` nodes that all changed at `clock`.
     pub fn new(rows: usize, clock: u64) -> Stamps {
-        Stamps { clock, rows: vec![[0; GROUPS]; rows], latest: [0; GROUPS], all: clock, lists: Default::default() }
+        Stamps { clock, composition: Vec::new(), last_composition: clock, rows: vec![[0; GROUPS]; rows], latest: [0; GROUPS], all: clock, lists: Default::default() }
     }
 
     /// The clock: it advances on every write, so an unchanged clock proves an unchanged scene.
@@ -79,6 +83,24 @@ impl Stamps {
 
     /// Record a write to `group` of `row`. Returns the new clock.
     pub fn mark(&mut self, row: u32, group: Group) -> u64 {
+        let clock = self.mark_preserving_composition(row, group);
+        self.mark_composition(row);
+        clock
+    }
+
+    pub fn last_composition(&self) -> u64 { self.last_composition.max(self.all) }
+
+    pub fn composition_current(&self, row: u32, at: u64) -> bool {
+        self.all <= at && self.composition.get(row as usize).copied().unwrap_or(0) <= at
+    }
+
+    pub(crate) fn mark_composition(&mut self, row: u32) {
+        self.last_composition = self.clock;
+        if self.composition.len() < self.rows.len() { self.composition.resize(self.rows.len(), 0); }
+        if let Some(at) = self.composition.get_mut(row as usize) { *at = self.clock; }
+    }
+
+    pub(crate) fn mark_preserving_composition(&mut self, row: u32, group: Group) -> u64 {
         self.clock += 1;
         let g = group as usize;
         self.latest[g] = self.clock;
@@ -160,6 +182,11 @@ impl Stamps {
     /// The clock of the last write to `group` of `row` (a change to everything counts).
     pub fn stamp(&self, row: u32, group: Group) -> u64 {
         self.rows.get(row as usize).map_or(self.all, |stamps| stamps[group as usize].max(self.all))
+    }
+
+    /// Last change to any field of this row, including changes attributed to the whole scene.
+    pub fn row_revision(&self, row: u32) -> u64 {
+        self.rows.get(row as usize).and_then(|groups| groups.iter().max()).copied().unwrap_or(0).max(self.all)
     }
 
     /// Whether something built from `group` of `row` at clock `built_at` is still valid.

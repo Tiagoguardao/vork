@@ -19,17 +19,20 @@ pub(super) type SharedDeferredCommandBufferActions = Arc<Mutex<DeferredCommandBu
 #[derive(Default)]
 pub(crate) struct DeferredCommandBufferActions {
     pub buffer_mappings: Vec<DeferredBufferMapping>,
+    pub submission_callbacks: Vec<alloc::boxed::Box<dyn FnOnce(SubmissionIndex) + Send>>,
     pub on_submitted_work_done_callbacks: Vec<dispatch::BoxSubmittedWorkDoneCallback>,
 }
 
 impl DeferredCommandBufferActions {
     pub fn append(&mut self, other: &mut Self) {
+        self.submission_callbacks.append(&mut other.submission_callbacks);
         self.buffer_mappings.append(&mut other.buffer_mappings);
         self.on_submitted_work_done_callbacks
             .append(&mut other.on_submitted_work_done_callbacks);
     }
 
-    pub fn execute(self, queue: &dispatch::DispatchQueue) {
+    pub fn execute(self, queue: &dispatch::DispatchQueue, index: SubmissionIndex) {
+        for callback in self.submission_callbacks { callback(index.clone()); }
         for mapping in self.buffer_mappings {
             mapping.buffer.map_async(
                 mapping.mode,

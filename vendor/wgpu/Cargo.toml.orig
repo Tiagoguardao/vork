@@ -263,6 +263,9 @@ smallvec.workspace = true
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
 portable-atomic.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wgpu-hal = { workspace = true, features = ["validation_canary"] }
+
 [dev-dependencies]
 # Used in doc-tests
 bytemuck.workspace = true

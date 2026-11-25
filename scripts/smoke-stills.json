@@ -1,0 +1,136 @@
+{
+  "paths.json": [
+    "--at",
+    "0"
+  ],
+  "program-computed-read.json": [
+    "--at",
+    "0"
+  ],
+  "program-import.json": [
+    "--at",
+    "0"
+  ],
+  "program-shared.json": [
+    "--at",
+    "0"
+  ],
+  "scenes/greenlight/scene/raster-local-boundary.json": [
+    "--at",
+    "0"
+  ],
+  "scenes/greenlight/scene/raster-scalar-opacity.json": [
+    "--at",
+    "0"
+  ],
+  "scenes/greenlight/scene/shapes-eight.json": [
+    "--at",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-cloth-bend.json": [
+    "--frame-start",
+    "0",
+    "--frame-end",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-cloth-closest.json": [
+    "--frame-start",
+    "0",
+    "--frame-end",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-cloth-cross.json": [
+    "--frame-start",
+    "0",
+    "--frame-end",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-collider-ranges.json": [
+    "--frame-start",
+    "3",
+    "--frame-end",
+    "3"
+  ],
+  "scenes/greenlight/scene/sim-drop-shift.json": [
+    "--frame-start",
+    "0",
+    "--frame-end",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-drop-tiny.json": [
+    "--frame-start",
+    "0",
+    "--frame-end",
+    "0"
+  ],
+  "scenes/greenlight/scene/sim-grid-scalar.json": [
+    "--frame-start",
+    "1",
+    "--frame-end",
+    "1"
+  ],
+  "scenes/greenlight/scene/sim-grid-vector.json": [
+    "--frame-start",
+    "1",
+    "--frame-end",
+    "1"
+  ],
+  "scenes/greenlight/scene/sim-rim.json": [
+    "--frame-start",
+    "3",
+    "--frame-end",
+    "3"
+  ],
+  "sweep-capped.json": [
+    "--at",
+    "0"
+  ],
+  "sweep-loop.json": [
+    "--at",
+    "0"
+  ],
+  "sweep-open.json": [
+    "--at",
+    "0"
+  ],
+  "text-arabic-45.json": [
+    "--at",
+    "0"
+  ],
+  "text-arabic-80.json": [
+    "--at",
+    "0"
+  ],
+  "text-bengali-45.json": [
+    "--at",
+    "0"
+  ],
+  "text-bengali-80.json": [
+    "--at",
+    "0"
+  ],
+  "text-bidi-45.json": [
+    "--at",
+    "0"
+  ],
+  "text-bidi-80.json": [
+    "--at",
+    "0"
+  ],
+  "text-devanagari-45.json": [
+    "--at",
+    "0"
+  ],
+  "text-devanagari-80.json": [
+    "--at",
+    "0"
+  ],
+  "text-latin-45.json": [
+    "--at",
+    "0"
+  ],
+  "text-latin-80.json": [
+    "--at",
+    "0"
+  ]
+}

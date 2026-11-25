@@ -77,8 +77,8 @@ void vork_nv_drop(NvSession *s) {
     free(s);
 }
 
-/* Driver initialization needs no Vulkan device. Keep the libraries loaded so
- * prepare can overlap device startup without unloading/reinitializing CUDA. */
+/* Called after Vulkan device creation. Keep the libraries loaded between
+ * CUDA initialization and native session attachment. */
 NvSession *vork_nv_prepare(int *error) {
     NvSession *s = calloc(1, sizeof(*s));
     *error = -1;

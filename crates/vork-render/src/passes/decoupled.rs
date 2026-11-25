@@ -644,7 +644,11 @@ impl KernelPlan {
             // Only transport evaluators and the containment prepass need the
             // installed active-set capacity. Opaque/classify/compose stages keep
             // their existing zero-transport kernels and generic fallbacks.
-            let boundaries=if matches!(stage,ShadeStage::Evaluate|ShadeStage::EvaluateProgram(_)|ShadeStage::Occupancy) {boundary_capacity} else {0};
+            let boundaries = match stage {
+                ShadeStage::Evaluate | ShadeStage::Occupancy => boundary_capacity,
+                ShadeStage::EvaluateProgram(id) if program_features[id as usize] & crate::forward_variant::FEATURE_LIT == 0 => boundary_capacity,
+                _ => 0,
+            };
             crate::pipelines::ProgramKernel::Decoupled {stage,features,subsurface:render.settings.integrator.subsurface_method()==Some(vork_scene::v2::SubsurfaceMethod::Thickness),emitter_profiles,boundaries}
         };
         let implicit_slots=!per_sample && !plan.transparent;
@@ -2516,6 +2520,29 @@ mod tests {
 mod transport_feature_tests {
     use super::*;
     use crate::forward_variant::*;
+
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang"]
+    fn pane_over_hook_preserves_refraction_boundaries() -> anyhow::Result<()> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let renderer = crate::test_renderer()?;
+        let mut scene = vork_scene::v2::Scene::load(&root.join("pane-over-hook.json"))?;
+        scene.render.settings = vork_scene::Profile::load("std/final")?.resolve(&Default::default())?;
+        scene.render.settings.integrator.raster_mut().unwrap().refraction = vork_scene::Refraction::Ray;
+        let installed = renderer.install_with_options(scene, &root, crate::InstallOptions {
+            variants: crate::pipelines::VariantCompile::Setup, ..Default::default()
+        })?;
+        let kernels = installed.pipelines.camera_evaluations.lock().unwrap();
+        let capacities: std::collections::BTreeMap<_, _> = kernels.keys().filter_map(|kernel| match kernel {
+            crate::pipelines::ProgramKernel::Decoupled {stage: ShadeStage::EvaluateProgram(id), boundaries, ..} => Some((*id, *boundaries)),
+            _ => None,
+        }).collect();
+        assert_eq!(capacities.len(), 2);
+        assert!(capacities.values().any(|&capacity| capacity == 0));
+        assert!(capacities.values().any(|&capacity| capacity > 0));
+        Ok(())
+    }
 
     #[test]
     fn refraction_entries_keep_off_bin_solid_materials() {

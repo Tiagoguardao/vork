@@ -13,7 +13,7 @@ use crate::types::{
     PaintItem, PaintKind, PaintPhase, RawNode, Rect, Transform2D,
 };
 use crate::value::Value;
-use std::collections::HashSet;
+type HashSet<T> = hashbrown::HashSet<T, rustc_hash::FxBuildHasher>;
 
 /// Group bounds union their children this many levels down, no further (see [`bounds_for`]).
 const BOUNDS_MAX_DEPTH: usize = 32;
@@ -23,7 +23,11 @@ const BOUNDS_MAX_DEPTH: usize = 32;
 /// it: nothing outlives the scene state it was computed from, so nothing needs invalidating. Every entry is the
 /// value the uncached computation returns, bit for bit.
 #[derive(Default)]
-struct BuildMemo {
+struct BuildMemo<'a> {
+    /// A full parallel page emits leaves first. Groups then read those same leaf bounds.
+    defer_groups: bool,
+    parent: ParentPaint,
+    emitted_leaves: Option<EmittedLeaves<'a>>,
     /// [`Scene::node_canvas_affine_and_transform`] by node id.
     canvas: HashMap<NodeId, Option<(Affine, Transform2D)>>,
     /// Bounds that no depth cut-off truncated, with the height of the subtree they cover: the same at any depth
@@ -31,7 +35,59 @@ struct BuildMemo {
     bounds: HashMap<NodeId, (Option<Rect>, usize)>,
 }
 
-impl BuildMemo {
+/// The clip, effects and fallback reasons inherited by siblings are identical
+/// throughout a display-list build. Each emitting worker keeps its last parent.
+#[derive(Default)]
+struct ParentPaint {
+    id: Option<String>,
+    clip: Vec<ClipDescriptor>,
+    effects: Vec<PaintEffect>,
+    mask_source: bool,
+    opacity: bool,
+    blend: bool,
+}
+
+impl ParentPaint {
+    fn read(&mut self, scene: &Scene, node: &RawNode, mask_sources: &HashSet<String>) {
+        let parent = scene.parent_map.get(node.id()).or_else(|| scene.transient_parent_of.get(node.id()));
+        if self.id.as_ref() == parent { return; }
+        let groups = collect_parent_group_ids(scene, parent.map(String::as_str));
+        *self = Self {
+            id: parent.cloned(),
+            clip: collect_clip_chain(scene, &groups),
+            effects: group_effects(scene, &groups),
+            mask_source: groups.iter().any(|id| mask_sources.contains(id)),
+            opacity: has_group_opacity_ancestor(scene, &groups),
+            blend: has_blend_mode_ancestor(scene, &groups),
+        };
+    }
+}
+
+/// Group children usually follow their boundary in paint order. Consume those bounds
+/// in place and index by name only when visibility or stacking changes that order.
+struct EmittedLeaves<'a> {
+    items: &'a [PaintItem],
+    next: usize,
+    by_id: Option<HashMap<&'a str, Option<Rect>>>,
+}
+impl EmittedLeaves<'_> {
+    fn get(&mut self, id: &str) -> Option<Option<Rect>> {
+        let eligible = |item: &PaintItem| item.is_primary_node_item
+            && !matches!(item.kind, PaintKind::GroupBoundary | PaintKind::PageBackground)
+            && item.node_type != "blend";
+        while self.items.get(self.next).is_some_and(|item| !item.is_primary_node_item) {
+            self.next += 1;
+        }
+        if let Some(item) = self.items.get(self.next).filter(|item| item.node_id == id) {
+            self.next += 1;
+            return eligible(item).then_some(item.bounds_canvas);
+        }
+        self.by_id.get_or_insert_with(|| self.items.iter().filter(|item| eligible(item))
+            .map(|item| (item.node_id.as_str(), item.bounds_canvas)).collect()).get(id).copied()
+    }
+}
+
+impl BuildMemo<'_> {
     fn canvas(&mut self, scene: &Scene, id: &str) -> Option<(Affine, Transform2D)> {
         if let Some(c) = self.canvas.get(id) {
             return *c;
@@ -52,31 +108,46 @@ impl BuildMemo {
 
 /// Build the display list for one page (displayList.ts:99-122).
 pub fn build_display_list(scene: &Scene, page_id: &str) -> DisplayList {
-    build_page_list(scene, page_id, true)
+    build_page_list(scene, page_id, true, |_| {})
 }
 
 /// Structural source membership for retained offscreen emission. Visibility remains a row value.
 pub fn build_retained_display_list(scene: &Scene, page_id: &str) -> DisplayList {
-    build_page_list(scene, page_id, false)
+    build_page_list(scene, page_id, false, |_| {})
 }
 
-fn build_page_list(scene: &Scene, page_id: &str, visible_only: bool) -> DisplayList {
-    let node_order = scene.flattened_z_order_for_page_opts(page_id, visible_only, true);
+/// Build the page list and collect planner inputs from each visible effective node.
+pub fn build_page_list(scene: &Scene, page_id: &str, visible_only: bool, mut observe: impl FnMut(&RawNode)) -> DisplayList {
     let clip_mask_source_ids = collect_clip_mask_source_ids(scene);
-    let mut memo = BuildMemo::default();
-    let mut items = Vec::new();
-    for (z_index, node_id) in node_order.iter().enumerate() {
-        let Some(node) = scene.effective_node(node_id) else {
-            continue;
-        };
-        items.extend(build_paint_items_for_node(
-            scene,
-            node,
-            z_index,
-            &clip_mask_source_ids,
-            &mut memo,
-        ));
-    }
+    use rayon::prelude::*;
+    let mut nodes = Vec::new();
+    let mut next_z = 0;
+    scene.visit_page_z(page_id, visible_only, true, |node_id, visible| {
+        if let Some(node) = scene.effective_node(node_id) {
+            if visible { observe(node); }
+            nodes.push((next_z, node));
+        }
+        next_z += 1;
+    });
+    let parallel_page = nodes.len() > 2048;
+    let emit = |chunk: &[(usize, &RawNode)]| {
+        let mut memo = BuildMemo { defer_groups: parallel_page, ..Default::default() };
+        let mut items = Vec::with_capacity(chunk.len());
+        for &(z, node) in chunk {
+            append_paint_items_for_node(scene, node, z, &clip_mask_source_ids, &mut memo, &mut items);
+        }
+        items
+    };
+    let items = if !parallel_page {
+        emit(&nodes)
+    } else {
+        let grain = nodes.len().div_ceil(rayon::current_num_threads()).max(2048);
+        let chunks: Vec<_> = nodes.par_chunks(grain).map(emit).collect();
+        let mut items = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+        for chunk in chunks { items.extend(chunk); }
+        finish_group_bounds(scene, &mut items);
+        items
+    };
     let page_index = scene
         .doc
         .pages
@@ -87,6 +158,27 @@ fn build_page_list(scene: &Scene, page_id: &str, visible_only: bool) -> DisplayL
         page_id: page_id.to_string(),
         page_index,
         items,
+    }
+}
+
+/// A group's bounds union its children, including children omitted from the display list. The
+/// visible leaf items already contain their bounds from the parallel page build. Use those
+/// directly and let the ordinary recursive walk handle hidden children, nesting and depth limits.
+fn finish_group_bounds(scene: &Scene, items: &mut [PaintItem]) {
+    if !items.iter().any(|item| item.kind == PaintKind::GroupBoundary) { return; }
+    let mut memo = BuildMemo { emitted_leaves: Some(EmittedLeaves { items, next: 0, by_id: None }), ..Default::default() };
+    let groups: Vec<_> = items.iter().enumerate()
+        .filter(|(_, item)| item.kind == PaintKind::GroupBoundary)
+        .map(|(i, item)| {
+            memo.emitted_leaves.as_mut().unwrap().next = i + 1;
+            (i, scene.effective_node(&item.node_id).and_then(|node| node_bounds_canvas(scene, node, &mut memo)))
+        })
+        .collect();
+    for (start, bounds) in groups {
+        let z = items[start].z_index;
+        for item in items[start..].iter_mut().take_while(|item| item.z_index == z) {
+            item.bounds_canvas = bounds;
+        }
     }
 }
 
@@ -116,13 +208,14 @@ fn build_display_list_for_canvas_with(scene: &Scene, memo: &mut BuildMemo) -> Di
         let Some(node) = scene.effective_node(node_id) else {
             continue;
         };
-        items.extend(build_paint_items_for_node(
+        append_paint_items_for_node(
             scene,
             node,
             z_index,
             &clip_mask_source_ids,
             memo,
-        ));
+            &mut items,
+        );
     }
     DisplayList {
         // Synthetic: the canvas root is not a page. `page_index` is unused by
@@ -145,19 +238,22 @@ pub fn display_list_items_for(
     z_index_start: usize,
     clip_mask_source_ids: &HashSet<String>,
 ) -> Vec<PaintItem> {
+    display_list_items_at(scene, node_order.iter().enumerate().map(|(i, id)| (z_index_start + i, id.as_str())), clip_mask_source_ids)
+}
+
+/// Rebuild retained display-list sources at their original ordinals. A non-drawing
+/// group can separate the ordinals of two consecutive output spans.
+pub fn display_list_items_at<'a>(
+    scene: &Scene,
+    sources: impl IntoIterator<Item = (usize, &'a str)>,
+    clip_mask_source_ids: &HashSet<String>,
+) -> Vec<PaintItem> {
     let mut memo = BuildMemo::default();
     let mut items = Vec::new();
-    for (k, node_id) in node_order.iter().enumerate() {
-        let Some(node) = scene.effective_node(node_id) else {
-            continue;
-        };
-        items.extend(build_paint_items_for_node(
-            scene,
-            node,
-            z_index_start + k,
-            clip_mask_source_ids,
-            &mut memo,
-        ));
+    for (z_index, node_id) in sources {
+        if let Some(node) = scene.effective_node(node_id) {
+            append_paint_items_for_node(scene, node, z_index, clip_mask_source_ids, &mut memo, &mut items);
+        }
     }
     items
 }
@@ -167,11 +263,10 @@ pub fn display_list_items_for(
 /// of [`clip_mask_source_ids`], so a caller can keep the set up to date as
 /// nodes change.
 pub fn clip_mask_source_of(scene: &Scene, id: &str) -> Option<String> {
-    let node = scene
-        .resolved_by_id
-        .get(id)
-        .or_else(|| scene.node(id))
-        .or_else(|| scene.transient_by_id.get(id))?;
+    clip_mask_source(scene.effective_node(id)?)
+}
+
+fn clip_mask_source(node: &RawNode) -> Option<String> {
     if node.node_type() != "group" {
         return None;
     }
@@ -268,17 +363,22 @@ pub fn canvas_root_frame_size(scene: &Scene) -> Option<(f64, f64)> {
 }
 
 /// displayList.ts:142-176.
-fn build_paint_items_for_node(
+fn append_paint_items_for_node(
     scene: &Scene,
     node: &RawNode,
     z_index: usize,
     clip_mask_source_ids: &HashSet<String>,
     memo: &mut BuildMemo,
-) -> Vec<PaintItem> {
+    items: &mut Vec<PaintItem>,
+) {
     let base = build_base_paint_item(scene, node, z_index, clip_mask_source_ids, memo);
-    let mut items = vec![base.clone()];
+    let shape_text = has_shape_text(node);
+    let connector_text = has_connector_text(node);
+    items.push(base);
+    if !shape_text && !connector_text { return; }
+    let base = items.last().expect("just emitted").clone();
 
-    if has_shape_text(node) {
+    if shape_text {
         let mut reasons = base.fallback_reasons.clone();
         push_unique(&mut reasons, "intra-node-ordering");
         items.push(PaintItem {
@@ -290,7 +390,7 @@ fn build_paint_items_for_node(
             ..base.clone()
         });
     }
-    if has_connector_text(node) {
+    if connector_text {
         let mut reasons = base.fallback_reasons.clone();
         push_unique(&mut reasons, "intra-node-ordering");
         items.push(PaintItem {
@@ -302,7 +402,6 @@ fn build_paint_items_for_node(
             ..base
         });
     }
-    items
 }
 
 /// displayList.ts:178-209.
@@ -314,23 +413,27 @@ fn build_base_paint_item(
     memo: &mut BuildMemo,
 ) -> PaintItem {
     let kind = primary_paint_kind(node);
-    // One ancestor walk serves the effects, the clip chain and the fallback reasons.
-    let parent_group_ids = collect_parent_group_ids(scene, node.id());
-    let clip_chain = collect_clip_chain(scene, &parent_group_ids);
-    let effects = collect_effects(scene, node, &parent_group_ids);
-    let mut fallback_reasons = collect_fallback_reasons(
-        scene,
-        node,
-        &effects,
-        clip_mask_source_ids,
-        &parent_group_ids,
-        &clip_chain,
-    );
+    memo.parent.read(scene, node, clip_mask_source_ids);
+    let clip_chain = memo.parent.clip.clone();
+    let mut effects = collect_effects(node);
+    effects.extend_from_slice(&memo.parent.effects);
+    let mut fallback_reasons = collect_fallback_reasons(node, &effects, clip_mask_source_ids, &memo.parent);
     // collectTransientTextFallbackReasons (displayList.ts:220-223): transient
     // richtext (table cell contents) report 'unsupported-node-kind'.
     if kind == PaintKind::Richtext && scene.transient_by_id.contains_key(node.id()) {
         push_unique(&mut fallback_reasons, "unsupported-node-kind");
     }
+    let (bounds_canvas, world) = if memo.defer_groups {
+        let world = scene.node_canvas_affine_and_transform(node.id());
+        let bounds = match kind {
+            PaintKind::GroupBoundary => None,
+            _ if node.node_type() == "group" => node_bounds_canvas(scene, node, memo),
+            _ => world.and_then(|(affine, _)| leaf_bounds(scene, node, affine, memo)),
+        };
+        (bounds, world)
+    } else {
+        (node_bounds_canvas(scene, node, memo), memo.canvas(scene, node.id()))
+    };
     PaintItem {
         id: format!("{}:{}", node.id(), kind.as_str()),
         node_id: node.id().to_string(),
@@ -342,9 +445,9 @@ fn build_base_paint_item(
         kind,
         z_index,
         phase: paint_phase(node, kind),
-        bounds_canvas: node_bounds_canvas(scene, node, memo),
-        world_transform: memo.canvas_transform(scene, node.id()),
-        world_affine: memo.canvas_affine(scene, node.id()),
+        bounds_canvas,
+        world_transform: world.map(|(_, transform)| transform),
+        world_affine: world.map(|(affine, _)| affine),
         opacity: node.opacity(),
         clip_chain,
         blend_mode: blend_mode_of(node),
@@ -362,8 +465,7 @@ fn primary_paint_kind(node: &RawNode) -> PaintKind {
     match node.node_type() {
         "group" => PaintKind::GroupBoundary,
         "richtext" => PaintKind::Richtext,
-        "generated" if node.str("renderMode") == Some("vector-asset") => PaintKind::Svg,
-        "generated" if node.str("renderMode") == Some("raster-asset") => PaintKind::Image,
+
         _ => PaintKind::ShapeFill,
     }
 }
@@ -389,23 +491,10 @@ fn paint_phase(node: &RawNode, kind: PaintKind) -> PaintPhase {
 
 /// displayList.ts:234-242 — clip-mask source rectangles across the document.
 pub fn clip_mask_source_ids(scene: &Scene) -> HashSet<String> {
-    let mut ids: HashSet<String> = scene
-        .node_order
-        .iter()
-        .filter_map(|id| clip_mask_source_of(scene, id))
-        .collect();
-    // Envelopes (E8.17): their transient groups' masks, and everything an envelope draws when the envelope
-    // itself is a clip mask.
-    if !scene.envelope_transients.is_empty() {
-        ids.extend(scene.envelope_mask_sources.iter().cloned());
-        let masked_envelopes: Vec<&String> =
-            scene.envelope_transients.keys().filter(|e| ids.contains(*e)).collect();
-        let extra: Vec<String> = masked_envelopes
-            .into_iter()
-            .flat_map(|e| scene.envelope_transients[e].iter().cloned())
-            .collect();
-        ids.extend(extra);
-    }
+    let mut ids = HashSet::default();
+    scene.visit_effective_nodes(|_, node| {
+        if let Some(mask) = clip_mask_source(node) { ids.insert(mask); }
+    });
     ids
 }
 
@@ -415,26 +504,24 @@ fn collect_clip_mask_source_ids(scene: &Scene) -> HashSet<String> {
 
 /// displayList.ts:244-268.
 fn collect_fallback_reasons(
-    scene: &Scene,
     node: &RawNode,
     effects: &[PaintEffect],
     clip_mask_source_ids: &HashSet<String>,
-    parent_group_ids: &[String],
-    clip_chain: &[ClipDescriptor],
+    parent: &ParentPaint,
 ) -> Vec<&'static str> {
     let mut reasons: Vec<&'static str> = Vec::new();
     if clip_mask_source_ids.contains(node.id())
-        || parent_group_ids.iter().any(|id| clip_mask_source_ids.contains(id))
+        || parent.mask_source
     {
         push_unique(&mut reasons, "text-mask-source");
     }
-    if !clip_chain.is_empty() {
+    if !parent.clip.is_empty() {
         push_unique(&mut reasons, "ancestor-clip-mask");
     }
-    if has_group_opacity_ancestor(scene, parent_group_ids) {
+    if parent.opacity {
         push_unique(&mut reasons, "group-opacity");
     }
-    if blend_mode_of(node).is_some() || has_blend_mode_ancestor(scene, parent_group_ids) {
+    if blend_mode_of(node).is_some() || parent.blend {
         push_unique(&mut reasons, "blend-mode");
     }
     if effects
@@ -459,7 +546,7 @@ fn collect_fallback_reasons(
     }
     if matches!(
         node.node_type(),
-        "table" | "generated" | "generator" | "blend"
+        "generator" | "blend"
     ) {
         push_unique(&mut reasons, "unsupported-node-kind");
     }
@@ -467,31 +554,31 @@ fn collect_fallback_reasons(
 }
 
 /// displayList.ts:270-287. `parent_group_ids` is [`collect_parent_group_ids`] of the node.
-fn collect_effects(scene: &Scene, node: &RawNode, parent_group_ids: &[String]) -> Vec<PaintEffect> {
+fn collect_effects(node: &RawNode) -> Vec<PaintEffect> {
     let mut effects = Vec::new();
-    let id = node.id().to_string();
+    let id = node.id();
     if has_shadow(node) {
         effects.push(PaintEffect {
             kind: PaintEffectKind::Shadow,
-            source_node_id: id.clone(),
+            source_node_id: id.to_owned(),
         });
     }
     if has_stroke(node) {
         effects.push(PaintEffect {
             kind: PaintEffectKind::Stroke,
-            source_node_id: id.clone(),
+            source_node_id: id.to_owned(),
         });
     }
     if has_background_blur(node) {
         effects.push(PaintEffect {
             kind: PaintEffectKind::BackgroundBlur,
-            source_node_id: id.clone(),
+            source_node_id: id.to_owned(),
         });
     }
     if blend_mode_of(node).is_some() {
         effects.push(PaintEffect {
             kind: PaintEffectKind::BlendMode,
-            source_node_id: id.clone(),
+            source_node_id: id.to_owned(),
         });
     }
     // The fill stack (E3.1 P3): an image fill is the pattern effect; a shader
@@ -500,20 +587,15 @@ fn collect_effects(scene: &Scene, node: &RawNode, parent_group_ids: &[String]) -
     if matches!(fill, Some(Paint::Image(_))) {
         effects.push(PaintEffect {
             kind: PaintEffectKind::Pattern,
-            source_node_id: id.clone(),
+            source_node_id: id.to_owned(),
         });
     }
-    if matches!(fill, Some(Paint::Shader(_)))
-        || matches!(
-            crate::paint::node_text_fills(node).last(),
-            Some(Paint::Shader(_))
-        )
-    {
-        effects.push(PaintEffect {
-            kind: PaintEffectKind::Shader,
-            source_node_id: id.clone(),
-        });
-    }
+
+    effects
+}
+
+fn group_effects(scene: &Scene, parent_group_ids: &[String]) -> Vec<PaintEffect> {
+    let mut effects = Vec::new();
     for group_id in parent_group_ids {
         // NOTE: TS reads the CANONICAL node here (scene.getNodeById,
         // displayList.ts:280-285).
@@ -569,16 +651,11 @@ fn collect_clip_chain(scene: &Scene, parent_group_ids: &[String]) -> Vec<ClipDes
 /// displayList.ts `collectParentGroupIds`. Walks
 /// `getNodeGroupId ?? getParentIdForTransientNode`, pushing only ParentNodes
 /// and stepping THROUGH non-parent transient hosts (table / generated).
-fn collect_parent_group_ids(scene: &Scene, node_id: &str) -> Vec<String> {
+fn collect_parent_group_ids<'a>(scene: &'a Scene, mut parent_id: Option<&'a str>) -> Vec<String> {
     let mut ids = Vec::new();
     // Ancestor chains are usually a few links long, but a rig of groups inside groups can be a thousand: a list
     // scanned per step made each walk quadratic in the depth.
     let mut seen = SeenIds::default();
-    let mut parent_id: Option<&str> = scene
-        .parent_map
-        .get(node_id)
-        .or_else(|| scene.transient_parent_of.get(node_id))
-        .map(String::as_str);
     while let Some(pid) = parent_id {
         if !seen.insert(pid) {
             break;
@@ -643,7 +720,6 @@ fn has_shadow(node: &RawNode) -> bool {
 fn has_stroke(node: &RawNode) -> bool {
     crate::paint::with_top_stroke(node, |s| s.is_some_and(|s| s.width > 0.0))
 }
-
 
 /// displayList.ts `hasBackgroundBlur`: backdrop-capable type AND a visible
 /// backdrop effect (`readBackdrop`, `effect::backdrop`) — NOT the
@@ -775,25 +851,19 @@ fn bounds_uncached(
         return (None, Some(0));
     };
     if node.node_type() == "group" {
-        let children: Vec<String> = node
-            .array("children")
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let children = node.array("children").into_iter().flatten().filter_map(Value::as_str);
         let mut acc: Option<(f64, f64, f64, f64)> = None;
         // The deepest level below this group the union reached; `None` once the cut-off truncated it.
         let mut height = Some(0);
         for cid in children {
-            let Some(child) = scene.effective_node(&cid) else {
-                continue;
+            let (r, child_height) = match memo.emitted_leaves.as_mut().and_then(|leaves| leaves.get(cid)) {
+                Some(bounds) if depth < BOUNDS_MAX_DEPTH => (bounds, Some(0)),
+                _ => {
+                    let Some(child) = scene.effective_node(cid) else { continue };
+                    if child.node_type() == "blend" { continue; }
+                    bounds_for(scene, child, depth + 1, memo)
+                }
             };
-            if child.node_type() == "blend" {
-                continue; // skip blend bounds inside groups (simplified)
-            }
-            let (r, child_height) = bounds_for(scene, child, depth + 1, memo);
             height = match (height, child_height) {
                 (Some(h), Some(c)) => Some(h.max(c + 1)),
                 _ => None,
@@ -1178,23 +1248,6 @@ mod tests {
         assert!(c.fallback_reasons.contains(&"ancestor-clip-mask"));
         assert_eq!(c.clip_chain.len(), 1);
         assert_eq!(c.clip_chain[0].mode, "group-mask");
-    }
-
-    #[test]
-    fn generated_raster_kind_is_image_when_not_expanded() {
-        // With expandTransientNodes=true the host never appears; check the
-        // kind classification path directly through a vector-asset host that
-        // has no cachedAssetUrl... the kind logic itself:
-        let n = RawNode::from_value(json!({
-            "id":"gen","type":"generated","generatedKind":"latex","renderMode":"raster-asset"
-        }))
-        .unwrap();
-        assert_eq!(super::primary_paint_kind(&n), PaintKind::Image);
-        let n2 = RawNode::from_value(json!({
-            "id":"gen","type":"generated","generatedKind":"latex","renderMode":"vector-asset"
-        }))
-        .unwrap();
-        assert_eq!(super::primary_paint_kind(&n2), PaintKind::Svg);
     }
 
     #[test]

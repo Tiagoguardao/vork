@@ -1,4 +1,4 @@
-//! [`TexturePool`]: the pixel graph's textures, reused across nodes and frames under a byte budget.
+//! [`TexturePool`]: render textures, reused across frames under a byte budget.
 //!
 //! A texture is handed out as a [`PoolTexture`], a shared handle: images are immutable once made, so a node's
 //! output can feed several consumers. When the last handle drops, the texture goes back to the pool's free list
@@ -124,10 +124,7 @@ fn bytes_for(w: u32, h: u32, storage: Storage) -> u64 {
     w as u64 * h as u64 * storage.bytes_per_pixel()
 }
 
-/// Bytes of free textures the pool keeps for reuse, whatever the budget leaves room for. Captures the pool adopts
-/// come back to the free list at their own sizes, which few later requests match (a 3D unit's capture is sized to
-/// its view, and a diorama frame drew 7 of ~67 MB): kept up to the whole budget they were most of a renderer's
-/// footprint (a diorama renderer peaked at 3.5 GB, 2.7 GB this way, at the same speed).
+/// Maximum number of bytes held in free textures for reuse.
 pub const FREE_KEPT_BYTES: u64 = 256 << 20;
 
 /// Destroy free textures, oldest first, until in-use + free + `extra` fits the budget and the free ones fit
@@ -227,7 +224,7 @@ impl TexturePool {
         let reuse = s
             .free
             .iter()
-            .position(|f| f.w == w && f.h == h && f.storage == storage && f.texture.usage().contains(USAGE));
+            .position(|f| f.w == w && f.h == h && f.storage == storage);
         let texture = match reuse {
             Some(i) => {
                 if s.stats.in_use + bytes > s.stats.budget {
@@ -252,7 +249,7 @@ impl TexturePool {
                 s.stats.created += 1;
                 s.stats.resident += bytes;
                 self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("pixel graph image"),
+                    label: Some("pooled render texture"),
                     size: wgpu::Extent3d {
                         width: w,
                         height: h,
@@ -267,42 +264,6 @@ impl TexturePool {
                 })
             }
         };
-        s.stats.in_use += bytes;
-        s.stats.peak = s.stats.peak.max(s.stats.in_use);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Ok(PoolTexture(Rc::new(Inner {
-            texture: Some(texture),
-            view,
-            w,
-            h,
-            storage,
-            pool: Rc::downgrade(&self.state),
-        })))
-    }
-
-    /// Wrap a texture the renderer made (a capture) so it counts against the budget and returns to the free list.
-    /// It must be `Rgba16Float` or `Rgba32Float` with at least the pool's usages.
-    pub fn adopt(&self, texture: wgpu::Texture) -> Result<PoolTexture, PixelError> {
-        let storage = match texture.format() {
-            wgpu::TextureFormat::Rgba16Float => Storage::F16,
-            wgpu::TextureFormat::Rgba32Float => Storage::F32,
-            f => return Err(PixelError::Invalid(format!("the pixel graph can't adopt a {f:?} texture"))),
-        };
-        if !texture.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC) {
-            return Err(PixelError::Invalid("an adopted texture must be sampled and copied".into()));
-        }
-        let (w, h) = (texture.width(), texture.height());
-        let bytes = bytes_for(w, h, storage);
-        let mut s = self.state.borrow_mut();
-        if s.stats.in_use + bytes > s.stats.budget {
-            return Err(PixelError::Budget {
-                needed: bytes,
-                in_use: s.stats.in_use,
-                budget: s.stats.budget,
-            });
-        }
-        trim(&mut s, bytes);
-        s.stats.resident += bytes;
         s.stats.in_use += bytes;
         s.stats.peak = s.stats.peak.max(s.stats.in_use);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

@@ -160,22 +160,7 @@ pub struct BooleanRequest {
     pub accuracy: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bounds {
-    pub min_x: f64,
-    pub min_y: f64,
-    pub max_x: f64,
-    pub max_y: f64,
-}
-
-impl Bounds {
-    pub(crate) fn include(&mut self, x: f64, y: f64) {
-        self.min_x = self.min_x.min(x);
-        self.min_y = self.min_y.min(y);
-        self.max_x = self.max_x.max(x);
-        self.max_y = self.max_y.max(y);
-    }
-}
+pub use crate::path_geom::bounds::Bounds;
 
 #[derive(Debug, Clone)]
 pub enum BooleanOutcome {

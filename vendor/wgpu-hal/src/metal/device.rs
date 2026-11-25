@@ -296,6 +296,54 @@ fn fnv(seed: u64, parts: &[&[u8]]) -> u64 {
 }
 
 impl super::Device {
+    fn texture_descriptor(&self, desc: &crate::TextureDescriptor) -> Retained<MTLTextureDescriptor> {
+        let mtl_format = self
+        .shared
+            .private_texture_format_caps
+            .map_format(desc.format);
+
+        let descriptor = MTLTextureDescriptor::new();
+
+        let mtl_type = match desc.dimension {
+            wgt::TextureDimension::D1 => MTLTextureType::Type1D,
+            wgt::TextureDimension::D2 => {
+                if desc.sample_count > 1 {
+                    unsafe { descriptor.setSampleCount(desc.sample_count as usize) };
+                    MTLTextureType::Type2DMultisample
+                } else if desc.size.depth_or_array_layers > 1 {
+                    unsafe {
+                        descriptor.setArrayLength(desc.size.depth_or_array_layers as usize)
+                    };
+                    MTLTextureType::Type2DArray
+                } else {
+                    MTLTextureType::Type2D
+                }
+            }
+            wgt::TextureDimension::D3 => {
+                unsafe { descriptor.setDepth(desc.size.depth_or_array_layers as usize) };
+                MTLTextureType::Type3D
+            }
+        };
+
+        let mtl_storage_mode = if desc.usage.contains(wgt::TextureUses::TRANSIENT)
+            && self.shared.private_caps.supports_memoryless_storage
+        {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
+        };
+
+        descriptor.setTextureType(mtl_type);
+        unsafe { descriptor.setWidth(desc.size.width as usize) };
+        unsafe { descriptor.setHeight(desc.size.height as usize) };
+        unsafe { descriptor.setMipmapLevelCount(desc.mip_level_count as usize) };
+        descriptor.setPixelFormat(mtl_format);
+        descriptor.setUsage(conv::map_texture_usage(desc.format, desc.usage));
+        descriptor.setStorageMode(mtl_storage_mode);
+
+        descriptor
+    }
+
     fn compile_passthrough_msl(&self, label: crate::Label<'_>, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
         let options = MTLCompileOptions::new();
         // Match Naga modules: honor invariant vertex positions in passthrough MSL.
@@ -688,55 +736,20 @@ impl crate::Device for super::Device {
     unsafe fn flush_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
     unsafe fn invalidate_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
 
+    fn texture_binding_size(&self, desc: &crate::TextureDescriptor) -> Option<u64> {
+        autoreleasepool(|_| {
+            let size = self.shared.device.heapTextureSizeAndAlignWithDescriptor(&self.texture_descriptor(desc)).size;
+            (size != 0).then_some(size as u64)
+        })
+    }
+
     unsafe fn create_texture(
         &self,
         desc: &crate::TextureDescriptor,
     ) -> DeviceResult<super::Texture> {
-        let mtl_format = self
-            .shared
-            .private_texture_format_caps
-            .map_format(desc.format);
-
         autoreleasepool(|_| {
-            let descriptor = MTLTextureDescriptor::new();
-
-            let mtl_type = match desc.dimension {
-                wgt::TextureDimension::D1 => MTLTextureType::Type1D,
-                wgt::TextureDimension::D2 => {
-                    if desc.sample_count > 1 {
-                        unsafe { descriptor.setSampleCount(desc.sample_count as usize) };
-                        MTLTextureType::Type2DMultisample
-                    } else if desc.size.depth_or_array_layers > 1 {
-                        unsafe {
-                            descriptor.setArrayLength(desc.size.depth_or_array_layers as usize)
-                        };
-                        MTLTextureType::Type2DArray
-                    } else {
-                        MTLTextureType::Type2D
-                    }
-                }
-                wgt::TextureDimension::D3 => {
-                    unsafe { descriptor.setDepth(desc.size.depth_or_array_layers as usize) };
-                    MTLTextureType::Type3D
-                }
-            };
-
-            let mtl_storage_mode = if desc.usage.contains(wgt::TextureUses::TRANSIENT)
-                && self.shared.private_caps.supports_memoryless_storage
-            {
-                MTLStorageMode::Memoryless
-            } else {
-                MTLStorageMode::Private
-            };
-
-            descriptor.setTextureType(mtl_type);
-            unsafe { descriptor.setWidth(desc.size.width as usize) };
-            unsafe { descriptor.setHeight(desc.size.height as usize) };
-            unsafe { descriptor.setMipmapLevelCount(desc.mip_level_count as usize) };
-            descriptor.setPixelFormat(mtl_format);
-            descriptor.setUsage(conv::map_texture_usage(desc.format, desc.usage));
-            descriptor.setStorageMode(mtl_storage_mode);
-
+            let descriptor = self.texture_descriptor(desc);
+            let mtl_type = descriptor.textureType();
             let raw = self
                 .shared
                 .device

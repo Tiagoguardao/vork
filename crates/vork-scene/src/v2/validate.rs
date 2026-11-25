@@ -14,6 +14,181 @@ impl BufferType {
     }
 }
 impl Scene {
+    fn validate_geometry<'a>(
+        &'a self,
+        name: &str,
+        g: &Geometry,
+        lookup: &impl Fn(&str) -> Result<&'a Buffer>,
+    ) -> Result<()> {
+        if matches!(g.topology, Topology::Implicit) {
+            ensure!(g.attributes.len()==1 && g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty() && g.subdivision.is_none() && g.face_vertex_counts.is_none() && g.crease_edge.is_empty() && g.widths.is_none() && g.curve_vertex_counts.is_none(), "geometry {name}: implicit requires exactly one grid and no mesh modifiers");
+            let b=lookup(g.attributes.values().next().unwrap())?;
+            ensure!(b.element_type==BufferType::F32 && b.dims.is_some_and(|d|d.iter().all(|&v|v>=2)), "geometry {name}: implicit requires f32 dims >= 2");
+            return Ok(());
+        }
+        if matches!(g.topology, Topology::Volume) {
+            ensure!(!g.attributes.is_empty(), "geometry {name}: volume requires named grid fields");
+            ensure!(g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty()
+                && g.face_vertex_counts.is_none() && g.crease_edge.is_empty()
+                && g.subdivision.is_none()
+                && g.curve_vertex_counts.is_none() && g.widths.is_none(),
+                "geometry {name}: volume fields cannot have mesh/curve data or modifiers");
+            for buffer in g.attributes.values() {
+                ensure!(self.buffers.get(buffer).is_some_and(|b|b.is_volume_grid()), "geometry {name}: volume fields require grid buffers");
+            }
+            return Ok(());
+        }
+        for buffer in g.attributes.values().chain(g.indices.iter()) {
+            ensure!(lookup(buffer)?.grid.is_none() && lookup(buffer)?.dims.is_none(), "geometry {name}: grid buffers require volume topology");
+        }
+        if matches!(g.topology, Topology::Curves) {
+            let counts = g.curve_vertex_counts.as_ref().context("curves require curve_vertex_counts")?;
+            let widths = g.widths.as_ref().context("curves require widths (diameter)")?;
+            ensure!(lookup(counts)?.element_type == BufferType::U32, "curve_vertex_counts require u32");
+            ensure!(lookup(widths)?.element_type == BufferType::F32, "widths require f32");
+            ensure!(g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty(),
+                "geometry {name}: curves do not support indices, material_ranges or morphs yet");
+            ensure!(g.subdivision.is_none() && g.crease_edge.is_empty(), "curves do not support mesh modifiers or creases");
+            ensure!(g.attributes.contains_key("POSITION"), "curves require POSITION");
+            ensure!(!g.attributes.keys().any(|a| matches!(a.as_str(), "NORMAL"|"TANGENT"|"TEXCOORD_0"|"TEXCOORD_1"|"JOINTS_0"|"WEIGHTS_0")),
+                "curves generate normals and UVs; authored normal/tangent/UV and skin attributes are unsupported");
+        } else if matches!(g.topology, Topology::Points) {
+            let widths = g.widths.as_ref().context("points require widths (diameter)")?;
+            ensure!(lookup(widths)?.element_type == BufferType::F32, "point widths require f32");
+            ensure!(g.curve_vertex_counts.is_none() && g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty(),
+                "geometry {name}: points do not support curve counts, indices, material_ranges or morphs");
+            ensure!(g.subdivision.is_none() && g.crease_edge.is_empty(),
+                "points do not support mesh modifiers or creases");
+            ensure!(g.attributes.contains_key("POSITION"), "points require POSITION");
+            ensure!(!g.attributes.keys().any(|a| matches!(a.as_str(), "NORMAL"|"TANGENT"|"TEXCOORD_0"|"TEXCOORD_1"|"JOINTS_0"|"WEIGHTS_0")),
+                "points generate normals and UVs; authored normal/tangent/UV and skin attributes are unsupported");
+        } else {
+            ensure!(g.curve_vertex_counts.is_none() && g.widths.is_none(),
+                "curve_vertex_counts requires curves; widths requires curves or points topology");
+        }
+        for (attr, buffer) in &g.attributes {
+            let b = lookup(buffer)?;
+            if is_color_attribute(attr) {
+                ensure!(matches!(b.element_type, BufferType::Vec3 | BufferType::Vec4),
+                    "geometry {name}: {attr} buffer has wrong type; expected Vec3 or Vec4");
+            } else if let Some((_, expected)) = STANDARD_ATTRIBUTES.iter().find(|(n, _)| n == attr) {
+                ensure!(
+                    b.element_type == *expected,
+                    "geometry {name}: {attr} buffer has wrong type; expected {expected:?}"
+                );
+            }
+        }
+        if let Some(index) = &g.indices {
+            ensure!(
+                matches!(lookup(index)?.element_type, BufferType::U32),
+                "indices require u32"
+            );
+        }
+        ensure!(g.subdivision.is_none() || g.material_ranges.is_empty(), "geometry {name}: subdivision requires one material (no material_ranges)");
+        if let Some(sizes) = &g.face_vertex_counts {
+            ensure!(
+                matches!(g.topology, Topology::Triangles),
+                "geometry {name}: polygon cages require triangle topology"
+            );
+            ensure!(
+                !sizes.is_empty() && sizes.iter().all(|n| *n >= 3),
+                "geometry {name}: face_vertex_counts require at least three corners per polygon"
+            );
+            ensure!(
+                g.material_ranges.is_empty(),
+                "geometry {name}: polygon cages cannot have triangle material_ranges; subdivide with std first"
+            );
+            let corners: u64 = sizes.iter().map(|n| u64::from(*n)).sum();
+            let count = g
+                .indices
+                .as_ref()
+                .and_then(|i| self.buffers[i].len())
+                .or_else(|| {
+                    g.indices
+                        .is_none()
+                        .then(|| {
+                            g.attributes
+                                .get("POSITION")
+                                .and_then(|p| self.buffers[p].len())
+                        })
+                        .flatten()
+                });
+            if let Some(count) = count {
+                ensure!(
+                    corners == count as u64,
+                    "geometry {name}: face_vertex_counts cover {corners} of {count} corners"
+                );
+            }
+        }
+        let mut edges = std::collections::BTreeSet::new();
+        let vertices = g
+            .attributes
+            .get("POSITION")
+            .and_then(|p| self.buffers.get(p))
+            .and_then(Buffer::len);
+        for edge in &g.crease_edge {
+            let [a, b] = edge.vertices;
+            ensure!(
+                edge.crease.is_finite() && edge.crease >= 0.0,
+                "geometry {name}: edge crease sharpness must be finite and nonnegative"
+            );
+            ensure!(
+                a != b && vertices.is_none_or(|n| (a as usize) < n && (b as usize) < n),
+                "geometry {name}: crease endpoints require distinct in-range vertices"
+            );
+            ensure!(
+                edges.insert((a.min(b), a.max(b))),
+                "geometry {name}: duplicate crease edge"
+            );
+        }
+        if !g.material_ranges.is_empty() {
+            ensure!(
+                g.material_ranges
+                    .iter()
+                    .all(|range| range.start % 3 == 0 && range.count % 3 == 0),
+                "geometry {name}: material_ranges require triangle-aligned starts and counts"
+            );
+            // Ranges partition the index range: every triangle draws exactly once.
+            let mut ranges: Vec<_> = g
+                .material_ranges
+                .iter()
+                .map(|x| (u64::from(x.start), u64::from(x.start) + u64::from(x.count)))
+                .collect();
+            ranges.sort();
+            let mut next = 0;
+            for (start, end) in ranges {
+                ensure!(
+                    start == next,
+                    "geometry {name}: material_ranges must partition the index range; {} at index {next}",
+                    if start < next { "overlap" } else { "gap" }
+                );
+                next = end;
+            }
+            let total = match &g.indices {
+                Some(index) => lookup(index)?.len(),
+                None => g
+                    .attributes
+                    .get("POSITION")
+                    .and_then(|p| self.buffers.get(p)?.len()),
+            };
+            if let Some(total) = total {
+                ensure!(
+                    next == total as u64,
+                    "geometry {name}: material_ranges cover {next} of {total} indices; they must partition the index range"
+                );
+            }
+        }
+        for morph in g.morphs.values() {
+            for name in std::iter::once(&morph.POSITION).chain(morph.NORMAL.iter()) {
+                ensure!(
+                    matches!(lookup(name)?.element_type, BufferType::Vec3),
+                    "morph deltas require vec3"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_resources(&self, nodes_by_name: &BTreeMap<&str, &Node>, require_camera:bool) -> Result<()> {
         let mut errors = Vec::new();
         errors.extend(self.geometry_stages.iter().enumerate().map(|(index,stage)| -> Result<()> {
@@ -237,175 +412,10 @@ impl Scene {
             }
             Ok(())
         }).filter_map(Result::err));
-        errors.extend(self.geometry.iter().map(|(name,g)| -> Result<()> {
-            if matches!(g.topology, Topology::Implicit) {
-                ensure!(g.attributes.len()==1 && g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty() && g.subdivision.is_none() && g.face_vertex_counts.is_none() && g.crease_edge.is_empty() && g.widths.is_none() && g.curve_vertex_counts.is_none(), "geometry {name}: implicit requires exactly one grid and no mesh modifiers");
-                let b=lookup(g.attributes.values().next().unwrap())?;
-                ensure!(b.element_type==BufferType::F32 && b.dims.is_some_and(|d|d.iter().all(|&v|v>=2)), "geometry {name}: implicit requires f32 dims >= 2");
-                return Ok(());
-            }
-            if matches!(g.topology, Topology::Volume) {
-                ensure!(!g.attributes.is_empty(), "geometry {name}: volume requires named grid fields");
-                ensure!(g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty()
-                    && g.face_vertex_counts.is_none() && g.crease_edge.is_empty()
-                    && g.subdivision.is_none()
-                    && g.curve_vertex_counts.is_none() && g.widths.is_none(),
-                    "geometry {name}: volume fields cannot have mesh/curve data or modifiers");
-                for buffer in g.attributes.values() {
-                    ensure!(self.buffers.get(buffer).is_some_and(|b|b.is_volume_grid()), "geometry {name}: volume fields require grid buffers");
-                }
-                return Ok(());
-            }
-            for buffer in g.attributes.values().chain(g.indices.iter()) {
-                ensure!(lookup(buffer)?.grid.is_none() && lookup(buffer)?.dims.is_none(), "geometry {name}: grid buffers require volume topology");
-            }
-            if matches!(g.topology, Topology::Curves) {
-                let counts = g.curve_vertex_counts.as_ref().context("curves require curve_vertex_counts")?;
-                let widths = g.widths.as_ref().context("curves require widths (diameter)")?;
-                ensure!(lookup(counts)?.element_type == BufferType::U32, "curve_vertex_counts require u32");
-                ensure!(lookup(widths)?.element_type == BufferType::F32, "widths require f32");
-                ensure!(g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty(),
-                    "geometry {name}: curves do not support indices, material_ranges or morphs yet");
-                ensure!(g.subdivision.is_none() && g.crease_edge.is_empty(), "curves do not support mesh modifiers or creases");
-                ensure!(g.attributes.contains_key("POSITION"), "curves require POSITION");
-                ensure!(!g.attributes.keys().any(|a| matches!(a.as_str(), "NORMAL"|"TANGENT"|"TEXCOORD_0"|"TEXCOORD_1"|"JOINTS_0"|"WEIGHTS_0")),
-                    "curves generate normals and UVs; authored normal/tangent/UV and skin attributes are unsupported");
-            } else if matches!(g.topology, Topology::Points) {
-                let widths = g.widths.as_ref().context("points require widths (diameter)")?;
-                ensure!(lookup(widths)?.element_type == BufferType::F32, "point widths require f32");
-                ensure!(g.curve_vertex_counts.is_none() && g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty(),
-                    "geometry {name}: points do not support curve counts, indices, material_ranges or morphs");
-                ensure!(g.subdivision.is_none() && g.crease_edge.is_empty(),
-                    "points do not support mesh modifiers or creases");
-                ensure!(g.attributes.contains_key("POSITION"), "points require POSITION");
-                ensure!(!g.attributes.keys().any(|a| matches!(a.as_str(), "NORMAL"|"TANGENT"|"TEXCOORD_0"|"TEXCOORD_1"|"JOINTS_0"|"WEIGHTS_0")),
-                    "points generate normals and UVs; authored normal/tangent/UV and skin attributes are unsupported");
-            } else {
-                ensure!(g.curve_vertex_counts.is_none() && g.widths.is_none(),
-                    "curve_vertex_counts requires curves; widths requires curves or points topology");
-            }
-            for (attr, buffer) in &g.attributes {
-                let b = lookup(buffer)?;
-                if is_color_attribute(attr) {
-                    ensure!(matches!(b.element_type, BufferType::Vec3 | BufferType::Vec4),
-                        "geometry {name}: {attr} buffer has wrong type; expected Vec3 or Vec4");
-                } else if let Some((_, expected)) = STANDARD_ATTRIBUTES.iter().find(|(n, _)| n == attr) {
-                    ensure!(
-                        b.element_type == *expected,
-                        "geometry {name}: {attr} buffer has wrong type; expected {expected:?}"
-                    );
-                }
-            }
-            if let Some(index) = &g.indices {
-                ensure!(
-                    matches!(lookup(index)?.element_type, BufferType::U32),
-                    "indices require u32"
-                );
-            }
-            ensure!(g.subdivision.is_none() || g.material_ranges.is_empty(), "geometry {name}: subdivision requires one material (no material_ranges)");
-            if let Some(sizes) = &g.face_vertex_counts {
-                ensure!(
-                    matches!(g.topology, Topology::Triangles),
-                    "geometry {name}: polygon cages require triangle topology"
-                );
-                ensure!(
-                    !sizes.is_empty() && sizes.iter().all(|n| *n >= 3),
-                    "geometry {name}: face_vertex_counts require at least three corners per polygon"
-                );
-                ensure!(
-                    g.material_ranges.is_empty(),
-                    "geometry {name}: polygon cages cannot have triangle material_ranges; subdivide with std first"
-                );
-                let corners: u64 = sizes.iter().map(|n| u64::from(*n)).sum();
-                let count = g
-                    .indices
-                    .as_ref()
-                    .and_then(|i| self.buffers[i].len())
-                    .or_else(|| {
-                        g.indices
-                            .is_none()
-                            .then(|| {
-                                g.attributes
-                                    .get("POSITION")
-                                    .and_then(|p| self.buffers[p].len())
-                            })
-                            .flatten()
-                    });
-                if let Some(count) = count {
-                    ensure!(
-                        corners == count as u64,
-                        "geometry {name}: face_vertex_counts cover {corners} of {count} corners"
-                    );
-                }
-            }
-            let mut edges = std::collections::BTreeSet::new();
-            let vertices = g
-                .attributes
-                .get("POSITION")
-                .and_then(|p| self.buffers.get(p))
-                .and_then(Buffer::len);
-            for edge in &g.crease_edge {
-                let [a, b] = edge.vertices;
-                ensure!(
-                    edge.crease.is_finite() && edge.crease >= 0.0,
-                    "geometry {name}: edge crease sharpness must be finite and nonnegative"
-                );
-                ensure!(
-                    a != b && vertices.is_none_or(|n| (a as usize) < n && (b as usize) < n),
-                    "geometry {name}: crease endpoints require distinct in-range vertices"
-                );
-                ensure!(
-                    edges.insert((a.min(b), a.max(b))),
-                    "geometry {name}: duplicate crease edge"
-                );
-            }
-            if !g.material_ranges.is_empty() {
-                ensure!(
-                    g.material_ranges
-                        .iter()
-                        .all(|range| range.start % 3 == 0 && range.count % 3 == 0),
-                    "geometry {name}: material_ranges require triangle-aligned starts and counts"
-                );
-                // Ranges partition the index range: every triangle draws exactly once.
-                let mut ranges: Vec<_> = g
-                    .material_ranges
-                    .iter()
-                    .map(|x| (u64::from(x.start), u64::from(x.start) + u64::from(x.count)))
-                    .collect();
-                ranges.sort();
-                let mut next = 0;
-                for (start, end) in ranges {
-                    ensure!(
-                        start == next,
-                        "geometry {name}: material_ranges must partition the index range; {} at index {next}",
-                        if start < next { "overlap" } else { "gap" }
-                    );
-                    next = end;
-                }
-                let total = match &g.indices {
-                    Some(index) => lookup(index)?.len(),
-                    None => g
-                        .attributes
-                        .get("POSITION")
-                        .and_then(|p| self.buffers.get(p)?.len()),
-                };
-                if let Some(total) = total {
-                    ensure!(
-                        next == total as u64,
-                        "geometry {name}: material_ranges cover {next} of {total} indices; they must partition the index range"
-                    );
-                }
-            }
-            for morph in g.morphs.values() {
-                for name in std::iter::once(&morph.POSITION).chain(morph.NORMAL.iter()) {
-                    ensure!(
-                        matches!(lookup(name)?.element_type, BufferType::Vec3),
-                        "morph deltas require vec3"
-                    );
-                }
-            }
-            Ok(())
-        }).filter_map(Result::err));
+        errors.extend(
+            self.geometry.iter()
+                .filter_map(|(name, geometry)| self.validate_geometry(name, geometry, &lookup).err()),
+        );
         // Camera materials must opt into a ray program before surface-input validation.
         let mut camera_nodes: Vec<_> = self.nodes.iter().collect();
         let mut camera_materials = std::collections::BTreeSet::new();
@@ -839,7 +849,7 @@ impl Scene {
             if let Some(line) = time.refusal() { anyhow::bail!("node {:?}: {line}", node.name); }
             if (time.looping || time.reverse()) && time.duration.is_none() {
                 let sources = media.media_sources(node);
-                ensure!(sources.len() + self.audio_sources(node).len() == 1, "node {:?}: time: {} write time.duration", node.name,
+                ensure!(sources.len() + media.separate_audio_sources(node, &sources).len() == 1, "node {:?}: time: {} write time.duration", node.name,
                     if sources.is_empty() { "loop and speed < 0 need an end;" } else { "several sources have no one length;" });
             }
         }
@@ -1126,6 +1136,14 @@ pub struct MediaReaders<'a> {
     keyed: std::cell::OnceCell<BTreeMap<String, std::collections::BTreeSet<String>>>,
 }
 impl MediaReaders<'_> {
+    /// Explicit sounds whose files do not already supply a picture span.
+    pub fn separate_audio_sources(&self, node: &Node, images: &std::collections::BTreeSet<String>) -> std::collections::BTreeSet<String> {
+        let mut files = self.scene.audio_sources(node);
+        for name in images {
+            if let Some(file) = &self.scene.images[name].file { files.remove(file); }
+        }
+        files
+    }
     /// Movie and frame-sequence images sampled by materials or paints of `node` and its subtree.
     pub fn media_sources(&self, node: &Node) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();

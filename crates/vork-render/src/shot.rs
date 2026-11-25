@@ -1,4 +1,5 @@
 //! Complete ordered shot rendering, encoding and CPU output delivery.
+pub(crate) mod export_identity;
 pub mod worker;
 pub use crate::png_output::Output;
 use crate::png_output::{FrameOutputWriter, Outputs};
@@ -17,6 +18,14 @@ use std::{
 };
 use vork_encode::{Backend, EncodeSettings, Encoder};
 use vork_scene::Scene;
+/// A still has two coordinates: the instant to sample and the integer used to
+/// identify that picture in every destination.
+pub(crate) struct Still {
+    pub request: vork_time::Request,
+    pub index: u32,
+    pub time: f32,
+}
+
 /// Output and scheduling values for a shot; structural GPU resources stay installed.
 #[derive(Clone)]
 pub struct Shot {
@@ -39,6 +48,12 @@ pub struct Shot {
     pub settings: serde_json::Map<String, serde_json::Value>,
     #[cfg(any(test, feature = "test-support"))]
     pub test_techniques: serde_json::Map<String, serde_json::Value>,
+    /// Skip the movie soundtrack while keeping scene audio available to animation.
+    pub no_audio: bool,
+    /// Write a chunk export identity even when no frame range was supplied.
+    pub export_identity: bool,
+    /// Build version embedded by the executable driving this render.
+    pub build_version: Option<&'static str>,
     pub no_write: bool,
     pub gpu_only: bool,
     pub diagnostics: bool,
@@ -63,7 +78,7 @@ pub type SceneEdit = fn(&mut vork_scene::Scene, &Path) -> Result<()>;
 /// Finished files and their timings, retaining GPU ownership until dropped.
 /// Library callers reclaim resources normally. A one-shot process can exit with
 /// this value alive after flushing its output, avoiding redundant driver teardown.
-/// Input decoder children have already been cancelled and reaped.
+/// External video decoders are reaped before a process exit can close their pipes.
 /// With hardware video, drop this before std::process::exit/libc exit; only _exit
 /// may skip the drop without running driver exit hooks.
 pub struct RenderedShot {
@@ -104,8 +119,8 @@ impl RenderedShot {
         Self { report, _encoders: encoders, _slots: Vec::new(), _scene: None, _canvas: Some(canvas), _renderer: Some(renderer), delivery: String::new() }
     }
     /// End a successful one-shot process after its caller has flushed reports.
-    /// Files, encoders and decoder children are already finished. Library
-    /// callers instead drop this value to reclaim GPU owners normally.
+    /// File writers and encoders have finished. Reap any live video decoders
+    /// at the process boundary. Library callers reclaim owners by dropping this value.
     #[doc(hidden)]
     pub fn exit_process(self) -> ! {
         let code = if self.report["interrupted"] == true { 130 } else { 0 };
@@ -122,6 +137,9 @@ impl RenderedShot {
 /// a save still running here is abandoned, and the store keeps its previous entries.
 #[doc(hidden)]
 pub fn exit_process(code: i32) -> ! {
+    // An installation can own live compositor and paint decoders. Reap them
+    // before process exit bypasses their drops and closes their readers.
+    crate::footage::stop_decoders_for_exit();
     // This boundary skips Rust drops; deliver queued diagnostics before exiting.
     vork_slang::progress::finish_events();
     // _exit skips the pipeline cache's destructor. Its Metal binary archive
@@ -159,6 +177,9 @@ impl Default for Shot {
             settings: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_techniques: Default::default(),
+            no_audio: false,
+            export_identity: false,
+            build_version: None,
             no_write: false,
             gpu_only: false,
             diagnostics: false,
@@ -263,15 +284,50 @@ pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 pub(crate) fn directory_marked(path: &Path) -> bool {
     path.as_os_str().to_string_lossy().ends_with(std::path::is_separator)
 }
-pub(crate) fn video_destination(path: &Path) -> bool {
-    !directory_marked(path)
-        && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mp4") || s.eq_ignore_ascii_case("mov"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Destination { Directory, Png, Exr, Video, Audio, Unknown }
+impl Destination {
+    pub(crate) fn of(path: &Path) -> Self {
+        if directory_marked(path) { return Self::Directory; }
+        match path.extension() {
+            None => Self::Directory,
+            Some(e) if e.eq_ignore_ascii_case("png") => Self::Png,
+            Some(e) if e.eq_ignore_ascii_case("exr") => Self::Exr,
+            Some(e) if e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("mov") => Self::Video,
+            Some(e) if e.eq_ignore_ascii_case("wav") => Self::Audio,
+            _ => Self::Unknown,
+        }
+    }
 }
-/// A known file extension, or a directory: no extension or a trailing separator
-/// (`frames.v2/`). Any other extension is a mistake, never a silent PNG folder.
-pub(crate) fn recognized_destination(path: &Path) -> bool {
-    directory_marked(path)
-        || path.extension().is_none_or(|e| ["png", "exr", "mp4", "mov", "wav"].iter().any(|k| e.eq_ignore_ascii_case(k)))
+pub(crate) fn video_destination(path: &Path) -> bool { Destination::of(path) == Destination::Video }
+pub(crate) fn mp4_destination(path: &Path) -> bool {
+    video_destination(path) && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+}
+pub(crate) fn recognized_destination(path: &Path) -> bool { Destination::of(path) != Destination::Unknown }
+pub(crate) fn png_destination(path: &Path) -> bool { Destination::of(path) == Destination::Png }
+pub(crate) fn exr_destination(path: &Path) -> bool { Destination::of(path) == Destination::Exr }
+
+pub(crate) fn validate_unique_destinations(out: &[PathBuf]) -> Result<()> {
+    for (i, path) in out.iter().enumerate() {
+        ensure_usage!(
+            !out[..i].contains(path),
+            "duplicate output path: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    match Destination::of(path) {
+        Destination::Png | Destination::Exr | Destination::Video => sidecar(path, suffix),
+        _ => path.join(suffix),
+    }
+}
+pub(crate) fn write_sidecar(path: &Path, suffix: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let path = sidecar_path(path, suffix);
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 /// Frame placeholders belong to the basename; parent directories are literal.
@@ -326,23 +382,24 @@ impl Shot {
     /// A device that lacks what the scene needs is replaced by one that provides it
     /// (`Renderer::providing`), and the installation is built again on that one.
     pub fn render_retained(self, retained: Retained) -> Result<RenderedShot> {
-        std::thread::scope(|scope| self.render_scoped_with(scope, Some(retained), None))
+        std::thread::scope(|scope| self.render_scoped_with(scope, Some(retained), None, None, None))
     }
 
     /// Render the exact expansion against which the worker established identity,
     /// with what the worker holds: nothing before its first device.
-    fn render_retained_decoded(self, retained: Option<Retained>, decoded: Scene) -> Result<RenderedShot> {
-        std::thread::scope(|scope| self.render_scoped_with(scope, retained, Some(decoded)))
+    fn render_retained_decoded(self, retained: Option<Retained>, decoded: Scene, pages: crate::install::StaticResources, opened: crate::footage::Opened) -> Result<RenderedShot> {
+        std::thread::scope(|scope| self.render_scoped_with(scope, retained, Some(decoded), Some(pages), Some(opened)))
     }
 
     pub(crate) fn render_scoped<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>) -> Result<RenderedShot> {
-        self.render_scoped_with(scope, None, None)
+        self.render_scoped_with(scope, None, None, None, None)
     }
 
-    fn render_scoped_with<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>, retained: Option<Retained>, decoded: Option<Scene>) -> Result<RenderedShot> {
+    fn render_scoped_with<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>, retained: Option<Retained>, decoded: Option<Scene>, pages: Option<crate::install::StaticResources>, opened: Option<crate::footage::Opened>) -> Result<RenderedShot> {
         let warnings = crate::warnings::Collector::default();
         let _warning_scope = warnings.enter();
         let wall = Instant::now();
+        let kept = retained.is_some() || decoded.is_some();
         let (previous_renderer, mut previous_install, mut previous_canvas) = match retained {
             Some(Retained { renderer, installed, canvas }) => (Some(renderer), installed, canvas),
             None => (None, None, None),
@@ -359,6 +416,9 @@ impl Shot {
             settings,
             #[cfg(any(test, feature = "test-support"))]
             test_techniques,
+            no_audio,
+            export_identity: requested_identity,
+            build_version,
             no_write,
             gpu_only,
             diagnostics,
@@ -407,7 +467,19 @@ impl Shot {
         let settings = vork_scene::test_settings(&settings, &test_techniques)?;
         // Until the device is asked for, everything that fails is the document, its files or
         // the call: each refusal below is the scene's unless it says otherwise.
-        let mut scene = if audio_only {
+        let base = scene_path.parent().unwrap_or(Path::new("."));
+        // Session revisions can read private snapshots and carry live state.
+        // Chunk manifests are for independent, one-shot renders.
+        let identify_export = !kept && !no_write && !gpu_only
+            && (requested_identity || frame_start.is_some() || frame_end.is_some())
+            && (audio_only || out.iter().any(|path| mp4_destination(path)));
+        let opened = opened.or_else(|| previous_canvas.as_ref().map(|kept| kept.opened().clone()))
+            .or_else(|| previous_install.as_ref().map(|(scene, _)| scene.opened.clone())).unwrap_or_default();
+        let identity = if identify_export { crate::InputIdentity::Export } else { crate::InputIdentity::Reuse };
+        // Picture admission validates the edited scene. Audio admission validates before an edit.
+        // Only a subsequent change can invalidate the content checks for this render.
+        let revalidate_content = overrides.resolution.is_some() || overrides.fps.is_some() || (audio_only && edit.is_some());
+        let (mut scene, files) = if audio_only {
             let mut scene = match (decoded, &document) {
                 (Some(scene), _) => scene,
                 (None, Some(bytes)) => crate::decode_scene_document(bytes, &scene_path)?,
@@ -415,17 +487,27 @@ impl Shot {
             };
             scene.render.settings = settings;
             scene.validate_content(false).map_err(scene_error)?;
-            if let Some(edit) = edit { edit(&mut scene, scene_path.parent().unwrap_or(Path::new("."))).map_err(scene_error)?; }
-            scene
+            if let Some(edit) = edit { edit(&mut scene, base).map_err(scene_error)?; }
+            // An audio-only render can succeed even when picture inputs cannot be identified.
+            let files = if identify_export { crate::inspect_files(&scene, base, identity, &opened).ok().flatten() } else { None };
+            (scene, files)
         } else {
             match &document {
-                Some(bytes) => load_document_with_settings(bytes, &scene_path, settings, &profile.name, edit, decoded).map_err(scene_error)?,
-                None => crate::load_with_settings(&scene_path, settings, &profile.name, edit)?,
+                Some(bytes) => admit_document_with_settings(bytes, &scene_path, settings, &profile.name, edit, decoded, identity, &opened).map_err(scene_error)?,
+                None => {
+                    let mut scene = crate::load_scene_document(&scene_path).with_context(|| format!("load scene {}", scene_path.display()))?;
+                    scene.render.settings = settings;
+                    crate::admit_scene(scene, &scene_path, &profile.name, edit, identity, &opened)?
+                }
             }
         };
         if let Some(resolution)=overrides.resolution {scene.render.resolution=resolution;}
         if let Some(fps)=overrides.fps {scene.render.fps=fps;}
-        scene.validate_content(!audio_only).map_err(scene_error)?;
+        if revalidate_content { scene.validate_content(!audio_only).map_err(scene_error)?; }
+        if !audio_only && let Some(resolution) = resolution {
+            ensure_usage!(resolution.iter().all(|&v| v > 0), "resolution must be positive");
+            scene.render.resolution = resolution;
+        }
         // What the scene can encode for the display is refused with the scene's other errors, before device work.
         crate::output_device::admit(&scene, &destinations, target).map_err(scene_error)?;
         let raw_colors: std::collections::BTreeMap<_, _> = destinations.iter()
@@ -442,6 +524,12 @@ impl Shot {
                 vork_encode::validate_video_clock(scene.render.fps, (last_frame + 1 - first_frame) as u64, path).map_err(device)?;
             }
         }
+        let export_identity = if identify_export {
+            let keep_samples = default_denoise.as_ref().map(|(_, _, keep_samples)| *keep_samples);
+            files.and_then(|files| export_identity::identify(&scene, base, files, &profile, keep_samples, build_version, &opened))
+        } else {
+            None
+        };
         let wav = |p: &PathBuf| {
             !directory_marked(p) && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav"))
         };
@@ -457,7 +545,7 @@ impl Shot {
             ensure_usage!(outputs.is_empty() && !provisional && png_depth != crate::PngDepth::Sixteen,
                 "WAV does not accept picture outputs, provisional output or PNG depth");
             let base = scene_path.parent().unwrap_or(Path::new("."));
-            let mix = crate::audio::Mix::new(&scene, base).map_err(scene_error)?;
+            let mix = crate::audio::Mix::new_in(&scene, base, &opened).map_err(scene_error)?;
             let root = scene
                 .render
                 .root
@@ -484,12 +572,11 @@ impl Shot {
                 for path in &out {
                     let meta = sidecar(path, "meta.json");
                     let timings = sidecar(path, "timings.json");
-                    metadata.push((
-                        meta.clone(),
-                        serde_json::to_vec(
-                            &serde_json::json!({"version":1,"kind":"audio","fps":scene.render.fps,"frame_start":first_frame,"frame_end":last_frame,"warnings":[],"audio":{"sample_rate":vork_audio::SAMPLE_RATE,"channels":["L","R"],"samples":frames.len()}}),
-                        )?,
-                    ));
+                    let mut record = serde_json::json!({"version":1,"kind":"audio","fps":scene.render.fps,"frame_start":first_frame,"frame_end":last_frame,"warnings":[],"audio":{"sample_rate":vork_audio::SAMPLE_RATE,"channels":["L","R"],"samples":frames.len()}});
+                    if let Some(identity) = &export_identity {
+                        export_identity::record(&mut record, identity, path)?;
+                    }
+                    metadata.push((meta.clone(), serde_json::to_vec(&record)?));
                     std::fs::write(
                         &timings,
                         serde_json::to_vec(
@@ -510,13 +597,33 @@ impl Shot {
                 delivery: String::new(),
             });
         }
-        let sound = if !no_write && !gpu_only && out.iter().any(|p| video_destination(p)) {
+        let mut picture_paths = out.iter().filter(|path| !video_destination(path)).peekable();
+        let implicit_still = at.is_none() && frame_start.is_none() && frame_end.is_none() && clip_frames > 1
+            && picture_paths.peek().is_some() && picture_paths.all(|path| png_destination(path));
+        ensure_usage!(at.as_ref().is_none_or(|t| t.exact() >= Default::default()), "--at must be nonnegative and finite");
+        ensure_usage!(at.is_none() || (frame_start.is_none() && frame_end.is_none()),
+            "--at selects one still; it cannot be combined with --frame-start or --frame-end");
+        let fps = scene.render.fps;
+        let still = at.map(vork_time::Request::Authored).or_else(|| implicit_still.then_some(vork_time::Request::Frame(0, fps)))
+            .map(|request| -> Result<Still> {
+                Ok(Still { time: request.numeric()?, index: request.nearest_frame(fps)?, request })
+            }).transpose().map_err(|error| error.context(FailureKind::Usage))?;
+        // Explicit selections replace only their numbered files. A still alongside video has its own index.
+        let still_index = still.as_ref().map(|still| still.index);
+        let selected = if let Some(index) = still_index {
+            Some(index..=index)
+        } else if frame_start.is_some() || frame_end.is_some() {
+            Some(first_frame as u32..=last_frame as u32)
+        } else {
+            None
+        };
+        let sound = if !no_audio && !no_write && !gpu_only && out.iter().any(|p| video_destination(p)) {
             crate::audio::MovieSound::prepare(
                 &scene,
                 scene_path.parent().unwrap_or(Path::new(".")),
                 first_frame,
                 last_frame,
-                &out,
+                &out, &opened,
             ).map_err(scene_error)?
         } else {
             None
@@ -538,19 +645,12 @@ impl Shot {
         let shader_creation_start = previous_renderer.as_ref().filter(|_| device_reused).map_or(0, |r| crate::timing::creations(&r.device).len());
         let device_worker = scope.spawn(move || Renderer::providing(previous_renderer, needs).map_err(setup));
 
-        if let Some(resolution) = resolution {
-            ensure_usage!(
-                resolution.iter().all(|&v| v > 0),
-                "resolution must be positive"
-            );
-            scene.render.resolution = resolution;
-        }
         // A 2D canvas (composition: {space: "2d"}) renders through the canvas stage.
         if scene.is_canvas() {
             return crate::canvas::render(crate::canvas::Request {
                 base: scene_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                scene, out, outputs, at, frame_start, frame_end, png_depth, exr_codec, raw_colors, display: target, no_write, gpu_only, diagnostics, stop, profile_record, device_reused,
-                sound, kept: previous_canvas,
+                scene, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display: target, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused,
+                sound, opened, kept: previous_canvas,
             }, device_worker, &warnings, wall);
         }
         // HDR code values are written in 16 bits, whatever depth was asked for.
@@ -560,24 +660,12 @@ impl Shot {
         }
         let outputs = resolve_outputs(outputs, &scene.render.aovs);
         let scene_parse_ms = parse_start.elapsed().as_secs_f64() * 1000.;
-        let authored_at=at;
-        let at=authored_at.as_ref().map(|time|vork_time::Request::from(time).numeric()).transpose().map_err(|error|error.context(FailureKind::Usage))?;
-        if let Some(t) = at {
-            ensure_usage!(
-                t.is_finite() && authored_at.as_ref().is_none_or(|t|t.exact()>=Default::default()),
-                "--at must be nonnegative and finite"
-            );
-        }
+        let at = still.as_ref().map(|still| still.time);
         let [w, h] = scene.render.resolution;
-        let fps = scene.render.fps;
         // A trailing separator always names a directory, whatever its extension.
-        let has_format = |path: &PathBuf, extension: &str| {
-            !directory_marked(path) && path.extension().is_some_and(|s| s.eq_ignore_ascii_case(extension))
-        };
         let is_video = |path: &PathBuf| video_destination(path);
-        let is_exr = |path: &PathBuf| has_format(path, "exr");
-        // One still: colour at the path, other channels beside it as NAME.<channel>.png.
-        let is_png = |path: &PathBuf| has_format(path, "png");
+        let is_exr = |path: &PathBuf| exr_destination(path);
+        let is_png = |path: &PathBuf| png_destination(path);
         let is_file = |path: &PathBuf| is_exr(path) || is_png(path);
         for path in &out {
             ensure_usage!(
@@ -600,13 +688,6 @@ impl Shot {
                 path.display()
             );
         }
-        // A .png is one still; with no time or range given it renders t=0, like Blender's
-        // current frame. Mixed with frame directories or EXR sequences it stays an error.
-        let implicit_still = at.is_none() && frame_start.is_none() && frame_end.is_none() && clip_frames > 1
-            && !directory_paths.is_empty() && directory_paths.iter().all(|p| is_png(p));
-        let at = if implicit_still { Some(0.) } else { at };
-        ensure_usage!(at.is_none() || (frame_start.is_none() && frame_end.is_none()),
-            "--at selects one still; it cannot be combined with --frame-start or --frame-end");
         let frames = if at.is_some() && !video {
             1
         } else {
@@ -618,27 +699,12 @@ impl Shot {
         let still_pass = video && at.is_some() && !directory_paths.is_empty();
         // Loop positions count from the range's first frame; files, sidecars and
         // times use absolute frame indices.
-        let index = |frame: usize| first_frame + frame;
-        // Frame identity stays integer; evaluation receives numeric seconds.
-        let frame_request=|frame:usize| -> vork_time::Request {
-            if video || at.is_none() {vork_time::Request::Frame(index(frame) as u32,fps)}
-            else {authored_at.as_ref().map(vork_time::Request::from).unwrap_or(vork_time::Request::Numeric(0.))}
-        };
+        let loop_still = still.as_ref().filter(|_| !video);
+        let output_index = |frame: usize| loop_still.map_or((first_frame + frame) as u32, |still| still.index);
+        let frame_request = |frame: usize| loop_still.map_or_else(
+            || vork_time::Request::Frame(output_index(frame), fps), |still| still.request.clone());
         let frame_time = |frame: usize| frame_request(frame).numeric().expect("validated output time");
-        let still_request=|| authored_at.as_ref().map(vork_time::Request::from).unwrap_or(vork_time::Request::Numeric(0.));
-        let still_index=at.map(|_| -> Result<u32> {
-            let frame=still_request().exact()?.scale(&vork_time::exact::decimal(&fps.to_string())?)
-                .add(&vork_time::exact::Germ::point(vork_time::exact::decimal("1/2")?)).floor();
-            u32::try_from(frame).context("still frame index exceeds u32 identity capacity").context(FailureKind::Usage)
-        }).transpose().map_err(scene_error)?;
-        let output_index = |frame: usize| if video || at.is_none() { index(frame) as u32 } else { still_index.unwrap() };
-        for (i, path) in out.iter().enumerate() {
-            ensure_usage!(
-                !out[..i].contains(path),
-                "duplicate output path: {}",
-                path.display()
-            );
-        }
+        validate_unique_destinations(&out)?;
         if video {
             ensure_usage!(
                 at.is_none() || !directory_paths.is_empty(),
@@ -687,17 +753,6 @@ impl Shot {
                 std::fs::create_dir_all(path)?;
             }
         }
-        // Explicit selections replace only their numbered files. A still
-        // alongside video uses its own absolute identity, not the video range.
-        // The run begins (and removes old outputs) only after encoder
-        // preparation has proved every output can be written.
-        let selected = if let Some(index) = still_index {
-            Some(index..=index)
-        } else if frame_start.is_some() || frame_end.is_some() {
-            Some(first_frame as u32..=last_frame as u32)
-        } else {
-            None
-        };
         let outputs = Outputs::new(outputs);
         let readback = outputs.readback(
             directory_paths.iter().any(|p| !is_exr(p)),
@@ -713,7 +768,7 @@ impl Shot {
         };
         let (renderer, installed, mut encoders, encoder_prepare_ms, encoder_attach_ms, foreground, output_run) =
             std::thread::scope(|prepare_scope| -> Result<_> {
-                // Codec/driver preparation needs no render device. Begin it
+                // Device-independent encoder preparation can begin
                 // before joining device creation; stills spawn no worker.
                 let prepare = video.then(|| {
                     prepare_scope.spawn(|| -> Result<_> {
@@ -759,20 +814,25 @@ impl Shot {
                 }
                 // Keep optional variants behind install AND frame-slot pipelines.
                 let foreground = renderer.compiler.foreground_preparation();
+                let revision = vork_slang::RevisionFiles::current();
                 let (installed, encoders, encoder_prepare_ms, encoder_attach_ms, output_run) =
                     std::thread::scope(|scope| -> Result<_> {
                         // The install worker owns the scene: it walks its nodes and drops it, so it has the stack
                         // a scene nested to its limit needs.
+                        let compiler_inputs = crate::programs::session_inputs::current();
                         let install = vork_scene::scene_thread().spawn_scoped(scope, || {
+                            let _revision = revision.enter();
+                            let _inputs = crate::programs::session_inputs::enter(compiler_inputs);
                             let _warning_scope = warnings.enter();
                             let mut scene = scene;
-                            let mut previous_install = previous_install;
-                            let plan = install_plan(&renderer, &mut scene, default_denoise.as_ref(), install_readback, frames == 1, video || gpu_only, &outputs.0, frame_request(0), target)?;
+                            let mut plan = install_plan(&renderer, &mut scene, default_denoise.as_ref(), install_readback, frames == 1, video || gpu_only, &outputs.0, frame_request(0), target)?;
                             if let Some((installed, key)) = previous_install.take() {
                                 if key == plan.delivery { return Ok((installed, plan.delivery, true)); }
                                 // Release the stale installation before the new one allocates.
                                 drop(installed);
                             }
+                            plan.options.previous_resources = pages;
+                            plan.options.opened = opened;
                             renderer.install_with_options(scene, scene_path.parent().unwrap_or(Path::new(".")), plan.options)
                             .with_context(|| format!("install scene {}", scene_path.display()))
                             .map(|installed| (installed, plan.delivery, false))
@@ -808,7 +868,7 @@ impl Shot {
                             .join()
                             .map_err(|panic| panicked("scene install worker", panic))??;
                         validate_clock_requests(&installed.0,(0..frames).map(&frame_request)
-                            .chain(still_pass.then(&still_request))).map_err(scene_error)?;
+                            .chain(still.as_ref().filter(|_| still_pass).map(|still| still.request.clone()))).map_err(scene_error)?;
                         Ok((installed, encoders, preparation_ms, encoder_attach_ms, output_run))
                     })?;
                 Ok((
@@ -901,7 +961,7 @@ impl Shot {
                         exr_codec,
                         png_depth,
                         ring_entries,
-                        if still_pass { 0 } else { first_frame },
+                        still_index.map_or(first_frame, |index| index as usize),
                         if is_exr(path) {(fps.numerator() as i32,fps.denominator() as u32)} else {(1,1)},
                         target.display,
                         raw_colors[*path],
@@ -1010,7 +1070,7 @@ impl Shot {
                     // reinstallation, so their queued successors cannot be delivered.
                     if !video && installed.transients.check_recording().is_ok() && refused.skip(output_index(frame), &error) {
                         if !still_pass {
-                            for writer in &png_outputs { writer.skip(index(frame))?; }
+                            for writer in &png_outputs { writer.skip(output_index(frame) as usize)?; }
                         }
                         frame += 1;
                         vork_slang::progress::completed(frame);
@@ -1046,14 +1106,14 @@ impl Shot {
             // The existing final display reduction observes the exact RGBA8
             // image delivered to the encoder, after every compositor entry.
             // Check each accepted frame, including animated alpha, before push.
-            if video_paths.iter().any(|path|has_format(path,"mp4")) {
+            if video_paths.iter().any(|path|mp4_destination(path)) {
                 ensure_usage!(p.exposure.is_some_and(|e|e.coverage==1.),
                     "MP4 requires an opaque final image; transparency requires .mov (ProRes 4444)");
             }
             let encode_push_ms = push_encoders(&mut encoders, slot, frame, &submission)?;
             if diagnostics && (frame == 0 || frame + 1 == frames) {
                 if let Some(memory) = renderer.device.generate_allocator_report() {
-                    memory_frames.push(serde_json::json!({"frame": index(frame),
+                    memory_frames.push(serde_json::json!({"frame": output_index(frame),
                         "allocated_bytes": memory.total_allocated_bytes,
                         "reserved_bytes": memory.total_reserved_bytes}));
                 }
@@ -1069,10 +1129,10 @@ impl Shot {
                 drop(foreground.take());
             }
             metadata_frames.push(serde_json::json!({"index":output_index(frame),"time":frame_time(frame),"camera":installed.camera_name_at_request(&frame_request(frame))?,"depth_unit_m":p.camera.depth_unit_m,"terminated_medium_paths":p.timing.terminated_medium_paths,"discarded_medium_radiance":p.timing.discarded_medium_radiance,"dropped_path_samples":p.timing.dropped_path_samples,"dropped_light_samples":p.timing.dropped_light_samples,"invalid_pixel_count":invalid_count,"invalid_pixels":&p.timing.invalid_pixels,"exposure":p.exposure.map(|e|e.json())}));
-            if let Some(e) = p.exposure { frame_exposures.push((index(frame), e)); }
-            samples.push(serde_json::json!({"frame":index(frame),"time":frame_time(frame),"cpu_thread_ms":cpu_thread_ms,"encode_push_wall_ms":encode_push_ms,"output_release_wall_ms":output_release_ms[i],"encode_pipe_wait_wall_ms":slot.ring.encoder_surfaces.iter().map(|s|s.pipe_wait_ms()).sum::<f64>(),"collect_wall_ms":collect_wall_ms,"cpu_prepare_ms":p.timing.cpu_prepare_ms,"cpu_submit_ms":p.timing.cpu_submit_ms,"cpu_finish_ms":p.timing.cpu_finish_ms,"denoise_wait_ms":p.timing.denoise_wait_ms,"denoise_pack_ms":p.timing.denoise_pack_ms,"denoise_filter_ms":p.timing.denoise_filter_ms,"denoise_upload_ms":p.timing.denoise_upload_ms,"timing_source":p.timing.timing_source,"gpu_ms":p.timing.gpu_ms,"gpu_elapsed_ms":p.timing.gpu_elapsed_ms,"gpu_spans_ms":&p.timing.gpu_spans_ms,"nonfinite":p.timing.nonfinite,"terminated_medium_paths":p.timing.terminated_medium_paths,"discarded_medium_radiance":p.timing.discarded_medium_radiance,"dropped_path_samples":p.timing.dropped_path_samples,"dropped_light_samples":p.timing.dropped_light_samples,"invalid_pixel_count":invalid_count,"invalid_pixels":&p.timing.invalid_pixels,"sample_count":p.timing.sample_count,"variants_pending":p.timing.variants_pending,"path_kernel":p.timing.path_kernel}));
+            if let Some(e) = p.exposure { frame_exposures.push((output_index(frame) as usize, e)); }
+            samples.push(serde_json::json!({"frame":output_index(frame),"time":frame_time(frame),"cpu_thread_ms":cpu_thread_ms,"encode_push_wall_ms":encode_push_ms,"output_release_wall_ms":output_release_ms[i],"encode_pipe_wait_wall_ms":slot.ring.encoder_surfaces.iter().map(|s|s.pipe_wait_ms()).sum::<f64>(),"collect_wall_ms":collect_wall_ms,"cpu_prepare_ms":p.timing.cpu_prepare_ms,"cpu_submit_ms":p.timing.cpu_submit_ms,"cpu_finish_ms":p.timing.cpu_finish_ms,"denoise_wait_ms":p.timing.denoise_wait_ms,"denoise_pack_ms":p.timing.denoise_pack_ms,"denoise_filter_ms":p.timing.denoise_filter_ms,"denoise_upload_ms":p.timing.denoise_upload_ms,"timing_source":p.timing.timing_source,"gpu_ms":p.timing.gpu_ms,"gpu_elapsed_ms":p.timing.gpu_elapsed_ms,"gpu_spans_ms":&p.timing.gpu_spans_ms,"nonfinite":p.timing.nonfinite,"terminated_medium_paths":p.timing.terminated_medium_paths,"discarded_medium_radiance":p.timing.discarded_medium_radiance,"dropped_path_samples":p.timing.dropped_path_samples,"dropped_light_samples":p.timing.dropped_light_samples,"invalid_pixel_count":invalid_count,"invalid_pixels":&p.timing.invalid_pixels,"sample_count":p.timing.sample_count,"variants_pending":p.timing.variants_pending,"path_kernel":p.timing.path_kernel}));
             if !still_pass {
-                for writer in &png_outputs { writer.push(index(frame), p.clone())?; }
+                for writer in &png_outputs { writer.push(output_index(frame) as usize, p.clone())?; }
             }
             frame += 1;
             vork_slang::progress::completed(frame);
@@ -1093,11 +1153,12 @@ impl Shot {
         };
         if still_pass {
             vork_slang::progress::phase("Rendering selected still", 1);
-            let still_frame = still_index.unwrap() as usize;
+            let still = still.as_ref().expect("mixed video and still");
+            let still_frame = still.index as usize;
             let pixels = loop {
                 let slot = &mut slots[0];
                 slot.write_color = false;
-                let attempt = slot.submit_indexed_outputs(&installed, &renderer, still_index.unwrap(), still_request(), readback)
+                let attempt = slot.submit_indexed_outputs(&installed, &renderer, still.index, still.request.clone(), readback)
                     .and_then(|()| slot.collect_readback(&renderer)).map_err(device);
                 match attempt {
                     Ok(pixels) => break pixels,
@@ -1118,14 +1179,14 @@ impl Shot {
             invalid_pixel_count += still_invalid_count;
             if first_invalid_pixel.is_none() {
                 first_invalid_pixel = still_invalid_pixels.iter().find_map(|(view, pixels)|
-                    pixels.coordinates.first().map(|&xy| (still_index.unwrap(), view.clone(), xy)));
+                    pixels.coordinates.first().map(|&xy| (still.index, view.clone(), xy)));
             }
             still_terminated_medium_paths = pixels.timing.terminated_medium_paths;
             still_discarded_medium_radiance = pixels.timing.discarded_medium_radiance;
             still_exposure = pixels.exposure;
             still_camera = Some(pixels.camera);
             for writer in &png_outputs {
-                writer.push(0, pixels.clone())?;
+                writer.push(still_frame, pixels.clone())?;
             }
         }
         Ok((encoder_finish_ms, memory_frames))
@@ -1251,15 +1312,13 @@ impl Shot {
         let mut exposures = Vec::new();
         let mut pending_metadata = Vec::new();
         for path in out.iter().filter(|_| output_run.is_some()) {
-            let file_path = |suffix: &str| {
-                if is_video(path) || is_file(path) { sidecar(path, suffix) }
-                else { path.join(suffix) }
-            };
+            let file_path = |suffix: &str| sidecar_path(path, suffix);
             let mut frames = if !is_video(path) && still_pass {
-                vec![serde_json::json!({"index":still_index.unwrap(),"time":at.unwrap(),"camera":installed.camera_name_at_request(&still_request())?,
+                let still = still.as_ref().expect("mixed video and still");
+                vec![serde_json::json!({"index":still.index,"time":still.time,"camera":installed.camera_name_at_request(&still.request)?,
                     "depth_unit_m":still_camera.as_ref().unwrap().depth_unit_m,"terminated_medium_paths":still_terminated_medium_paths,"discarded_medium_radiance":still_discarded_medium_radiance,"dropped_path_samples":still_dropped_path_samples,"dropped_light_samples":still_dropped_light_samples,"invalid_pixel_count":still_invalid_count,"invalid_pixels":&still_invalid_pixels,"exposure":still_exposure.map(|e: crate::Exposure|e.json())})]
             } else { metadata_frames.clone() };
-            let still_rows: Vec<_> = still_exposure.map(|e| (0, e)).into_iter().collect();
+            let still_rows: Vec<_> = still_exposure.zip(still_index).map(|(e, index)| (index as usize, e)).into_iter().collect();
             let mut rows = if !is_video(path) && still_pass { &still_rows[..] } else { &frame_exposures[..] };
             // Only a destination that writes the display image gets its report: video, or PNG
             // colour. EXR holds scene-linear values; control-only directories hold no colour.
@@ -1271,6 +1330,9 @@ impl Shot {
             let meta_path = file_path("meta.json");
             if let Some(parent) = meta_path.parent() { std::fs::create_dir_all(parent)?; }
             let mut meta = metadata(&frames);
+            if mp4_destination(path) && let Some(identity) = &export_identity {
+                export_identity::record(&mut meta, identity, path)?;
+            }
             // Every viewed picture's sidecar names the display it is encoded for, sRGB included, as its PNG's
             // colour chunk or its video stream does.
             if is_video(path) || (!is_exr(path) && outputs.has(Output::Color)) {
@@ -1289,8 +1351,7 @@ impl Shot {
             pending_metadata.push((meta_path.clone(), serde_json::to_vec_pretty(&meta)?));
             sidecars.push(meta_path);
             // Every written render reports where its time went.
-            let timing_path = file_path("timings.json");
-            std::fs::write(&timing_path, serde_json::to_vec_pretty(&report)?)?;
+            let timing_path = write_sidecar(path, "timings.json", &serde_json::to_vec_pretty(&report)?)?;
             sidecars.push(timing_path);
         }
         report["interrupted"] = interrupted.into();
@@ -1328,7 +1389,13 @@ pub(crate) fn install_plan(renderer: &Renderer, scene: &mut vork_scene::Scene, d
     if let Some((profile, level, keep_samples)) = default_denoise {
         crate::denoise::resolve_default(renderer, scene, profile, *level, *keep_samples);
     }
-    let delivery = format!("{install_readback:?}|{single_frame}|{gpu_color}|{outputs:?}|{display:?}|{}|{}", serde_json::to_string(&scene.render)?,
+    let camera_cut = scene.render.camera.is_none() && scene.animation.iter()
+        .flat_map(|layer| layer.tracks.iter().flatten())
+        .any(|track| track.path == ["render", "camera"]);
+    let start = camera_cut.then_some(&initial_time);
+    let settings = &scene.render.settings;
+    let policy = (settings.promotion_denoise, settings.bounded_secondary_compilation, settings.approximate_field_boundaries);
+    let delivery = format!("{policy:?}|{start:?}|{install_readback:?}|{single_frame}|{gpu_color}|{outputs:?}|{display:?}|{}|{}", serde_json::to_string(&scene.render)?,
         serde_json::to_string(scene.compositor())?);
     Ok(InstallPlan { delivery, options: crate::InstallOptions {
         initial_time,
@@ -1340,27 +1407,16 @@ pub(crate) fn install_plan(renderer: &Renderer, scene: &mut vork_scene::Scene, d
     } })
 }
 
-/// Load an in-memory authored document the way `load_with_settings` loads a file:
-/// std expansion, authored locations for diagnostics, settings, the caller's
-/// rewrite, then renderer-support validation.
-fn load_document_with_settings(bytes: &[u8], path: &Path, settings: vork_scene::Settings, profile: &str, edit: Option<SceneEdit>, decoded: Option<Scene>) -> Result<vork_scene::Scene> {
-    let base = path.parent().unwrap_or(Path::new("."));
-    let mut scene = (|| -> Result<vork_scene::Scene> {
+fn admit_document_with_settings(bytes: &[u8], path: &Path, settings: vork_scene::Settings, profile: &str,
+    edit: Option<SceneEdit>, decoded: Option<Scene>, identity: crate::InputIdentity, opened: &crate::footage::Opened) -> Result<(Scene, Option<std::collections::BTreeSet<PathBuf>>)> {
+    let mut scene = (|| -> Result<Scene> {
         let scene = match decoded { Some(scene) => scene, None => crate::decode_scene_document(bytes, path)? };
         scene.validate().map_err(|error| scene.authored_error(error))?;
         Ok(scene)
     })().with_context(|| format!("load scene {}", path.display()))?;
     scene.apply_settings(settings, profile)
         .with_context(|| format!("load scene {} with profile {profile}", path.display()))?;
-    // The same source admission as `load_with_settings`: typed scene and source
-    // problems (missing or irregular files included) before any device work.
-    crate::validate_inputs(&scene, base)
-        .with_context(|| format!("load scene {} with profile {profile}", path.display()))?;
-    if let Some(edit) = edit {
-        edit(&mut scene, base).with_context(|| format!("edit scene {}", path.display()))?;
-        crate::validate_inputs(&scene, base)?;
-    }
-    Ok(scene)
+    crate::admit_scene(scene, path, profile, edit, identity, opened)
 }
 
 fn invalid_samples_warning(count: u64, diagnostic: &str) -> Option<String> {
@@ -1398,6 +1454,25 @@ pub(crate) fn exposure_summary(rows: &[(usize, crate::Exposure)]) -> Option<serd
 mod refusal_tests {
     use super::*;
     use crate::failure::exit_code;
+
+    #[test]
+    fn audio_export_validates_the_result_of_a_scene_edit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let destination = dir.path().join("mix.wav");
+        let error = Shot {
+            scene: dir.path().join("scene.json"),
+            document: Some(br#"{"version":2,"nodes":[]}"#.to_vec()),
+            out: vec![destination.clone().into()],
+            edit: Some(|scene, _| { scene.version = 1; Ok(()) }),
+            ..Default::default()
+        }.render().err().expect("edited scene is invalid");
+
+        assert!(format!("{error:#}").contains("only scene version 2"), "{error:#}");
+        assert_eq!(exit_code(&error), 3);
+        assert!(!destination.exists());
+        Ok(())
+    }
+
     #[test]
     fn a_sequence_skips_refused_frames_and_reports_them_with_their_category() {
         let scene = |message: &str| scene_error(anyhow::Error::new(crate::FrameRefused(message.into())));

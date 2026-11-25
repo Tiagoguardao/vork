@@ -24,7 +24,9 @@ struct Inputs {
 Hair chiang(ShadingContext ctx, Inputs i) {
     // primitive_id is the source curve ordinal, unchanged by tube tessellation,
     // camera/sample identity, instance transforms, or cache reloads.
-    let random=i.random<0. ? float(pixel_hash(ctx.primitive_id+1u)>>8u)*(1./16777216.) : i.random;
+    let random=(i.random_color==0. && i.random_roughness==0.)
+        ? 0.
+        : (i.random<0. ? float(pixel_hash(ctx.primitive_id+1u)>>8u)*(1./16777216.) : i.random);
     if (int(i.parametrization) == int(HairParametrization::Melanin))
         return principled_hair_melanin(i.melanin,i.melanin_redness,i.tint,
             i.roughness,i.radial_roughness,i.coat,i.ior,i.offset,

@@ -16,11 +16,6 @@ of maintaining a second mathematical implementation. `npm run check:generated --
 `cargo test -p vork-std` also checks all committed generated artifacts. It requires Node,
 `npm ci --prefix packages/ts`, Python 3 and `cargo fetch --locked` for all-platform licence sources.
 
-Build without the `vork std` command: `cargo build -p vork-cli --no-default-features`.
-Scene geometry builders remain available.
-
-
-
 `text` is a native std loader: Moda's text engine (`crates/moda-text`) lays out the
 supplied TrueType/OpenType font's text and gives the glyph outlines, which it
 tessellates with MIT/Apache-2.0 Lyon. It emits

@@ -10,11 +10,9 @@ See README.md (Install) for binary setup.
 
 Device-limit errors name the failing resource, limit and remedy.
 
-Canvas documents support audio answers only.
+Canvas nodes support transform, bounds and screen. Canvas text and paths support size and length.
 A canvas inside a canvas cannot set viewBox or preserveAspectRatio.
-A canvas frame draws at most 335,544 ordered items (each path, text or image
-is one; a path under a mask or blend may take more). A larger frame is
-refused with the count and the limit.
+Canvas frames with more than 335,544 ordered items use additional depth passes.
 
 Fog, smoke and fire use closed triangle carriers or grid volumes, or constant/height
 world media, through complete-camera path transport. Varying world density without
@@ -69,9 +67,10 @@ when compilation is needed; repeats take 1 to 3 s. It does not build the shared 
 With a warm engine, supported scenes draw with it while any needed scene kernel compiles
 in a detached background process; delivery and exit do not wait for it. Scenes the engine
 cannot draw (authored programs, a participating medium, AOVs, splats, points or hair, or
-cameras other than one std/camera, say) use their own scene kernel. Only
-shader warming may stop successfully at its ten-minute limit; required GPU/tool
-checks fail on errors or their own stage timeouts.
+cameras other than one std/camera, say) use their own scene kernel. A path-traced world
+inside a canvas starts no background process. Only shader warming may stop early and still
+succeed, at its ten-minute limit or when interrupted; required GPU/tool checks fail on
+errors or their own stage timeouts.
 Use setup --skip-warmup for the GPU/tools report only, or setup --all for the
 bundled program/profile catalog and built-in descriptors without the shader time limit. You can interrupt setup
 safely and rerun it: completed device-local cache entries are retained.

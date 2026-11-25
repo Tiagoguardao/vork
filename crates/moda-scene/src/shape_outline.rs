@@ -502,11 +502,8 @@ pub fn translate(points: Vec<BlendPathPoint>, dx: f64, dy: f64) -> Vec<BlendPath
         .collect()
 }
 
-/// A shape node's body outline, node-local, with its `closed` flag: what the
-/// engine's body lane converts it to (`build_body_item`). `path` nodes return
-/// their authored `points` (corner rounding included), `None` for any other
-/// type (lines, text, groups, containers, …).
-pub fn node_outline(node: &RawNode) -> Option<(Vec<BlendPathPoint>, bool)> {
+/// A shape node's body outline in local space, including live path corners.
+pub fn node_outline(node: &RawNode) -> Option<Vec<BlendPathPoint>> {
     let w = node.f64("width").unwrap_or(0.0);
     let h = node.f64("height").unwrap_or(0.0);
     // `x.cornerRadius || 0` (JS falsy: 0/NaN/missing → 0).
@@ -516,53 +513,39 @@ pub fn node_outline(node: &RawNode) -> Option<(Vec<BlendPathPoint>, bool)> {
             .unwrap_or(0.0)
     };
     Some(match node.node_type() {
-        "rectangle" => (
-            smoothed_or_plain_rectangle_outline(
-                w,
-                h,
-                node.json_field("cornerRadius"),
-                node.json_field("cornerSmoothing"),
-                node.json_field("cornerStyle"),
-            ),
-            true,
+        "rectangle" => smoothed_or_plain_rectangle_outline(
+            w,
+            h,
+            node.json_field("cornerRadius"),
+            node.json_field("cornerSmoothing"),
+            node.json_field("cornerStyle"),
         ),
-        "ellipse" => (
-            ellipse_outline(
-                w,
-                h,
-                node.f64("startAngle"),
-                node.f64("sweepAngle"),
-                node.f64("innerRadiusRatio"),
-            ),
-            true,
+        "ellipse" => ellipse_outline(
+            w,
+            h,
+            node.f64("startAngle"),
+            node.f64("sweepAngle"),
+            node.f64("innerRadiusRatio"),
         ),
-        "star" => (
-            star_outline(
-                w,
-                h,
-                node.f64("numPoints").unwrap_or(f64::NAN),
-                node.f64("innerRadiusRatio"),
-                cr(),
-            ),
-            true,
+        "star" => star_outline(
+            w,
+            h,
+            node.f64("numPoints").unwrap_or(f64::NAN),
+            node.f64("innerRadiusRatio"),
+            cr(),
         ),
-        "polygon" => (
-            polygon_outline(w, h, node.f64("sides").unwrap_or(f64::NAN), cr()),
-            true,
-        ),
+        "polygon" => polygon_outline(w, h, node.f64("sides").unwrap_or(f64::NAN), cr()),
         "path" => {
             let points: Vec<BlendPathPoint> = node
                 .points()
                 .map(|a| a.iter().filter_map(BlendPathPoint::from_ref).collect())
                 .unwrap_or_default();
-            let closed = node.bool("closed").unwrap_or(false);
             let corners = crate::path_geom::round_corners::PathCorners::read(node);
-            let points = if corners.rounds_anything() {
-                crate::path_geom::round_corners::round_path_corners_with(&points, closed, &corners)
+            if corners.rounds_anything() {
+                crate::path_geom::round_corners::round_path_corners_with(&points, node.path_closure(), &corners)
             } else {
                 points
-            };
-            (points, closed)
+            }
         }
         _ => return None,
     })

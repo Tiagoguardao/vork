@@ -95,8 +95,7 @@ impl Segments {
         r: &crate::Renderer, mut batch: Batch<'_>, upload: &wgpu::Buffer,
         bytes: &[u8], stream_ready: bool,
     ) -> (wgpu::SubmissionIndex, f64) {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("validate_publish_inclusive");
+        profile_span!(_profile, "validate_publish_inclusive");
         if !bytes.is_empty() { r.queue.write_buffer(upload, 0, bytes); }
         let start = std::time::Instant::now();
         batch.uploads_published();
@@ -145,8 +144,7 @@ impl Segments {
         commands: impl ExactSizeIterator<Item = wgpu::CommandBuffer>,
     ) -> wgpu::SubmissionIndex {
         ownership.submit(commands.len());
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("queue_submit");
+        profile_span!(_profile, "queue_submit");
         #[cfg(feature = "frame-profile")]
         crate::frame_profile::count("queue_submissions", 1);
         #[cfg(test)]

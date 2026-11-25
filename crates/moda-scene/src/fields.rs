@@ -67,22 +67,11 @@ const BASE: &[&str] = &[
     "maskType",
     "maskInvert",
     "maskFeather",
-    // Variables v2: field → variable bindings and explicit modes per collection.
-    // The bound fields keep their literals, which are what renders here.
     "bindings",
-    "variableModes",
     // Styles (design-systems.md §5): slot → style id. The styled fields keep the
     // style's values, which are what renders here.
     "styleRefs",
     "metadata",
-    // Transient: marks a node a flipbook's onion skin added when the scene was made (`crate::flipbook::ONION_KEY`).
-    "_onion",
-    // Canvas/layer display label. Not a declared schema field (the canonical node
-    // name lives at `metadata.name`), but legacy/agent write paths persist a
-    // top-level `name` on nodes AND the envelope, and the collab projection
-    // round-trips any undeclared top-level key through its `meta` catch-all
-    // (projection.py `apply_canvas_data_to_doc`). It is a pure label with no
-    // render effect, so recognizing it avoids a false decline.
     "name",
     // Duplicated/pasted node's reference to its source node id. Not a declared
     // schema field — the duplication/paste bookkeeping writes it as an untyped
@@ -130,8 +119,6 @@ const BASE: &[&str] = &[
     // A reference image (`exportExcluded`): the export hosts drop the layer before a job reaches the renderer
     // (export-hosts `exportExcluded.mjs`), so a render here draws it like any layer (screenshots show it).
     "exportExcluded",
-    // A generated node's identity (format 29, generated-content RFC §10): its key path under the generator and its
-    // content hash. Editor-only (reconciliation reads them); the node renders as itself.
     "genKey",
     "genHash",
 ];
@@ -140,7 +127,7 @@ const BASE: &[&str] = &[
 const FILL: &[&str] = &["fills"];
 
 /// The stroke stack (`strokes`): each stroke carries its own width, caps,
-/// joins, dashes, width profile / brush objects and arrowheads.
+/// joins, dashes and arrowheads.
 const STROKE: &[&str] = &["strokes"];
 
 /// Illustrator's Appearance order (E8.2, `crate::appearance`): the fill and stroke ids (and a group's
@@ -283,13 +270,9 @@ const PATH_ONLY: &[&str] = &[
     // Live corners: the path-wide style (round / inverted / chamfer); a point's own
     // `cornerStyle` / `cornerRadius` override it (`round_path_corners_with`).
     "cornerStyle",
-    // Pen samples recorded while drawing (brush plan §4.5); path-level, not
-    // stroke-scoped. Read by brushes set to vary with pressure/tilt/rotation.
-    "inkChannels",
     // Figma's vector network (E7.9): authoritative geometry when present;
     // `points` / `closed` / `fillRule` are derived from it. Drawn natively by
     // `moda_engine::tess::network` (fills per region, strokes per segment).
-    "vectorNetwork",
 ];
 
 const STAR_ONLY: &[&str] = &["numPoints", "innerRadiusRatio", "cornerRadius", "blendMode"];
@@ -312,21 +295,14 @@ const GROUP_ONLY: &[&str] = &[
     "effects",
     // Envelope distort (`envelope`, E8.17): a warp preset, mesh or top-object outline that bends the group's
     // content, resolved by `envelope.rs` into transients drawn in place of the children.
-    "envelope",
     // Repeat objects (`repeat`, Object ▸ Repeat): radial, grid or mirror copies of the group's children, resolved
     // by `repeat.rs` into transients drawn in place of the children.
-    "repeat",
     // A live Image Trace object's state (`imageTrace`, E8.15): options, stats and the id of the
     // hidden source child. Editor-only: the group renders as its children (paths shown, the
     // source image hidden), so nothing here reads it.
     "imageTrace",
     // A flipbook drawing's exposure in timeline frames (`hold`, motion-model.md §12.10), read through its flipbook.
-    "hold",
-    // A flipbook (format 28, motion-model.md §12.10): the group draws one child, `flipbook.current`
-    // (`crate::flipbook`), which the timeline sets frame by frame.
-    "flipbook",
-    // The onion skin preview on a flipbook (editor state, never saved or exported; `crate::flipbook::expand_onion`).
-    "onionSkin",
+
 ];
 
 /// `BooleanNode` (nodes.ts, E7.1): a group-like transform, its children, the operation, and
@@ -376,21 +352,6 @@ const RICHTEXT_ONLY: &[&str] = &[
     "clipTextToBounds",
 ];
 
-/// A raster paint layer's own fields (spike). `pixelSelection` is editor state (the marching ants' key, kept on the
-/// node so selecting is an undo step): never saved and never rendered, so both renderers ignore it alike.
-// `hold`: a flipbook drawing's exposure in timeline frames (motion-model.md §12.10), read through its flipbook.
-// `assistants`: drawing assistants (perspective / ellipse rulers, docs/design/drawing-assistants.md), an editor
-// painting aid that never renders, so both renderers ignore it alike.
-const PAINT_ONLY: &[&str] = &[
-    "surface",
-    "blendMode",
-    "lockTransparency",
-    "pixelSelection",
-    "_paintLayer",
-    "hold",
-    "assistants",
-];
-
 const BLEND_ONLY: &[&str] = &[
     "sourceIds",
     "spineId",
@@ -403,59 +364,6 @@ const BLEND_ONLY: &[&str] = &[
     "reverseStack",
     // Applied to every step (`blend::expand_blend_node`).
     "blendMode",
-];
-
-const TABLE_ONLY: &[&str] = &[
-    // The layer blend mode (Figma's Layer row): the layer's drawn result blends as one layer.
-    "blendMode",
-    "rows",
-    "columns",
-    "cells",
-    "backgroundColors",
-    "headerBackgroundColor",
-    "columnStrokeConfig",
-    "rowStrokeConfig",
-    "cornerRadius",
-    // Whether row heights are re-measured from cell content ('auto') or kept as authored
-    // (absent/'fixed'). Nothing in the engine READS it: row heights are already
-    // resolved into `rows[].size` by the time a doc reaches us, so measurement is a pure
-    // frontend concern. It is mirrored purely so a doc carrying it doesn't spill as
-    // `unknown:node-field` and send the whole page to the Chromium fallback.
-    "rowSizing",
-];
-
-const GENERATED_ONLY: &[&str] = &[
-    // The layer blend mode (Figma's Layer row): the layer's drawn result blends as one layer.
-    "blendMode",
-    "generatedKind",
-    "generatedSource",
-    "renderMode",
-    "cachedAssetUrl",
-    "cachedVectorPath",
-    "cachedNaturalDimensions",
-    // A chart's part values for one motion frame (charts/motion_parts.rs): the render feed only, never saved.
-    "_motionParts",
-];
-
-// `_generatorOutput` / `_generatorStatus`: the editor feed only (its worker's output, never saved).
-// Format 29 (generated-content RFC §4.1): `children` is a nodes-mode generator's derived cache (drawn as its
-// children), `sources` its source layers; `outputKey`, `overrides` and `host` are the editor's.
-// `_compositionTime`: the frame's time inside a composition, written per frame by moda-render's graph lane.
-const GENERATOR_ONLY: &[&str] = &[
-    "blendMode",
-    "code",
-    "params",
-    "seed",
-    "seedIdentity",
-    "sourceVisible",
-    "children",
-    "sources",
-    "outputKey",
-    "overrides",
-    "host",
-    "_generatorOutput",
-    "_generatorStatus",
-    "_compositionTime",
 ];
 
 fn contains(groups: &[&[&str]], key: &str) -> bool {
@@ -548,11 +456,6 @@ pub fn is_known_field(node_type: &str, key: &str) -> bool {
         ],
         "richtext" => &[BASE, GEOM, EFFECTS, STROKE, FILL, DISTORT, RICHTEXT_ONLY],
         "blend" => &[BASE, BLEND_ONLY],
-        "table" => &[BASE, GEOM, STROKE, TABLE_ONLY],
-        "generated" => &[BASE, GEOM, STROKE, GENERATED_ONLY],
-        "generator" => &[BASE, GEOM, EFFECTS, GENERATOR_ONLY],
-        // Raster paint layer (spike): hydrates as a rectangle (`normalize::normalize_paint_in_place`).
-        "paint" => &[BASE, GEOM, EFFECTS, PAINT_ONLY],
         _ => return false,
     };
     contains(groups, key)
@@ -597,24 +500,7 @@ pub const ENVELOPE_KEYS: &[&str] = &[
     "pages",
     "category",
     "authoringModel",
-    // Variables v2 (design-systems.md §4.1): collections, variables and the
-    // document's explicit modes. Never read here: the engine renders the cached
-    // literals the editor keeps next to every binding (variables.rs).
-    "variableCollections",
-    "variables",
-    "variableModes",
-    // Styles (design-systems.md §5.1). Never read here: layers keep the style's
-    // values as literals.
     "styles",
-    // Document brush table (brushes.md §4.4; `Scene.getSceneState().brushes`,
-    // emitted by the save serializer only when non-empty). Brush artwork is
-    // never on a page; the outline/brush renderers (plan P8, P16–P19) read it.
-    "brushes",
-    // Document pattern table (E8.5, `crate::pattern`; emitted only when non-empty). Pattern artwork is never
-    // on a page; the engine's pattern paint reads it.
-    "patterns",
-    // Document code table (live-nodes.md §3.2): generator nodes' `CodeDef`s by content hash.
-    "code",
     "animations",
     "activeTemplatePackageIds",
     "config",
@@ -650,156 +536,6 @@ mod tests {
     use crate::value::json;
 
     #[test]
-    fn known_fields_accept_documented_schema() {
-        // nodes.ts:741-762 (rectangle), 1275-1375 (richtext)
-        assert!(is_known_field("rectangle", "cornerRadius"));
-        assert!(is_known_field("rectangle", "cornerSmoothing"));
-        assert!(is_known_field("container", "cornerSmoothing"));
-        assert!(is_known_field("container", "component"));
-        assert!(is_known_field("container", "instance"));
-        assert!(is_known_field("container", "componentSet"));
-        assert!(is_known_field("rectangle", "propertyRefs"));
-        // `path` carries its own uniform cornerRadius now.
-        assert!(is_known_field("path", "cornerRadius"));
-        assert!(!is_known_field("rectangle", "perspective")); // the old corner-pin field is gone
-                                                              // Canonical planar distortion: KNOWN on the five distort-capable
-                                                              // box types as of node-distort PR 2 (the native engine renders the warp).
-                                                              // Any other kind carrying `distort` is out-of-schema and still spills.
-        for t in ["rectangle", "ellipse", "star", "polygon", "richtext"] {
-            assert!(
-                is_known_field(t, "distort"),
-                "distort must be native-known on the capable types ({t})"
-            );
-        }
-        for t in ["line", "group", "container", "path"] {
-            assert!(
-                !is_known_field(t, "distort"),
-                "distort must stay unknown on non-capable types ({t})"
-            );
-        }
-        assert!(is_known_field("richtext", "htmlContent"));
-        // E-M.7: one `effects` list on every effect-capable kind; the flat
-        // effect keys it replaced spill.
-        for t in ["rectangle", "container", "ellipse", "path", "star", "polygon", "line", "richtext"] {
-            assert!(is_known_field(t, "effects"), "effects must be known on {t}");
-            for flat in ["shadowColor", "shadowBlur", "innerShadowColor", "backgroundBlur", "layerBlur", "shaderEffects"] {
-                assert!(!is_known_field(t, flat), "flat effect key {flat} must spill on {t}");
-            }
-        }
-        assert!(is_known_field("group", "effects")); // group layer filters (#1177)
-        assert!(is_known_field("group", "envelope")); // envelope distort (E8.17)
-        assert!(is_known_field("group", "repeat")); // repeat objects
-        assert!(!is_known_field("rectangle", "envelope"));
-        assert!(!is_known_field("line", "pointerAtBeginning")); // stored arrowheads are strokes[].startArrow/endArrow
-                                                                // E3.1 paint stacks: a line's arrowheads moved onto its stroke.
-        assert!(!is_known_field("line", "startArrowShape"));
-        assert!(!is_known_field("line", "endArrowShape"));
-        assert!(!is_known_field("ellipse", "radiusX")); // the old center+radius form is gone
-                                                        // Paint stacks (E3.1): every fillable node stores `fills` (a video is a
-                                                        // fill's paint), every strokeable node `strokes`; the flat keys are gone.
-        for t in [
-            "rectangle",
-            "container",
-            "ellipse",
-            "path",
-            "star",
-            "polygon",
-            "richtext",
-        ] {
-            assert!(is_known_field(t, "fills"), "fills must be known on {t}");
-        }
-        for t in [
-            "rectangle",
-            "container",
-            "ellipse",
-            "path",
-            "star",
-            "polygon",
-            "richtext",
-            "line",
-            "table",
-            "generated",
-        ] {
-            assert!(is_known_field(t, "strokes"), "strokes must be known on {t}");
-        }
-        for t in ["rectangle", "ellipse", "star", "line", "richtext"] {
-            for flat in [
-                "fill",
-                "fillPriority",
-                "fillVideoSrc",
-                "fillVideoPosterSrc",
-                "fillPatternImageSrc",
-                "fillShaderId",
-                "stroke",
-                "strokeWidth",
-                "lineCap",
-                "dash",
-            ] {
-                assert!(
-                    !is_known_field(t, flat),
-                    "flat key {flat} must spill on {t}"
-                );
-            }
-        }
-        assert!(!is_known_field("line", "fills")); // lines carry no fill
-        // Appearance on groups (E8.2): a group's fills and strokes paint its merged outline.
-        assert!(is_known_field("group", "fills"));
-        assert!(is_known_field("group", "strokes"));
-        assert!(is_known_field("group", "appearanceOrder"));
-        assert!(is_known_field("rectangle", "appearanceOrder"));
-        // Rich text's glyph-colour override (its `fills` is the box background).
-        assert!(is_known_field("richtext", "textFills"));
-        assert!(!is_known_field("rectangle", "textFills"));
-        assert!(!is_known_field("rectangle", "futureProp"));
-
-        // Node-level pivot (BaseNodeProperties) — the native v3 evaluator reads
-        // these, so every node kind must recognize them (no false decline).
-        assert!(is_known_field("rectangle", "pivotX"));
-        assert!(is_known_field("richtext", "pivotY"));
-        assert!(is_known_field("group", "pivotX"));
-        // Benign top-level label bled onto nodes by collab/agent write paths.
-        assert!(is_known_field("rectangle", "name"));
-        // Duplicated/pasted node's source-node reference — bookkeeping only, no
-        // render effect; recognized on every kind (measured live-prod decline).
-        assert!(is_known_field("rectangle", "originalId"));
-        assert!(is_known_field("group", "originalId"));
-        assert!(is_known_field("richtext", "originalId"));
-        // Internal pattern-image annotation (ImageService.ts) — non-render-affecting
-        // UX metadata; recognized on every kind (measured live-prod decline).
-        assert!(is_known_field("rectangle", "_patternImageInfo"));
-        assert!(is_known_field("ellipse", "_patternImageInfo"));
-        // NARROW fix, NOT a blanket underscore rule: an arbitrary unrecognized
-        // `_`-prefixed field STILL spills (the `_` prefix is a render-affecting
-        // schema convention here — see BASE doc), so drift stays caught.
-        assert!(!is_known_field("rectangle", "_futureInternalProp"));
-        // Per-glyph kinetic-typography deltas render on the native vector lane.
-        assert!(is_known_field("richtext", "unitTransforms"));
-        assert!(!is_known_field("rectangle", "unitTransforms")); // richtext-only
-
-        // Brushes / variable-width strokes (brush plan §4): the width profile,
-        // taper, wave, dynamics and brush live on each `strokes[]` entry now
-        // (E3.1), so the flat keys spill everywhere; pen samples stay path-level.
-        for f in [
-            "strokeProfile",
-            "strokeTaper",
-            "strokeWave",
-            "strokeDynamic",
-            "strokeBrush",
-        ] {
-            for t in ["path", "line", "rectangle", "ellipse", "star", "polygon"] {
-                assert!(!is_known_field(t, f), "{f} must be unknown on {t}");
-            }
-        }
-        assert!(is_known_field("path", "inkChannels"));
-        for t in ["line", "rectangle", "ellipse", "star", "polygon"] {
-            assert!(
-                !is_known_field(t, "inkChannels"),
-                "inkChannels must stay unknown on {t}"
-            );
-        }
-    }
-
-    #[test]
     fn envelope_keys_include_collab_projected_metadata() {
         // The collab projection spreads the `meta` Y.Map to the top level; these
         // benign metadata keys must not spill as `unknown:envelope-field`.
@@ -827,7 +563,7 @@ mod tests {
         // flag must never send a page to the fallback renderer.
         for t in [
             "rectangle", "container", "section", "ellipse", "line", "path", "star", "polygon", "group",
-            "richtext", "blend", "table", "generated",
+            "richtext", "blend",
         ] {
             assert!(
                 is_known_field(t, "layoutPositioning"),
@@ -915,4 +651,131 @@ mod tests {
         .unwrap();
         assert_eq!(unknown_fields(&on_line), vec!["distort".to_string()]);
     }
+    #[test]
+    fn known_fields_accept_documented_schema() {
+        // nodes.ts:741-762 (rectangle), 1275-1375 (richtext)
+        assert!(is_known_field("rectangle", "cornerRadius"));
+        assert!(is_known_field("rectangle", "cornerSmoothing"));
+        assert!(is_known_field("container", "cornerSmoothing"));
+        assert!(is_known_field("container", "component"));
+        assert!(is_known_field("container", "instance"));
+        assert!(is_known_field("container", "componentSet"));
+        assert!(is_known_field("rectangle", "propertyRefs"));
+        // `path` carries its own uniform cornerRadius now.
+        assert!(is_known_field("path", "cornerRadius"));
+        assert!(!is_known_field("rectangle", "perspective")); // the old corner-pin field is gone
+                                                              // Canonical planar distortion: KNOWN on the five distort-capable
+                                                              // box types as of node-distort PR 2 (the native engine renders the warp).
+                                                              // Any other kind carrying `distort` is out-of-schema and still spills.
+        for t in ["rectangle", "ellipse", "star", "polygon", "richtext"] {
+            assert!(
+                is_known_field(t, "distort"),
+                "distort must be native-known on the capable types ({t})"
+            );
+        }
+        for t in ["line", "group", "container", "path"] {
+            assert!(
+                !is_known_field(t, "distort"),
+                "distort must stay unknown on non-capable types ({t})"
+            );
+        }
+        assert!(is_known_field("richtext", "htmlContent"));
+        // E-M.7: one `effects` list on every effect-capable kind; the flat
+        // effect keys it replaced spill.
+        for t in ["rectangle", "container", "ellipse", "path", "star", "polygon", "line", "richtext"] {
+            assert!(is_known_field(t, "effects"), "effects must be known on {t}");
+            for flat in ["shadowColor", "shadowBlur", "innerShadowColor", "backgroundBlur", "layerBlur", "shaderEffects"] {
+                assert!(!is_known_field(t, flat), "flat effect key {flat} must spill on {t}");
+            }
+        }
+        assert!(is_known_field("group", "effects")); // group layer filters (#1177)
+        assert!(!is_known_field("group", "envelope")); // removed envelope schema
+        assert!(!is_known_field("group", "repeat")); // removed repeat schema
+        assert!(!is_known_field("rectangle", "envelope"));
+        assert!(!is_known_field("line", "pointerAtBeginning")); // stored arrowheads are strokes[].startArrow/endArrow
+                                                                // E3.1 paint stacks: a line's arrowheads moved onto its stroke.
+        assert!(!is_known_field("line", "startArrowShape"));
+        assert!(!is_known_field("line", "endArrowShape"));
+        assert!(!is_known_field("ellipse", "radiusX")); // the old center+radius form is gone
+                                                        // Paint stacks (E3.1): every fillable node stores `fills` (a video is a
+                                                        // fill's paint), every strokeable node `strokes`; the flat keys are gone.
+        for t in [
+            "rectangle",
+            "container",
+            "ellipse",
+            "path",
+            "star",
+            "polygon",
+            "richtext",
+        ] {
+            assert!(is_known_field(t, "fills"), "fills must be known on {t}");
+        }
+        for t in [
+            "rectangle",
+            "container",
+            "ellipse",
+            "path",
+            "star",
+            "polygon",
+            "richtext",
+            "line",
+        ] {
+            assert!(is_known_field(t, "strokes"), "strokes must be known on {t}");
+        }
+        for t in ["rectangle", "ellipse", "star", "line", "richtext"] {
+            for flat in [
+                "fill",
+                "fillPriority",
+                "fillVideoSrc",
+                "fillVideoPosterSrc",
+                "fillPatternImageSrc",
+                "fillShaderId",
+                "stroke",
+                "strokeWidth",
+                "lineCap",
+                "dash",
+            ] {
+                assert!(
+                    !is_known_field(t, flat),
+                    "flat key {flat} must spill on {t}"
+                );
+            }
+        }
+        assert!(!is_known_field("line", "fills")); // lines carry no fill
+        // Appearance on groups (E8.2): a group's fills and strokes paint its merged outline.
+        assert!(is_known_field("group", "fills"));
+        assert!(is_known_field("group", "strokes"));
+        assert!(is_known_field("group", "appearanceOrder"));
+        assert!(is_known_field("rectangle", "appearanceOrder"));
+        // Rich text's glyph-colour override (its `fills` is the box background).
+        assert!(is_known_field("richtext", "textFills"));
+        assert!(!is_known_field("rectangle", "textFills"));
+        assert!(!is_known_field("rectangle", "futureProp"));
+
+        // Node-level pivot (BaseNodeProperties) — the native v3 evaluator reads
+        // these, so every node kind must recognize them (no false decline).
+        assert!(is_known_field("rectangle", "pivotX"));
+        assert!(is_known_field("richtext", "pivotY"));
+        assert!(is_known_field("group", "pivotX"));
+        // Benign top-level label bled onto nodes by collab/agent write paths.
+        assert!(is_known_field("rectangle", "name"));
+        // Duplicated/pasted node's source-node reference — bookkeeping only, no
+        // render effect; recognized on every kind (measured live-prod decline).
+        assert!(is_known_field("rectangle", "originalId"));
+        assert!(is_known_field("group", "originalId"));
+        assert!(is_known_field("richtext", "originalId"));
+        // Internal pattern-image annotation (ImageService.ts) — non-render-affecting
+        // UX metadata; recognized on every kind (measured live-prod decline).
+        assert!(is_known_field("rectangle", "_patternImageInfo"));
+        assert!(is_known_field("ellipse", "_patternImageInfo"));
+        // NARROW fix, NOT a blanket underscore rule: an arbitrary unrecognized
+        // `_`-prefixed field STILL spills (the `_` prefix is a render-affecting
+        // schema convention here — see BASE doc), so drift stays caught.
+        assert!(!is_known_field("rectangle", "_futureInternalProp"));
+        // Per-glyph kinetic-typography deltas render on the native vector lane.
+        assert!(is_known_field("richtext", "unitTransforms"));
+        assert!(!is_known_field("rectangle", "unitTransforms")); // richtext-only
+
+    }
+
 }

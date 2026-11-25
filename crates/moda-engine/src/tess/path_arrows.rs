@@ -1,7 +1,7 @@
 //! E6.1: arrowheads on open paths (design-editor.md §7.19: arrowheads belong to the stroke and take its paint).
 //!
-//! A stroke's `startArrow` / `endArrow` draw on any OPEN path (`closed` absent or false): the start arrowhead at
-//! the first sub-path's first anchor, the end arrowhead at the last sub-path's last anchor, each pointing along
+//! A stroke's `startArrow` / `endArrow` draw at the first and last drawable contours' outer endpoints
+//! when the respective contour is open. Each arrowhead points along
 //! the path's end tangent (a retracted handle falls back to the next control point, then the next anchor). The
 //! shapes are the line's (`line_to_path`: triangle, open caret, reverse triangle, diamond, circle) and so is the
 //! stroke's set-back under each filled one (`arrow_trim_distance`: the arrowhead's depth, plus half the weight under
@@ -18,7 +18,8 @@ use super::line_to_path::{
     arrow_trim_distance, filled_arrow_shape_points, open_arrow_stroke_points, ArrowShape,
 };
 use super::moda_engine_path_types::PathCmd;
-use super::{cut_open_path_ends, open_path_ends, PathEnd};
+use super::tessellator::{cut_path_ends, path_ends};
+use super::{PathClosure, PathContours, PathEnd};
 use moda_scene::paint::Stroke;
 
 /// The smallest arrowhead on a path (px): a line's default pointer size.
@@ -36,7 +37,7 @@ pub fn path_arrow_size(width: f64, arrow_scale: Option<f64>) -> f64 {
 
 /// A stroke's arrowhead shapes (start, end), `None` where it has none (or an unknown shape).
 pub fn stroke_arrows(stroke: &Stroke) -> (Option<ArrowShape>, Option<ArrowShape>) {
-    if stroke.brush.as_ref().is_some_and(|b| !b.is_null()) || stroke.width <= 0.0 {
+    if stroke.width <= 0.0 {
         return (None, None);
     }
     (
@@ -56,6 +57,7 @@ pub fn stroke_has_arrows(stroke: &Stroke) -> bool {
 pub struct PathArrows {
     /// The path the stroke draws: its ends cut back under the arrowheads.
     pub body: Vec<PathCmd>,
+    pub body_closed: Vec<bool>,
     /// Filled arrowheads (closed sub-paths), painted with the stroke's paint under the nonzero rule.
     pub filled: Vec<PathCmd>,
     /// Open carets (open sub-paths), stroked with the stroke's weight, caps and joins.
@@ -83,13 +85,18 @@ fn head(
 
 /// `stroke`'s arrowheads on the path `cmds` (the drawn geometry, corner rounding applied), or `None` when the
 /// path is closed, the stroke has no arrowhead, or the path has no length.
-pub fn path_arrows(cmds: &[PathCmd], closed: bool, stroke: &Stroke) -> Option<PathArrows> {
-    if closed {
+pub fn path_arrows<'a>(
+    cmds: &'a [PathCmd],
+    closure: impl Into<PathClosure<'a>>,
+    stroke: &Stroke,
+) -> Option<PathArrows> {
+    let closure = closure.into();
+    if matches!(closure, PathClosure::Uniform(true)) {
         return None;
     }
     let (start, end) = stroke_arrows(stroke);
-    run_arrows(
-        cmds,
+    run_contour_arrows(
+        PathContours::new(cmds, closure),
         start,
         end,
         path_arrow_size(stroke.width, stroke.arrow_scale),
@@ -109,26 +116,47 @@ pub fn run_arrows(
     cap: Option<&str>,
     width: f64,
 ) -> Option<PathArrows> {
+    run_contour_arrows(PathContours::new(cmds, false), start, end, size, cap, width)
+}
+
+fn run_contour_arrows(
+    path: PathContours<'_>,
+    start: Option<ArrowShape>,
+    end: Option<ArrowShape>,
+    size: f64,
+    cap: Option<&str>,
+    width: f64,
+) -> Option<PathArrows> {
     if start.is_none() && end.is_none() {
         return None;
     }
-    let (start_end, end_end) = open_path_ends(cmds)?;
+    let (start_end, end_end) = path_ends(path)?;
+    let start = start.zip(start_end);
+    let end = end.zip(end_end);
+    if start.is_none() && end.is_none() {
+        return None;
+    }
     // An open caret is stroked like the path: the stroke runs on into its apex (as Figma's and Illustrator's line
     // arrows do), the caret's join covering the stroke's end.
     let trim = |shape: Option<ArrowShape>| match shape {
         None | Some(ArrowShape::Open) => 0.0,
         Some(s) => arrow_trim_distance(s, size, size, cap, width),
     };
-    let body = cut_open_path_ends(cmds, trim(start), trim(end));
+    let (body, body_closed) = cut_path_ends(
+        path,
+        trim(start.map(|(shape, _)| shape)),
+        trim(end.map(|(shape, _)| shape)),
+    );
     let (mut filled, mut open) = (Vec::new(), Vec::new());
-    if let Some(s) = start {
-        head(s, &start_end, size, &mut filled, &mut open);
+    if let Some((s, endpoint)) = start {
+        head(s, &endpoint, size, &mut filled, &mut open);
     }
-    if let Some(s) = end {
-        head(s, &end_end, size, &mut filled, &mut open);
+    if let Some((s, endpoint)) = end {
+        head(s, &endpoint, size, &mut filled, &mut open);
     }
     Some(PathArrows {
         body,
+        body_closed,
         filled,
         open,
         size,
@@ -254,19 +282,14 @@ mod tests {
     }
 
     #[test]
-    fn closed_paths_unknown_shapes_and_brushes_draw_none() {
+    fn closed_paths_unknown_shapes_and_zero_width_draw_none() {
         let cmds = vec![
             PathCmd::Move { x: 0.0, y: 0.0 },
             PathCmd::Line { x: 100.0, y: 0.0 },
         ];
         assert!(path_arrows(&cmds, true, &stroke(json!({"endArrow": "triangle"}))).is_none());
         assert!(path_arrows(&cmds, false, &stroke(json!({"endArrow": "bogus"}))).is_none());
-        assert!(path_arrows(
-            &cmds,
-            false,
-            &stroke(json!({"endArrow": "triangle", "brush": {"brushId": "b"}}))
-        )
-        .is_none());
+
         assert!(path_arrows(
             &cmds,
             false,

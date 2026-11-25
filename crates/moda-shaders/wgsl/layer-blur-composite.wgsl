@@ -38,6 +38,8 @@ struct LayerBlurCompositeUniforms {
 @group(1) @binding(0) var<uniform> composite: LayerBlurCompositeUniforms;
 @group(1) @binding(1) var captureSampler: sampler;
 @group(1) @binding(2) var captureTexture: texture_2d<f32>;
+@group(1) @binding(3) var<storage, read> compositeRecords: array<LayerBlurCompositeUniforms>;
+@group(1) @binding(4) var captureLayers: texture_2d_array<f32>;
 
 // The node's clip mask (a clip-mask group above it), the same group-2 binding
 // and fragment contract as every path shader: the capture is taken unmasked
@@ -68,10 +70,10 @@ struct VSOut {
   @builtin(position) position: vec4<f32>,
   @location(0) uv: vec2<f32>,
   @location(1) worldPos: vec2<f32>,
+  @location(2) @interpolate(flat) record: u32,
 };
 
-@vertex
-fn vs(@builtin(vertex_index) vid: u32) -> VSOut {
+fn compositeVertex(vid: u32, item: LayerBlurCompositeUniforms, record: u32) -> VSOut {
   // Two triangles forming a unit quad in [0,1] (same winding as shape-solid).
   var corner: vec2<f32>;
   switch (vid) {
@@ -82,14 +84,25 @@ fn vs(@builtin(vertex_index) vid: u32) -> VSOut {
     case 4u: { corner = vec2<f32>(1.0, 0.0); }
     default: { corner = vec2<f32>(1.0, 1.0); }
   }
-  let world = composite.rect.xy + corner * composite.rect.zw;
+  let world = item.rect.xy + corner * item.rect.zw;
   var clip = frameUniforms * vec4<f32>(world, 0.0, 1.0);
-  clip.z = composite.params.x; // precomputed linear depth for the node's z
+  clip.z = item.params.x; // precomputed linear depth for the node's z
   var out: VSOut;
   out.position = clip;
   out.uv = corner;
   out.worldPos = world;
+  out.record = record;
   return out;
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> VSOut {
+  return compositeVertex(vid, composite, 0u);
+}
+
+@vertex
+fn vs_layers(@builtin(vertex_index) vid: u32, @builtin(instance_index) id: u32) -> VSOut {
+  return compositeVertex(vid, compositeRecords[id], id);
 }
 
 // Signed distance to a rounded box centred on the origin (radii: top-left,
@@ -103,10 +116,9 @@ fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radii: vec4<f32>) -> f32 {
   return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-@fragment
-fn fs(inp: VSOut) -> @location(0) vec4<f32> {
+fn compositeColor(inp: VSOut, item: LayerBlurCompositeUniforms, sampled: vec4f) -> vec4f {
   // Page clip (canvas space, same test as every other instance).
-  let bounds = composite.clip;
+  let bounds = item.clip;
   if (inp.worldPos.x < bounds.x ||
       inp.worldPos.x > bounds.x + bounds.z ||
       inp.worldPos.y < bounds.y ||
@@ -116,13 +128,26 @@ fn fs(inp: VSOut) -> @location(0) vec4<f32> {
   // Premultiplied capture × opacity (opacity is 1.0 in the MVP — the captured
   // items already bake node opacity — but the slot keeps the P3 isolation-
   // opacity path a uniform write, not a shader change).
-  let color = textureSample(captureTexture, captureSampler, inp.uv) * composite.params.y;
+  let color = sampled * item.params.y;
   // Rounded clip, antialiased over one target pixel (the distance's screen
   // derivative), like the frame's own edge.
-  let rr = composite.rrect;
+  let rr = item.rrect;
   let halfSize = rr.zw * 0.5;
-  let d = sdRoundedBox(inp.worldPos - (rr.xy + halfSize), halfSize, composite.rrectRadii);
+  let d = sdRoundedBox(inp.worldPos - (rr.xy + halfSize), halfSize, item.rrectRadii);
   let aa = max(fwidth(d), 1e-6);
   let coverage = select(1.0, clamp(0.5 - d / aa, 0.0, 1.0), rr.z > 0.0 && rr.w > 0.0);
   return color * coverage * clipMaskCoverage(inp.worldPos);
+}
+
+
+@fragment
+fn fs(inp: VSOut) -> @location(0) vec4f {
+  return compositeColor(inp, composite, textureSample(captureTexture, captureSampler, inp.uv));
+}
+
+@fragment
+fn fs_layers(inp: VSOut) -> @location(0) vec4f {
+  let item = compositeRecords[inp.record];
+  let sampled = textureSample(captureLayers, captureSampler, inp.uv, i32(item.params.z));
+  return compositeColor(inp, item, sampled);
 }

@@ -174,6 +174,28 @@ fn quadratic_and_arc_segments_become_cubics_through_the_same_points() {
 }
 
 #[test]
+fn blend_samples_and_curve_segments_share_the_rendered_arc() {
+    use crate::path_geom::arc::{arc_endpoint_to_center, arc_to_beziers, ArcParams};
+    // Radii correction puts this arc on a diameter. Separate conversions disagreed
+    // on the sweep and sampled the polyline with a different number of steps.
+    let arc = ArcParams { x: 393., y: 188., rx: 44., ry: 44., x_axis_rotation: 15., large_arc: true, sweep: true };
+    let points = [BlendPathPoint::Move { x: 0., y: 0. }, BlendPathPoint::Arc {
+        x: arc.x, y: arc.y, rx: arc.rx, ry: arc.ry, x_axis_rotation: arc.x_axis_rotation,
+        large_arc: arc.large_arc, sweep: arc.sweep,
+    }];
+    let sweep = arc_endpoint_to_center(0., 0., &arc).unwrap().dtheta;
+    let steps = (sweep.abs() / std::f64::consts::FRAC_PI_2 * 8.).ceil() as usize;
+    assert_eq!(flatten_path_to_polyline(&points, false).len(), 1 + steps);
+    let shape = Shape::from_points(&points, false);
+    let curves = arc_to_beziers(0., 0., &arc);
+    assert_eq!(shape.contours[0].segs.len(), curves.len());
+    for (seg, curve) in shape.contours[0].segs.iter().zip(curves) {
+        assert_eq!(seg.c1, curve.cp1.into());
+        assert_eq!(seg.c2, curve.cp2.into());
+    }
+}
+
+#[test]
 fn correspondence_equalises_segments_and_keeps_the_end_shapes() {
     let a = square(-50.0, -50.0, 100.0); // 4 segments
     let b = star(0.0, 0.0, 60.0, 25.0, 5); // 10 segments
@@ -277,12 +299,8 @@ fn fills(v: Value) -> Vec<Fill> {
 
 #[test]
 fn solid_colours_interpolate_per_channel() {
-    let red = Paint::Solid(crate::paint::SolidPaint {
-        color: json!("#ff0000"),
-    });
-    let blue = Paint::Solid(crate::paint::SolidPaint {
-        color: json!("rgba(0, 0, 255, 0.5)"),
-    });
+    let red = Paint::Solid(crate::paint::SolidPaint::new(json!("#ff0000")));
+    let blue = Paint::Solid(crate::paint::SolidPaint::new(json!("rgba(0, 0, 255, 0.5)")));
     let mid = lerp_paint(&red, &blue, 0.5);
     assert_eq!(
         crate::paint::solid_color(&mid),
@@ -849,4 +867,15 @@ fn a_blend_of_a_many_anchor_outline_is_linear_in_its_anchors() {
     assert_eq!(reply["status"], "ok");
     assert_eq!(reply["steps"].as_array().unwrap().len(), 2);
     assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+}
+
+#[test]
+fn blend_center_uses_the_turn_between_subdivision_samples() {
+    let shape = Shape::from_points(&[
+        BlendPathPoint::Move { x: 0.0, y: 0.0 },
+        BlendPathPoint::Curve { x: 1.0, y: 0.0, cp1: (0.0, 0.0), cp2: (1.0, 1.0) },
+    ], false);
+    // y(t) = 3(1-t)t² turns at 2/3.
+    assert!((shape.bounds().unwrap().max_y - 4.0/9.0).abs() < 1e-15);
+    assert!((shape.center().unwrap().1 - 2.0/9.0).abs() < 1e-15);
 }

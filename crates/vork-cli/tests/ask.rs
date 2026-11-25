@@ -8,6 +8,10 @@ use std::{
 };
 
 struct Fixture(PathBuf);
+fn binary() -> std::ffi::OsString {
+    std::env::var_os("VORK_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_vork").into())
+}
+
 impl Fixture {
     fn new(scene: Value) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -21,7 +25,7 @@ impl Fixture {
         Self(root)
     }
     fn run(&self, questions: &Value, stdin: bool) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_vork"));
+        let mut command = Command::new(binary());
         command
             .env("VORK_GPU", "no-such-device")
             .env("VK_ICD_FILENAMES", self.0.join("no-vulkan.json"))
@@ -67,6 +71,26 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn half_turn_keeps_the_glyphs_ink_box_in_place() {
+    // Inter's U+01AB has a control point beyond its rightmost ink. A half turn
+    // about the control hull would displace both horizontal edges.
+    let f = Fixture::new(json!({"version":2,"composition":{"space":"2d"},
+        "render":{"resolution":[400,400]},"nodes":[{"type":"text","name":"g",
+        "content":"ƫ","font":"inter.ttf","font-size":200,"fill":"white"}],
+        "animation":[{"tracks":[{"path":["nodes","g","glyphs",0,"rotation"],
+            "keys":[[0,{"euler":[0,0,0]}],[1,{"euler":[0,0,std::f64::consts::PI]}]]}]}]}));
+    std::fs::write(f.0.join("inter.ttf"),
+        include_bytes!("../../moda-engine/tests/fixtures/fonts/inter/Inter_24pt-Regular.ttf")).unwrap();
+    let boxes = f.ask(json!([{"node":"g","read":"bounds","at":0},{"node":"g","read":"bounds","at":1}]));
+    for corner in 0..2 {
+        for axis in 0..2 {
+            let edge = |i: usize| boxes[i][corner][axis].as_f64().unwrap();
+            assert!((edge(0) - edge(1)).abs() < 1e-3, "{boxes}");
+        }
     }
 }
 
@@ -302,20 +326,34 @@ fn instance_selection_live_count_and_time_offset() {
     near(&result[3], &json!([[7, -1, 0], [9, 1, 0]]));
 }
 
+const THREE_BY_TWO_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 2, 8, 2,
+        0, 0, 0, 18, 22, 241, 77, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 168, 135, 1, 6, 56,
+        11, 0, 89, 96, 8, 239, 238, 131, 155, 210, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+
 #[test]
 fn image_headers_are_read_without_pixels_or_device() {
     let fixture =
         Fixture::new(json!({"version":2,"nodes":[],"images":{"plate":{"file":"plate.png"}}}));
-    let bytes = [
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 2, 8, 2,
-        0, 0, 0, 18, 22, 241, 77, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 168, 135, 1, 6, 56,
-        11, 0, 89, 96, 8, 239, 238, 131, 155, 210, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-    std::fs::write(fixture.0.join("plate.png"), bytes).unwrap();
+    std::fs::write(fixture.0.join("plate.png"), THREE_BY_TWO_PNG).unwrap();
     assert_eq!(
         fixture.ask(json!([{"image":"plate","read":"info"}])),
         json!([{"width":3,"height":2}])
     );
+}
+
+#[test]
+fn movie_time_field_uses_the_showing_nodes_clock() {
+    let mut scene = triangle();
+    scene["images"] = json!({"movie":{"file":"plate.mp4"}});
+    scene["materials"] = json!({"paint":{"inputs":{"base_color":{"image":"movie"}}}});
+    scene["nodes"][0]["children"][0]["materials"] = json!(["paint"]);
+    scene["nodes"][0]["children"][0]["time"] = json!({"offset":"1/4","speed":"3/2","duration":1});
+    let fixture = Fixture::new(scene);
+    std::fs::write(fixture.0.join("plate.mp4"), include_bytes!("../../vork-render/tests/fixtures/small-movie.mp4")).unwrap();
+    near(&fixture.ask(json!([{"field":"images.movie.time","at":"1/6"}])), &json!([0.5]));
 }
 
 #[test]
@@ -567,6 +605,8 @@ fn refusals_are_one_line_and_never_emit_partial_answers() {
         (json!({"node":"hero","read":"coverage"}), "not built yet"),
         (json!({"node":"hero","read":"luminance"}), "not built yet"),
         (json!({"node":"hero","read":"info"}), "property"),
+        (json!({"node":"title","read":"size"}), "text address key with read size"),
+        (json!({"node":"curve","read":"length"}), "path address key with read length"),
         (json!({"field":"nodes.hero.no_such_field"}), "field"),
         (json!({"buffer":"p","range":[2,2]}), "range"),
         (json!({"buffer":"p","file":"never.bin"}), "not built yet"),
@@ -652,4 +692,193 @@ fn compositor_fields_preserve_nullable_values_in_output_and_captures() {
             assert!(value[2][0].as_object().unwrap().contains_key("resolution"));
         }
     }
+}
+
+#[test]
+fn canvas_uses_sampled_geometry_and_layout_without_a_device() {
+    let fixture = Fixture::new(json!({
+        "version":2,"composition":{"space":"2d"},"render":{"resolution":[120,80]},
+        "nodes":[{"name":"group","children":[
+            {"type":"path","name":"bar","d":"M0 0 H40 V10 H0 Z","fill":"red"},
+            {"type":"path","name":"curve","d":"M0 0 C0 40 60 40 60 0 Q80 20 100 0 Z","pathLength":1}
+        ]},{"type":"text","name":"title","content":"Title","font":"font.ttf","font-size":20}],
+        "animation":[{"tracks":[{"path":["nodes","group","translation"],"interpolation":"LINEAR",
+            "keys":[[0,[10,20,0]],[1,[30,20,0]]]}]}]
+    }));
+    std::fs::write(
+        fixture.0.join("font.ttf"),
+        include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"),
+    )
+    .unwrap();
+    let answers = fixture.ask(json!([
+        {"node":"bar","read":"transform","at":0.5},
+        {"node":"bar","read":"bounds","at":[1,0.5,0]},
+        {"node":"bar","read":"screen","at":0.5},
+        {"text":"title","read":"size"},
+        {"path":"curve","read":"length"}
+    ]));
+    near(
+        &answers[0],
+        &json!([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 20, 20, 0, 1]),
+    );
+    near(
+        &answers[1],
+        &json!([
+            [[30, 20], [70, 30]],
+            [[20, 20], [60, 30]],
+            [[10, 20], [50, 30]]
+        ]),
+    );
+    assert_eq!(answers[2], json!({"box":[20,20,60,30],"inside":1.0}));
+    let text = &answers[3];
+    assert_eq!(text["line_count"], 1);
+    assert!(text["lines"][0]["baseline"].as_f64().unwrap() > 0.);
+    near(&text["box"][1][0], &text["lines"][0]["advance"]);
+    // Chromium SVGPathElement.getTotalLength() on the same closed cubic and quadratic.
+    assert!((answers[4].as_f64().unwrap() - 241.0612335205078).abs() < 0.002);
+    let refused = fixture.run(
+        &json!([{"node":"bar","read":"bounds"},{"text":"bar","read":"size"}]),
+        false,
+    );
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&refused.stderr).lines().count(), 1);
+}
+
+#[test]
+#[ignore = "requires a real GPU and ffmpeg for the reference frame"]
+fn canvas_bounds_match_drawn_text_and_stroke() {
+    let fixture = Fixture::new(json!({"version":2,"composition":{"space":"2d"},
+        "render":{"resolution":[320,128],"background":"white"},"nodes":[
+        {"type":"text","name":"title","content":"Title","font":"font.ttf","font-size":48,
+            "translation":[8,12,0],"fill":"black"},
+        {"name":"lower","translation":[12,88,0],"children":[{"type":"path","name":"bar",
+            "d":"M0 0 H180 V12 H0 Z","stroke":"black","stroke-width":4,"fill":"black"}]}]}));
+    std::fs::write(
+        fixture.0.join("font.ttf"),
+        include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"),
+    )
+    .unwrap();
+    let answers =
+        fixture.ask(json!([{"node":"title","read":"bounds"},{"node":"lower","read":"bounds"}]));
+    let frame = fixture.0.join("frame.png");
+    let output = Command::new(binary())
+        .arg("render")
+        .arg(fixture.0.join("scene.json"))
+        .arg("--out")
+        .arg(&frame)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pixels = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&frame)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        .output()
+        .unwrap();
+    assert!(pixels.status.success());
+    assert_eq!(pixels.stdout.len(), 320 * 128 * 3);
+    for (index, rows) in [(0, 0..80), (1, 80..128)] {
+        let mut edges = [320, 128, 0, 0];
+        for y in rows {
+            for x in 0..320 {
+                if pixels.stdout[(y * 320 + x) * 3] < 128 {
+                    edges = [
+                        edges[0].min(x),
+                        edges[1].min(y),
+                        edges[2].max(x + 1),
+                        edges[3].max(y + 1),
+                    ];
+                }
+            }
+        }
+        for (j, edge) in edges.into_iter().enumerate() {
+            let measured = answers[index][j / 2][j % 2].as_f64().unwrap();
+            assert!(
+                (measured - edge as f64).abs() <= 2.,
+                "item {index} edge {j}: {measured} vs {edge}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canvas_time_lists_remeasure_styled_paths_and_reflow_text() {
+    let fixture = Fixture::new(json!({
+        "version":2,"composition":{"space":"2d"},"render":{"resolution":[200,100]},
+        "nodes":[{"type":"path","name":"bar","d":"M0 0H10V10H0Z"},
+                 {"type":"text","name":"title","content":"Title Title","font":"font.ttf","width":85}],
+        "animation":[{"tracks":[
+            {"path":["nodes","bar","d"],"keys":[[0,"M0 0H10V10H0Z"],[2,"M0 0H30V50H0Z"]]},
+            {"path":["nodes","title","font-size"],"keys":[[0,16],[2,32]]}
+        ]}]
+    }));
+    std::fs::write(fixture.0.join("font.ttf"), include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf")).unwrap();
+    let answers = fixture.ask(json!([
+        {"path":"bar","read":"length","at":[2,1,0]},
+        {"text":"title","read":"size","at":[2,0,2]}
+    ]));
+    near(&answers[0], &json!([160,100,40]));
+    let large = &answers[1][0];
+    assert_eq!(large, &answers[1][2]);
+    assert_eq!(large["line_count"], 2);
+    assert_eq!(answers[1][1]["line_count"], 1);
+    assert!(large["lines"][1]["baseline"].as_f64().unwrap() > large["lines"][0]["baseline"].as_f64().unwrap());
+    assert!(large["lines"][0]["advance"].as_f64().unwrap() <= 85.);
+}
+
+#[test]
+fn movie_info_reads_the_header_when_no_picture_decodes() {
+    let fixture = Fixture::new(json!({"version":2,"composition":{"space":"2d"},"nodes":[],
+        "images":{"film":{"file":"header.mp4"}}}));
+    let path = fixture.0.join("header.mp4");
+    let encoded = Command::new("ffmpeg").args(["-nostdin","-v","error","-f","lavfi","-i",
+        "color=white:s=64x48:r=4:d=1","-c:v","libx264","-threads","1","-movflags","+faststart"])
+        .arg(&path).status().unwrap();
+    assert!(encoded.success());
+    // Keep the stream and sample tables but erase all four encoded samples.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let payload = bytes.windows(4).position(|w| w == b"mdat").unwrap() + 4;
+    bytes[payload..].fill(0);
+    std::fs::write(path, bytes).unwrap();
+    assert_eq!(fixture.ask(json!([{"image":"film","read":"info"}])),
+        json!([{"width":64,"height":48,"fps":4,"duration":1.0}]));
+}
+
+#[test]
+fn canvas_image_info_reads_stills_and_samples_sequence_time() {
+    let fixture = Fixture::new(json!({
+        "version":2, "composition":{"space":"2d"}, "render":{"fps":2},
+        "images":{"still":{"file":"frame.03.png"},"clip":{"file":"frame.%02d.png"}},
+        "nodes":[{"type":"path","name":"picture","d":"M0 0H10V10H0Z","fill":{"image":"still"}}],
+        "animation":[{"tracks":[
+            {"path":["images","clip","time"],"keys":[[0,0],[1,"1/2"]]},
+            {"path":["nodes","picture","translation"],"keys":[[0,[0,0,0]],[1,[10,0,0]]]}
+        ]}]
+    }));
+    let one_pixel = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+        0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196,
+        137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69,
+        78, 68, 174, 66, 96, 130,
+    ];
+    std::fs::write(fixture.0.join("frame.03.png"), one_pixel).unwrap();
+    std::fs::write(fixture.0.join("frame.04.png"), THREE_BY_TWO_PNG).unwrap();
+    let answers = fixture.ask(json!([
+        {"node":"picture","read":"bounds","at":0},
+        {"image":"still","read":"info"},
+        {"image":"clip","read":"info","at":[0,"999/1000",1]},
+        {"node":"picture","read":"bounds","at":1}
+    ]));
+    assert_eq!(answers[0], json!([[0.0,0.0],[10.0,10.0]]));
+    assert_eq!(answers[1], json!({"width":1,"height":1}));
+    assert_eq!(answers[2], json!([
+        {"width":1,"height":1},{"width":1,"height":1},{"width":3,"height":2}
+    ]));
+    assert_eq!(answers[3], json!([[10.0,0.0],[20.0,10.0]]));
 }

@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::seams::{BackdropOp, BackdropSplit, CoverageSource};
 
 use super::kernel::{
-    backdrop_blur_passes, generate_optimized_gaussian_kernel, BlurPass, MAX_BLUR_KERNEL_SIZE,
+    backdrop_blur_passes, blur_pass_uniform, generate_optimized_gaussian_kernel, BlurPass,
 };
 
 /// `MAX_DIFFUSION_DITHER_CELLS` (`WebGPUBackdropBlurRenderer.ts:212`).
@@ -49,9 +49,9 @@ pub struct BackdropRenderer {
     dither_render: wgpu::RenderPipeline,
     /// The backdrop filter kinds' pass (`backdrop-filter.wgsl`), compiled on first use: pages without a filter
     /// kind never build it.
-    filter: std::cell::OnceCell<wgpu::RenderPipeline>,
+    filter: std::sync::OnceLock<wgpu::RenderPipeline>,
     /// The adjustment kinds' pass (`backdrop-adjust.wgsl`) and its bind group layout, compiled on first use.
-    adjust: std::cell::OnceCell<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
+    adjust: std::sync::OnceLock<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
     effect_bgl: wgpu::BindGroupLayout,
     shape_effect_bgl: wgpu::BindGroupLayout,
     coverage_bgl: wgpu::BindGroupLayout,
@@ -69,7 +69,7 @@ pub struct BackdropRenderer {
     /// straight back into it.
     frame_format: wgpu::TextureFormat,
     /// Exact blend-mode splits (`blend.rs`).
-    blend: super::blend::BlendExec,
+    pub(crate) blend: super::blend::BlendExec,
 }
 
 fn shader(device: &wgpu::Device, id: &str) -> Result<wgpu::ShaderModule> {
@@ -457,8 +457,8 @@ impl BackdropRenderer {
                 None,
                 &[],
             ),
-            filter: std::cell::OnceCell::new(),
-            adjust: std::cell::OnceCell::new(),
+            filter: std::sync::OnceLock::new(),
+            adjust: std::sync::OnceLock::new(),
             effect_bgl,
             shape_effect_bgl,
             coverage_bgl,
@@ -471,11 +471,6 @@ impl BackdropRenderer {
         })
     }
 
-    /// Forget blend-split state left by an earlier frame (see `BlendExec::reset`).
-    pub fn begin_frame(&self) {
-        self.blend.reset();
-    }
-
     /// SEAMS §7 steps 2–3: copy `region_px` from the (resolved, sample_count-1)
     /// target, run the effect chain, composite back. The caller has already
     /// ended the main render pass and resumes it with LoadOp::Load after.
@@ -484,6 +479,7 @@ impl BackdropRenderer {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_split(
         &self,
+        saved: &mut super::blend::BlendStack,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -495,6 +491,7 @@ impl BackdropRenderer {
     ) -> Result<()> {
         if split.op.is_blend_split() {
             return self.blend.execute(
+                saved,
                 device,
                 queue,
                 encoder,
@@ -1091,16 +1088,7 @@ impl BackdropRenderer {
         kernel: &BlurPass,
         direction: u32,
     ) {
-        let kernel_size = kernel.size.min(MAX_BLUR_KERNEL_SIZE);
-        let mut uniform = vec![0f32; 4 + MAX_BLUR_KERNEL_SIZE * 4];
-        uniform[0] = direction as f32;
-        uniform[1] = kernel_size as f32;
-        uniform[2] = width as f32;
-        uniform[3] = height as f32;
-        for i in 0..kernel_size {
-            uniform[4 + i * 4] = kernel.weights.get(i).copied().unwrap_or(0.0);
-            uniform[4 + i * 4 + 1] = kernel.offsets.get(i).copied().unwrap_or(0.0);
-        }
+        let uniform = blur_pass_uniform(kernel, direction, [width as f32, height as f32]);
         let ubuf = self.uniform_buffer(
             device,
             queue,

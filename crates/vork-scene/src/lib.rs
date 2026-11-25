@@ -12,6 +12,7 @@ pub const SCHEMA_URL: &str = concat!(
 pub const STARTER_SCENE: &str = include_str!(concat!(env!("OUT_DIR"), "/starter.json"));
 
 pub mod libraries;
+pub mod migration;
 pub mod v2;
 pub use v2::*;
 

@@ -51,7 +51,39 @@ pub(super) fn fingerprint(query: &Query, value: &Option<Vec<u8>>) -> Option<Vec<
     })
 }
 
+thread_local! {
+    static REVISION: std::cell::RefCell<Option<std::sync::Arc<Observations>>> = const { std::cell::RefCell::new(None) };
+}
+/// A render of a rejected edit's predecessor reads the published compiler inputs.
+#[derive(Clone, Default)]
+pub struct RevisionFiles(Option<std::sync::Arc<Observations>>);
+impl RevisionFiles {
+    pub(super) fn new(files: Observations) -> Self { Self(Some(std::sync::Arc::new(files))) }
+    pub(super) fn is_live(&self) -> bool { self.0.is_none() }
+    pub fn current() -> Self { Self(REVISION.with(|r| r.borrow().clone())) }
+    pub fn enter(&self) -> RevisionScope { RevisionScope(REVISION.with(|r| r.replace(self.0.clone()))) }
+    pub fn contains_source(path: &Path) -> bool {
+        std::path::absolute(path).is_ok_and(|path| REVISION.with(|r|
+            r.borrow().as_ref().is_some_and(|files| files.get(&Query { op: 0, path }).is_some_and(Option::is_some))))
+    }
+    pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
+        if REVISION.with(|r| r.borrow().is_none()) { return fs::read(path); }
+        let query = Query { op: 0, path: std::path::absolute(path)? };
+        match REVISION.with(|r| r.borrow().as_ref().and_then(|files| files.get(&query).cloned())) {
+            Some(value) => value.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)),
+            None => fs::read(path),
+        }
+    }
+}
+pub struct RevisionScope(Option<std::sync::Arc<Observations>>);
+impl Drop for RevisionScope {
+    fn drop(&mut self) { REVISION.with(|r| r.replace(self.0.take())); }
+}
+
 pub(super) fn observe(query: &Query) -> Option<Vec<u8>> {
+    if let Some(value) = REVISION.with(|r| r.borrow().as_ref().and_then(|files| files.get(query).cloned())) {
+        return value;
+    }
     match query.op {
         0 => fs::read(&query.path).ok(),
         1 => query

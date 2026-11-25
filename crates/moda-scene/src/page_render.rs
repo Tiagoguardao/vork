@@ -27,97 +27,6 @@ use crate::types::RawPage;
 /// `PAGE_DEFAULTS.backgroundColor` (`core/config/canvasDefaults.ts:147`).
 pub const PAGE_DEFAULT_BACKGROUND: &str = "#ffffff";
 
-/// `KNOWN_SHADER_PALETTE_KEYS` (`core/procedural/patterns/shaderPaletteKeys.ts:14-28`) —
-/// order matters: the first key with a usable average wins.
-const KNOWN_SHADER_PALETTE_KEYS: [&str; 13] = [
-    "colors",
-    "gridColors",
-    "palette",
-    "swirlColors",
-    "metalColors",
-    "baseColor",
-    "backgroundColor",
-    "backgroundColors",
-    "panelColor",
-    "blobColor",
-    "ribbonColors",
-    "blobColors",
-    "metaballColors",
-];
-
-/// `averageHexColors` (`core/scene/scene.pages.ts:185-208`): only entries
-/// matching `^#?[0-9a-fA-F]{6}$` (after trim) count; channel-wise mean,
-/// `Math.round`ed, emitted as lowercase `#rrggbb`. None when nothing matched.
-fn average_hex_colors<'a>(colors: impl Iterator<Item = &'a str>) -> Option<String> {
-    let mut sr: u64 = 0;
-    let mut sg: u64 = 0;
-    let mut sb: u64 = 0;
-    let mut count: u64 = 0;
-    for color in colors {
-        let t = color.trim();
-        // /^#?([0-9a-fA-F]{6})$/ — at most one leading '#', exactly 6 hex digits.
-        let hex = t.strip_prefix('#').unwrap_or(t);
-        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
-        }
-        sr += u64::from_str_radix(&hex[0..2], 16).ok()?;
-        sg += u64::from_str_radix(&hex[2..4], 16).ok()?;
-        sb += u64::from_str_radix(&hex[4..6], 16).ok()?;
-        count += 1;
-    }
-    if count == 0 {
-        return None;
-    }
-    // JS Math.round(value / count) on non-negative values == round half up.
-    let avg = |s: u64| -> u64 { ((s as f64) / (count as f64)).round() as u64 };
-    Some(format!("#{:02x}{:02x}{:02x}", avg(sr), avg(sg), avg(sb)))
-}
-
-/// `sampleRepresentativeShaderColor` (`core/scene/scene.pages.ts:210-237`).
-///
-/// 1. `background ?? backgroundColor` if it is a STRING (nullish-coalescing:
-///    an explicit JSON `null` background falls through to `backgroundColor`;
-///    any other non-string `background` value still shadows it).
-/// 2. First `KNOWN_SHADER_PALETTE_KEYS` array whose string entries average to
-///    a color (6-digit-hex entries only — 8-digit/rgba entries are skipped).
-/// 3. `centers[*].color` strings averaged (mesh-rbf style params).
-pub fn sample_representative_shader_color(shader_params: Option<&Value>) -> Option<String> {
-    // `!shaderParams || typeof shaderParams !== 'object'` — JS arrays are
-    // typeof 'object' but have none of the looked-up keys, so collapsing
-    // arrays to None is behavior-identical.
-    let obj = shader_params?.as_object()?;
-
-    let background = match obj.get("background") {
-        Some(Value::Null) | None => obj.get("backgroundColor"),
-        other => other,
-    };
-    if let Some(Value::String(s)) = background {
-        return Some(s.clone());
-    }
-
-    for key in KNOWN_SHADER_PALETTE_KEYS {
-        if let Some(Value::Array(arr)) = obj.get(key) {
-            if let Some(rep) = average_hex_colors(arr.iter().filter_map(Value::as_str)) {
-                return Some(rep);
-            }
-        }
-    }
-
-    if let Some(Value::Array(centers)) = obj.get("centers") {
-        // `typeof value === 'object' && value !== null && 'color' in value`,
-        // collect string colors; return the average DIRECTLY (no fallthrough).
-        return average_hex_colors(
-            centers
-                .iter()
-                .filter_map(|v| v.as_object())
-                .filter_map(|o| o.get("color"))
-                .filter_map(Value::as_str),
-        );
-    }
-
-    None
-}
-
 /// The `fill` field of `PageRenderData` (`pageRenderFill`,
 /// `core/scene/scene.pages.ts`): the page quad's solid colour. The top
 /// background layer decides: a solid's colour string, a shader's
@@ -155,11 +64,7 @@ pub fn page_render_fill(page: &RawPage) -> String {
             .color
             .as_str()
             .map_or_else(|| PAGE_DEFAULT_BACKGROUND.to_string(), str::to_string),
-        crate::paint::Paint::Shader(s) => {
-            let params = s.params.clone().map(Value::Object);
-            sample_representative_shader_color(params.as_ref())
-                .unwrap_or_else(|| PAGE_DEFAULT_BACKGROUND.to_string())
-        }
+
         _ => PAGE_DEFAULT_BACKGROUND.to_string(),
     }
 }
@@ -176,10 +81,6 @@ mod tests {
     /// A page whose background is the one `paint`.
     fn page_with(paint: Value) -> RawPage {
         page(json!({"id": "p", "fills": [{"id": "fill-0", "paint": paint}]}))
-    }
-
-    fn shader_page(params: Value) -> RawPage {
-        page_with(json!({"type": "shader", "shaderId": "shape-grid-dots", "params": params}))
     }
 
     #[test]
@@ -225,58 +126,6 @@ mod tests {
         ] {
             assert_eq!(page_render_fill(&page_with(paint.clone())), "#ffffff", "paint {paint}");
         }
-    }
-
-    #[test]
-    fn shader_averages_first_palette_key() {
-        // The d463d8b5 page-4 case: avg(#0B0C10, #00F5FF) = #058188-ish teal.
-        let p = shader_page(json!({
-            "colors": ["#0B0C10", "#00F5FF"],
-            "blobColors": ["#00F5FF", "#00FFA3"],
-            "backgroundColors": ["#0B0C10", "#0a1628"]
-        }));
-        // (11+0)/2=5.5→6, (12+245)/2=128.5→129, (16+255)/2=135.5→136
-        assert_eq!(page_render_fill(&p), "#068188");
-    }
-
-    #[test]
-    fn shader_background_string_wins() {
-        let p = shader_page(json!({"background": "#00000000", "colors": ["#ff0000"]}));
-        // Even a non-6-digit background string is returned VERBATIM (the page
-        // system's colorToNormalizedRgb then fails on 8-digit hex → white).
-        assert_eq!(page_render_fill(&p), "#00000000");
-    }
-
-    #[test]
-    fn shader_null_background_falls_to_background_color() {
-        let p = shader_page(json!({"background": null, "backgroundColor": "#abcdef"}));
-        assert_eq!(page_render_fill(&p), "#abcdef");
-    }
-
-    #[test]
-    fn shader_palette_key_order_and_skipping() {
-        // 8-digit entries are skipped by averageHexColors; an array that
-        // averages to nothing falls through to the NEXT key.
-        let p = shader_page(json!({
-            "colors": ["#00000000", "rgba(1,2,3,1)"],
-            "gridColors": ["#102030", "#304050"]
-        }));
-        assert_eq!(page_render_fill(&p), "#203040");
-    }
-
-    #[test]
-    fn shader_centers_fallback() {
-        let p = shader_page(json!({"centers": [{"color": "#102030"}, {"color": "#304050"}, {"x": 1}]}));
-        assert_eq!(page_render_fill(&p), "#203040");
-    }
-
-    #[test]
-    fn shader_no_usable_params_is_white() {
-        for params in [json!({}), json!({"colors": "nope"})] {
-            assert_eq!(page_render_fill(&shader_page(params.clone())), "#ffffff", "params {params}");
-        }
-        let p = page_with(json!({"type": "shader", "shaderId": "shape-grid-dots"}));
-        assert_eq!(page_render_fill(&p), "#ffffff");
     }
 
     #[test]

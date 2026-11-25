@@ -1049,9 +1049,7 @@ pub fn fit_points(input: &[V2], opts: &FitOptions) -> FitOutput {
         u: 1.0,
     });
 
-    // Arc-length fractions, measured with the ONE arc-length implementation
-    // markers use (`path_length::cubic_arc_length`, what `anchor_fractions`
-    // sums), so a sample's `t` and an anchor's `t` agree on the fitted path.
+    // Measure sample and anchor fractions along the fitted path.
     let seg_len: Vec<f64> = segs.iter().map(|s| shared_arc_len(s, 1.0)).collect();
     let mut cum = Vec::with_capacity(segs.len() + 1);
     let mut acc = 0.0;

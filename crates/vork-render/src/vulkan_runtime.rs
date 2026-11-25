@@ -18,6 +18,59 @@ pub(crate) fn instance(desc: wgpu::InstanceDescriptor) -> Result<wgpu::Instance>
     nvidia_instance(desc, entry)
 }
 
+/// NVIDIA's Vulkan acceleration-structure runtime can fault inside libcuda
+/// when the selected Vulkan device is hidden from CUDA.
+#[cfg(target_os = "linux")]
+pub(crate) fn nvidia_ray_driver(
+    adapter: &wgpu::hal::vulkan::Adapter,
+    name: &str,
+) -> Result<Option<libloading::Library>> {
+    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    let mut ids = vk::PhysicalDeviceIDProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default()
+        .push_next(&mut driver).push_next(&mut ids);
+    unsafe {
+        adapter.shared_instance().raw_instance()
+            .get_physical_device_properties2(adapter.raw_physical_device(), &mut properties);
+    }
+    if driver.driver_id != vk::DriverId::NVIDIA_PROPRIETARY {
+        return Ok(None);
+    }
+    let library = unsafe { libloading::Library::new("libcuda.so.1") }.with_context(|| {
+        format!("{name} Vulkan acceleration structures need libcuda.so.1 from the NVIDIA graphics driver; install or expose the matching driver library, or select another Vulkan adapter")
+    })?;
+    // Without a mask, leave CUDA initialization to the Vulkan driver.
+    if std::env::var_os("CUDA_VISIBLE_DEVICES").is_some() {
+        anyhow::ensure!(
+            cuda_exposes_uuid(&library, &ids.device_uuid).context("query CUDA-visible GPUs")?,
+            "{name} Vulkan acceleration structures need the rendering GPU visible to CUDA; adjust or unset CUDA_VISIBLE_DEVICES, or select another Vulkan adapter",
+        );
+    }
+    Ok(Some(library))
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_exposes_uuid(library: &libloading::Library, uuid: &[u8; 16]) -> Result<bool> {
+    // CUDA's driver ABI takes a CUdevice (int) and a CUuuid (16 bytes).
+    unsafe {
+        let init = library.get::<unsafe extern "C" fn(u32) -> i32>(b"cuInit\0")?;
+        let count = library.get::<unsafe extern "C" fn(*mut i32) -> i32>(b"cuDeviceGetCount\0")?;
+        let device = library.get::<unsafe extern "C" fn(*mut i32, i32) -> i32>(b"cuDeviceGet\0")?;
+        let get_uuid = library.get::<unsafe extern "C" fn(*mut [u8; 16], i32) -> i32>(b"cuDeviceGetUuid\0")?;
+        let mut visible = 0;
+        if init(0) != 0 || count(&mut visible) != 0 {
+            return Ok(false);
+        }
+        Ok((0..visible).any(|ordinal| {
+            let mut handle = 0;
+            let mut candidate = [0; 16];
+            device(&mut handle, ordinal) == 0
+                && get_uuid(&mut candidate, handle) == 0
+                && candidate == *uuid
+        }))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn nvidia_instance(desc: wgpu::InstanceDescriptor, entry: ash::Entry) -> Result<wgpu::Instance> {
     // Respect explicit operator/CI selection before any optional probe work.

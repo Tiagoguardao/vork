@@ -28,7 +28,7 @@ use std::time::Instant;
 use vork_encode::{Backend, EncodeSettings, Encoder, Surface};
 use vork_scene::v2::{self, NodeKind, TextUnit, TrackTarget, UnitProperty};
 use vork_scene::Scene;
-use crate::canvas_draw::{PaintForm, PaintSource};
+use crate::canvas_draw::{MediaPublication, PaintForm, PaintSource, TextPaintRevisions};
 
 macro_rules! ensure_usage {
     ($condition:expr, $($message:tt)*) => {
@@ -38,6 +38,23 @@ macro_rules! ensure_usage {
 
 /// The levels of pieces, innermost first: a glyph's transform applies first, then its word's, then its line's.
 const LEVELS: [TextUnit; 3] = [TextUnit::Glyphs, TextUnit::Words, TextUnit::Lines];
+
+/// Columns in glyph, word and line order, shared with LEVELS.
+struct TextLevels<T>([T; 3]);
+
+impl<T> std::ops::Index<&TextUnit> for TextLevels<T> {
+    type Output = T;
+    fn index(&self, unit: &TextUnit) -> &T {
+        &self.0[match unit { TextUnit::Glyphs => 0, TextUnit::Words => 1, TextUnit::Lines => 2 }]
+    }
+}
+
+#[derive(Clone, Default)]
+struct TextTracks {
+    pieces: bool,
+    paint_units: [Option<Arc<std::collections::BTreeSet<(TextUnit, usize)>>>; 2],
+    glyphs: bool,
+}
 
 /// One node of the canvas tree, flattened in paint order.
 struct Item {
@@ -57,6 +74,21 @@ struct Rest {
     path: Option<crate::canvas_draw::PathValues>,
     text: bool,
 }
+/// Apply one numeric placement track in layer order. Both the initial evaluation and
+/// subsequent writes to a placement column use the same blending arithmetic.
+fn blend_placement(part: u8, transform: &mut v2::Transform, opacity: &mut f32,
+    value: &[f32], weight: f32, additive: bool) {
+    use crate::animation::{blend, BlendKind};
+    use crate::canvas_draw::change;
+    match part {
+        change::TRANSLATION => blend(&mut transform.translation, value, weight, additive, BlendKind::Add),
+        change::SCALE => blend(&mut transform.scale, value, weight, additive, BlendKind::Multiply),
+        change::ROTATION => blend(transform.rotation_mut(), value, weight, additive, BlendKind::Rotation),
+        change::OPACITY => blend(std::slice::from_mut(opacity), value, weight, additive, BlendKind::Add),
+        _ => unreachable!("a numeric placement column"),
+    }
+}
+
 /// Every item's children, in paint order, as one array.
 struct Children {
     /// Item `i`'s children are `items[first[i]..first[i + 1]]`.
@@ -109,21 +141,18 @@ struct TextItem {
     run_of: Arc<Vec<usize>>,
     code_points: usize,
     clip_source: bool,
-    units: Arc<BTreeMap<TextUnit, Vec<Vec<usize>>>>,
+    units: Arc<TextLevels<Vec<Vec<usize>>>>,
     /// Per level, the piece each code point belongs to.
-    piece_of: Arc<BTreeMap<TextUnit, Vec<Option<usize>>>>,
+    piece_of: Arc<TextLevels<Vec<Option<usize>>>>,
     /// Per level, each piece's ink box at rest (node px: left, top, right, bottom).
-    boxes: Arc<BTreeMap<TextUnit, Vec<Option<[f64; 4]>>>>,
+    boxes: Arc<TextLevels<Vec<Option<[f64; 4]>>>>,
     /// The centre of all the node's ink at rest: Moda turns every code point about it when all form one unit.
     centre: DVec2,
     /// Each code point's fill and stroke at rest (its run's, else the node's).
     fill: Vec<PaintSource>,
     stroke: Vec<PaintSource>,
     stroke_width: f64,
-    /// Whether tracks address this node's glyphs, words or lines.
-    pieces_keyed: bool,
-    /// Whether tracks key a glyph's, word's or line's fill: each code point then draws in its own colour.
-    fill_keyed: bool,
+    tracks: TextTracks,
     /// The text laid out: the one layout its box, lines, ink boxes and draws read.
     layout: Arc<Laid>,
     degraded_paints: Vec<(PaintSource, String)>,
@@ -131,6 +160,23 @@ struct TextItem {
     size: [f64; 2],
 }
 impl TextItem {
+    /// Boundaries follow authored runs and independently keyed paint units.
+    fn paint_ranges(&self, stroke: bool) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let keyed = self.tracks.paint_units[usize::from(stroke)].as_deref();
+        let mut start = 0;
+        std::iter::from_fn(move || {
+            if start >= self.code_points { return None; }
+            let end = (start + 1..self.code_points).find(|&cp| {
+                self.run_of[cp] != self.run_of[start] || keyed.is_some_and(|units| LEVELS.iter().any(|level| {
+                    let (a, b) = (self.piece_of[level][start], self.piece_of[level][cp]);
+                    a != b && [a, b].into_iter().flatten().any(|i| units.contains(&(*level, i)))
+                }))
+            }).unwrap_or(self.code_points);
+            let range = start..end;
+            start = end;
+            Some(range)
+        })
+    }
     /// Moda's vector lane declined this text (right-to-left or complex script); its degraded tier draws it.
     fn degraded(&self) -> bool { self.layout.vector.is_none() }
 }
@@ -138,6 +184,7 @@ impl TextItem {
 /// same HTML without its colours (text, runs, fonts and their axes, size, spacing, alignment, white space), box
 /// width and wrapping, on this document's fonts. Where a node draws and in what colours is no part of it.
 struct Laid {
+    metrics: Vec<[f64; 2]>,
     /// Moda's vector layout; `None` when its vector lane declines the text and its degraded tier draws it.
     vector: Option<moda_text::vector::VectorLayout>,
     /// The box's width (px): the widest line when the text has no width of its own.
@@ -146,9 +193,7 @@ struct Laid {
     height: f64,
     /// Per line, the source code points its segments hold, in order.
     lines: Vec<Vec<usize>>,
-    /// A hash of the content this layout is of (`LaidKey`), made once when the text is laid out: what names the
-    /// layout where the key itself is too big to carry. Equal content has an equal hash within a process.
-    content: u64,
+
 }
 /// What lays text out: its HTML with paints named, not coloured (`TextHtml::layout`), its width and whether it wraps. The line-height policy is CSS for every node.
 type LaidKey = (Arc<str>, Option<u64>, bool);
@@ -164,6 +209,30 @@ struct UnitValue {
     stroke: Vec<UnitPaint>,
     origin: Option<[(f32, f32); 2]>,
 }
+#[derive(Clone, Default, PartialEq)]
+struct UnitValues(Vec<((TextUnit, usize), UnitValue)>);
+
+impl UnitValues {
+    fn position(&self, key: &(TextUnit, usize)) -> Result<usize, usize> {
+        self.0.binary_search_by_key(key, |entry| entry.0)
+    }
+
+    fn get(&self, key: &(TextUnit, usize)) -> Option<&UnitValue> {
+        self.position(key).ok().map(|slot| &self.0[slot].1)
+    }
+
+    fn write(&mut self, key: (TextUnit, usize)) -> &mut UnitValue {
+        let slot = match self.position(&key) {
+            Ok(slot) => slot,
+            Err(slot) => {
+                self.0.insert(slot, (key, UnitValue::default()));
+                slot
+            }
+        };
+        &mut self.0[slot].1
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum UnitPaint {
     Css(Arc<crate::animation::style::StyleValue>, f32),
@@ -183,6 +252,51 @@ struct Draw {
     spec: Arc<moda_text::ops::TextNodeSpec>,
     model: [f32; 16],
     layout: Arc<Laid>,
+}
+
+/// A plan can outlive the next evaluated frame. It holds one shared directory of text rows.
+/// Updating an item detaches its directory page and batch vector while earlier plans keep theirs.
+const DRAW_ROWS_PER_PAGE: usize = 64;
+type DrawPage = [Option<Arc<Vec<Draw>>>; DRAW_ROWS_PER_PAGE];
+
+#[derive(Clone)]
+struct TextDrawRows(Arc<Vec<Option<Arc<DrawPage>>>>);
+
+impl TextDrawRows {
+    fn new(items: usize) -> Self {
+        Self(Arc::new(vec![None; items.div_ceil(DRAW_ROWS_PER_PAGE)]))
+    }
+
+    fn get(&self, item: usize) -> &[Draw] {
+        self.0.get(item / DRAW_ROWS_PER_PAGE).and_then(Option::as_ref)
+            .and_then(|page| page[item % DRAW_ROWS_PER_PAGE].as_ref())
+            .map_or(&[], |row| row.as_slice())
+    }
+
+    fn slot(&mut self, item: usize) -> &mut Option<Arc<Vec<Draw>>> {
+        let directory = Arc::make_mut(&mut self.0);
+        let page = directory[item / DRAW_ROWS_PER_PAGE].get_or_insert_with(|| Arc::new(std::array::from_fn(|_| None)));
+        &mut Arc::make_mut(page)[item % DRAW_ROWS_PER_PAGE]
+    }
+
+    fn replace(&mut self, item: usize, draws: &mut Vec<Draw>) {
+        let next = (!draws.is_empty()).then(|| Arc::new(std::mem::take(draws)));
+        if let Some(old) = std::mem::replace(self.slot(item), next).and_then(Arc::into_inner) {
+            *draws = old;
+        }
+    }
+}
+
+impl std::ops::Index<usize> for TextDrawRows {
+    type Output = [Draw];
+    fn index(&self, item: usize) -> &[Draw] { self.get(item) }
+}
+
+#[cfg(test)]
+impl std::ops::IndexMut<usize> for TextDrawRows {
+    fn index_mut(&mut self, item: usize) -> &mut [Draw] {
+        Arc::make_mut(self.slot(item).as_mut().expect("snapshot text row")).as_mut_slice()
+    }
 }
 
 /// A canvas document: its text laid out, its fonts loaded, its tracks compiled.
@@ -213,9 +327,116 @@ pub(crate) struct Document {
     /// Frames by what changed since the frame before: unchanged, then each `ChangeKind`.
     changes: std::cell::Cell<[u64; 5]>,
 }
+/// Visit the sampled paints, including images selected by path, run and glyph tracks.
+fn visit_image_paints(node: &crate::canvas_draw::Node, values: &crate::canvas_draw::Values, mut image: impl FnMut(&str)) {
+    let mut paint = |value: &moda_scene::value::Value| {
+        if value["type"] == "image" && let Some(src) = value["src"].as_str() { image(src); }
+    };
+    if let (crate::canvas_draw::Kind::Path(path), Some(values)) = (&node.kind, &values.path) {
+        for source in path.paints(values) {
+            if let PaintSource::Moda(value) = source.as_ref() { paint(value); }
+        }
+    }
+    fn text(parts: &[crate::canvas_draw::TextPart], paint: &mut impl FnMut(&moda_scene::value::Value)) {
+        use crate::canvas_draw::TextPart;
+        for part in parts {
+            match part {
+                TextPart::Paint { paint: value, .. } => paint(value),
+                TextPart::Group { children, .. } => text(children, paint),
+                TextPart::Batch(_) => {}
+            }
+        }
+    }
+    text(&values.text_composition, &mut paint);
+}
+
+/// The canvas evaluator's resolved movie paints, without frame decoding or GPU work.
+pub(crate) struct SoundPaints {
+    document: Document,
+    items: Vec<usize>,
+    names: RefCell<Vec<Option<BTreeSet<String>>>>,
+    bindings: Vec<crate::animation::BindingPlan>,
+    scratch: RefCell<crate::animation::SoundScratch>,
+}
+
+impl SoundPaints {
+    pub(crate) fn new(scene: &Scene, base: &Path, wanted: &std::collections::HashSet<&str>, opened: &crate::footage::Opened) -> Result<Self> {
+        let document = Document::new_with_paints(scene, base, Some(wanted), opened)?;
+        let items: Vec<_> = document.items.iter().enumerate()
+            .filter(|(_, item)| wanted.contains(item.name.as_str())).map(|(i, _)| i).collect();
+        let names = RefCell::new(vec![None; items.len()]);
+        let bindings = items.iter().map(|&item| {
+            let tracks = document.tracks_of(item).iter().copied().filter(|&flat|
+                document.kinds[flat as usize] == Some(ChangeKind::Content));
+            document.plan.binding_plan(item, tracks)
+        }).collect();
+        let scratch = RefCell::new(document.plan.sound_scratch());
+        Ok(Self { document, items, names, bindings, scratch })
+    }
+
+    pub(crate) fn items(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+        self.items.iter().enumerate().map(|(slot, &item)| (self.document.items[item].name.as_str(), slot))
+    }
+
+    pub(crate) fn animated(&self, slot: usize) -> bool { !self.bindings[slot].is_empty() }
+
+    pub(crate) fn sample(&self, slot: usize, instant: &vork_time::exact::Germ, first: i64, last: i64,
+        scope_rate: Option<&vork_time::exact::Rational>) -> Result<i64> {
+        let doc = &self.document;
+        let binding = &self.bindings[slot];
+        let item = self.items[slot];
+        let mut names = self.names.borrow_mut();
+        if binding.is_empty() && names[slot].is_some() { return Ok(last); }
+        let mut samples = doc.samples.borrow_mut();
+        let end = doc.plan.sample_binding(binding, instant, first, last, scope_rate,
+            &mut self.scratch.borrow_mut(), &mut samples)?;
+        if names[slot].is_none() || !samples.changed().is_empty() {
+            let mut values = doc.unevaluated(item);
+            let mut node = None;
+            doc.evaluate_item(&samples, item, true, true, &mut doc.styles.borrow_mut(),
+                &mut doc.text_specs.borrow_mut(), &mut node, &mut values, &mut Vec::new())?;
+            let mut movies = BTreeSet::new();
+            let node = node.as_deref().unwrap_or(&doc.items[item].node);
+            visit_image_paints(node, &values, |name| { movies.insert(name.to_owned()); });
+            names[slot] = Some(movies);
+        }
+        Ok(end)
+    }
+
+    pub(crate) fn shows(&self, item: usize, movie: &str) -> bool {
+        self.names.borrow()[item].as_ref().expect("sampled paints").contains(movie)
+    }
+}
+
+/// Bounds of every authored subtree at the last instant a question measured.
+struct MeasuredBounds {
+    time: vork_time::Request,
+    boxes: Vec<Option<[f64; 4]>>,
+    effect: Vec<Option<usize>>,
+}
+pub(crate) struct BoundsBatch {
+    wanted: std::collections::HashSet<usize>,
+    measured: Option<MeasuredBounds>,
+}
+impl MeasuredBounds {
+    fn answer(&self, doc: &Document, item: usize, read: &str) -> Result<serde_json::Value> {
+        if let Some(effect) = self.effect[item] {
+            bail!("ask: bounds depend on mask, clip or filter on {:?}; remove it to measure the geometry", doc.items[effect].name);
+        }
+        let Some([x, y, right, bottom]) = self.boxes[item] else {
+            return Ok(serde_json::Value::Null);
+        };
+        if read == "bounds" {
+            return Ok(serde_json::json!([[x, y], [right, bottom]]));
+        }
+        crate::ask::screen_box([x, y, right, bottom], f64::from(doc.page.size[0]), f64::from(doc.page.size[1]))
+    }
+}
+
 /// Immutable installed inputs shared by concurrently sampled frames. Each document owns
 /// its samples, stamped scene, planner and draw caches; no frame copies these inputs.
 pub(crate) struct Prepared {
+    opened: crate::footage::Opened,
     /// The canvas's scene, kept when its image graph or a view stage is prepared from it: it keeps a float
     /// picture (`float`), or it blends in another encoding than sRGB, which only its view turns into code
     /// values a reader or a display takes.
@@ -230,12 +451,9 @@ pub(crate) struct Prepared {
     images: v2::Table<v2::Image>,
     base: PathBuf,
     font_lists: Vec<Vec<PathBuf>>,
-    keyed: BTreeMap<String, BTreeSet<UnitProperty>>,
-    glyphs_keyed: BTreeSet<String>,
     /// What a restyling track starts from, for each item one names (`restyled_field`); `None` for every other
     /// item. By item.
     authored: Vec<Option<Box<Authored>>>,
-    size: [u32; 2],
     items: Vec<Item>,
     /// Each item's rest values, by item.
     rest: Vec<Rest>,
@@ -260,8 +478,6 @@ pub(crate) struct Prepared {
     item_tracks: Vec<u32>,
     /// The tracks of the page's background: the tracks that target no item and still draw.
     page_tracks: Vec<u32>,
-    font_host: Arc<moda_text::TextHost>,
-    font_layouts: HashMap<LaidKey, std::sync::Weak<Laid>>,
 }
 impl std::ops::Deref for Document {
     type Target = Prepared;
@@ -272,18 +488,77 @@ pub(crate) struct WorldPart {
     item: usize,
     pub scene: Scene,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StyleField {
+    Fill,
+    Stroke,
+    StrokeWidth,
+    Property(v2::StyleProperty),
+}
+
+impl StyleField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Stroke => "stroke",
+            Self::StrokeWidth => "stroke-width",
+            Self::Property(property) => property.name(),
+        }
+    }
+}
+
+struct ReferenceFields {
+    path_data: StyleField,
+    filter: StyleField,
+    clip_path: StyleField,
+    mask: StyleField,
+}
+
+static REFERENCE_FIELDS: std::sync::LazyLock<ReferenceFields> = std::sync::LazyLock::new(|| {
+    let property = |name| StyleField::Property(v2::StyleProperty::parse(name).expect("registered canvas field"));
+    ReferenceFields { path_data: property("d"), filter: property("filter"), clip_path: property("clip-path"), mask: property("mask") }
+});
+
+#[derive(Default, PartialEq)]
+struct StyleFields(Vec<(StyleField, Arc<crate::animation::style::StyleValue>)>);
+
+impl StyleFields {
+    fn get(&self, key: StyleField) -> Option<&Arc<crate::animation::style::StyleValue>> {
+        self.0.iter().find(|entry| entry.0 == key).map(|entry| &entry.1)
+    }
+
+    fn set(&mut self, key: StyleField, value: Arc<crate::animation::style::StyleValue>) {
+        if let Some(entry) = self.0.iter_mut().find(|entry| entry.0 == key) {
+            entry.1 = value;
+        } else {
+            // Preserve the authored field-application order when multiple tracks write one node.
+            let position = self.0.partition_point(|entry| entry.0.name() < key.name());
+            self.0.insert(position, (key, value));
+        }
+    }
+
+    fn content(&self, include_paint: bool) -> impl Iterator<Item = &(StyleField, Arc<crate::animation::style::StyleValue>)> {
+        self.0.iter().filter(move |(field, _)| match field {
+            StyleField::Fill | StyleField::Stroke => include_paint,
+            _ => *field != REFERENCE_FIELDS.filter && *field != REFERENCE_FIELDS.clip_path && *field != REFERENCE_FIELDS.mask,
+        })
+    }
+
+}
 struct StyledItem {
-    fields: BTreeMap<String, Arc<crate::animation::style::StyleValue>>,
+    fields: StyleFields,
     draw: Arc<crate::canvas_draw::Node>,
     text: Option<Arc<TextItem>>,
     revision: u64,
     text_revision: u64,
 }
+#[derive(Clone)]
 struct TextSpecs {
+    paint_revisions: TextPaintRevisions,
     revision: u64,
     content_revision: u64,
-    style_revision: u64,
-    units: BTreeMap<(TextUnit, usize), UnitValue>,
+    style_revision: Option<u64>,
+    units: UnitValues,
     specs: Vec<Arc<moda_text::ops::TextNodeSpec>>,
     composition: Vec<crate::canvas_draw::TextPart>,
     clip: Option<Arc<moda_text::ops::TextNodeSpec>>,
@@ -293,8 +568,6 @@ struct TextSpecs {
 struct Fonts {
     host: Arc<moda_text::TextHost>,
     store: std::rc::Rc<moda_text::vector::VectorFontStore>,
-    /// Moda's degraded tier on the scene's fonts, built when a node needs it.
-    degraded: std::rc::Rc<std::cell::OnceCell<moda_text::degraded::DegradedEngine>>,
     /// The layouts in use, by content: an entry lives as long as a text item or draw holds it.
     layouts: std::rc::Rc<RefCell<Layouts>>,
 }
@@ -323,7 +596,7 @@ struct FrameState {
     nodes: Vec<Option<Arc<crate::canvas_draw::Node>>>,
     values: Vec<crate::canvas_draw::Values>,
     /// Each item's text batches, in the order it draws them (`Draw::sub`); empty for an item that draws none.
-    draws: Vec<Vec<Draw>>,
+    draws: TextDrawRows,
     /// Which nodes draw at all: visible, present on their clocks, and so is every ancestor.
     shown: Vec<bool>,
     /// Of those, the ones no zero scale at or above them collapses: a text node's batches are built only then.
@@ -331,8 +604,9 @@ struct FrameState {
 }
 impl FrameState {
     /// Every text batch, in item order.
+    #[cfg(test)]
     fn batches(&self) -> impl Iterator<Item = &Draw> {
-        self.draws.iter().flatten()
+        (0..self.values.len()).flat_map(|item| self.draws.get(item))
     }
 }
 /// The document's evaluated table: every item's values at the last frame evaluated, written in place by each
@@ -406,7 +680,7 @@ impl ChangeKind {
             TrackTarget::Node { node, property: property @ (P::Fill | P::Stroke) } if form.is_some() && rest(node, *property == P::Fill) == form => Self::PaintValue,
             // Opacity scales whatever paint is there: a colour, a gradient or an image.
             TrackTarget::Node { node, property: P::FillOpacity | P::StrokeOpacity } if numeric && path(node) => Self::PaintValue,
-            TrackTarget::Node { property: P::Style(p), .. } if matches!(p.name(), "clip-path" | "mask") => Self::Structure,
+            TrackTarget::Node { property: P::Style(p), .. } if matches!(p.name(), "clip-path" | "mask" | "mask-type" | "mix-blend-mode" | "isolation") => Self::Structure,
             TrackTarget::Render(v2::RenderProperty::Background) => Self::Structure,
             _ => Self::Content,
         })
@@ -417,13 +691,13 @@ impl ChangeKind {
 /// that field as authored, and a changed content field makes the node again with the new value in it. `None`
 /// for every other track. (A stroke-width track restyles a text node; a path's stroke width is a number of its
 /// own.)
-fn restyled_field(target: &TrackTarget) -> Option<(&str, &'static str)> {
+fn restyled_field(target: &TrackTarget) -> Option<(&str, StyleField)> {
     use v2::NodeProperty as P;
     match target {
-        TrackTarget::Node { node, property: P::Style(p) } => Some((node.as_str(), p.name())),
-        TrackTarget::Node { node, property: P::Fill } => Some((node.as_str(), "fill")),
-        TrackTarget::Node { node, property: P::Stroke } => Some((node.as_str(), "stroke")),
-        TrackTarget::Node { node, property: P::StrokeWidth } => Some((node.as_str(), "stroke-width")),
+        TrackTarget::Node { node, property: P::Style(p) } => Some((node.as_str(), StyleField::Property(*p))),
+        TrackTarget::Node { node, property: P::Fill } => Some((node.as_str(), StyleField::Fill)),
+        TrackTarget::Node { node, property: P::Stroke } => Some((node.as_str(), StyleField::Stroke)),
+        TrackTarget::Node { node, property: P::StrokeWidth } => Some((node.as_str(), StyleField::StrokeWidth)),
         _ => None,
     }
 }
@@ -432,11 +706,11 @@ fn restyled_field(target: &TrackTarget) -> Option<(&str, &'static str)> {
 /// which that track's value is mixed from.
 struct Authored {
     node: v2::Node,
-    fields: Vec<(&'static str, serde_json::Value)>,
+    fields: Vec<(StyleField, serde_json::Value)>,
 }
 impl Authored {
     /// The authored value of a field a track names; null for one the node does not write.
-    fn field(&self, name: &str) -> &serde_json::Value {
+    fn field(&self, name: StyleField) -> &serde_json::Value {
         static NULL: serde_json::Value = serde_json::Value::Null;
         self.fields.iter().find(|(field, _)| *field == name).map_or(&NULL, |(_, value)| value)
     }
@@ -575,8 +849,8 @@ fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
 fn build_text(
     node: &v2::Node, images: &v2::Table<v2::Image>, base: &Path,
     lists: &[Vec<PathBuf>], fonts: &Fonts,
-    keyed: Option<&BTreeSet<UnitProperty>>, glyphs_keyed: bool,
-    styles: &BTreeMap<String, Arc<crate::animation::style::StyleValue>>, media: &crate::canvas_draw::Media,
+    tracks: TextTracks,
+    styles: &StyleFields, media: &crate::canvas_draw::Media,
 ) -> Result<Option<TextItem>> {
     v2::Scene::validate_text(node, images)?;
     let files = |font: &v2::FontFiles| -> Vec<PathBuf> {font.files().iter().map(|file|base.join(file)).collect()};
@@ -586,7 +860,7 @@ fn build_text(
                         let list = files(run_font.unwrap_or(font));
                         vork_std::moda::family(lists.iter().position(|l| *l == list).expect("collected font list"))
                     };
-                    let TextHtml { layout: layout_html, colors } = text_html(&node.kind, &family, glyphs_keyed)?;
+                    let TextHtml { layout: layout_html, colors } = text_html(&node.kind, &family, tracks.glyphs)?;
                     let layout_html: Arc<str> = layout_html.into();
                     let here = format!("node {:?}", node.name);
                     let laid = v2::laid_out_runs(content, *white_space);
@@ -600,30 +874,27 @@ fn build_text(
                     spec.run_colors = Arc::new(colors);
                     // The degraded tier lays out and rasters the HTML as drawn, colours and all: it is made only for
                     // text that tier draws, and there the spec holds it.
-                    let drawn = || self::html(&node.kind, &family, glyphs_keyed);
+                    let drawn = || self::html(&node.kind, &family, tracks.glyphs);
                     let accepted = fonts.lay_out(&spec, layout_html, &here, &drawn)?;
                     let is_degraded = accepted.vector.is_none();
                     if is_degraded { spec.html = drawn()?.into(); }
                     // Without a width the box is the widest line, so text-align places lines within it.
                     if width.is_none() { spec.width = Some(accepted.width); }
                     let plain: Vec<char> = plain_text.chars().collect();
-                    let mut units = BTreeMap::new();
-                    for unit in [TextUnit::Glyphs, TextUnit::Words] {
-                        let ranges = v2::unit_ranges(&plain_text, unit);
-                        units.insert(unit, ranges.into_iter().map(|range| {
+                    let units = TextLevels(LEVELS.map(|unit| {
+                        if unit == TextUnit::Lines { return line_code_points(&accepted.lines, &plain); }
+                        v2::unit_ranges(&plain_text, unit).into_iter().map(|range| {
                             let start = plain_text[..range.start].chars().count();
-                            (start..start + plain_text[range].chars().count()).collect::<Vec<usize>>()
-                        }).collect::<Vec<_>>());
-                    }
-                    units.insert(TextUnit::Lines, line_code_points(&accepted.lines, &plain));
-                    let mut piece_of = BTreeMap::new();
-                    for (unit, pieces) in &units {
+                            (start..start + plain_text[range].chars().count()).collect::<Vec<_>>()
+                        }).collect()
+                    }));
+                    let piece_of = TextLevels(LEVELS.map(|unit| {
                         let mut of = vec![None; plain.len()];
-                        for (index, code_points) in pieces.iter().enumerate() {
+                        for (index, code_points) in units[&unit].iter().enumerate() {
                             for &cp in code_points { of[cp] = Some(index); }
                         }
-                        piece_of.insert(*unit, of);
-                    }
+                        of
+                    }));
                     let run_of: Vec<usize> = laid.iter().map(|(_, run)| *run).collect();
                     let height = accepted.height;
                     // The box Moda's frame walk bounds the node by: its width, and the text's height.
@@ -631,13 +902,13 @@ fn build_text(
                     let (fills, strokes) = text_paints(node, images, base, styles, media, size, &run_of)?;
                     // A paint as `text_paints` resolves it, for the degraded tier's coverage below.
                     let bounds = Some([0., 0., size[0], size[1]]);
-                    let resolve = |field:&str, value:Option<&v2::Paint>, node_value:&v2::Paint| -> Result<PaintSource> {
+                    let resolve = |field: StyleField, value:Option<&v2::Paint>, node_value:&v2::Paint| -> Result<PaintSource> {
                         if value.is_none() {
                             if let Some(crate::animation::style::StyleValue::Paint(paint))=styles.get(field).map(|v|v.as_ref()) {
                                 return crate::canvas_draw::resolve_animated_paint(images,base,bounds.unwrap(),paint,media);
                             }
                         }
-                        crate::canvas_draw::resolve_paint(images,base,value.unwrap_or(node_value),bounds,&format!("{here}: {field}"),media)
+                        crate::canvas_draw::resolve_paint(images,base,value.unwrap_or(node_value),bounds,&format!("{here}: {}", field.name()),media)
                     };
                     let mut degraded_paints = Vec::new();
                     if is_degraded && fills.iter().any(|p| matches!(p, PaintSource::Moda(_))) {
@@ -646,7 +917,7 @@ fn build_text(
                             let mut coverage = node.kind.clone();
                             if let NodeKind::Text { content, fill: coverage_fill, .. } = &mut coverage {
                                 let selected = |value: Option<&v2::Paint>| -> Result<v2::Paint> {
-                                    Ok(if resolve("fill",value,fill)? == *source {
+                                    Ok(if resolve(StyleField::Fill,value,fill)? == *source {
                                         v2::Paint::Css("white".into())
                                     } else { v2::Paint::NONE })
                                 };
@@ -658,26 +929,24 @@ fn build_text(
                             degraded_paints.push((source.clone(), self::html(&coverage, &family, false)?));
                         }
                     }
-                    let keys = keyed;
-                    let pieces_keyed = keys.is_some();
+                    let pieces_keyed = tracks.pieces;
                     if is_degraded {
                         ensure!(!pieces_keyed, "{here}: glyph, word and line tracks on right-to-left or complex-script text are not built yet");
                         ensure!(strokes.iter().all(|s| matches!(s, PaintSource::None)), "{here}: stroke on right-to-left or complex-script text is not built yet");
                     }
                     let (boxes, centre) = if pieces_keyed && !is_degraded {
                         let cp_boxes = accepted.vector.as_ref().map_or_else(Vec::new, |vector| vector.code_point_boxes(plain.len()));
-                        let mut boxes = BTreeMap::new();
-                        for (unit, pieces) in &units {
-                            boxes.insert(*unit, pieces.iter().map(|cps| cps.iter().filter_map(|&cp| cp_boxes[cp]).fold(None, |a, b| Some(union(a, b)))).collect::<Vec<_>>());
-                        }
+                        let boxes = TextLevels(LEVELS.map(|unit| units[&unit].iter().map(|cps|
+                            cps.iter().filter_map(|&cp| cp_boxes[cp]).fold(None, |a, b| Some(union(a, b)))
+                        ).collect()));
                         let all = cp_boxes.iter().flatten().fold(None, |a, b| Some(union(a, *b)));
                         (boxes, all.map_or(DVec2::ZERO, |b| DVec2::new((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)))
                     } else {
-                        (BTreeMap::new(), DVec2::ZERO)
+                        (TextLevels(Default::default()), DVec2::ZERO)
                     };
                     Some(TextItem {
                         spec, run_of: Arc::new(run_of), code_points: plain.len(), clip_source: false, units: Arc::new(units), piece_of: Arc::new(piece_of), boxes: Arc::new(boxes), centre, fill: fills, stroke: strokes, stroke_width: f64::from(*stroke_width),
-                        pieces_keyed, fill_keyed: keys.is_some_and(|k| k.contains(&UnitProperty::Fill)), layout: accepted, degraded_paints, size,
+                        tracks, layout: accepted, degraded_paints, size,
                     })
                 }
                 NodeKind::Node {} | NodeKind::Path { .. } => None,
@@ -688,27 +957,27 @@ fn build_text(
 /// Each code point's fill and stroke: its run's, else the node's (a paint track's value, in `styles`, when the run
 /// has none of its own), resolved in the text's box. `run_of` is each code point's run.
 fn text_paints(node: &v2::Node, images: &v2::Table<v2::Image>, base: &Path,
-    styles: &BTreeMap<String, Arc<crate::animation::style::StyleValue>>, media: &crate::canvas_draw::Media,
+    styles: &StyleFields, media: &crate::canvas_draw::Media,
     size: [f64; 2], run_of: &[usize]) -> Result<(Vec<PaintSource>, Vec<PaintSource>)> {
     let NodeKind::Text { content, stroke, stroke_width, fill, .. } = &node.kind else { unreachable!() };
     let here = format!("node {:?}", node.name);
     let runs = content.runs();
     let bounds = Some([0., 0., size[0], size[1]]);
-    let resolve = |field:&str, value:Option<&v2::Paint>, node_value:&v2::Paint| -> Result<PaintSource> {
+    let resolve = |field: StyleField, value:Option<&v2::Paint>, node_value:&v2::Paint| -> Result<PaintSource> {
         if value.is_none() {
             if let Some(crate::animation::style::StyleValue::Paint(paint))=styles.get(field).map(|v|v.as_ref()) {
                 return crate::canvas_draw::resolve_animated_paint(images,base,bounds.unwrap(),paint,media);
             }
         }
-        crate::canvas_draw::resolve_paint(images,base,value.unwrap_or(node_value),bounds,&format!("{here}: {field}"),media)
+        crate::canvas_draw::resolve_paint(images,base,value.unwrap_or(node_value),bounds,&format!("{here}: {}", field.name()),media)
     };
-    let paints = |field: &str, node_value: &v2::Paint, run_value: &dyn Fn(&v2::Run) -> Option<v2::Paint>| -> Result<Vec<PaintSource>> {
+    let paints = |field: StyleField, node_value: &v2::Paint, run_value: &dyn Fn(&v2::Run) -> Option<v2::Paint>| -> Result<Vec<PaintSource>> {
         let per_run = runs.iter().map(|run| resolve(field,run_value(run).as_ref(),node_value)).collect::<Result<Vec<_>>>()?;
         resolve(field,None,node_value)?;
         Ok(run_of.iter().map(|&run|per_run[run].clone()).collect())
     };
-    let fills = paints("fill", fill, &|run| run.fill.clone())?;
-    let strokes = if *stroke_width > 0. { paints("stroke", stroke, &|run| run.stroke.clone())? } else { vec![PaintSource::None; run_of.len()] };
+    let fills = paints(StyleField::Fill, fill, &|run| run.fill.clone())?;
+    let strokes = if *stroke_width > 0. { paints(StyleField::Stroke, stroke, &|run| run.stroke.clone())? } else { vec![PaintSource::None; run_of.len()] };
     Ok((fills, strokes))
 }
 
@@ -717,7 +986,7 @@ fn text_paints(node: &v2::Node, images: &v2::Table<v2::Image>, base: &Path,
 /// do not depend on those, so none is made again or copied (the tables are shared): the runs' colours and each
 /// code point's paints are made.
 fn repainted_text(node: &v2::Node, kept: &TextItem, images: &v2::Table<v2::Image>, base: &Path,
-    styles: &BTreeMap<String, Arc<crate::animation::style::StyleValue>>, media: &crate::canvas_draw::Media) -> Result<TextItem> {
+    styles: &StyleFields, media: &crate::canvas_draw::Media) -> Result<TextItem> {
     v2::Scene::validate_text(node, images)?;
     let (fill, stroke) = text_paints(node, images, base, styles, media, kept.size, &kept.run_of)?;
     let mut spec = kept.spec.clone();
@@ -727,44 +996,59 @@ fn repainted_text(node: &v2::Node, kept: &TextItem, images: &v2::Table<v2::Image
         spec, fill, stroke,
         run_of: kept.run_of.clone(), units: kept.units.clone(), piece_of: kept.piece_of.clone(), boxes: kept.boxes.clone(), layout: kept.layout.clone(),
         code_points: kept.code_points, clip_source: kept.clip_source, centre: kept.centre, stroke_width: kept.stroke_width,
-        pieces_keyed: kept.pieces_keyed, fill_keyed: kept.fill_keyed, degraded_paints: kept.degraded_paints.clone(), size: kept.size,
+        tracks: kept.tracks.clone(), degraded_paints: kept.degraded_paints.clone(), size: kept.size,
     })
 }
 
-/// A canvas scene's font lists, one family each: every text node's and every run's, authored or keyed.
-fn font_lists(scene: &Scene, base: &Path) -> Result<Vec<Vec<PathBuf>>> {
-    let mut lists: Vec<Vec<PathBuf>> = Vec::new();
-    let files = |font: &v2::FontFiles| -> Vec<PathBuf> { font.files().iter().map(|file| base.join(file)).collect() };
-    fn collect(nodes: &[v2::Node], files: &dyn Fn(&v2::FontFiles) -> Vec<PathBuf>, lists: &mut Vec<Vec<PathBuf>>) {
+fn canvas_tracks(scene: &Scene) -> Result<Vec<(&v2::Track, TrackTarget)>> {
+    let mut tracks = Vec::new();
+    for (layer, targets) in scene.animation.iter().zip(scene.track_targets()?) {
+        tracks.extend(layer.tracks.iter().flatten().zip(targets));
+    }
+    for owned in scene.node_owned_layers()? {
+        tracks.extend(owned.layer.tracks.iter().flatten().zip(owned.targets));
+    }
+    Ok(tracks)
+}
+
+/// A canvas scene's font lists, one family each: every selected text node's and run's, authored or keyed.
+fn font_lists(scene: &Scene, base: &Path, tracks: &[(&v2::Track, TrackTarget)],
+              includes: &impl Fn(&str) -> bool) -> Result<Vec<Vec<PathBuf>>> {
+    fn insert(lists: &mut Vec<Vec<PathBuf>>, base: &Path, font: &v2::FontFiles) {
+        let list: Vec<_> = font.files().iter().map(|file| base.join(file)).collect();
+        if !lists.contains(&list) { lists.push(list); }
+    }
+    fn collect(nodes: &[v2::Node], base: &Path, includes: &impl Fn(&str) -> bool, lists: &mut Vec<Vec<PathBuf>>) {
         for node in nodes {
-            if let NodeKind::Text { font, content, .. } = &node.kind {
-                let mut fonts = vec![font.clone()];
-                fonts.extend(content.runs().iter().filter_map(|run| run.font.clone()));
-                for font in &fonts {
-                    let list = files(font);
-                    if !lists.contains(&list) { lists.push(list); }
+            if let NodeKind::Text { font, content, .. } = &node.kind
+                && includes(&node.name)
+            {
+                insert(lists, base, font);
+                for run in content.runs().iter() {
+                    if let Some(font) = &run.font { insert(lists, base, font); }
                 }
             }
-            collect(&node.children, files, lists);
+            collect(&node.children, base, includes, lists);
         }
     }
-    collect(&scene.nodes, &files, &mut lists);
-    let owned=scene.node_owned_layers()?;
-    for tracks in scene.animation.iter().map(|l|&l.tracks).chain(owned.iter().map(|l|&l.layer.tracks)) {
-        for track in tracks.iter().flatten() {
-            if track.path.last().is_some_and(|p|p=="font") {
-                if let v2::Values::Inline(values)=&track.values {for value in values {
-                    let font:v2::FontFiles=serde_json::from_value(value.clone())?;
-                    let list=files(&font);if !lists.contains(&list){lists.push(list);}
-                }}
-            }
-            if track.path.last().is_some_and(|p|p=="content") {
-                if let v2::Values::Inline(values)=&track.values {
-                    for value in values {
-                        let content:v2::Content=serde_json::from_value(value.clone())?;
-                        for run in content.runs().iter() {if let Some(font)=&run.font {let list=files(font);if !lists.contains(&list){lists.push(list);}}}
+    let mut lists = Vec::new();
+    collect(&scene.nodes, base, includes, &mut lists);
+    for (track, target) in tracks {
+        if let (TrackTarget::Node { node, property: v2::NodeProperty::Style(property) }, v2::Values::Inline(values)) =
+            (target, &track.values)
+            && includes(node)
+        {
+            match property.name() {
+                "font" => for value in values {
+                    insert(&mut lists, base, &serde_json::from_value(value.clone())?);
+                },
+                "content" => for value in values {
+                    let content: v2::Content = serde_json::from_value(value.clone())?;
+                    for run in content.runs().iter() {
+                        if let Some(font) = &run.font { insert(&mut lists, base, font); }
                     }
-                }
+                },
+                _ => {}
             }
         }
     }
@@ -772,13 +1056,13 @@ fn font_lists(scene: &Scene, base: &Path) -> Result<Vec<Vec<PathBuf>>> {
 }
 
 /// The files a canvas reads that the scene's other sources do not list: its font files and the files of the
-/// images its paints name, authored or keyed. False when one cannot be listed (a painted movie, frame sequence or
-/// rendered image, tracks that do not resolve), so a session keeps nothing of such a document and reads it again
+/// images its paints name, authored or keyed. A self-contained movie has one pinned file. A session declines a frame sequence or
+/// rendered image, or tracks that do not resolve, so it reads those inputs again
 /// for every render. An image no paint names is not read and is not a source.
-pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>) -> bool {
+pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>, for_export: bool, opened: &crate::footage::Opened) -> bool {
     let mut complete = true;
     // Nodes inside nested worlds' canvases are read too: more files than this document's own, never fewer.
-    match font_lists(scene, base) {
+    match canvas_tracks(scene).and_then(|tracks| font_lists(scene, base, &tracks, &|_| true)) {
         Ok(lists) => files.extend(lists.into_iter().flatten()),
         Err(_) => complete = false,
     }
@@ -829,7 +1113,19 @@ pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>)
         if image.render.is_some() { complete = false; }
         let Some(file) = image.file.as_deref() else { continue };
         let path = base.join(file);
-        if crate::footage::is_media(&path) { complete = false; } else { files.insert(path); }
+        if !for_export && crate::footage::is_sequence(&path) {
+            complete = false;
+        } else if crate::footage::is_sequence(&path) {
+            match crate::footage::sequence(&path) {
+                Ok(sequence) => files.extend(sequence),
+                Err(_) => complete = false,
+            }
+        } else {
+            if crate::footage::is_media(&path) && opened.revision(&path).is_err() {
+                complete = false;
+            }
+            files.insert(path);
+        }
     }
     complete
 }
@@ -842,7 +1138,18 @@ pub(crate) fn has_worlds(nodes: &[v2::Node]) -> bool {
 impl Document {
     /// Lay out every text node of a canvas scene and compile its tracks.
     pub(crate) fn new(scene: &Scene, base: &Path) -> Result<Self> {
+        Self::new_with_paints(scene, base, None, &Default::default())
+    }
+
+    /// With a selection, keep the full clock tree and prepare only the named items' paint and layout.
+    pub(crate) fn new_with_paints(scene: &Scene, base: &Path, wanted: Option<&std::collections::HashSet<&str>>, opened: &crate::footage::Opened) -> Result<Self> {
+        Self::prepare_document(scene, base, wanted, opened, None)
+    }
+
+    fn prepare_document(scene: &Scene, base: &Path, wanted: Option<&std::collections::HashSet<&str>>,
+        opened: &crate::footage::Opened, previous: Option<(&Self, &BTreeSet<&Path>)>) -> Result<Self> {
         ensure!(scene.is_canvas(), "not a 2D canvas");
+        let includes = |name: &str| wanted.is_none_or(|wanted| wanted.contains(name));
         let [w, h] = scene.render.resolution;
         let composition = scene.composition.as_ref().expect("a canvas has a composition");
         let aspect = v2::AspectRatio::parse(composition.preserve_aspect_ratio.as_deref()).map_err(anyhow::Error::msg)?;
@@ -851,27 +1158,30 @@ impl Document {
         let whole = scene;
         let outer = scene.without_compositions()?;
         let scene: &Scene = &outer;
-        let lists = font_lists(scene, base)?;
-        let host = Arc::new(vork_std::moda::host(&vork_std::moda::read(&lists)?)?);
-        let fonts = Fonts { store: std::rc::Rc::new(host.vector_font_store_lenient()), host, degraded: Default::default(), layouts: Default::default() };
-        // Every track with its target: the scene's and the nodes' own.
-        let mut tracks: Vec<(&v2::Track, TrackTarget)> = Vec::new();
-        for (layer, targets) in scene.animation.iter().zip(scene.track_targets()?) {
-            tracks.extend(layer.tracks.iter().flatten().zip(targets));
-        }
-        for owned in scene.node_owned_layers()? {
-            tracks.extend(owned.layer.tracks.iter().flatten().zip(owned.targets));
-        }
+        let tracks = canvas_tracks(scene)?;
+        let lists = font_lists(scene, base, &tracks, &includes)?;
+        let fonts = if let Some((old, _)) = previous.filter(|(old, _)| old.font_lists == lists) {
+            old.fonts.clone()
+        } else {
+            let host = Arc::new(vork_std::moda::host(&vork_std::moda::read(&lists)?)?);
+            Fonts { store: std::rc::Rc::new(host.vector_font_store_lenient()), host, layouts: Default::default() }
+        };
         // Which pieces' fields each text node's tracks key, and CSS colour keys read once.
-        let mut keyed: BTreeMap<String, BTreeSet<UnitProperty>> = BTreeMap::new();
-        let mut glyphs_keyed: BTreeSet<String> = BTreeSet::new();
+        let mut keyed = HashMap::<&str, TextTracks>::new();
         for (_, target) in &tracks {
-            let TrackTarget::Text { node, unit, property, .. } = target else { continue };
-            keyed.entry(node.clone()).or_default().insert(*property);
-            if *unit == TextUnit::Glyphs { glyphs_keyed.insert(node.clone()); }
+            let TrackTarget::Text { node, unit, index, property } = target else { continue };
+            let fields = keyed.entry(node.as_str()).or_default();
+            fields.pieces = true;
+            if matches!(property, UnitProperty::Fill | UnitProperty::Stroke) {
+                let keyed = fields.paint_units[usize::from(*property == UnitProperty::Stroke)].get_or_insert_with(Default::default);
+                Arc::make_mut(keyed).insert((*unit, *index));
+            }
+            fields.glyphs |= *unit == TextUnit::Glyphs;
 
         }
-        let media = crate::canvas_draw::Media::new(scene, base)?;
+        let previous_media = previous.map(|(doc, files)| (doc.media.borrow(), files));
+        let media = crate::canvas_draw::Media::with_readers(scene, base, wanted, opened,
+            previous_media.as_ref().map(|(readers, files)| (&**readers, *files)))?;
         // The scene's nodes in paint order, each where the scene holds it, with its parent's item: a walk with
         // its own stack, so the tree's depth costs no call stack.
         let mut flat: Vec<SceneNode> = Vec::new();
@@ -888,7 +1198,7 @@ impl Document {
         }
         let mut items = Vec::with_capacity(flat.len());
         // The fields each node's tracks restyle.
-        let mut restyled: HashMap<&str, Vec<&'static str>> = HashMap::new();
+        let mut restyled: HashMap<&str, Vec<StyleField>> = HashMap::new();
         for (node, field) in tracks.iter().filter_map(|(_, target)| restyled_field(target)) {
             let fields = restyled.entry(node).or_default();
             if !fields.contains(&field) { fields.push(field); }
@@ -898,11 +1208,14 @@ impl Document {
         let mut worlds = Vec::new();
         let mut rest: Vec<Rest> = Vec::with_capacity(flat.len());
         for &SceneNode { node, parent } in &flat {
-            let text = build_text(node, &scene.images, base, &lists, &fonts, keyed.get(&node.name), glyphs_keyed.contains(&node.name), &BTreeMap::new(), &media)?;
+            let selected = includes(&node.name);
+            let text = if selected {
+                build_text(node, &scene.images, base, &lists, &fonts, keyed.get(node.name.as_str()).cloned().unwrap_or_default(), &StyleFields::default(), &media)?
+            } else { None };
             // A stroke-width track restyles a text node only.
-            let fields: Vec<&'static str> = restyled.get(node.name.as_str()).into_iter().flatten().copied()
-                .filter(|field| *field != "stroke-width" || text.is_some()).collect();
-            authored.push(if fields.is_empty() { None } else {
+            let fields: Vec<StyleField> = restyled.get(node.name.as_str()).into_iter().flatten().copied()
+                .filter(|field| *field != StyleField::StrokeWidth || text.is_some()).collect();
+            authored.push(if !selected || fields.is_empty() { None } else {
                 let mut source_node=node.without_children();
                 source_node.animation.clear();
                 // The fields' authored values, as the node writes them: read from the written node, which is not kept.
@@ -912,27 +1225,27 @@ impl Document {
                     source["font-variation-settings"]=serde_json::json!(font_variation_settings);
                     source["font-feature-settings"]=serde_json::json!(font_feature_settings);
                 }
-                let fields = fields.into_iter().filter_map(|field| Some((field, source.get(field)?.clone()))).collect();
+                let fields = fields.into_iter().filter_map(|field| Some((field, source.get(field.name())?.clone()))).collect();
                 Some(Box::new(Authored { node: source_node, fields }))
             });
             let world = node.composition.as_ref().is_some_and(|c| c.space == v2::Space::World);
             let kind = match (&node.kind, &text) {
                 (_, Some(text)) => crate::canvas_draw::Kind::Text { size: text.size },
-                _ if world => {
+                _ if world && wanted.is_none() => {
                     // The world's picture fills the canvas's box, at the output's pixel density.
                     let [x, y, vw, vh] = whole.canvas_view_box().map(f64::from);
                     let px = [(vw * scale[0]).round().max(1.) as u32, (vh * scale[1]).round().max(1.) as u32];
                     worlds.push(WorldPart { item: items.len(), scene: whole.world_part(&node.name, px)? });
                     crate::canvas_draw::Kind::World { bounds: [x, y, x + vw, y + vh] }
                 }
-                (NodeKind::Path { .. }, _) => crate::canvas_draw::Kind::Path(Arc::new(crate::canvas_draw::path_item(&scene.images, base, node, &media)?)),
+                (NodeKind::Path { .. }, _) if selected => crate::canvas_draw::Kind::Path(Arc::new(crate::canvas_draw::path_item(&scene.images, base, node, &media)?)),
                 _ => crate::canvas_draw::Kind::Group,
             };
             let filter = match &node.filter {
-                Some(filter) => crate::canvas_draw::parse_filter(filter).with_context(|| format!("node {:?}", node.name))?,
-                None => Default::default(),
+                Some(filter) if selected => crate::canvas_draw::parse_filter(filter).with_context(|| format!("node {:?}", node.name))?,
+                _ => Default::default(),
             };
-            let draw = crate::canvas_draw::Node { parent, clip_path: None, mask: None, filter, kind };
+            let draw = crate::canvas_draw::Node { parent, clip_path: None, mask: None, mask_type: node.mask_type, blend: node.mix_blend_mode, isolation: node.isolation, filter, kind };
             rest.push(Rest { parent, transform: node.transform.clone(), opacity: node.opacity, text: text.is_some(),
                 path: match &draw.kind { crate::canvas_draw::Kind::Path(path) => Some(path.values), _ => None } });
             items.push(Item { name: node.name.clone(), visible: node.visibility.visible, text, node: draw });
@@ -970,7 +1283,7 @@ impl Document {
             let count = text.units[&TextUnit::Lines].len();
             ensure!(*index < count, "track {}: node {node:?} has {count} lines; index {index} is past the end", v2::display_path(&track.path));
         }
-        let mut plan = crate::animation::Plan::compile_with_buffers(scene, base, None)?;
+        let mut plan = crate::animation::Plan::compile_in(scene, base, None, opened)?;
         plan.mark_canvas_nodes(&mut flat)?;
         let samples = RefCell::new(plan.samples_naming_changes());
         let mut kinds: Vec<Option<ChangeKind>> = {
@@ -1004,8 +1317,11 @@ impl Document {
             _ => None,
         }).collect();
         let track_parts: Vec<u8> = plan.sampled(&samples.borrow()).map(|(target, ..)| match target {
-            TrackTarget::Node { property: v2::NodeProperty::Translation | v2::NodeProperty::Rotation | v2::NodeProperty::Scale, .. } => crate::canvas_draw::change::TRANSFORM,
+            TrackTarget::Node { property: v2::NodeProperty::Translation, .. } => crate::canvas_draw::change::TRANSLATION,
+            TrackTarget::Node { property: v2::NodeProperty::Rotation, .. } => crate::canvas_draw::change::ROTATION,
+            TrackTarget::Node { property: v2::NodeProperty::Scale, .. } => crate::canvas_draw::change::SCALE,
             TrackTarget::Node { property: v2::NodeProperty::Opacity, .. } => crate::canvas_draw::change::OPACITY,
+            TrackTarget::Node { property: v2::NodeProperty::Style(p), .. } if p.name() == "filter" => crate::canvas_draw::change::FILTER,
             _ => crate::canvas_draw::change::REST,
         }).collect();
         // The sampler names tracks by flat index, and these tables are in authored-track order: the same order
@@ -1043,12 +1359,12 @@ impl Document {
         let graph_images = whole.compositor_image_reads(whole.compositor()).into_iter()
             .filter_map(|name| whole.images.get(&name).map(|image| image.time.clone()).map(|time| (name, time))).collect();
         let prepared = Arc::new(Prepared {
+            opened: opened.clone(),
             view: (float || working != v2::WorkingColorSpace::Srgb).then(|| whole.clone()),
             float, working, graph_images, images: scene.images.clone(), base: base.into(),
-            font_lists: lists, keyed, glyphs_keyed, authored, size: [w, h], items, rest,
+            font_lists: lists, authored, items, rest,
             children, by_name, plan, page, worlds, kinds, track_items, track_parts,
             item_tracks_first, item_tracks, page_tracks,
-            font_host: fonts.host.clone(), font_layouts: fonts.layouts.borrow().by_content.clone(),
         });
         Ok(Self { prepared, fonts, samples, styles, media: RefCell::new(media),
             retained: Default::default(), text_specs, evaluated: Default::default(),
@@ -1063,30 +1379,6 @@ impl Document {
     fn next_id() -> u64 {
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-    /// Start a worker's retained history over the same installed content and laid-out text.
-    fn from_prepared(prepared: Arc<Prepared>, media: crate::canvas_draw::Media) -> Self {
-        let host = prepared.font_host.clone();
-        let fonts = Fonts {
-            store: std::rc::Rc::new(host.vector_font_store_lenient()), host,
-            degraded: Default::default(),
-            layouts: std::rc::Rc::new(RefCell::new(Layouts {
-                by_content: prepared.font_layouts.clone(), sweep_at: 0,
-            })),
-        };
-        let items = prepared.items.len();
-        Self {
-            samples: RefCell::new(prepared.plan.samples_naming_changes()), prepared, fonts,
-            styles: RefCell::new((0..items).map(|_| None).collect()),
-            text_specs: RefCell::new((0..items).map(|_| None).collect()),
-            media: RefCell::new(media), retained: Default::default(), evaluated: Default::default(),
-            stale: std::cell::Cell::new(true), text: Default::default(), changes: Default::default(),
-            item_marks: RefCell::new(vec![0; items]),
-            #[cfg(test)]
-            id: Self::next_id(),
-            #[cfg(test)]
-            snapshots: Default::default(),
-        }
     }
     /// Item `i` as authored. Only an item a track restyles is read this way, and `new` kept exactly those.
     fn authored(&self, i: usize) -> Result<&Authored> {
@@ -1122,7 +1414,7 @@ impl Document {
     pub(crate) fn draw(&self, engine: &crate::canvas_draw::Engine, worlds: &Pictures, renderer: &Renderer, request: &vork_time::Request,
         errors: Option<&wgpu::Buffer>) -> Result<wgpu::Texture> {
         let frame = self.frame(request)?;
-        let drawn = worlds.draw(renderer, self, &frame, engine, errors)?;
+        let (drawn, _) = worlds.draw(renderer, self, &frame, None, engine, errors, None, || {})?;
         if let (Some(graph), None) = (&worlds.graph, errors) { graph.check(renderer)?; }
         let Some(view) = &worlds.view else { return Ok(drawn) };
         // Each draw's viewed picture is a texture of its own: its readers are recorded in commands submitted
@@ -1149,6 +1441,144 @@ impl Document {
             "content": content, "structure": structure})
     }
 
+    pub(crate) fn measure_image_time(
+        &self,
+        name: &str,
+        image: &v2::Image,
+        request: &vork_time::Request,
+    ) -> Result<vork_time::exact::Germ> {
+        let mut samples = self.plan.samples();
+        self.plan.sample_request_into(request.numeric()?, request, &mut samples)?;
+        let scene_time = request.exact()?;
+        self.plan.footage_time(&samples, &scene_time, name, image.time.as_ref())?
+            .with_context(|| format!("ask: image {name:?} is absent at this time"))
+    }
+
+    pub(crate) fn bounds_batch<'a>(&self, names: impl Iterator<Item = &'a str>) -> BoundsBatch {
+        BoundsBatch { wanted: names.filter_map(|name| self.by_name.get(name).copied()).collect(), measured: None }
+    }
+
+    pub(crate) fn measure(
+        &self,
+        name: &str,
+        kind: &str,
+        read: &str,
+        request: &vork_time::Request,
+        bounds: &mut BoundsBatch,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let &i = self.by_name.get(name)
+            .with_context(|| format!("ask: unknown canvas node {name:?}"))?;
+        if kind == "node" && read != "transform"
+            && let Some(cached) = bounds.measured.as_ref().filter(|b| b.time == *request) {
+            return cached.answer(self, i, read);
+        }
+        let effect;
+        let frame = self.frame(request)?;
+        {
+            let evaluated = self.evaluated.borrow();
+            let state = &evaluated.as_ref().unwrap().state;
+            let node = state.nodes[i].as_deref().unwrap_or(&self.items[i].node);
+            match kind {
+                "path" => {
+                    let crate::canvas_draw::Kind::Path(path) = &node.kind else {
+                        bail!("ask: {name:?} must be a path")
+                    };
+                    return Ok(if state.shown[i] {
+                        json!(path.measured_length())
+                    } else {
+                        Value::Null
+                    });
+                }
+                "text" => {
+                    let styles = self.styles.borrow();
+                    let text = state.nodes[i]
+                        .as_ref()
+                        .and(styles[i].as_ref())
+                        .and_then(|style| style.text.as_deref())
+                        .or(self.items[i].text.as_ref())
+                        .with_context(|| format!("ask: {name:?} must be text"))?;
+                    if !state.shown[i] {
+                        return Ok(Value::Null);
+                    }
+                    let laid = &text.layout;
+                    let lines: Vec<_> = laid
+                        .metrics
+                        .iter()
+                        .map(
+                            |[advance, baseline]| json!({ "advance":advance, "baseline":baseline }),
+                        )
+                        .collect();
+                    return Ok(
+                        json!({"box":[[0.,0.],[laid.width,laid.height]], "line_count":lines.len(), "lines":lines}),
+                    );
+                }
+                "node" if read == "transform" => {
+                    if !state.shown[i] {
+                        return Ok(Value::Null);
+                    }
+                    let chain: Vec<_> = std::iter::successors(Some(i), |&n| self.rest[n].parent)
+                        .map(|n| &state.values[n].transform)
+                        .collect();
+                    return Ok(json!(crate::canvas_draw::placed_matrix(
+                        &self.page, &chain
+                    )?));
+                }
+                "node" => {
+                    // These operations determine their silhouette from pixels. A plan's
+                    // capture allocation or mask box cannot answer geometric bounds.
+                    let mut ancestors = vec![None; self.items.len()];
+                    let mut subtree = vec![None; self.items.len()];
+                    for (j, item) in self.items.iter().enumerate() {
+                        let node = state.nodes[j].as_deref().unwrap_or(&item.node);
+                        if state.shown[j] && (node.clip_path.is_some() || node.mask.is_some()
+                            || !node.filter.0.is_empty()) {
+                            subtree[j] = Some(j);
+                        }
+                        ancestors[j] = self.rest[j].parent.and_then(|p| ancestors[p]).or(subtree[j]);
+                    }
+                    // Preorder indices preserve the first offending node in the original walk.
+                    for j in (0..subtree.len()).rev() {
+                        if let (Some(p), Some(child)) = (self.rest[j].parent, subtree[j]) {
+                            subtree[p] = Some(subtree[p].map_or(child, |v| v.min(child)));
+                        }
+                    }
+                    for (first, ancestor) in subtree.iter_mut().zip(ancestors) {
+                        *first = ancestor.or(*first);
+                    }
+                    if let Some(j) = subtree[i] {
+                        bail!("ask: bounds depend on mask, clip or filter on {:?}; remove it to measure the geometry", self.items[j].name);
+                    }
+                    effect = subtree;
+                }
+                _ => bail!("ask: {kind} is unavailable on a canvas"),
+            }
+        }
+        // The world image is a placed rectangle. Planning its geometry only requires
+        // the dimensions the renderer would register for the completed picture.
+        let mut captures = Vec::new();
+        let pictures = self
+            .worlds
+            .iter()
+            .zip(&frame.worlds)
+            .enumerate()
+            .map(|(i, (world, time))| {
+                time.as_ref()?;
+                let src = format!("{}gpu/ask/{i}", moda_engine::effects::PIXEL_SINK_SRC_PREFIX);
+                let size = world.scene.render.resolution;
+                captures.push((src.clone(), size, 0));
+                Some((src, size))
+            })
+            .collect::<Vec<_>>();
+        if !captures.is_empty() {
+            crate::canvas_draw::install_captures(&captures);
+        }
+        let plan = self.plan(&pictures)?;
+        let retained = self.retained.borrow();
+        let boxes = retained.as_ref().unwrap().measured_boxes(&plan, self.items.len(), &bounds.wanted);
+        bounds.measured.insert(MeasuredBounds { time: request.clone(), boxes, effect }).answer(self, i, read)
+    }
+
     /// One instant: every node's animated values (transform, visibility, opacity, a path's keyed fields), and the
     /// batches of each text node in paint order: its Moda specs with its pieces' motion and paint.
     ///
@@ -1159,11 +1589,40 @@ impl Document {
     fn frame(&self, request: &vork_time::Request) -> Result<Frame> {
         let _profile = moda_engine::prof::span("canvas.evaluation");
         let frame = self.evaluate(request).and_then(|(frame, changed)| {
-            self.write_rows(&changed)?;
+            let bindings_changed = self.publish_frame_media(request, MediaPublication::Frame)?;
+            // A shared paint can appear or disappear on a matte whose own tracks stood still.
+            self.write_rows(if bindings_changed { &Changed::Every } else { &changed })?;
             Ok(frame)
         });
         if frame.is_err() { self.evaluated.borrow_mut().take(); }
         frame
+    }
+
+    /// Publish the media read by the evaluated rows before planning their picture.
+    fn publish_frame_media(&self, request: &vork_time::Request, publication: MediaPublication) -> Result<bool> {
+        let mut media = self.media.borrow_mut();
+        if media.is_empty() { return Ok(false); }
+        let evaluated = self.evaluated.borrow();
+        let state = &evaluated.as_ref().expect("the frame's table").state;
+        let collect = |items: &[usize], drawing_only: bool| {
+            let mut paints = std::collections::HashSet::new();
+            for &i in items {
+                if state.shown[i] && (!drawing_only || state.drawing[i]) {
+                    let node = state.nodes[i].as_deref().unwrap_or(&self.items[i].node);
+                    visit_image_paints(node, &state.values[i], |src| { paints.insert(src.to_owned()); });
+                }
+            }
+            paints
+        };
+        let mut paints = collect(media.reader_items(), true);
+        if publication == MediaPublication::Missing {
+            // Only a painted mask needs its entry at open. A collapsed mask may share
+            // the image of a drawing row elsewhere in the document.
+            let retained = self.retained.borrow();
+            let masks = collect(retained.as_ref().expect("accepted rows").mask_paint_items(), false);
+            paints.retain(|src| masks.contains(src));
+        }
+        media.update(&self.plan, &self.samples.borrow(), &request.exact()?, publication, |src| paints.contains(src))
     }
 
     /// Write what a frame evaluated into the installed scene, from the evaluated table: the frame's values are in
@@ -1226,6 +1685,9 @@ impl Document {
                 // A node arriving or leaving on its clock changes which nodes draw.
                 let same_presence = !self.plan.has_clocks() || (old.present.len() == samples.clocks.len()
                     && old.present.iter().zip(&samples.clocks).all(|(a,b)| *a == b.is_some()));
+                if !same_presence || kind >= Some(ChangeKind::Content) {
+                    crate::canvas_host_memory::require_serial_growth()?;
+                }
                 if same_presence { (changed_tracks.is_empty(), kind) } else { (false, Some(ChangeKind::Structure)) }
             }
         };
@@ -1248,7 +1710,6 @@ impl Document {
             // The table stands, and the scene is owed nothing new.
             let evaluated = self.evaluated.borrow();
             let state = &evaluated.as_ref().expect("the state that stands").state;
-            self.media.borrow_mut().update(&self.plan, samples, &scene_instant, &state.shown)?;
             return Ok((Frame { request: request.clone(), worlds: worlds(&state.shown), images }, Changed::Nothing));
         }
         // Do not publish a partially evaluated state after an error.
@@ -1259,10 +1720,9 @@ impl Document {
         let (background, shown, present) = match previous {
             Some(mut old) if change < Some(ChangeKind::Structure) => {
                 let _profile = moda_engine::prof::span("canvas.evaluate.changed");
-                self.media.borrow_mut().update(&self.plan, samples, &scene_instant, &old.state.shown)?;
                 // What changed, named by the tracks that changed: each one's item, evaluated again in place.
-                let (items, bound) = self.changed_items(samples);
-                if let Some(same_draws) = self.evaluate_changed(samples, &mut old.state, &items, &mut styled, &mut specs)? {
+                let (mut items, bound) = self.changed_items(samples);
+                if let Some(same_draws) = self.evaluate_changed(samples, &mut old.state, &mut items, &mut styled, &mut specs)? {
                     #[cfg(debug_assertions)]
                     self.assert_whole(samples, &old.state, &old.present, &mut styled, &mut specs)?;
                     let worlds = worlds(&old.state.shown);
@@ -1271,6 +1731,7 @@ impl Document {
                     return Ok((Frame { request: request.clone(), worlds, images }, Changed::Items(items, bound)));
                 }
                 // A scale reached or left zero: which nodes draw changed after all, and every item is evaluated.
+                crate::canvas_host_memory::require_serial_growth()?;
                 (old.state.background, std::mem::take(&mut old.state.shown), old.present)
             }
             previous => {
@@ -1278,22 +1739,22 @@ impl Document {
                 present.clear();
                 if self.plan.has_clocks() { present.extend(samples.clocks.iter().map(Option::is_some)); }
                 let shown = self.shown(samples);
-                self.media.borrow_mut().update(&self.plan, samples, &scene_instant, &shown)?;
                 (self.background(samples), shown, present)
             }
         };
         let _nodes_profile = moda_engine::prof::span("canvas.evaluate.nodes");
         let count = self.items.len();
-        let mut state = FrameState { background, nodes: Vec::with_capacity(count), values: Vec::with_capacity(count), draws: Vec::with_capacity(count),
+        let mut state = FrameState { background, nodes: Vec::with_capacity(count), values: Vec::with_capacity(count), draws: TextDrawRows::new(count),
             shown, drawing: Vec::with_capacity(count) };
         for i in 0..count {
             // Items are parents first.
             let parent_drawing = self.rest[i].parent.is_none_or(|p| state.drawing[p]);
             state.nodes.push(None);
             state.values.push(self.unevaluated(i));
-            state.draws.push(Vec::new());
+            let mut draws = Vec::new();
             let drawing = self.evaluate_item(samples, i, state.shown[i], parent_drawing, &mut styled, &mut specs,
-                &mut state.nodes[i], &mut state.values[i], &mut state.draws[i])?;
+                &mut state.nodes[i], &mut state.values[i], &mut draws)?;
+            if !draws.is_empty() { state.draws.replace(i, &mut draws); }
             state.drawing.push(drawing);
         }
         self.check_references(&state.nodes)?;
@@ -1307,7 +1768,7 @@ impl Document {
     /// The values an item's slot holds before its first evaluation writes them.
     fn unevaluated(&self, i: usize) -> crate::canvas_draw::Values {
         crate::canvas_draw::Values { style_revision: 0, transform: self.rest[i].transform.clone(), visible: false, opacity: 0., path: None, texts: 0,
-            text_composition: Vec::new(), text_revision: 0, text_paint_revision: 0, world: None }
+            text_composition: Vec::new(), text_revision: 0, text_paint_revisions: Default::default(), world: None }
     }
 
     /// Item `i`'s tracks, ascending: the order they blend in.
@@ -1380,12 +1841,49 @@ impl Document {
     /// parent draws from the state, so a changed parent is brought to this sample before its changed child. Returns whether the state still draws the text
     /// batches it drew; `None` when an item's scale reached or left zero, which changes what draws below it: the
     /// caller evaluates every item.
-    fn evaluate_changed(&self, samples: &crate::animation::Samples, state: &mut FrameState, items: &[(usize, u8)],
+    fn evaluate_changed(&self, samples: &crate::animation::Samples, state: &mut FrameState, items: &mut [(usize, u8)],
         styled: &mut [Option<StyledItem>], specs: &mut [Option<TextSpecs>]) -> Result<Option<bool>> {
         let zero = |t: &v2::Transform| t.scale[0] == 0. || t.scale[1] == 0.;
         let mut draws: Vec<Draw> = Vec::new();
         let mut same_draws = true;
-        for &(i, what) in items {
+        use crate::canvas_draw::change;
+        // Placement tracks only affect these local columns. A zero-scale transition is the
+        // exception: it changes descendant drawing and requires a full evaluation.
+        // Ranges are disjoint because changed_items sorts and coalesces row indices.
+        let plan = &self.plan;
+        let (first, tracks, parts, rest) = (&self.item_tracks_first, &self.item_tracks, &self.track_parts, &self.rest);
+        let shown = &state.shown;
+        let holds = moda_scene::rows::visit_changed(&mut state.values, items, |edit| edit.0, |v, edit| {
+            let (i, what) = *edit;
+            if what & (change::REST | change::FILTER) != 0 || !shown[i] { return true; }
+            let was_zero = zero(&v.transform);
+            let mut transform = rest[i].transform.clone();
+            let mut opacity = rest[i].opacity;
+            for &track in &tracks[first[i] as usize..first[i + 1] as usize] {
+                let part = parts[track as usize];
+                if part & what == 0 { continue; }
+                if let Some((_, crate::animation::Sample::Numeric(value), weight, additive)) = plan.sampled_at(samples, track as usize) {
+                    if weight != 0. { blend_placement(part, &mut transform, &mut opacity, value, weight, additive); }
+                }
+            }
+            if what & change::TRANSLATION != 0 { v.transform.translation = transform.translation; }
+            if what & change::SCALE != 0 { v.transform.scale = transform.scale; }
+            if what & change::ROTATION != 0 { v.transform.rotation = transform.rotation; }
+            if what & change::OPACITY != 0 { v.opacity = opacity; }
+            if v.transform.translation[2] != 0. || v.transform.scale[2] != 1. ||
+                (what & change::ROTATION != 0 && {
+                    let q = Quat::from_array(v.transform.resolved_rotation()).normalize();
+                    !(q.x.abs() < 1e-5 && q.y.abs() < 1e-5)
+                }) {
+                // The full evaluator reports the authored node and invalid coordinate.
+                return false;
+            }
+            if zero(&v.transform) != was_zero { return false; }
+            true
+        });
+        if !holds { return Ok(None); }
+        for &(i, what) in items.iter() {
+            if what & (change::REST | change::FILTER) == 0 { continue; }
             draws.clear();
             let parent_drawing = self.rest[i].parent.is_none_or(|p| state.drawing[p]);
             let was_zero = zero(&state.values[i].transform);
@@ -1406,9 +1904,9 @@ impl Document {
                     _ => false,
                 };
                 let rest = !same_node || old.style_revision != values.style_revision || old.visible != values.visible || old.path != values.path
-                    || old.texts != values.texts || old.text_revision != values.text_revision || old.text_paint_revision != values.text_paint_revision || old.text_composition != values.text_composition;
+                    || old.texts != values.texts || old.text_revision != values.text_revision || old.text_paint_revisions != values.text_paint_revisions || old.text_composition != values.text_composition;
                 debug_assert!(drawing == state.drawing[i] && (old.transform == values.transform || what & change::TRANSFORM != 0)
-                    && (old.opacity == values.opacity || what & change::OPACITY != 0) && (!rest || what & change::REST != 0),
+                    && (old.opacity == values.opacity || what & change::OPACITY != 0) && (!rest || what & (change::REST | change::FILTER) != 0),
                     "item {:?} changed in a way its changed tracks do not name (named {what:#b})", self.items[i].name);
             }
             let _ = (what, drawing);
@@ -1417,7 +1915,7 @@ impl Document {
                 .all(|(a, b)| Arc::ptr_eq(&a.spec, &b.spec) && Arc::ptr_eq(&a.layout, &b.layout)));
             if !same {
                 // The item owns its batches: replacing them moves no other item's.
-                std::mem::swap(&mut state.draws[i], &mut draws);
+                state.draws.replace(i, &mut draws);
                 same_draws = false;
             }
         }
@@ -1479,24 +1977,29 @@ impl Document {
         let mut opacity = at_rest.opacity;
         let mut path = at_rest.path;
         // Made when a track writes one.
-        let mut fields: Option<BTreeMap<String, Arc<crate::animation::style::StyleValue>>> = None;
-        let mut units: Option<BTreeMap<(TextUnit, usize), UnitValue>> = None;
+        let mut fields: Option<StyleFields> = None;
+        let mut units: Option<UnitValues> = None;
         for &track in self.tracks_of(i) {
             let Some((target, sample, weight, additive)) = self.plan.sampled_at(samples, track as usize) else { continue };
             if weight == 0. { continue; }
             match (target, sample) {
                 (TrackTarget::Node { property, .. }, crate::animation::Sample::Style(value)) => {
-                    let field=match property {v2::NodeProperty::Style(p)=>p.name(),v2::NodeProperty::Fill=>"fill",v2::NodeProperty::Stroke=>"stroke",_=>unreachable!()};
+                    let key = match property { v2::NodeProperty::Style(p) => StyleField::Property(*p), v2::NodeProperty::Fill => StyleField::Fill, v2::NodeProperty::Stroke => StyleField::Stroke, _ => unreachable!() };
+                    if key == REFERENCE_FIELDS.filter && weight >= 1. {
+                        fields.get_or_insert_with(StyleFields::default).set(key, value.clone());
+                        continue;
+                    }
+                    let field = key.name();
                     let kind=target.style_interpolation().unwrap();
-                    let rest=fields.as_ref().and_then(|f|f.get(field)).cloned().map(Ok).unwrap_or_else(|| {
-                        let mut value=self.authored(i)?.field(field).clone();
+                    let rest=fields.as_ref().and_then(|f|f.get(key)).cloned().map(Ok).unwrap_or_else(|| {
+                        let mut value=self.authored(i)?.field(key).clone();
                         if field=="filter" && value.is_null() {value=serde_json::json!("none");}
                         crate::animation::style::StyleValue::parse(kind,&value).map(Arc::new)
                     })?;
-                    fields.get_or_insert_with(BTreeMap::new).insert(field.into(),Arc::new(rest.mix(value,weight,kind)));
+                    fields.get_or_insert_with(StyleFields::default).set(key,Arc::new(rest.mix(value,weight,kind)));
                 }
                 (TrackTarget::Text { unit, index, property, .. }, crate::animation::Sample::Style(value)) => {
-                    let piece=units.get_or_insert_with(BTreeMap::new).entry((*unit,*index)).or_default();
+                    let piece=units.get_or_insert_with(UnitValues::default).write((*unit, *index));
                     if let crate::animation::style::StyleValue::Origin(origin)=value.as_ref() {
                         let rest=piece.origin.unwrap_or([(0.5,0.);2]);
                         piece.origin=Some(std::array::from_fn(|i|(rest[i].0+(origin[i].0-rest[i].0)*weight,rest[i].1+(origin[i].1-rest[i].1)*weight)));
@@ -1506,11 +2009,12 @@ impl Document {
                     slot.push(UnitPaint::Css(value.clone(),weight));
                 }
                 (TrackTarget::Node { property: property @ (v2::NodeProperty::Fill | v2::NodeProperty::Stroke), .. }, crate::animation::Sample::Numeric(value)) => {
-                    let field=if *property==v2::NodeProperty::Fill {"fill"} else {"stroke"};
-                    let rest=match fields.as_ref().and_then(|f|f.get(field)) {Some(v)=>v.json(),None=>self.authored(i)?.field(field).clone()};
+                    let key = if *property == v2::NodeProperty::Fill { StyleField::Fill } else { StyleField::Stroke };
+                    let field = key.name();
+                    let rest=match fields.as_ref().and_then(|f|f.get(key)) {Some(v)=>v.json(),None=>self.authored(i)?.field(key).clone()};
                     let mut color=rest.as_str().and_then(|v|paint(field,v).ok().flatten()).unwrap_or([0.;4]);
                     crate::animation::blend(&mut color,value,weight,additive,crate::animation::BlendKind::Add);
-                    fields.get_or_insert_with(BTreeMap::new).insert(field.into(),Arc::new(crate::animation::style::StyleValue::Paint(crate::animation::style::Paint::Color(color.map(|v|v.clamp(0.,1.))))));
+                    fields.get_or_insert_with(StyleFields::default).set(key,Arc::new(crate::animation::style::StyleValue::Paint(crate::animation::style::Paint::Color(color.map(|v|v.clamp(0.,1.))))));
                 }
                 (TrackTarget::Node { node, property }, crate::animation::Sample::Numeric(value)) => {
                     let t = &mut transform;
@@ -1518,24 +2022,23 @@ impl Document {
                     match property {
                         v2::NodeProperty::Style(p) => {
                             use crate::animation::style::StyleValue;
-                            let field=p.name();
-                            let rest=fields.as_ref().and_then(|f|f.get(field)).cloned().map(Ok).unwrap_or_else(||StyleValue::parse(p.interpolation(),self.authored(i)?.field(field)).map(Arc::new))?;
+                            let key = StyleField::Property(*p);
+                            let field = key.name();
+                            let rest=fields.as_ref().and_then(|f|f.get(key)).cloned().map(Ok).unwrap_or_else(||StyleValue::parse(p.interpolation(),self.authored(i)?.field(key)).map(Arc::new))?;
                             let mut number=value[0];
                             let sample=if additive {
                                 let base=rest.json().as_f64().with_context(||format!("node {node:?}: {field} cannot combine from a keyword"))? as f32;
                                 number=base+number*weight;StyleValue::Json(serde_json::json!(number))
                             } else {rest.mix(&StyleValue::Json(serde_json::json!(number)),weight,p.interpolation())};
-                            fields.get_or_insert_with(BTreeMap::new).insert(field.into(),Arc::new(sample));
+                            fields.get_or_insert_with(StyleFields::default).set(key,Arc::new(sample));
                         }
-                        v2::NodeProperty::Translation => crate::animation::blend(&mut t.translation, value, weight, additive, add),
-                        v2::NodeProperty::Scale => crate::animation::blend(&mut t.scale, value, weight, additive, crate::animation::BlendKind::Multiply),
-                        v2::NodeProperty::Rotation => crate::animation::blend(t.rotation_mut(), value, weight, additive, crate::animation::BlendKind::Rotation),
-                        v2::NodeProperty::Opacity => crate::animation::blend(std::slice::from_mut(&mut opacity), value, weight, additive, add),
+                        v2::NodeProperty::Translation | v2::NodeProperty::Scale | v2::NodeProperty::Rotation | v2::NodeProperty::Opacity =>
+                            blend_placement(self.track_parts[track as usize], t, &mut opacity, value, weight, additive),
                         v2::NodeProperty::StrokeWidth if at_rest.text => {
-                            let authored_width=self.authored(i)?.field("stroke-width").as_f64().unwrap();
-                            let mut width=fields.as_ref().and_then(|f|f.get("stroke-width")).and_then(|s|s.json().as_f64()).unwrap_or(authored_width) as f32;
+                            let authored_width=self.authored(i)?.field(StyleField::StrokeWidth).as_f64().unwrap();
+                            let mut width=fields.as_ref().and_then(|f|f.get(StyleField::StrokeWidth)).and_then(|s|s.json().as_f64()).unwrap_or(authored_width) as f32;
                             crate::animation::blend(std::slice::from_mut(&mut width),value,weight,additive,add);
-                            fields.get_or_insert_with(BTreeMap::new).insert("stroke-width".into(),Arc::new(crate::animation::style::StyleValue::Json(serde_json::json!(width))));
+                            fields.get_or_insert_with(StyleFields::default).set(StyleField::StrokeWidth,Arc::new(crate::animation::style::StyleValue::Json(serde_json::json!(width))));
                         }
                         property => {
                             let Some(path) = &mut path else { continue };
@@ -1551,7 +2054,7 @@ impl Document {
                 }
                 (TrackTarget::Text { unit, index, property, .. }, crate::animation::Sample::Numeric(value)) => {
                     if !at_rest.text { continue; }
-                    let piece = units.get_or_insert_with(BTreeMap::new).entry((*unit, *index)).or_default();
+                    let piece = units.get_or_insert_with(UnitValues::default).write((*unit, *index));
                     match property {
                         UnitProperty::Translation => crate::animation::blend(&mut piece.translation, value, weight, additive, crate::animation::BlendKind::Add),
                         UnitProperty::Scale => crate::animation::blend(&mut piece.scale, value, weight, additive, crate::animation::BlendKind::Multiply),
@@ -1581,47 +2084,55 @@ impl Document {
             values.texts = 0;
             values.text_composition.clear();
             values.text_revision = text_revision(&*specs);
-            values.text_paint_revision = if at_rest.text { specs[i].as_ref().map_or(0, |c| c.revision) } else { 0 };
+            values.text_paint_revisions = specs[i].as_ref().map_or_else(Default::default, |c| c.paint_revisions.clone());
             return Ok(false);
         }
         // Style tracks restyle the node: it is parsed again when a content field differs from the one kept.
         let restyled = fields.is_some();
         if let Some(fields) = fields {
             if styled[i].as_ref().is_none_or(|cached|cached.fields!=fields) {
-                let content_fields=|fields:&BTreeMap<String,Arc<crate::animation::style::StyleValue>>| fields.iter().filter(|(field,_)|!matches!(field.as_str(),"filter"|"clip-path"|"mask")).map(|(field,value)|(field.clone(),value.clone())).collect::<BTreeMap<_,_>>();
-                let content_changed=styled[i].as_ref().map_or_else(||!content_fields(&fields).is_empty(),|old|content_fields(&old.fields)!=content_fields(&fields));
+                let content_changed = styled[i].as_ref().map_or_else(
+                    || fields.content(true).next().is_some(),
+                    |old| old.fields.content(true).ne(fields.content(true)),
+                );
                 let node=if content_changed {
                     // The node as authored, with each field a track wrote in it: written into the typed node, field by field.
                     let mut node=self.authored(i)?.node.clone();
-                    for (field,value) in &fields {if field!="d" {node.set_field(field,&value.json())?;}}
+                    for (field,value) in &fields.0 {if *field != REFERENCE_FIELDS.path_data {node.set_field(field.name(),&value.json())?;}}
                     Some(node)
                 } else {None};
                 // The kept text when only its paints differ: the fields other than fill and stroke are the ones it
                 // was made from, and Moda's vector lane draws it (the degraded tier rasters its colours).
                 let kept=styled[i].as_ref().filter(|_|node.is_some()).and_then(|old| {
-                    let other=|fields:&BTreeMap<String,Arc<crate::animation::style::StyleValue>>| fields.iter().filter(|(field,_)|!matches!(field.as_str(),"fill"|"stroke"|"filter"|"clip-path"|"mask")).map(|(field,value)|(field.clone(),value.clone())).collect::<BTreeMap<_,_>>();
-                    old.text.clone().filter(|text|!text.degraded() && other(&old.fields)==other(&fields))
+                    old.text.clone().filter(|text| !text.degraded() && old.fields.content(false).eq(fields.content(false)))
                 });
                 let mut text=match (&node,kept) {
                     (Some(node),Some(kept))=>Some(Arc::new(repainted_text(node,&kept,&self.images,&self.base,&fields,&self.media.borrow())?)),
-                    (Some(node),None)=>build_text(node,&self.images,&self.base,&self.font_lists,&self.fonts,self.keyed.get(&node.name),self.glyphs_keyed.contains(&node.name),&fields,&self.media.borrow())?.map(Arc::new),
+                    (Some(node),None)=>build_text(node,&self.images,&self.base,&self.font_lists,&self.fonts,item.text.as_ref().map_or_else(TextTracks::default, |text| text.tracks.clone()),&fields,&self.media.borrow())?.map(Arc::new),
                     (None,_)=>styled[i].as_ref().and_then(|old|old.text.clone()),
                 };
                 if let Some(text)=&mut text {Arc::make_mut(text).clip_source=item.text.as_ref().is_some_and(|t|t.clip_source);}
                 let mut draw=styled[i].as_ref().filter(|_|!content_changed).map_or_else(||item.node.clone(),|old|(*old.draw).clone());
+                if let Some(sample) = &node {
+                    draw.mask_type = sample.mask_type;
+                    draw.blend = sample.mix_blend_mode;
+                    draw.isolation = sample.isolation;
+                }
                 if let Some(node)=node.as_ref().filter(|node|matches!(node.kind,NodeKind::Path{..})) {
-                    let mut path=crate::canvas_draw::sampled_path_item(&self.images,&self.base,node,fields.get("d").map(|v|v.as_ref()),&self.media.borrow())?;
-                    for (field,value) in &fields {if let crate::animation::style::StyleValue::Paint(p)=value.as_ref(){path.set_paint(&self.images,&self.base,field,p,&self.media.borrow())?;}}
+                    let mut path=crate::canvas_draw::sampled_path_item(&self.images,&self.base,node,fields.get(REFERENCE_FIELDS.path_data).map(|v|v.as_ref()),&self.media.borrow())?;
+                    for (field,value) in &fields.0 {if let crate::animation::style::StyleValue::Paint(p)=value.as_ref(){path.set_paint(&self.images,&self.base,field.name(),p,&self.media.borrow())?;}}
                     draw.kind=crate::canvas_draw::Kind::Path(Arc::new(path));
                 }
-                let reference=|field:&str,rest:Option<usize>| fields.get(field).map_or(rest,|value|value.json().as_str().and_then(|name|self.by_name.get(name).copied()));
-                draw.clip_path=reference("clip-path",item.node.clip_path);
-                draw.mask=reference("mask",item.node.mask);
+                let reference=|field:StyleField,rest:Option<usize>| fields.get(field).map_or(rest,|value|value.json().as_str().and_then(|name|self.by_name.get(name).copied()));
+                draw.clip_path=reference(REFERENCE_FIELDS.clip_path,item.node.clip_path);
+                draw.mask=reference(REFERENCE_FIELDS.mask,item.node.mask);
                 if let Some(text)=&text {draw.kind=crate::canvas_draw::Kind::Text{size:text.size};}
-                draw.filter=if let Some(crate::animation::style::StyleValue::Filter(filter))=fields.get("filter").map(|v|v.as_ref()) {filter.clone()} else {item.node.filter.clone()};
+                draw.filter=if let Some(crate::animation::style::StyleValue::Filter(filter))=fields.get(REFERENCE_FIELDS.filter).map(|v|v.as_ref()) {filter.clone()} else {item.node.filter.clone()};
                 let revision=styled[i].as_ref().map_or(1,|c|c.revision+1);
-                let text_paints:Vec<_>=text.iter().flat_map(|t|t.fill.iter().chain(&t.stroke)).collect();
-                crate::canvas_draw::install_images(&[&draw],&text_paints)?;
+                if content_changed && self.media.borrow().publish_assets {
+                    let text_paints: Vec<_> = text.iter().flat_map(|t| t.fill.iter().chain(&t.stroke)).collect();
+                    crate::canvas_draw::install_images(&[&draw], &text_paints)?;
+                }
                 let text_revision=styled[i].as_ref().map_or(0,|old|old.text_revision)+u64::from(content_changed && text.is_some());
                 styled[i]=Some(StyledItem{fields,draw:Arc::new(draw),text,revision,text_revision});
             }
@@ -1645,13 +2156,13 @@ impl Document {
             if drawing {
                 // The text node consumes its own samples, cached-spec hits included.
                 let keyed = units.unwrap_or_default();
-                for ((unit,index),_) in &keyed {
+                for ((unit,index),_) in &keyed.0 {
                     let count=text.units[unit].len();
                     ensure!(*index<count,"node {:?}: {} has {count} pieces at this time; index {index} is past the end",item.name,unit.segment());
                 }
                 let slot = &mut specs[i];
                 let style_revision = style.map_or(0, |s| s.text_revision);
-                if slot.as_ref().is_none_or(|c| c.units != keyed || c.style_revision != style_revision) {
+                if slot.as_ref().is_none_or(|c| c.units != keyed || c.style_revision != Some(style_revision)) {
                     let (text_specs, mut composition) = if text.degraded() && !text.degraded_paints.is_empty() {
                         let text_specs = text.degraded_paints.iter().map(|(_, html)| {
                             let mut spec = text.spec.clone(); spec.html = html.clone().into(); spec
@@ -1683,21 +2194,26 @@ impl Document {
                         let mut geometry = text.clone();
                         geometry.fill = vec![PaintSource::Color([1.; 4]); text.code_points];
                         geometry.stroke = vec![PaintSource::None; text.code_points];
-                        geometry.fill_keyed = false;
+                        geometry.tracks.paint_units = Default::default();
                         geometry.spec.fill_override = Some("white".into());
-                        let clip_units = keyed.iter().map(|(key, value)| {
+                        let clip_units = UnitValues(keyed.0.iter().map(|(key, value)| {
                             let mut value = value.clone();
                             value.opacity = 1.; value.fill.clear(); value.stroke.clear();
                             (*key, value)
-                        }).collect();
+                        }).collect());
                         Some(Arc::new(self.batches(&item.name, &geometry, &clip_units)?.0.remove(0)))
                     } else { None };
                     let same_geometry = !text.degraded() && slot.as_ref().is_some_and(|old|
-                        old.composition == composition && old.specs.len() == text_specs.len()
+                        old.specs.len() == text_specs.len()
                         && old.specs.iter().zip(&text_specs).all(|(a,b)| a.same_paint_geometry(b))
                         && match (&old.clip, &clip) { (None,None) => true, (Some(a),Some(b)) => a == b, _ => false });
                     let content_revision = slot.as_ref().map_or(1, |old| old.content_revision + u64::from(!same_geometry));
-                    *slot = Some(TextSpecs { revision, content_revision, style_revision, units: keyed, composition, clip, specs: text_specs.into_iter().map(Arc::new).collect() });
+                    let paint_revisions = text_specs.iter().chain(clip.as_deref()).enumerate().map(|(sub, spec)| {
+                        let Some(old) = slot.as_ref() else { return revision; };
+                        let previous = old.specs.get(sub).or_else(|| (sub == old.specs.len()).then_some(old.clip.as_ref()).flatten());
+                        if previous.is_some_and(|p| p.as_ref() == spec) { old.paint_revisions[sub] } else { revision }
+                    }).collect();
+                    *slot = Some(TextSpecs { paint_revisions, revision, content_revision, style_revision: Some(style_revision), units: keyed, composition, clip, specs: text_specs.into_iter().map(Arc::new).collect() });
                 }
                 let cached = slot.as_ref().unwrap();
                 for (sub, spec) in cached.specs.iter().enumerate() {
@@ -1718,8 +2234,9 @@ impl Document {
         values.path = path;
         values.texts = texts;
         values.text_revision = text_revision(&*specs);
-        values.text_paint_revision = if at_rest.text { specs[i].as_ref().map_or(0, |c| c.revision) } else { 0 };
-        match if at_rest.text { specs[i].as_ref() } else { None } {
+        let batches = specs[i].as_ref().filter(|_| drawing);
+        values.text_paint_revisions = batches.map_or_else(Default::default, |c| c.paint_revisions.clone());
+        match batches {
             Some(cached) => values.text_composition.clone_from(&cached.composition),
             None => values.text_composition.clear(),
         }
@@ -1755,7 +2272,7 @@ impl Document {
     /// piece's that keys them, else its own. Text in one fill (its runs' colours) and one stroke on every code point (or none) is one
     /// spec; otherwise each stroke colour is a spec drawing only the outlines of its code points, and each fill
     /// colour a spec drawing only the fill of its code points, fills first.
-    fn batches(&self, name: &str, text: &TextItem, units: &BTreeMap<(TextUnit, usize), UnitValue>) -> Result<(Vec<moda_text::ops::TextNodeSpec>, Vec<crate::canvas_draw::TextPart>)> {
+    fn batches(&self, name: &str, text: &TextItem, units: &UnitValues) -> Result<(Vec<moda_text::ops::TextNodeSpec>, Vec<crate::canvas_draw::TextPart>)> {
         let n = text.code_points;
         let mut base = text.spec.clone();
         let paint_bounds=[0.,0.,text.size[0],text.size[1]];
@@ -1775,17 +2292,18 @@ impl Document {
             }
             Ok(paint)
         };
-        let mut unit_paints=BTreeMap::new();
-        for (&(unit,index),value) in units {
+        let mut unit_paints = Vec::with_capacity(units.0.len());
+        for ((unit, index), value) in &units.0 {
+            let (unit, index) = (*unit, *index);
             let first=text.units[&unit].get(index).and_then(|cps|cps.first()).copied();
             let paint=|layers:&[UnitPaint],rest:&[PaintSource]|->Result<Option<PaintSource>> {
                 if layers.is_empty(){Ok(None)}else{apply_paints(layers,first.map_or(PaintSource::None,|cp|rest[cp].clone())).map(Some)}
             };
-            unit_paints.insert((unit,index),(paint(&value.fill,&text.fill)?,paint(&value.stroke,&text.stroke)?));
+            unit_paints.push((paint(&value.fill,&text.fill)?,paint(&value.stroke,&text.stroke)?));
         }
         let mut fills = text.fill.clone();
         let mut strokes = text.stroke.clone();
-        if text.pieces_keyed {
+        if text.tracks.pieces {
             let mut xforms = Vec::with_capacity(n);
             for cp in 0..n {
                 let (mut m, mut b, mut opacity) = (DMat2::IDENTITY, DVec2::ZERO, 1f32);
@@ -1793,7 +2311,7 @@ impl Document {
                     let Some(index) = text.piece_of[&level][cp] else { continue };
                     let Some(value) = units.get(&(level, index)) else { continue };
                     let l = linear(value).with_context(|| format!("node {name:?}: {} {index}", level.segment()))?;
-                    let pivot = text.boxes.get(&level).and_then(|b| b[index]).map_or(text.centre, |b| {
+                    let pivot = text.boxes[&level].get(index).copied().flatten().map_or(text.centre, |b| {
                         let [(fx, px), (fy, py)] = value.origin.unwrap_or([(0.5, 0.), (0.5, 0.)]);
                         DVec2::new(b[0] + f64::from(fx) * (b[2] - b[0]) + f64::from(px), b[1] + f64::from(fy) * (b[3] - b[1]) + f64::from(py))
                     });
@@ -1803,7 +2321,7 @@ impl Document {
                     opacity *= value.opacity.clamp(0., 1.);
                 }
                 for level in LEVELS.into_iter().rev() {
-                    let Some((fill,stroke)) = text.piece_of[&level][cp].and_then(|index| unit_paints.get(&(level,index))) else {continue};
+                    let Some((fill,stroke)) = text.piece_of[&level][cp].and_then(|index| units.position(&(level, index)).ok().map(|slot| &unit_paints[slot])) else {continue};
                     if let Some(fill)=fill {fills[cp]=fill.clone();}
                     if let Some(stroke)=stroke {strokes[cp]=stroke.clone();}
                 }
@@ -1819,7 +2337,7 @@ impl Document {
             if n > 0 { base.unit_groups = (vec![0; n]).into(); }
         }
         if text.stroke_width <= 0. { strokes.iter_mut().for_each(|s| *s = PaintSource::None); }
-        crate::canvas_draw::install_images(&[],&fills.iter().chain(&strokes).collect::<Vec<_>>())?;
+        if self.media.borrow().publish_assets { crate::canvas_draw::install_images(&[],&fills.iter().chain(&strokes).collect::<Vec<_>>())?; }
         if fills.iter().chain(&strokes).any(|p| matches!(p, PaintSource::Moda(_))) {
             return Ok(self.painted_batches(text, units, base, fills, strokes));
         }
@@ -1834,54 +2352,45 @@ impl Document {
         let finish = |specs| {
             if compose { self.compose_units(text, units, specs, &[]) } else { (specs, Vec::new()) }
         };
-        let mut stroke_colours: Vec<[u8; 4]> = Vec::new();
-        for s in strokes.iter().filter_map(|s| quantised(*s)) {
-            if !stroke_colours.contains(&s) { stroke_colours.push(s); }
-        }
         let rgba = |q: [u8; 4]| q.map(|c| f32::from(c) / 255.);
-        // One spec when every code point has the same stroke, or none.
-        let one_stroke = strokes.iter().all(|s| quantised(*s) == stroke_colours.first().copied());
-        if !text.fill_keyed && one_stroke {
-            let mut spec = base;
-            if let Some(&colour) = stroke_colours.first() {
-                spec.stroke_color = Some(css(rgba(colour)));
-                spec.stroke_width = Some(text.stroke_width);
+        let stroke_keyed = text.tracks.paint_units[1].is_some() && text.stroke_width > 0.;
+        if text.tracks.paint_units[0].is_none() && !stroke_keyed && (strokes.iter().all(Option::is_none) || text.paint_ranges(true).nth(1).is_none()) {
+            if let Some(colour) = strokes.first().copied().and_then(quantised) {
+                base.stroke_color = Some(css(rgba(colour)));
+                base.stroke_width = Some(text.stroke_width);
             }
-            return Ok(finish(vec![spec]));
+            return Ok(finish(vec![base]));
         }
         if base.unit_transforms.is_empty() {
-            base.unit_transforms = (vec![moda_text::vector::ops::GlyphXform::IDENTITY; n]).into();
+            base.unit_transforms = Arc::new(vec![moda_text::vector::ops::GlyphXform::IDENTITY; n]);
         }
         let mut specs = Vec::new();
-        if !text.fill_keyed {
-            specs.push(base.clone());
-        } else {
-            let mut fill_colours: Vec<[u8; 4]> = Vec::new();
-            for f in fills.iter().filter_map(|f| quantised(*f)) {
-                if !fill_colours.contains(&f) { fill_colours.push(f); }
-            }
-            for colour in fill_colours {
+        if text.tracks.paint_units[0].is_some() {
+            for range in text.paint_ranges(false) {
                 let mut spec = base.clone();
-                spec.fill_override = Some(css(rgba(colour)));
-                spec.unit_fill = ((0..n).map(|cp| if quantised(fills[cp]) == Some(colour) { 1. } else { 0. }).collect::<Vec<_>>()).into();
+                spec.fill_override = Some(css(rgba(quantised(fills[range.start]).unwrap_or([0; 4]))));
+                spec.unit_range = Some(range);
                 specs.push(spec);
             }
+        } else {
+            specs.push(base.clone());
         }
-        for colour in stroke_colours {
+        let no_fill = Arc::new(vec![0.; n]);
+        for range in text.paint_ranges(true) {
+            let colour = quantised(strokes[range.start]);
+            if colour.is_none() && !stroke_keyed { continue; }
             let mut spec = base.clone();
-            spec.stroke_color = Some(css(rgba(colour)));
+            spec.stroke_color = Some(css(rgba(colour.unwrap_or([0; 4]))));
             spec.stroke_width = Some(text.stroke_width);
-            spec.unit_fill = (vec![0.; n]).into();
-            for (cp, xform) in std::sync::Arc::make_mut(&mut spec.unit_transforms).iter_mut().enumerate() {
-                if quantised(strokes[cp]) != Some(colour) { xform.opacity = 0.; }
-            }
+            spec.unit_fill = no_fill.clone();
+            spec.unit_range = Some(range);
             specs.push(spec);
         }
         Ok(finish(specs))
     }
 
     /// Paint each distinct run/glyph coverage with the same paint the path renderer consumes.
-    fn painted_batches(&self, text: &TextItem, units: &BTreeMap<(TextUnit, usize), UnitValue>,
+    fn painted_batches(&self, text: &TextItem, units: &UnitValues,
         mut base: moda_text::ops::TextNodeSpec, fills: Vec<PaintSource>, strokes: Vec<PaintSource>)
         -> (Vec<moda_text::ops::TextNodeSpec>, Vec<crate::canvas_draw::TextPart>) {
         let n = text.code_points;
@@ -1891,20 +2400,18 @@ impl Document {
         let mut specs = Vec::new();
         let mut paints = Vec::new();
         for (stroke, sources) in [(false, fills), (true, strokes)] {
-            let mut distinct = Vec::new();
-            for source in &sources {
-                if !matches!(source, PaintSource::None) && !distinct.contains(source) { distinct.push(source.clone()); }
-            }
-            for source in distinct {
+            let keyed = text.tracks.paint_units[usize::from(stroke)].is_some() && (!stroke || text.stroke_width > 0.);
+            let coverage = Arc::new(vec![if stroke { 0. } else { 1. }; n]);
+            for range in text.paint_ranges(stroke) {
+                let source = &sources[range.start];
+                if matches!(source, PaintSource::None) && !keyed { continue; }
                 let mut spec = base.clone();
                 spec.fill_override = Some("white".into());
-                spec.unit_fill = Arc::new(vec![if stroke { 0. } else { 1. }; n]);
+                spec.unit_fill = coverage.clone();
                 spec.stroke_color = stroke.then(|| "white".into());
                 spec.stroke_width = stroke.then_some(text.stroke_width);
-                for (cp, xform) in Arc::make_mut(&mut spec.unit_transforms).iter_mut().enumerate() {
-                    if sources[cp] != source { xform.opacity = 0.; }
-                }
-                paints.push(source.json());
+                spec.unit_range = Some(range);
+                paints.push(source.json().or_else(|| PaintSource::Color([0.; 4]).json()));
                 specs.push(spec);
             }
         }
@@ -1914,13 +2421,16 @@ impl Document {
     /// Keep independently faded unit pictures separate; range batches share their full layout.
     /// A word/line contains its glyph pictures; its opacity applies after those children compose.
     /// Paint order inside each picture remains all fills followed by all strokes.
-    fn compose_units(&self, text: &TextItem, units: &BTreeMap<(TextUnit, usize), UnitValue>,
+    fn compose_units(&self, text: &TextItem, units: &UnitValues,
         mut specs: Vec<moda_text::ops::TextNodeSpec>, paints: &[Option<moda_scene::value::Value>]) -> (Vec<moda_text::ops::TextNodeSpec>, Vec<crate::canvas_draw::TextPart>) {
         use crate::canvas_draw::TextPart;
-        // Fractional factors live on the composition groups; preserve zero selection masks.
-        for spec in &mut specs {
-            for xform in Arc::make_mut(&mut spec.unit_transforms).iter_mut() {
-                if xform.opacity > 0. { xform.opacity = 1.; }
+        // All paint ranges share the same transforms. Lift fractional opacity
+        // into the groups once, preserving the zero-opacity glyphs.
+        if let Some(first) = specs.first() {
+            let mut transforms = first.unit_transforms.clone();
+            if transforms.iter().any(|x| x.opacity > 0. && x.opacity < 1.) {
+                for x in Arc::make_mut(&mut transforms) { if x.opacity > 0. { x.opacity = 1.; } }
+                for spec in &mut specs { spec.unit_transforms = transforms.clone(); }
             }
         }
         let paths: Vec<Vec<_>> = (0..text.code_points).map(|cp| LEVELS.into_iter().rev().filter_map(|level| {
@@ -1940,8 +2450,10 @@ impl Document {
                 } else {
                     for (index, spec) in specs.iter().enumerate() {
                         let mut spec = spec.clone();
-                        spec.unit_range = Some(start..end);
-                        if spec.unit_transforms[start..end].iter().any(|x| x.opacity > 0.) {
+                        let range = spec.unit_range.as_ref().map_or(start..end, |r| r.start.max(start)..r.end.min(end));
+                        if range.is_empty() { continue; }
+                        spec.unit_range = Some(range.clone());
+                        if spec.unit_transforms[range].iter().any(|x| x.opacity > 0.) {
                             parts.push(match paints.get(index).and_then(Option::as_ref) {
                                 Some(paint) => TextPart::Paint { sub: out.len(), paint: paint.clone(), size, bounds: [0., 0., size[0], size[1]] },
                                 None => TextPart::Batch(out.len()),
@@ -1963,9 +2475,25 @@ impl Document {
     /// batches keep their geometry until their content or AA/raster scale changes; Moda places them anew.
     /// `worlds` are the pictures of the canvas's worlds at the frame the table stands at.
     fn plan(&self, worlds: &[Option<(String, [u32; 2])>]) -> Result<crate::canvas_draw::Plan> {
+        let mut plan = self.plan_for_draw(worlds)?;
+        plan.materialize(self.retained.borrow_mut().as_mut().context("canvas scene")?)?;
+        Ok(plan)
+    }
+
+    fn plan_for_draw(&self, worlds: &[Option<(String, [u32; 2])>]) -> Result<crate::canvas_draw::Plan> {
         let mut evaluated = self.evaluated.borrow_mut();
         let evaluated = evaluated.as_mut().context("internal: a canvas planned before a frame was evaluated")?;
         self.bring(&mut evaluated.state, worlds)
+    }
+
+    /// Publish the evaluated frame to GPU workers. Release the producer's old
+    /// reference before patching so a finished consumer costs no snapshot copy.
+    fn shared_plan(&self, engine: &crate::canvas_draw::Engine) -> Result<crate::canvas_draw::SharedPlan> {
+        let scene = self.retained.borrow().as_ref().expect("parallel frames follow a serial draw").picture_scene();
+        if !self.stale.get() && let Some(plan) = engine.published(scene) { return Ok(plan); }
+        engine.forget_published();
+        let plan = self.plan_for_draw(&[])?;
+        engine.publish(&plan).ok_or_else(|| wgpu::optional_allocations::Refused.into())
     }
 
     /// Give the scene its worlds' pictures, bring it whole to `state` if it is owed that, and plan it.
@@ -2008,10 +2536,9 @@ impl Document {
             Some(text) => text,
             None => {
                 let fonts = self.fonts.clone();
-                let draws: HashMap<_, _> = state.batches().map(|d| ((d.item, d.sub), d.clone())).collect();
+                let draws = state.draws.clone();
                 let text = std::rc::Rc::new(move |item: usize, sub: usize, model: [f32; 16], z: f64, clip: [f32; 4], scale: f64, opacity: f64, kept: Option<&moda_text_draw::TextQuadBatch>| {
-                    let draw = draws.get(&(item, sub)).context("a text batch the frame did not plan")?;
-                    let mut placed = draw.clone();
+                    let mut placed = draws.get(item).get(sub).context("a text batch the frame did not plan")?.clone();
                     placed.model = model;
                     Arc::make_mut(&mut placed.spec).opacity = opacity;
                     match kept {
@@ -2022,7 +2549,7 @@ impl Document {
                 text as crate::canvas_draw::CanvasTextBuilder
             }
         };
-        let result = crate::canvas_draw::plan(retained.as_mut().unwrap(), &page, text.clone())?;
+        let result = crate::canvas_draw::plan_for_draw(retained.as_mut().unwrap(), &page, text.clone())?;
         *self.text.borrow_mut() = Some(text);
         self.stale.set(false);
         Ok(result)
@@ -2058,36 +2585,26 @@ impl Fonts {
     /// layout, or, for text its vector lane declines, its degraded tier's lines and box.
     fn lay_out(&self, spec: &moda_text::ops::TextNodeSpec, layout_html: Arc<str>, here: &str, drawn: &dyn Fn() -> Result<String>) -> Result<Arc<Laid>> {
         let key: LaidKey = (layout_html, spec.width.map(f64::to_bits), spec.auto_width);
-        if let Some(laid) = self.layouts.borrow().by_content.get(&key).and_then(std::sync::Weak::upgrade) { return Ok(laid); }
+        {
+            let layouts = self.layouts.borrow();
+            if let Some(laid) = layouts.by_content.get(&key).and_then(std::sync::Weak::upgrade) { return Ok(laid); }
+        }
         let _profile = moda_engine::prof::span("canvas.text.layout");
-        // The port has no scene-owned emoji image provider. Classify the same sanitized
-        // paragraphs as drawing: removing controls can bring a base and selector together.
-        let paragraphs = moda_text::parser::parse_rich_text_to_paragraphs(&spec.html);
-        ensure!(paragraphs.iter().all(|paragraph| {
-            let text: String = paragraph.runs.iter().map(|run| run.text.as_str()).collect();
-            moda_text::emoji::split_text_into_segments(&text).iter()
-                .all(|segment| !matches!(segment, moda_text::emoji::Segment::Emoji(_)))
-        }), "{here}: emoji presentation is not built yet");
         // Without a width the box is the widest line, so text-align places lines within it.
         let fit = spec.width.is_none();
         let outlines = moda_text::vector::layout_counts()[1];
-        let content = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            hasher.finish()
-        };
         let uncoloured = moda_text::ops::TextNodeSpec { html: key.0.clone(), ..spec.clone() };
-        let laid = match moda_text::vector::accept_vector_layout(&uncoloured, &self.store, &self.host.catalog, moda_text::vector::VectorPlacement::VectorParity, fit) {
+        let laid = match moda_text::vector::accept_vector_layout(&uncoloured, &self.store, &self.host.catalog, moda_text::vector::VectorPlacement::VectorParity, fit, Some(&self.host)) {
             Ok(vector) => Laid {
+                metrics: vector.lines().iter().map(|l| [l.advance, l.baseline]).collect(),
                 width: vector.box_width(), height: vector.height(),
                 lines: vector.lines().iter().map(|line| line.source.iter().flat_map(|source| source.values()).flatten().collect()).collect(),
-                vector: Some(vector), content,
+                vector: Some(vector),
             },
             Err(moda_text::vector::VectorDecline { reason, cause, families, outlines: true }) =>
                 bail!("{here}: Moda's vector text lane declined this text ({reason} ({cause}; families {families:?}))"),
             Err(_) => {
-                let engine = self.degraded.get_or_init(|| self.host.degraded_engine());
+                let engine = self.host.canvas_engine();
                 let mut spec = spec.clone();
                 spec.html = drawn()?.into();
                 let mut layout = engine.layout_json(&spec).map_err(|error| anyhow::anyhow!("{here}: {error}"))?;
@@ -2097,7 +2614,8 @@ impl Fonts {
                 }
                 let lines = || layout["paragraphs"].as_array().into_iter().flatten().flat_map(|p| p["lines"].as_array().into_iter().flatten());
                 Laid {
-                    vector: None, content, width: spec.width.unwrap_or(0.),
+                    metrics: lines().map(|l| Ok([l["segments"].as_array().context("missing line segments")?.iter().map(|s| s["width"].as_f64().context("missing segment advance")).sum::<Result<f64>>()?, l["baselineY"].as_f64().context("missing baseline")?])).collect::<Result<_>>()?,
+                    vector: None, width: spec.width.unwrap_or(0.),
                     height: layout["totalHeightPx"].as_f64().unwrap_or_else(|| lines()
                         .map(|line| line["lineTopY"].as_f64().unwrap_or(0.) + line["lineHeightPx"].as_f64().unwrap_or(0.)).fold(0., f64::max)),
                     lines: lines().map(|line| line["segments"].as_array().into_iter().flatten()
@@ -2121,8 +2639,9 @@ impl Fonts {
 
     /// Recolour an unchanged vector op stream. Effects/emoji keep their ordinary preparation path.
     fn repaint(&self, draw: &Draw, kept: &moda_text_draw::TextQuadBatch) -> Result<Option<Arc<moda_text_draw::TextQuadBatch>>> {
-        if draw.layout.vector.is_none() || kept.degraded.is_some() || !kept.ops.is_empty()
-            || !draw.spec.effects.is_empty() || draw.spec.gradient.is_some() || draw.spec.shader_fill { return Ok(None); }
+        // A paint edit can reveal an image that emitted no op in the previous batch.
+        if draw.layout.vector.as_ref().is_none_or(|layout| layout.has_emojis()) || kept.degraded.is_some() || !kept.ops.is_empty()
+            || !draw.spec.effects.is_empty() || draw.spec.gradient.is_some() { return Ok(None); }
         let Some(vector) = &kept.vector else { return Ok(None) };
         if !vector.emojis.is_empty() { return Ok(None); }
         let stroke = draw.spec.stroke_color.as_deref().map(|css|
@@ -2154,7 +2673,7 @@ impl Fonts {
     fn build(&self, draw: &Draw, z: f64, clip: [f32; 4], scale: f64) -> Result<Option<Arc<moda_text_draw::TextQuadBatch>>> {
         let outcome = match &draw.layout.vector {
             None => {
-                let engine = self.degraded.get_or_init(|| self.host.degraded_engine());
+                let engine = self.host.canvas_engine();
                 moda_text_draw::build_degraded_batch(engine, &draw.spec, draw.model, z, clip, scale)
                     .with_context(|| format!("node {:?}: Moda's degraded text lane", draw.spec.node_id))?
             }
@@ -2182,6 +2701,28 @@ fn linear(value: &UnitValue) -> Result<DMat2> {
     let (sin, cos) = angle.sin_cos();
     let (sx, sy) = (f64::from(sx), f64::from(sy));
     Ok(DMat2::from_cols(DVec2::new(sx * cos, sx * sin), DVec2::new(-sy * sin, sy * cos)))
+}
+
+struct OutputCommand {
+    encoder: wgpu::CommandEncoder,
+    prefix: Option<moda_engine::scratch::FramePrefix>,
+}
+impl std::ops::Deref for OutputCommand {
+    type Target = wgpu::CommandEncoder;
+    fn deref(&self) -> &Self::Target { &self.encoder }
+}
+impl std::ops::DerefMut for OutputCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.encoder }
+}
+impl OutputCommand {
+    fn submit(self, queue: &wgpu::Queue) -> wgpu::SubmissionIndex {
+        let output = self.encoder.finish();
+        let _profile = moda_engine::prof::span("canvas.output.submit");
+        match self.prefix {
+            Some(prefix) => prefix.submit(output),
+            None => queue.submit([output]),
+        }
+    }
 }
 
 /// The GPU side: Moda's engine, which draws each frame's plan into its own 4x MSAA target and resolve, and the
@@ -2250,27 +2791,37 @@ impl Pictures {
     /// `floating`: the picture is read by a world, so an authored view delivers it floating point.
     pub(crate) fn new(renderer: &Renderer, document: &Document, base: &Path, floating: bool) -> Result<Self> {
         document.media.borrow_mut().prepare_gpu(renderer)?;
-        let worlds = document.worlds.iter().map(|world| crate::canvas_world::World::install(renderer, world.scene.clone(), base)
+        let worlds = document.worlds.iter().map(|world| crate::canvas_world::World::install(renderer, world.scene.clone(), base, &document.opened)
             .with_context(|| format!("node {:?}", document.items[world.item].name))).collect::<Result<Vec<_>>>()?;
         let view = if floating { Self::reader_stage(renderer, document, base)? } else { None };
-        let graph = document.view.as_ref().map(|scene| crate::compositor::CanvasGraph::new(renderer, scene, base)).transpose()?.flatten();
+        let graph = document.view.as_ref().map(|scene| crate::compositor::CanvasGraph::new(renderer, scene, base, &document.opened)).transpose()?.flatten();
         Ok(Self { graph, view, worlds: RefCell::new(worlds), pool: moda_engine::pixel::pool::TexturePool::new(&renderer.device, moda_engine::pixel::pool::TexturePool::budget_from_env()),
-            convert: crate::canvas_world::Convert::into_canvas(document.working()) })
+            convert: crate::canvas_world::Convert::into_canvas(document.working) })
     }
+    fn worker(renderer: &Renderer, document: &Prepared,
+        programs: Option<Arc<crate::compositor::CanvasGraphPrograms>>) -> Result<Self> {
+        let graph = programs.map(|programs| crate::compositor::CanvasGraph::from_programs(renderer,
+            document.view.as_ref().expect("a graph has an installed scene"), programs)).transpose()?;
+        Ok(Self { graph, view: None, worlds: Default::default(),
+            pool: moda_engine::pixel::pool::TexturePool::new(&renderer.device, moda_engine::pixel::pool::TexturePool::budget_from_env()),
+            convert: crate::canvas_world::Convert::into_canvas(document.working) })
+    }
+
     /// The stage that writes the canvas's picture as a reader takes it: its view's code values for sRGB,
     /// floating point, neither clamped nor rounded. Every picture that leaves a canvas has passed its view; a
     /// world reads the canvas so, and an EXR stores it so, whatever encoding the canvas blends in. A canvas
     /// whose view is the identity for sRGB (the default view of an sRGB canvas) has no stage: its drawn
     /// picture is that picture.
-    fn reader_stage(renderer: &Renderer, document: &Document, base: &Path) -> Result<Option<crate::display_program::PictureStage>> {
+    fn reader_stage(renderer: &Renderer, document: &Prepared, base: &Path) -> Result<Option<crate::display_program::PictureStage>> {
         let reader = crate::output_device::Target::default();
         document.view.as_ref().filter(|scene| !crate::display_program::Prepared::identity(scene, reader))
-            .map(|scene| crate::display_program::PictureStage::new(renderer, scene, base, reader, true)).transpose()
+            .map(|scene| crate::display_program::PictureStage::new(renderer, scene, base, reader, true, &document.opened)).transpose()
     }
     /// The canvas's picture at `frame` before its view: what Moda drew, then the canvas's image graph over it.
     /// `errors`: the shader diagnostics of the frame the picture is drawn for, where the graph records a result
     /// that is not finite; without them the graph's own word (`CanvasGraph::errors`).
-    fn draw(&self, renderer: &Renderer, document: &Document, frame: &Frame, engine: &crate::canvas_draw::Engine, errors: Option<&wgpu::Buffer>) -> Result<wgpu::Texture> {
+    fn draw(&self, renderer: &Renderer, document: &Document, frame: &Frame, output_index: Option<u32>, engine: &crate::canvas_draw::Engine, errors: Option<&wgpu::Buffer>,
+        recording: Option<moda_engine::scratch::OutputRecording<'_>>, planned: impl FnOnce()) -> Result<(wgpu::Texture, Option<moda_engine::scratch::FramePrefix>)> {
         let _gpu = moda_engine::prof::capturing().then(moda_engine::gpu_profile::resume);
         // Each present world is drawn by the 3D renderer at its local time, and its frame crosses into a pool
         // texture Moda's engine samples as an image: on the GPU, in queue order before Moda's drawing.
@@ -2278,7 +2829,14 @@ impl Pictures {
         let mut captures = Vec::new();
         let mut pictures = vec![None; frame.worlds.len()];
         let mut stored = Vec::new();
-        for ((world, request), picture) in self.worlds.borrow_mut().iter_mut().zip(&frame.worlds).zip(&mut pictures) {
+        let mut worlds = self.worlds.borrow_mut();
+        // Release every hidden camera before admitting any newly visible one,
+        // independent of authored world order. Pictures already submitted keep
+        // their native resources through their consumers.
+        for (world, request) in worlds.iter_mut().zip(&frame.worlds) {
+            if request.is_none() { world.hide(); }
+        }
+        for ((world, request), picture) in worlds.iter_mut().zip(&frame.worlds).zip(&mut pictures) {
             let Some(request) = request else { continue };
             let [w, h] = world.size;
             let output = world.draw(renderer, request).map_err(device)?;
@@ -2295,21 +2853,38 @@ impl Pictures {
         }
         if !frame.worlds.is_empty() { crate::canvas_draw::install_captures(&stored); }
         drop(worlds_profile);
-        let plan = document.plan(&pictures).map_err(scene_error)?;
-        let drawn = {
+        // Evaluation has already written changed rows. A world capture is a further
+        // scene input installed by plan(), so it must go through that step first.
+        let held = if pictures.is_empty() && !document.stale.get() {
+            document.retained.borrow().as_ref().zip(document.text.borrow().as_ref())
+                .and_then(|(scene, text)| engine.picture(scene.picture_scene(), &std::rc::Rc::downgrade(text)))
+        } else { None };
+        let drawn = if let Some(texture) = held { planned(); texture } else {
+            engine.forget_published();
+            let mut plan = document.plan_for_draw(&pictures).map_err(scene_error)?;
+            planned();
             let _profile = moda_engine::prof::span("canvas.draw");
-            engine.render_to_texture(&plan).map_err(device)?
+            engine.render_resident(&mut plan, document.retained.borrow_mut().as_mut().expect("planned scene")).map_err(device)?
         };
         drop(captures);
-        match &self.graph {
-            Some(graph) => { let _profile = moda_engine::prof::span("canvas.compositor"); graph.draw(renderer, &drawn, &frame.request, &frame.images, errors) },
-            None => Ok(drawn),
-        }
+        self.composite(renderer, drawn, frame, output_index, errors, recording.and_then(|r| r.finish()))
+    }
+
+    fn composite(&self, renderer: &Renderer, drawn: wgpu::Texture, frame: &Frame, output_index: Option<u32>, errors: Option<&wgpu::Buffer>,
+        mut prefix: Option<moda_engine::scratch::FramePrefix>) -> Result<(wgpu::Texture, Option<moda_engine::scratch::FramePrefix>)> {
+        let picture = if let Some(graph) = &self.graph {
+            let _profile = moda_engine::prof::span("canvas.compositor");
+            graph.draw(renderer, &drawn, &frame.request, output_index, &frame.images, errors, prefix.as_mut())?
+        } else {
+            drawn
+        };
+        Ok((picture, prefix))
     }
 }
 
 /// One frame in flight: its finished pixels stay on the GPU until acceptance and encoder release.
 struct Slot {
+    work: crate::canvas_parallel::FrameWork,
     frame: wgpu::Texture,
     stats: crate::display_stats::Stats,
     /// The slot's entry in the submission ring, as a 3D frame slot has: the encoders' surfaces, the frame they
@@ -2341,7 +2916,7 @@ struct NativeCanvasFrame {
     surfaces: Vec<Surface>,
     frame: Option<usize>,
 }
-type CanvasJob = (u32, f32, vork_time::Request, Slot);
+type CanvasJob = (u32, f32, Frame, crate::canvas_draw::SharedPlan, Slot);
 type CanvasCompletion = Result<(usize, Slot, Option<wgpu::SubmissionIndex>)>;
 type CanvasWorkers = Vec<(std::sync::mpsc::SyncSender<CanvasJob>, std::sync::mpsc::Receiver<CanvasCompletion>)>;
 
@@ -2367,16 +2942,20 @@ impl Target {
         let limit = renderer.device.limits().max_texture_dimension_2d;
         ensure!(size[0] <= limit && size[1] <= limit,
             crate::gpu_memory::device_limit("render resolution", format_args!("{}x{} pixels", size[0], size[1]), format_args!("max_texture_dimension_2d={limit} pixels per axis"), "reduce render.resolution"));
-        let engine = crate::canvas_draw::Engine::new(renderer, document.float(), document.working()).map_err(device)?;
+        let engine = crate::canvas_draw::Engine::new(renderer, document.float, document.working).map_err(device)?;
+        Ok(Self::with_pictures(renderer, size, document.float, Pictures::new(renderer, document, base, false)?, engine))
+    }
+
+    fn with_pictures(renderer: &Renderer, size: [u32; 2], float: bool, pictures: Pictures, engine: crate::canvas_draw::Engine) -> Self {
         let stride = (size[0] * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        Ok(Self { engine, device: renderer.device.clone(), size, drawn: RefCell::new(None), frame_format: renderer.output_format(), finish: Default::default(), compiler: renderer.compiler.clone(), stride,
-            pictures: Pictures::new(renderer, document, base, false)?, display: Default::default(), float: document.float(), picture: Default::default() })
+        Self { engine, device: renderer.device.clone(), size, drawn: RefCell::new(None), frame_format: renderer.output_format(), finish: Default::default(), compiler: renderer.compiler.clone(), stride,
+            pictures, display: Default::default(), float, picture: Default::default() }
     }
 
     /// Prepare this render's EXR picture: the canvas's picture after its view, as a reader takes it
     /// (`Pictures::reader_stage`). Its floating stage is built once and kept with the canvas; a canvas with
     /// none (the default view of an sRGB canvas) has its drawn picture read as it is, 8-bit or float.
-    fn set_raw(&self, renderer: &Renderer, document: &Document, base: &Path) -> Result<()> {
+    fn set_raw(&self, renderer: &Renderer, document: &Prepared, base: &Path) -> Result<()> {
         let mut picture = self.picture.borrow_mut();
         if picture.is_none() { *picture = Pictures::reader_stage(renderer, document, base)?; }
         Ok(())
@@ -2387,15 +2966,15 @@ impl Target {
     /// no stage. A float canvas is finished by its view stage for any display, and an 8-bit canvas for any
     /// other display than its own: the canvas's view runs in the display stage with that display as its
     /// target, over the drawn picture, as a world's view does. `scene` is the canvas's root scene.
-    fn set_display(&self, renderer: &Renderer, document: &Document, scene: &Scene, base: &Path, display: crate::output_device::Target) -> Result<()> {
+    fn set_display(&self, renderer: &Renderer, document: &Prepared, scene: &Scene, base: &Path, display: crate::output_device::Target) -> Result<()> {
         let mut stages = self.display.borrow_mut();
         let scene = document.view.as_ref().unwrap_or(scene);
-        let current = if !document.float() && crate::display_program::Prepared::identity(scene, display) {
+        let current = if !document.float && crate::display_program::Prepared::identity(scene, display) {
             None
         } else if let Some(index) = stages.built.iter().position(|(built, _)| *built == display) {
             Some(index)
         } else {
-            let stage = crate::display_program::PictureStage::new(renderer, scene, base, display, false)?;
+            let stage = crate::display_program::PictureStage::new(renderer, scene, base, display, false, &document.opened)?;
             stages.built.push((display, stage));
             Some(stages.built.len() - 1)
         };
@@ -2428,6 +3007,7 @@ impl Target {
         let mut ring = crate::ring::Entry::staging(&renderer.device, staging);
         ring.encoder_surfaces = surfaces;
         Slot {
+            work: Default::default(),
             frame: renderer.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("canvas frame"),
                 size: wgpu::Extent3d { width: self.size[0], height: self.size[1], depth_or_array_layers: 1 },
@@ -2448,10 +3028,17 @@ impl Target {
         }
     }
 
-    /// Draw one frame with Moda's engine (it submits its own work), then record the straight-alpha frame, its
+    /// Draw one frame and record the straight-alpha output, its
     /// exposure reduction and, with a readback, the copy of its pixels.
-    fn encode(&self, renderer: &Renderer, document: &Document, frame: &Frame, slot: &mut Slot) -> Result<wgpu::CommandEncoder> {
-        *self.drawn.borrow_mut() = Some(self.pictures.draw(renderer, document, frame, &self.engine, None)?);
+    fn encode(&self, renderer: &Renderer, document: &Document, frame: &Frame, index: u32, slot: &mut Slot, planned: impl FnOnce()) -> Result<OutputCommand> {
+        let recording = self.engine.record_for_output();
+        let (picture, prefix) = self.pictures.draw(renderer, document, frame, Some(index), &self.engine, None, Some(recording), planned)?;
+        self.encode_drawn(renderer, picture, frame, slot, prefix)
+    }
+
+    fn encode_drawn(&self, renderer: &Renderer, drawn: wgpu::Texture, frame: &Frame, slot: &mut Slot,
+        prefix: Option<moda_engine::scratch::FramePrefix>) -> Result<OutputCommand> {
+        *self.drawn.borrow_mut() = Some(drawn);
         let _profile = moda_engine::prof::span("canvas.output.convert_record");
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas frame") });
         self.finish(renderer, &mut encoder, &slot.frame, &frame.request, None)?;
@@ -2486,7 +3073,7 @@ impl Target {
                 buffer: &slot.ring.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.stride), rows_per_image: None },
             }, slot.frame.size());
         }
-        Ok(encoder)
+        Ok(OutputCommand { encoder, prefix })
     }
 
     /// Write the resolved frame into `destination` (storage-bindable) as straight alpha: the blend leaves associated
@@ -2550,7 +3137,7 @@ impl Target {
 
     /// A slot's frame once its submission is done: its exposure, with a readback its RGBA8 pixels, and with a
     /// raw read the picture after its view as associated float RGBA.
-    fn collect(&self, renderer: &Renderer, slot: &mut Slot, submission: wgpu::SubmissionIndex) -> Result<(crate::Exposure, Option<Vec<u8>>, Option<Vec<[f32; 4]>>)> {
+    fn collect(&self, renderer: &Renderer, slot: &mut Slot, submission: wgpu::SubmissionIndex) -> Result<(crate::Exposure, Option<crate::png_output::CanvasPixels>, Option<Vec<[f32; 4]>>)> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mapped = [slot.stats.pending().context("canvas exposure was not recorded")?].into_iter().chain(slot.readback.then_some(&slot.ring.readback)).chain(&slot.picture_errors).chain(slot.raw.as_ref().map(|raw| &raw.readback)).chain(slot.diagnostic_gpu.iter().flat_map(|gpu| gpu.readbacks())).collect::<Vec<_>>();
         for buffer in &mapped {
@@ -2583,18 +3170,22 @@ impl Target {
         }
         let _conversion = moda_engine::prof::span("canvas.output.convert_record");
         let pixels = slot.readback.then_some(&slot.ring.readback).map(|readback| {
-            let mut rgba = Vec::with_capacity((self.size[0] * self.size[1] * 4) as usize);
-            {
-                let mapped = readback.get_mapped_range(..);
-                for row in mapped.chunks(self.stride as usize).take(self.size[1] as usize) {
-                    rgba.extend_from_slice(&row[..(self.size[0] * 4) as usize]);
+            let row_bytes = self.size[0] as usize * 4;
+            let stride = self.stride as usize;
+            let len = row_bytes * self.size[1] as usize;
+            let mapped = readback.get_mapped_range(..);
+            let bytes = if stride == row_bytes {
+                mapped[..len].to_vec()
+            } else {
+                let mut pixels = Vec::with_capacity(len);
+                for row in mapped.chunks(stride).take(self.size[1] as usize) {
+                    pixels.extend_from_slice(&row[..row_bytes]);
                 }
-            }
+                pixels
+            };
+            drop(mapped);
             readback.unmap();
-            if slot.frame.format() == wgpu::TextureFormat::Bgra8Unorm {
-                for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); }
-            }
-            rgba
+            crate::png_output::CanvasPixels::new(bytes, slot.frame.format())
         });
         let raw = slot.raw.as_ref().map(|raw| {
             let mut rgba = Vec::with_capacity((self.size[0] * self.size[1]) as usize);
@@ -2618,25 +3209,25 @@ impl Target {
 
 /// `vork check` on a canvas: fonts load, images decode, and the first frame lays out and plans with Moda's engine
 /// (no GPU).
-pub(crate) fn check(scene: &Scene, base: &Path, renderer: &Renderer) -> Result<()> {
+pub(crate) fn check(scene: &Scene, base: &Path, renderer: &Renderer, opened: &crate::footage::Opened) -> Result<()> {
     // Everything here reads, lays out and installs the document: its refusals are the scene's,
     // except what the device hands back, which keeps its own category.
-    check_document(scene, base, renderer).map_err(scene_error)
+    check_document(scene, base, renderer, opened).map_err(scene_error)
 }
-fn check_document(scene: &Scene, base: &Path, renderer: &Renderer) -> Result<()> {
-    let document = Document::new(scene, base)?;
+fn check_document(scene: &Scene, base: &Path, renderer: &Renderer, opened: &crate::footage::Opened) -> Result<()> {
+    let document = Document::new_with_paints(scene, base, None, opened)?;
     document.install_images()?;
     document.media.borrow_mut().prepare_gpu(renderer)?;
     document.frame(&vork_time::Request::Numeric(0.))?;
     document.plan(&[])?;
     // A float canvas's image graph and view stage: their programs, inputs and images, as a render prepares them.
     if let Some(scene) = &document.view {
-        crate::compositor::CanvasGraph::new(renderer, scene, base)?;
-        crate::display_program::PictureStage::new(renderer, scene, base, Default::default(), false)?;
+        crate::compositor::CanvasGraph::new(renderer, scene, base, &document.opened)?;
+        crate::display_program::PictureStage::new(renderer, scene, base, Default::default(), false, &document.opened)?;
     }
     // Each world installs as its own 3D scene.
     for world in &document.worlds {
-        renderer.install_with_options(world.scene.clone(), base, crate::InstallOptions { readback: Default::default(), ..Default::default() })
+        renderer.install_with_options(world.scene.clone(), base, crate::InstallOptions { opened: document.opened.clone(), readback: Default::default(), ..Default::default() })
             .with_context(|| format!("node {:?}", document.items[world.item].name))?;
     }
     Ok(())
@@ -2663,7 +3254,7 @@ pub(crate) fn warm(scene: &Scene, base: &Path, renderer: &Renderer, display: cra
     document.install_images()?;
     let mut slot = target.slot(renderer, true, true, Vec::new());
     let frame = document.frame(&vork_time::Request::Numeric(0.))?;
-    let mut command = target.encode(renderer, &document, &frame, &mut slot)?;
+    let mut command = target.encode(renderer, &document, &frame, 0, &mut slot, || {})?;
     // A clip's native encoder takes the finished frame through `finish` as well, into its own surface: a
     // storage texture in the frame's format. Finishing into one here creates that pipeline (the copy of a
     // frame its view stage finished, or the same unassociate the frame took).
@@ -2675,7 +3266,7 @@ pub(crate) fn warm(scene: &Scene, base: &Path, renderer: &Renderer, display: cra
     target.finish(renderer, &mut command, &surface, &frame.request, Some(&slot.frame))?;
     #[cfg(feature = "frame-profile")]
     crate::frame_profile::count("queue_submissions", 1);
-    let submission = renderer.queue.submit([command.finish()]);
+    let submission = command.submit(&renderer.queue);
     renderer.wait(Some(submission))?;
     renderer.errors.check()
 }
@@ -2701,6 +3292,7 @@ pub(crate) struct Kept {
     target: Target,
 }
 impl Kept {
+    pub(crate) fn opened(&self) -> &crate::footage::Opened { &self.document.opened }
     /// The resolved scene and the directory its files resolve against: everything the document and the target are
     /// built from. Outputs, frame ranges and destinations are each render's own. The scene's content is hashed
     /// as the typed scene is walked, once (`crate::identity`).
@@ -2711,13 +3303,74 @@ impl Kept {
         crate::identity::write(&mut hash, scene)?;
         Ok(hash.finalize())
     }
+
+    /// Stage the new CPU inputs while the published document still owns its installation. The
+    /// first evaluated sample supplies the same row writes as a seek during an export.
+    pub(crate) fn revise(&mut self, renderer: &Renderer, scene: &Scene, base: &Path,
+        opened: &crate::footage::Opened, unchanged: &BTreeSet<&Path>) -> Result<bool> {
+        let old = &self.document;
+        if old.view.is_some() || has_worlds(&scene.nodes) { return Ok(false); }
+        let next = Document::prepare_document(scene, base, None, opened, Some((old, unchanged)))?;
+        if next.view.is_some() || next.page != old.page || next.items.len() != old.items.len()
+            || !Arc::ptr_eq(&next.fonts.host, &old.fonts.host) || old.stale.get() {
+            return Ok(false);
+        }
+        let identity = Self::identity(scene, base)?;
+        next.media.borrow_mut().prepare_gpu(renderer)?;
+        next.install_images()?;
+        // Text stamps are local to a bound row. Compare the new specs against that row's
+        // previous specs, even when neither document has an animated text style.
+        next.text_specs.borrow_mut().clone_from(&old.text_specs.borrow());
+        for cached in next.text_specs.borrow_mut().iter_mut().flatten() { cached.style_revision = None; }
+        let request = vork_time::Request::Numeric(0.);
+        next.evaluate(&request)?;
+        let written = {
+            let before = old.evaluated.borrow();
+            let Some(before) = before.as_ref() else { return Ok(false) };
+            let after = next.evaluated.borrow();
+            let after = &after.as_ref().expect("evaluated candidate").state;
+            let node = |i: usize| after.nodes[i].as_deref().unwrap_or(&next.items[i].node);
+            let changes: Vec<_> = before.state.values.iter().zip(&after.values).enumerate().filter_map(|(i, (a, b))| {
+                use crate::canvas_draw::change;
+                let old_node = before.state.nodes[i].as_deref().unwrap_or(&old.items[i].node);
+                if old_node != node(i) { return Some((i, change::ALL)); }
+                if a == b { return None; }
+                let mut placed = a.clone();
+                placed.transform.clone_from(&b.transform);
+                placed.opacity = b.opacity;
+                Some((i, if placed == *b { change::TRANSFORM | change::OPACITY } else { change::ALL }))
+            }).collect();
+            let mut page = next.page.clone();
+            page.background = after.background;
+            let mut rows = old.retained.borrow_mut();
+            let Some(rows) = rows.as_mut() else { return Ok(false) };
+            rows.write(&page, node, &after.values, &changes)
+        };
+        // A form change declines before writing a row. On a partial write or plan failure the
+        // published table can lower fresh rows under a fresh scene identity on its next look.
+        if matches!(written, Ok(false)) { return Ok(false); }
+        *next.retained.borrow_mut() = old.retained.borrow_mut().take();
+        next.stale.set(false);
+        // A matte needs a store entry to plan. The next look chooses the displayed movie frame.
+        if let Err(error) = written.and_then(|_| next.publish_frame_media(&request, MediaPublication::Missing))
+            .and_then(|bindings_changed| {
+                if bindings_changed { next.write_rows(&Changed::Every)?; }
+                next.plan(&[])
+            }) {
+            old.stale.set(true);
+            return Err(error);
+        }
+        self.document = next;
+        self.identity = identity;
+        Ok(true)
+    }
     /// Build what a render of `scene` builds before its first frame, with a render's errors, then evaluate and
     /// plan the first frame as `check` does: a session proves a candidate document this way before it publishes
     /// it. A canvas with worlds is planned by its first render instead, when the worlds' pictures exist; their
     /// scenes are installed here, in the target.
-    pub(crate) fn prepare(renderer: &Renderer, scene: &Scene, base: &Path, display: crate::output_device::Target) -> Result<Self> {
+    pub(crate) fn prepare(renderer: &Renderer, scene: &Scene, base: &Path, display: crate::output_device::Target, opened: &crate::footage::Opened) -> Result<Self> {
         let identity = Self::identity(scene, base)?;
-        let document = Document::new(scene, base).map_err(scene_error)?;
+        let document = Document::new_with_paints(scene, base, None, opened).map_err(scene_error)?;
         let target = Target::new(renderer, scene.render.resolution, &document, base).map_err(scene_error)?;
         // The view stage for the display the session's renders encode for: an authored view's program, inputs
         // and images are proved here, and the render finds the stage built.
@@ -2734,13 +3387,15 @@ impl Kept {
 /// What the shot entry hands over for a canvas.
 pub(crate) struct Request {
     pub sound: Option<crate::audio::MovieSound>,
+    pub opened: crate::footage::Opened,
     pub scene: Scene,
     pub base: PathBuf,
     pub out: Vec<PathBuf>,
     pub outputs: Vec<Output>,
-    pub at: Option<vork_time::Clock>,
-    pub frame_start: Option<usize>,
-    pub frame_end: Option<usize>,
+    pub still: Option<shot::Still>,
+    pub first_frame: usize,
+    pub last_frame: usize,
+    pub selected: Option<std::ops::RangeInclusive<u32>>,
     pub png_depth: crate::PngDepth,
     pub exr_codec: crate::ExrCodec,
     /// Each destination's EXR storage (`output.color_space`), by path.
@@ -2752,6 +3407,7 @@ pub(crate) struct Request {
     pub diagnostics: bool,
     pub stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub profile_record: serde_json::Value,
+    pub export_identity: Option<String>,
     pub device_reused: bool,
     /// A session's document and GPU side from an earlier render on the same renderer, reused when this render
     /// resolves to the same scene.
@@ -2760,7 +3416,7 @@ pub(crate) struct Request {
 
 /// Render a canvas to the destinations a 3D shot writes: a PNG still, a directory of frames, EXR frames, MP4 or MOV.
 pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHandle<'_, Result<Renderer>>, warnings: &crate::warnings::Collector, wall: Instant) -> Result<RenderedShot> {
-    let Request { scene, base, out, outputs, at: authored_at, frame_start, frame_end, png_depth, exr_codec, raw_colors, display, no_write, gpu_only, diagnostics, stop, profile_record, device_reused, sound, kept } = request;
+    let Request { scene, base, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused, sound, kept, opened } = request;
     let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
     let parse_start = Instant::now();
     let [w, h] = scene.render.resolution;
@@ -2768,19 +3424,16 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     ensure_usage!(!out.is_empty(), "at least one output destination is required");
     ensure_usage!(outputs.iter().all(|o| *o == Output::Color), "a 2D canvas has one channel, color; depth, motion, object IDs and AOVs are 3D outputs");
     ensure_usage!(png_depth == crate::PngDepth::Eight, "--png-depth 16: a 2D canvas is 8-bit");
-    let has_format = |path: &PathBuf, extension: &str| !shot::directory_marked(path) && path.extension().is_some_and(|s| s.eq_ignore_ascii_case(extension));
     let is_video = |path: &PathBuf| shot::video_destination(path);
-    let is_png = |path: &PathBuf| has_format(path, "png");
-    let is_exr = |path: &PathBuf| has_format(path, "exr");
+    let is_png = |path: &PathBuf| shot::png_destination(path);
+    let is_exr = |path: &PathBuf| shot::exr_destination(path);
     for path in &out {
         ensure_usage!(shot::recognized_destination(path),
             "--out {}: unrecognized extension; use .png (one still), .exr (with %06d), .mp4, .mov, or a directory (no extension, or end the path with /)", path.display());
         ensure_usage!(!is_exr(path) || path.file_name().is_some_and(|name| name.to_string_lossy().contains("%06d")), "EXR destination requires a %06d frame placeholder");
         ensure_usage!(!is_png(path) || !shot::has_frame_pattern(path), "--out {}: PNG frame patterns are unsupported; use a directory (every frame as NNNNNN.png)", path.display());
     }
-    for (i, path) in out.iter().enumerate() {
-        ensure_usage!(!out[..i].contains(path), "duplicate output path: {}", path.display());
-    }
+    shot::validate_unique_destinations(&out)?;
     let video_paths: Vec<PathBuf> = out.iter().filter(|p| is_video(p)).cloned().collect();
     let directory_paths: Vec<PathBuf> = out.iter().filter(|p| !is_video(p)).cloned().collect();
     let video = !video_paths.is_empty();
@@ -2788,27 +3441,11 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         i32::try_from(fps.numerator()).context("EXR rate numerator exceeds i32")?;
         u32::try_from(fps.denominator()).context("EXR rate denominator exceeds u32")?;
     }
-    let clip_frames = shot::clip_frame_count(&scene.render)?;
-    let at = authored_at.as_ref().map(|time| vork_time::Request::from(time).numeric()).transpose().map_err(|error| error.context(FailureKind::Usage))?;
-    if let Some(t) = at {
-        ensure_usage!(t.is_finite() && authored_at.as_ref().is_none_or(|t| t.exact() >= Default::default()), "--at must be nonnegative and finite");
-    }
-    let implicit_still = at.is_none() && frame_start.is_none() && frame_end.is_none() && clip_frames > 1
-        && !directory_paths.is_empty() && directory_paths.iter().all(|p| is_png(p));
-    let at = if implicit_still { Some(0.) } else { at };
-    ensure_usage!(at.is_none() || (frame_start.is_none() && frame_end.is_none()), "--at selects one still; it cannot be combined with --frame-start or --frame-end");
-    let first_frame = frame_start.unwrap_or(0);
-    let last_frame = frame_end.unwrap_or(clip_frames.saturating_sub(1));
-    ensure_usage!(first_frame <= last_frame && last_frame < clip_frames,
-        "frame range {first_frame}..{last_frame} must lie within the clip's frames 0..{} (render.fps x render.duration) with start <= end", clip_frames.saturating_sub(1));
+    let at = still.as_ref().map(|still| still.time);
     ensure_usage!(at.is_none() || !video, "--at selects one still; a video renders every frame");
     let frames = if at.is_some() { 1 } else { last_frame + 1 - first_frame };
-    let index = |frame: usize| first_frame + frame;
-    let frame_time = |frame: usize| -> Result<f32> {
-        match at { Some(t) => Ok(t), None => vork_time::Request::Frame(index(frame) as u32, fps).numeric() }
-    };
-    let still_index = at.map(|t| (f64::from(t) * fps.as_f64() + 0.5).floor() as u32);
-    let output_index = |frame: usize| still_index.unwrap_or(index(frame) as u32);
+    let still_index = still.as_ref().map(|still| still.index);
+    let output_index = |frame: usize| still_index.unwrap_or((first_frame + frame) as u32);
     if video {
         ensure_usage!(!no_write && !gpu_only, "video output cannot be combined with --no-write or --gpu-only");
         ensure_usage!(w % 2 == 0 && h % 2 == 0, "video output requires even dimensions");
@@ -2835,7 +3472,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let kept = kept.filter(|kept| Some(kept.identity) == known);
     let install_reused = kept.is_some();
     let (kept_document, kept_target) = kept.map_or((None, None), |kept| (Some(kept.document), Some(kept.target)));
-    // The video encoders' sessions open while the text is laid out.
+    // Prepare the encoders while the text is laid out.
     let (document, prepared) = std::thread::scope(|scope| {
         // The worker walks the scene to hash it, so it has the stack a scene nested to its limit needs.
         let prepared = vork_scene::scene_thread().spawn_scoped(scope, || {
@@ -2852,7 +3489,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         }).expect("start the encoder preparation worker");
         let document = match kept_document {
             Some(document) => Ok(document),
-            None => Document::new(&scene, &base).map_err(scene_error),
+            None => Document::new_with_paints(&scene, &base, None, &opened).map_err(scene_error),
         };
         (document, prepared.join().map_err(|panic| panicked("encoder preparation worker", panic)))
     });
@@ -2874,9 +3511,6 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     // Old outputs are removed only after every encoder can be written.
     for prepared in &prepared { prepared.validate_fallback(frames as u64, Some(&renderer.device)).map_err(device)?; }
     let output_run = if no_write || gpu_only { None } else {
-        let selected = if let Some(index) = still_index { Some(index..=index) }
-            else if frame_start.is_some() || frame_end.is_some() { Some(first_frame as u32..=last_frame as u32) }
-            else { None };
         Some(crate::output_run::OutputRun::begin(&out, selected)?)
     };
     let install_start = Instant::now();
@@ -2903,8 +3537,9 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let frame_bytes = (u64::from(w) * 4).div_ceil(256) * 256 * u64::from(h);
     // Native device/local/unified headroom decides whether replication is
     // optional. The encoder validates its fixed serial buffer independently.
-    let free = crate::canvas_parallel::headroom(&renderer.device).map(|(_, free)| free);
-    let host_working_set = crate::canvas_parallel::host_working_set();
+    let can_replicate = independent && limit > 1
+        && (forced_workers.is_some() || frames >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES);
+    let free = can_replicate.then(|| crate::canvas_parallel::headroom(&renderer.device)).flatten().map(|(_, free)| free);
     let serial_capacity = crate::constants::FRAMES_IN_FLIGHT.min(frames);
     // Each destination may retain conversion textures and a native shared ring;
     // readback/output slots include both the 8-bit and float pictures.
@@ -2913,13 +3548,14 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let limit = limit.min(ring_workers);
     let full_capacity = serial_capacity.max(limit * 2).min(frames);
     let capacity = crate::canvas_parallel::ring_limit(free, slot_bytes, serial_capacity, full_capacity);
-    let worker_limit = if independent && (forced_workers.is_some() || frames >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES) && free.is_some() && (cfg!(not(target_os = "macos")) || host_working_set.is_some()) { crate::canvas_parallel::replicas_for_ring(limit, capacity, full_capacity) } else { 1 };
+    let worker_limit = if free.is_some() { crate::canvas_parallel::replicas_for_ring(limit, capacity, full_capacity) } else { 1 };
     let mut workers = 1;
     // Native encoders keep the serial ring. Optional output slots and histories
     // are reserved only when main's existing policy admits parallel rendering.
     let mut in_flight = serial_capacity;
     let encoder_open_start = diagnostics.then(Instant::now);
     let mut encoders = prepared.into_iter().map(|prepared| prepared.open(renderer.device.clone(), renderer.queue.clone(), frames as u64, serial_capacity).map_err(device)).collect::<Result<Vec<_>>>()?;
+    let completion_handoff = !encoders.is_empty() && encoders.iter().all(Encoder::uses_completion_handoff);
     // Each slot's ring entry on every encoder, installed in frame order so entry indices match the slots.
     let surfaces = (0..in_flight).map(|_| encoders.iter_mut().map(|encoder| encoder.create_surface().map_err(setup)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     let encoder_start_ms = if video { encoder_prepare_ms + encoder_open_start.map_or(0., |s| s.elapsed().as_secs_f64() * 1000.) } else { 0. };
@@ -2930,7 +3566,6 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let slot_start = Instant::now();
     let native_frames = RefCell::new(surfaces.into_iter().map(|surfaces| NativeCanvasFrame { surfaces, frame: None, diagnostic_gpu: None }).collect::<Vec<_>>());
     let mut slots: Vec<Option<Slot>> = (0..in_flight).map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect();
-    let mut serial_slots = None;
     let png_writers: Vec<_> = directory_paths.iter().filter(|path| pngs && !is_exr(path)).map(|path|
         crate::png_output::FrameOutputWriter::canvas(path.clone(), w, h, in_flight, output_index(0) as usize, display.display)).collect();
     let raw_writers: Vec<_> = directory_paths.iter().filter(|path| raws && is_exr(path)).map(|path|
@@ -2949,139 +3584,229 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let mut rendered_frames = 0;
     let mut first_frame_ms = 0.;
     let mut interrupted = false;
-    let mp4 = video_paths.iter().any(|path| has_format(path, "mp4"));
+    let mp4 = video_paths.iter().any(|path| shot::mp4_destination(path));
     let mut refused = shot::Refusals::default();
-    let optional_budget = crate::canvas_parallel::budget(&renderer.device,
-        cfg!(not(target_os = "macos")) && renderer.adapter_info.device_type == wgpu::DeviceType::DiscreteGpu);
+    let host_memory = (worker_limit > 1).then(|| crate::canvas_host_memory::Guard::new(diagnostics)).flatten().map(Arc::new);
+    let optional_budget = host_memory.as_ref().and_then(|host| crate::canvas_parallel::budget(&renderer.device,
+        cfg!(not(target_os = "macos")) && renderer.adapter_info.device_type == wgpu::DeviceType::DiscreteGpu, host.clone()));
+    if diagnostics && worker_limit > 1 && optional_budget.is_none() {
+        eprintln!("canvas concurrency: memory counters unavailable; keep serial");
+    }
     let worker_limit = if optional_budget.is_some() { worker_limit } else { 1 };
     let result = std::thread::scope(|scope| -> Result<()> {
-        let spawn_workers = |count: usize| {
-            let mut pool = Vec::new();
-            let mut joins = Vec::new();
-            if count > 0 {
-                for _ in 0..count {
-                    let (send, receive) = std::sync::mpsc::sync_channel::<(u32, f32, vork_time::Request, Slot)>(1);
-                    let (done, completed) = std::sync::mpsc::channel();
-                    let renderer = &renderer;
-                    let scene = &scene;
-                    let base = &base;
-                    let prepared = document.prepared.clone();
-                    let shared_images = shared_images.clone();
-                    let budget = optional_budget.as_ref().expect("native headroom admits workers").clone();
-                    joins.push(vork_scene::scene_thread().spawn_scoped(scope, move || {
-                        let _warnings = warnings.enter();
-                        // A job's output lease survives cancellation of disposable
-                        // target/planner state. Retrying it never skips an output frame.
-                        let current = RefCell::new(None::<(usize, Slot)>);
-                        let run = || -> Result<()> {
-                            let _host_reservation = host_working_set.map(|bytes| budget.reserve_capacity(bytes)).transpose()?;
-                            // Thread-affine document, font stores, planner and GPU records live for the worker.
-                            let document = Document::from_prepared(prepared, crate::canvas_draw::Media::new(scene, base).map_err(scene_error)?);
-                            let mut target = Target::new(renderer, [w, h], &document, base).map_err(scene_error)?;
-                            target.engine.share_images(shared_images);
-                            target.set_display(renderer, &document, scene, base, display).map_err(scene_error)?;
-                            if raws { target.set_raw(renderer, &document, base)?; }
-                            if gpu_profile { moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue); }
-                            let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
-                            let _gpu_capture = diagnostics.then(moda_engine::gpu_profile::capture_state);
-                            while let Ok((_frame, _time, request, slot)) = receive.recv() {
-                                current.replace(Some((_frame as usize, slot)));
-                                let mut job = current.borrow_mut();
-                                let slot = &mut job.as_mut().unwrap().1;
-                                #[cfg(feature = "frame-profile")]
-                                let _profile_event = crate::frame_profile::event("canvas_submit",
-                                    match &request { vork_time::Request::Frame(frame, _) => *frame, _ => _frame }, _time);
-                                budget.refresh()?;
-                                let frame_profile = moda_engine::prof::span("canvas.frame");
-                                let instant = document.frame(&request).map_err(scene_error)?;
-                                if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
-                                let mut command = target.encode(renderer, &document, &instant, slot)?;
-                                let output_profile = moda_engine::prof::span("canvas.output.release_convert_submit");
-                                let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
-                                for surface in &slot.ring.encoder_surfaces {
-                                    match &surface.texture {
-                                        Some(destination) => target.finish(renderer, &mut command, destination, &instant.request, Some(&slot.frame)).map_err(device)?,
-                                        None => surface.record_copy(&mut command, &slot.frame),
-                                    }
-                                }
-                                drop(convert_profile);
-                                if diagnostics { slot.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut command); }
-                                // All consumers of this worker's resolve texture are queued before its next draw.
-                                #[cfg(feature = "frame-profile")]
-                                crate::frame_profile::count("queue_submissions", 1);
-                                let submission = renderer.queue.submit([command.finish()]);
-                                drop(output_profile);
-                                drop(frame_profile);
-                                if diagnostics {
-                                    for (name, ms) in moda_engine::prof::take_capture() { *slot.diagnostic_host.entry(name).or_default() += ms; }
-                                }
-                                if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
-                                drop(job);
-                                let (frame, slot) = current.take().unwrap();
-                                if done.send(Ok((frame, slot, Some(submission)))).is_err() { break; }
+        use crate::canvas_parallel::{Resize, Schedule};
+        let automatic = worker_limit > 1 && forced_workers.is_none();
+        let shared_masks = target.engine.publish_masks(worker_limit > 1 && forced_workers.is_some());
+        let spawn_worker = || {
+            let (send, receive) = std::sync::mpsc::sync_channel::<CanvasJob>(0);
+            let (done, completed) = std::sync::mpsc::channel();
+            let renderer = &renderer;
+            let prepared = document.prepared.clone();
+            let shared_masks = shared_masks.clone();
+            let shared_images = shared_images.clone();
+            let budget = optional_budget.as_ref().expect("native headroom admits workers").clone();
+            let host_memory = host_memory.as_ref().expect("host headroom admits workers");
+            let programs = target.pictures.graph.as_ref().map(|graph| graph.programs());
+            // A stage shares every installed resource except its mutable error word.
+            let (display_stage, raw_stage) = budget.run(|| (
+                target.display.borrow().stage().map(|stage| stage.replica(renderer)),
+                target.picture.borrow().as_ref().map(|stage| stage.replica(renderer)),
+            ))?;
+            let finish = target.finish.borrow().clone();
+            let draw = target.engine.draw_resources();
+            let join = vork_scene::scene_thread().spawn_scoped(scope, move || {
+                let _warnings = warnings.enter();
+                // A job's output lease survives cancellation of disposable
+                // target/planner state. Retrying it never skips an output frame.
+                let current = RefCell::new(None::<(usize, Slot)>);
+                let run = || -> Result<()> {
+                    let pictures = Pictures::worker(renderer, &prepared, programs).map_err(scene_error)?;
+                    let engine = moda_engine::Engine::from_draw_resources(draw).map_err(device)?;
+                    let mut target = Target::with_pictures(renderer, [w, h], prepared.float, pictures,
+                        crate::canvas_draw::Engine::with_engine(renderer, engine));
+                    target.engine.share_images(shared_images);
+                    *target.finish.get_mut() = finish;
+                    *target.picture.get_mut() = raw_stage;
+                    if let Some(stage) = display_stage {
+                        *target.display.get_mut() = Stages { built: vec![(display, stage)], current: Some(0) };
+                    }
+                    if gpu_profile { moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue); }
+                    let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
+                    let _gpu_capture = diagnostics.then(moda_engine::gpu_profile::capture_state);
+                    while let Ok((_frame, _time, instant, plan, slot)) = receive.recv() {
+                        current.replace(Some((_frame as usize, slot)));
+                        let mut job = current.borrow_mut();
+                        let slot = &mut job.as_mut().unwrap().1;
+                        #[cfg(feature = "frame-profile")]
+                        let _profile_event = crate::frame_profile::event("canvas_submit",
+                            output_index(_frame as usize), _time);
+                        let draw_start = automatic.then(Instant::now);
+                        host_memory.check(_frame as usize)?;
+                        budget.refresh()?;
+                        let frame_profile = moda_engine::prof::span("canvas.frame");
+                        if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
+                        let recording = target.engine.record_for_output();
+                        let drawn = target.engine.draw_shared(&plan, &shared_masks).map_err(device)?;
+                        drop(plan);
+                        let (drawn, prefix) = target.pictures.composite(renderer, drawn, &instant, Some(output_index(_frame as usize)), None, recording.finish())?;
+                        let mut command = target.encode_drawn(renderer, drawn, &instant, slot, prefix)?;
+                        host_memory.check(_frame as usize)?;
+                        let output_profile = moda_engine::prof::span("canvas.output.release_convert_submit");
+                        let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
+                        for surface in &slot.ring.encoder_surfaces {
+                            match &surface.texture {
+                                Some(destination) => target.finish(renderer, &mut command, destination, &instant.request, Some(&slot.frame)).map_err(device)?,
+                                None => surface.record_copy(&mut command, &slot.frame),
                             }
-                            Ok(())
-                        };
-                        let result = match budget.run(run) { Ok(result) => result, Err(refused) => Err(refused.into()) };
-                        if let Err(error) = result {
-                            if error.downcast_ref::<wgpu::optional_allocations::Refused>().is_some() {
-                                moda_engine::scratch::discard_pending();
-                                if let Some((frame, slot)) = current.take() {
-                                    let _ = done.send(Ok((frame, slot, None)));
-                                }
-                                // Return every queued lease, then exit after the
-                                // export thread disconnects and joins this worker.
-                                while let Ok((frame, _, _, slot)) = receive.recv() {
-                                    if done.send(Ok((frame as usize, slot, None))).is_err() { break; }
-                                }
-                            } else { let _ = done.send(Err(error)); }
                         }
-                    }).expect("start canvas frame worker"));
-                    pool.push((send, completed));
+                        drop(convert_profile);
+                        if diagnostics { slot.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut command); }
+                        // All consumers of this worker's resolve texture are queued before its next draw.
+                        #[cfg(feature = "frame-profile")]
+                        crate::frame_profile::count("queue_submissions", 1);
+                        let submission = command.submit(&renderer.queue);
+                        if let Some(start) = draw_start { slot.work.draw_ms = start.elapsed().as_secs_f64() * 1000.; }
+                        drop(output_profile);
+                        drop(frame_profile);
+                        if diagnostics {
+                            for (name, ms) in moda_engine::prof::take_capture() { *slot.diagnostic_host.entry(name).or_default() += ms; }
+                        }
+                        if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
+                        drop(job);
+                        let (frame, slot) = current.take().unwrap();
+                        if done.send(Ok((frame, slot, Some(submission)))).is_err() { break; }
+                    }
+                    Ok(())
+                };
+                let result = match budget.run(run) { Ok(result) => result, Err(refused) => Err(refused.into()) };
+                if let Err(error) = result {
+                    if crate::failure::cause::<wgpu::optional_allocations::Refused>(&error).is_some() {
+                        moda_engine::scratch::discard_pending();
+                        if let Some((frame, slot)) = current.take() {
+                            let _ = done.send(Ok((frame, slot, None)));
+                        }
+                        // Return every queued lease, then exit after the
+                        // export thread disconnects and joins this worker.
+                        while let Ok((frame, _, _, _, slot)) = receive.recv() {
+                            if done.send(Ok((frame as usize, slot, None))).is_err() { break; }
+                        }
+                    } else { let _ = done.send(Err(error)); }
                 }
-            }
-            (pool, joins)
+            }).map_err(|error| match error.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory => anyhow::Error::new(wgpu::optional_allocations::Refused),
+                _ => anyhow::Error::new(error).context("start canvas frame worker"),
+            })?;
+            Ok::<_, anyhow::Error>(((send, completed), join))
         };
-        let (mut pool, mut joins) = spawn_workers(0);
+        let mut pool = CanvasWorkers::new();
+        let mut joins = Vec::new();
+
         let mut retry_from = 0;
         let accepted = std::cell::Cell::new(0usize);
         let mut memory_refused = false;
-        let mut cold_host_ms = 0.;
-        let mut host_ms = 0.;
-        let delivery_ms = std::cell::Cell::new(0.);
-        let mut host_samples = 0usize;
-        let mut profitable_windows = 0usize;
+        let mut schedule = Schedule::default();
+        let mut admission_limit = worker_limit;
+        let mut awaiting_publication = false;
+        let mut lane_claims = Vec::new();
         loop {
         let result = (|| -> Result<()> {
         let mut pending: std::collections::VecDeque<(usize, f32, Instant, Option<wgpu::SubmissionIndex>)> = std::collections::VecDeque::new();
         // How many submitted frames wait for acceptance. A ring entry is busy from its frame's submission until
         // every consumer lets go of it. PNG writers take a copy at acceptance, so the whole ring can be on the
-        // GPU. A video encoder retains an entry until reuse. Serial rendering keeps its small submission
-        // window; parallel rendering fills the bounded ring so workers can continue while acceptance waits.
-        // The ordered native encoder ring releases its lease before accepting another frame.
-        let mut collect = |(frame, time, frame_start, submission): (usize, f32, Instant, Option<wgpu::SubmissionIndex>), slots: &mut [Option<Slot>], encoders: &mut [Encoder], pool: &CanvasWorkers, workers: usize, in_flight: usize| -> Result<()> {
-            let delivery_start = (worker_limit > 1).then(Instant::now);
-            let parallel = submission.is_none();
+        // GPU. A video encoder retains an entry until reuse. Completion-driven native video fills the
+        // bounded ring too: neither GPU completion nor VT handoff waits for host acceptance.
+        // Every native entry is released before its next conversion can overwrite it.
+        let handoff = |frame: usize, slot: &Slot, encoders: &mut [Encoder], parallel: bool, submission: &wgpu::SubmissionIndex| -> Result<Option<moda_engine::gpu_profile::GpuTime>> {
+            let handoff_profile = moda_engine::prof::span("canvas.output.handoff");
+            let started = Instant::now();
+            let mut native = native_frames.borrow_mut();
+            let native = &mut native[frame % serial_capacity];
+            if let Some(previous) = native.frame.take() {
+                #[cfg(test)]
+                frame_event("release", previous);
+                for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
+                    encoder.release(previous as u64, surface).map_err(device)?;
+                }
+            }
+            // NVENC reads the completed worker texture directly on the GPU.
+            let copy_pixels = parallel && (native.surfaces.iter().any(|surface| surface.texture.is_some())
+                || encoders.iter().any(Encoder::uses_pixel_readback));
+            let submission = if copy_pixels {
+                let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
+                // Only the export thread writes the encoder's ordered ring.
+                // Optional worker pixels never reserve native encoder entries.
+                if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, native.diagnostic_gpu.take()); }
+                let mut copy = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas encoder handoff") });
+                for surface in &native.surfaces {
+                    match &surface.texture {
+                        Some(destination) => target.finish_from(&mut copy, &slot.frame, destination, Finish::Copy)?,
+                        None => surface.record_copy(&mut copy, &slot.frame),
+                    }
+                }
+                if diagnostics { native.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut copy); }
+                #[cfg(feature = "frame-profile")]
+                crate::frame_profile::count("queue_submissions", 1);
+                let copy = copy.finish();
+                let _submit = moda_engine::prof::span("canvas.output.native_submit");
+                let submission = renderer.queue.submit([copy]);
+                drop(convert_profile);
+                submission
+            } else { submission.clone() };
+            for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
+                let source = surface.texture.clone().unwrap_or_else(|| slot.frame.clone());
+                encoder.push(frame as u64, source, surface, &submission).map_err(device)?;
+            }
+            crate::timing::encoded(started);
+            drop(handoff_profile);
+            native.frame = Some(frame);
+            #[cfg(test)]
+            frame_event("push", frame);
+            if copy_pixels && gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
+            let mut gpu_time = None;
+            if let Some(gpu) = native.diagnostic_gpu.as_ref().filter(|_| copy_pixels && diagnostics) {
+                let _wait = moda_engine::prof::span("canvas.output.wait_readback");
+                let (send, receive) = std::sync::mpsc::channel();
+                let buffers = gpu.readbacks().collect::<Vec<_>>();
+                for buffer in &buffers {
+                    let send = send.clone();
+                    buffer.map_async(wgpu::MapMode::Read, .., move |result| { let _ = send.send(result); });
+                }
+                renderer.wait(Some(submission.clone()))?;
+                for _ in buffers { receive.recv().context("canvas handoff timestamps")??; }
+                gpu_time = Some(gpu.time());
+            }
+            Ok(gpu_time)
+        };
+        let mut collect = |(frame, time, frame_start, submission): (usize, f32, Instant, Option<wgpu::SubmissionIndex>), slots: &mut [Option<Slot>], encoders: &mut [Encoder], pool: &CanvasWorkers, workers: usize, in_flight: usize, schedule: &mut Schedule| -> Result<()> {
+            let parallel = !pool.is_empty();
             let submission = match submission {
                 Some(submission) => submission,
                 None => {
                     let _wait = moda_engine::prof::span("canvas.output.wait_readback");
-                    let (completed, slot, submission) = pool[frame % workers].1.recv().context("canvas frame worker stopped")??;
+                    let (completed, slot, submission) = pool[frame % workers - 1].1.recv().context("canvas frame worker stopped")??;
                     ensure!(completed == frame, "canvas worker completion order");
                     slots[frame % in_flight] = Some(slot);
                     submission.ok_or(wgpu::optional_allocations::Refused)?
                 }
             };
+            let delivery_start = automatic.then(Instant::now);
             // Everything done to accept one frame; `canvas.output.wait_readback` and `canvas.output.deliver` are
             // inside it, so what they leave is this span's own.
             #[cfg(feature = "frame-profile")]
-            let _profile_event = crate::frame_profile::event("canvas_collect", index(frame) as u32, time);
+            let _profile_event = crate::frame_profile::event("canvas_collect", output_index(frame), time);
             let _accept_profile = moda_engine::prof::span("canvas.accept");
             let slot = slots[frame % in_flight].as_mut().expect("frame owns its ring entry");
             // A credit bounds raw pixels and compressed output until every destination finishes writing.
             let credit_profile = moda_engine::prof::span("canvas.output.wait_readback");
             let png_lease = (pngs || raws).then(|| std::sync::Arc::new(slot.ring.credit.acquire()));
             drop(credit_profile);
+            // Worker submissions arrive in frame order. Arm native completion before
+            // any exposure/pixel/timestamp readback can wait for this frame's GPU work.
+            let encoder_gpu = if parallel && completion_handoff {
+                handoff(frame, slot, encoders, true, &submission)?
+            } else { None };
+            #[cfg(test)]
+            frame_event("collect", frame);
             let collected = {
                 let _profile = moda_engine::prof::span("canvas.output.wait_readback");
                 target.collect(&renderer, slot, submission.clone())
@@ -3097,70 +3822,24 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                 }
                 Err(error) => return Err(error),
             };
+            if let Some(gpu) = encoder_gpu { slot.diagnostic_time.get_or_insert_default().append(gpu); }
             // A canvas shown as authored (`as_authored`) has no view that clips between its colours and the
             // display: a full channel is the colour asked for. A float canvas (a world, an authored view, an
             // image graph, linear light) and Display P3 code values shown as sRGB pass a view whose result can
             // run out of display range.
             if as_authored { e.clipped = None; }
             let _profile = moda_engine::prof::span("canvas.output.deliver");
-            if let Some(path) = video_paths.iter().find(|path| mp4 && has_format(path, "mp4")) {
+            if let Some(path) = video_paths.iter().find(|path| mp4 && shot::mp4_destination(path)) {
                 ensure_usage!(e.coverage == 1.,
-                    "--out {}: MP4 needs an opaque picture and this canvas leaves pixels transparent at {time} s; write .mov (ProRes 4444 keeps transparency) or PNG frames",
+                    "--out {}: MP4 needs an opaque picture and this canvas leaves pixels transparent at {time} s; set render.background to an opaque color for MP4, or write .mov (ProRes 4444 keeps transparency) or PNG frames",
                     path.display());
             }
-            let handoff_profile = moda_engine::prof::span("canvas.output.handoff");
-            if !encoders.is_empty() {
-                let started = Instant::now();
-                let mut native = native_frames.borrow_mut();
-                let native = &mut native[frame % serial_capacity];
-                if let Some(previous) = native.frame.take() {
-                    #[cfg(test)]
-                    frame_event("release", previous);
-                    for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
-                        encoder.release(previous as u64, surface).map_err(device)?;
-                    }
+            if !encoders.is_empty() && !completion_handoff {
+                if let Some(gpu) = handoff(frame, slot, encoders, parallel, &submission)? {
+                    slot.diagnostic_time.get_or_insert_default().append(gpu);
                 }
-                let submission = if parallel {
-                    let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
-                    // Only the export thread writes the encoder's ordered ring.
-                    // Optional worker pixels never reserve native encoder entries.
-                    if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, native.diagnostic_gpu.take()); }
-                    let mut copy = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas encoder handoff") });
-                    for surface in &native.surfaces {
-                        match &surface.texture {
-                            Some(destination) => target.finish_from(&mut copy, &slot.frame, destination, Finish::Copy)?,
-                            None => surface.record_copy(&mut copy, &slot.frame),
-                        }
-                    }
-                    if diagnostics { native.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut copy); }
-                    #[cfg(feature = "frame-profile")]
-                    crate::frame_profile::count("queue_submissions", 1);
-                    let submission = renderer.queue.submit([copy.finish()]);
-                    drop(convert_profile);
-                    if let Some(gpu) = native.diagnostic_gpu.as_ref().filter(|_| diagnostics) {
-                        let _wait = moda_engine::prof::span("canvas.output.wait_readback");
-                        let (send, receive) = std::sync::mpsc::channel();
-                        let buffers = gpu.readbacks().collect::<Vec<_>>();
-                        for buffer in &buffers {
-                            let send = send.clone();
-                            buffer.map_async(wgpu::MapMode::Read, .., move |result| { let _ = send.send(result); });
-                        }
-                        renderer.wait(Some(submission.clone()))?;
-                        for _ in buffers { receive.recv().context("canvas handoff timestamps")??; }
-                        slot.diagnostic_time.get_or_insert_default().append(gpu.time());
-                    }
-                    if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
-                    submission
-                } else { submission };
-                for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) {
-                    let source = surface.texture.clone().unwrap_or_else(|| slot.frame.clone());
-                    encoder.push(frame as u64, source, surface, &submission).map_err(device)?;
-                }
-                crate::timing::encoded(started);
-                native.frame = Some(frame);
-                #[cfg(test)]
-                frame_event("push", frame);
             }
+            let handoff_profile = moda_engine::prof::span("canvas.output.handoff");
             if let Some(rgba) = rgba {
                 let rgba = std::sync::Arc::new(rgba);
                 let lease = png_lease.as_ref().expect("PNG readback has a writer credit");
@@ -3187,7 +3866,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             }
             if rendered_frames == 0 { first_frame_ms = loop_start.elapsed().as_secs_f64() * 1000.; }
             metadata_frames.push(serde_json::json!({"index": output_index(frame), "time": time, "camera": null, "exposure": e.json()}));
-            frame_exposures.push((index(frame), e));
+            frame_exposures.push((output_index(frame) as usize, e));
             let mut sample = serde_json::json!({"frame": output_index(frame), "time": time, "frame_wall_ms": frame_start.elapsed().as_secs_f64() * 1000.});
             if diagnostics {
                 for (name, ms) in moda_engine::prof::take_capture() { *slot.diagnostic_host.entry(name).or_default() += ms; }
@@ -3199,75 +3878,139 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             rendered_frames += 1;
             accepted.set(frame + 1);
             vork_slang::progress::completed(rendered_frames + refused.count());
-            if let Some(start) = delivery_start { delivery_ms.set(delivery_ms.get() + start.elapsed().as_secs_f64() * 1000.); }
+            if let Some(start) = delivery_start {
+                let now = Instant::now();
+                slot.work.output_ms += (now - start).as_secs_f64() * 1000.;
+                schedule.observe(frame, slot.work, now);
+            }
             Ok(())
         };
         for frame in retry_from..frames {
             if stop.as_ref().is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)) && frame > 0 { interrupted = true; break; }
-            let mut admit_workers = !memory_refused && frame == 0 && forced_workers.is_some() && worker_limit > 1;
-            if !memory_refused && workers == 1 && worker_limit > 1 && host_samples >= crate::constants::CANVAS_PARALLEL_PROBE_FRAMES {
-                let warm_ms = host_ms / host_samples.max(1) as f64;
-                // Require enough remaining host work to repay duplicated target setup with
-                // margin, and avoid multiplying GPU- or encoder-bound work. Replicate target setup
-                // and cold frame preparation, not the shared parsing/layout installation.
-                let setup_ms = (install_ms + cold_host_ms) * worker_limit as f64;
-                // Delivery and worker preparation overlap. A delivery-bound parallel result can still
-                // save enough serial host work to repay startup. Compare those service times directly:
-                // requiring every worker to remain host-bound rejects gains as preparation gets faster.
-                let delivery_per_frame = delivery_ms.get() / host_samples.max(1) as f64;
-                let parallel_ms = (warm_ms / worker_limit as f64)
-                    .max(delivery_per_frame * crate::constants::CANVAS_PARALLEL_DELIVERY_MARGIN);
-                let gain = (warm_ms - parallel_ms).max(0.) * (frames - frame) as f64;
-                let profitable = frames - frame >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES
-                    && gain > setup_ms * crate::constants::CANVAS_PARALLEL_SETUP_MARGIN;
-                profitable_windows = if profitable { profitable_windows + 1 } else { 0 };
-                if profitable_windows >= crate::constants::CANVAS_PARALLEL_PROBE_WINDOWS {
-                    admit_workers = true;
+            let mut wanted = workers;
+            let host = host_memory.as_deref();
+            if !memory_refused && frame > 0 && workers == 1 && (awaiting_publication || forced_workers.is_some() && admission_limit > 1 && frames > 2) {
+                if document.retained.borrow().as_ref().is_some_and(|scene| target.engine.published(scene.picture_scene()).is_some()) {
+                    wanted = if automatic { 2 } else { admission_limit };
+                } else if awaiting_publication {
+                    target.engine.publish_masks(false);
+                    schedule.cancel_trial(2);
                 }
-                // Intro frames and initial GPU waits need not represent the rest of a clip.
-                // Reconsider sustained warm work without charging old waits to later windows.
-                host_ms = 0.;
-                host_samples = 0;
-                delivery_ms.set(0.);
+                awaiting_publication = false;
+            } else if automatic && !memory_refused {
+                match schedule.decide(workers, admission_limit, frames - frame, install_ms, diagnostics) {
+                    Resize::Grow if workers == 1 => {
+                        // Capture just the next serial draw. A direct placement replay
+                        // may have no CPU plan for a replica to consume.
+                        target.engine.publish_masks(true);
+                        awaiting_publication = true;
+                    }
+                    Resize::Grow => wanted += 1,
+                    Resize::Retire => wanted -= 1,
+                    Resize::Keep => {}
+                }
             }
-            if admit_workers {
-                // Preserve the existing policy's chosen count; native memory can
-                // only reduce it. The serial working set overestimates a replica
-                // because images are shared. Reservations guard later growth too.
-                let (used, free) = crate::canvas_parallel::headroom(&renderer.device).unwrap_or((u64::MAX, 0));
-                let wanted = forced_workers.unwrap_or(worker_limit).clamp(1, worker_limit)
-                    .min((free / used.max(frame_bytes).max(1)) as usize);
-                if wanted > 1 {
-                    while let Some(old) = pending.pop_front() { collect(old, &mut slots, &mut encoders, &pool, workers, in_flight)?; }
-                    let extra = optional_budget.as_ref().unwrap().run(|| (0..capacity.min(serial_capacity.max(wanted * 2)))
-                        .map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect::<Vec<_>>())
-                        .map_err(anyhow::Error::new)?;
-                    serial_slots = Some(std::mem::replace(&mut slots, extra));
+
+            if wanted != workers {
+                // Frame/slot/lane indices depend on the current moduli. Accept
+                // every old frame before changing either mapping.
+                while let Some(old) = pending.pop_front() { collect(old, &mut slots, &mut encoders, &pool, workers, in_flight, &mut schedule)?; }
+                let previous = workers;
+                let host = host.expect("optional workers have a memory guard");
+                if wanted < workers {
+                    // Shrink only after every output consumer has released its
+                    // entry. Growth keeps the native encoder ring intact; the
+                    // normal handoff can release those readers on next reuse.
+                    let native_ring = &mut *native_frames.borrow_mut();
+                    for previous in frame.saturating_sub(serial_capacity)..frame {
+                        let native = &mut native_ring[previous % serial_capacity];
+                        if let Some(index) = native.frame.take() {
+                            for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) { encoder.release(index as u64, surface).map_err(device)?; }
+                        }
+                    }
+                    stop_canvas_workers(pool.split_off(wanted - 1), joins.split_off(wanted - 1), &mut slots, &renderer)?;
                     workers = wanted;
-                    in_flight = slots.len();
-                    (pool, joins) = spawn_workers(workers);
-                    if diagnostics { eprintln!("canvas concurrency: 1 -> {workers} at frame {frame}; used={used}, free={free}"); }
+                    let retained_slots = serial_capacity + crate::canvas_parallel::extra_slots(serial_capacity, capacity, workers);
+                    // PNG/EXR writers own independent pixel copies until the
+                    // slot credit returns. Keep that memory charged meanwhile.
+                    for slot in slots[retained_slots..].iter().flatten() { slot.ring.credit.wait(); }
+                    slots.truncate(retained_slots);
+                    host.release_workers(lane_claims.pop().expect("one claim per replica"));
+                    if workers == 1 { target.engine.publish_masks(false); }
                 } else {
-                    memory_refused = true;
+                    let (used, free) = crate::canvas_parallel::headroom(&renderer.device).unwrap_or((u64::MAX, 0));
+                    wanted = wanted.min((free / used.max(frame_bytes).max(1)) as usize);
+                    let sample = host.sample(None).ok_or(wgpu::optional_allocations::Refused)?;
+                    let reserve = sample.reserve();
+                    let bytes = sample.resident_peak().saturating_add(vork_scene::LOAD_STACK_BYTES as u64);
+                    let admitted = (workers + 1..=wanted).rev().find(|&count| {
+                        let extra = crate::canvas_parallel::extra_slots(in_flight, capacity, count);
+                        host.claim_workers(sample, reserve, bytes.saturating_mul((count - workers) as u64),
+                            slot_bytes.saturating_mul(extra as u64))
+                    });
+                    if diagnostics {
+                        eprintln!("canvas concurrency: host admission at frame {frame}; worker_bytes={bytes}, available={}, source={}, reserve={reserve}, wanted={wanted}, admitted={}",
+                            sample.available, sample.source, admitted.unwrap_or(workers));
+                    }
+                    if let Some(count) = admitted {
+                        lane_claims.resize(count - 1, bytes);
+                        host.watch(sample, reserve);
+                        if workers == 1 { target.engine.publish_images(&shared_images); }
+                        let extra = crate::canvas_parallel::extra_slots(in_flight, capacity, count);
+                        slots.extend(optional_budget.as_ref().unwrap().run(|| (0..extra)
+                            .map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect::<Vec<_>>())?);
+                        for _ in workers..count {
+                            let (worker, join) = spawn_worker()?;
+                            pool.push(worker);
+                            joins.push(join);
+                        }
+                        workers = count;
+                    } else {
+                        admission_limit = workers;
+                        schedule.cancel_trial(workers + 1);
+                        if workers == 1 { target.engine.publish_masks(false); }
+                    }
+                }
+                in_flight = slots.len();
+                schedule.resized(in_flight);
+                if diagnostics && previous != workers {
+                    let reason = if previous < workers { "host memory admitted" } else { "throughput retired lane" };
+                    eprintln!("canvas concurrency: {previous} -> {workers} at frame {frame}; {reason}; slots={in_flight}");
                 }
             }
-            let window = if workers > 1 || encoders.is_empty() { in_flight } else { crate::constants::FRAMES_IN_FLIGHT.div_ceil(2).min(in_flight) };
+            let window = if !pool.is_empty() || encoders.is_empty() || completion_handoff { in_flight } else { crate::constants::FRAMES_IN_FLIGHT.div_ceil(2).min(in_flight) };
             // Frames stay in flight: the oldest is accepted only when the window is full, so the GPU draws it while
             // the next ones are built.
-            if pending.len() == window { collect(pending.pop_front().expect("a frame in flight"), &mut slots, &mut encoders, &pool, workers, in_flight)?; }
+            if pending.len() == window { collect(pending.pop_front().expect("a frame in flight"), &mut slots, &mut encoders, &pool, workers, in_flight, &mut schedule)?; }
             let frame_start = Instant::now();
             // Everything done to build and submit one frame: `canvas.evaluate`, `canvas.worlds`, `canvas.plan`,
             // `canvas.draw`, `canvas.output.convert_record` and `canvas.output.release_convert_submit` are inside
             // it, so a changing frame's time that none of them covers shows as this span's remainder.
             let frame_profile = moda_engine::prof::span("canvas.frame");
-            let time = frame_time(frame).map_err(scene_error)?;
-            let request = match at { Some(t) => vork_time::Request::Numeric(t), None => vork_time::Request::Frame(index(frame) as u32, fps) };
-            if !pool.is_empty() {
-                let slot = slots[frame % in_flight].take().expect("frame owns its ring entry");
-                if pool[frame % workers].0.send((frame as u32, time, request, slot)).is_err() {
+            let request = still.as_ref().map_or_else(|| vork_time::Request::Frame(output_index(frame), fps), |still| still.request.clone());
+            let time = request.numeric().map_err(scene_error)?;
+            let prepared_frame = if !pool.is_empty() {
+                host_memory.as_ref().unwrap().check(frame)?;
+                Some(crate::canvas_host_memory::with_workers(|| -> Result<_> {
+                    let instant = document.frame(&request).map_err(scene_error)?;
+                    let plan = document.shared_plan(&target.engine)?;
+                    Ok((instant, plan))
+                })?)
+            } else { None };
+            let mut draw_start = (automatic && prepared_frame.is_some()).then(Instant::now);
+            if frame % workers != 0 {
+                let (instant, plan) = prepared_frame.expect("worker receives a prepared frame");
+                let mut slot = slots[frame % in_flight].take().expect("frame owns its ring entry");
+                if let Some(start) = draw_start {
+                    slot.work.plan_ms = (start - frame_start).as_secs_f64() * 1000.;
+                    slot.work.output_ms = 0.;
+                }
+                drop(frame_profile);
+                if diagnostics { slot.diagnostic_host = moda_engine::prof::take_capture(); }
+                if pool[frame % workers - 1].0.send((frame as u32, time, instant, plan, slot)).is_err() {
                     // Initialization can fail before a worker accepts its first slot.
                     // Preserve that error rather than replacing it with channel closure.
-                    return match pool[frame % workers].1.recv() {
+                    return match pool[frame % workers - 1].1.recv() {
                         Ok(Err(error)) => Err(error),
                         _ => Err(anyhow::anyhow!("canvas frame worker stopped")),
                     };
@@ -3276,30 +4019,37 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                 continue;
             }
             #[cfg(feature = "frame-profile")]
-            let _profile_event = crate::frame_profile::event("canvas_submit", index(frame) as u32, time);
-            let instant = document.frame(&request).map_err(scene_error)?;
+            let _profile_event = crate::frame_profile::event("canvas_submit", output_index(frame), time);
+            let (instant, plan) = match prepared_frame {
+                Some((instant, plan)) => (instant, Some(plan)),
+                None => (document.frame(&request).map_err(scene_error)?, None),
+            };
             let slot = slots[frame % in_flight].as_mut().expect("frame owns its ring entry");
-            // Moda submits the draw independently of the output surfaces. Start it before
-            // waiting for this ring entry's previous encoder payload to drain.
+            // Record the draw before waiting for the previous encoder payload in this ring entry.
             #[cfg(test)]
             frame_event("draw", frame);
             if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
-            let mut command = target.encode(&renderer, &document, &instant, slot)?;
-            let frame_host_ms = if worker_limit > 1 { frame_start.elapsed().as_secs_f64() * 1000. } else { 0. };
-            let output_start = (worker_limit > 1).then(Instant::now);
+            let mut command = if let Some(plan) = plan {
+                let recording = target.engine.record_for_output();
+                let drawn = target.engine.draw_shared(&plan, &shared_masks).map_err(device)?;
+                let (drawn, prefix) = target.pictures.composite(&renderer, drawn, &instant, Some(output_index(frame)), None, recording.finish())?;
+                target.encode_drawn(&renderer, drawn, &instant, slot, prefix)?
+            } else { target.encode(&renderer, &document, &instant, output_index(frame), slot, || {
+                if automatic { draw_start = Some(Instant::now()); }
+            })? };
+            let output_start = automatic.then(Instant::now);
             let output_profile = moda_engine::prof::span("canvas.output.release_convert_submit");
             let release_profile = moda_engine::prof::span("canvas.output.encoder_release");
             let mut native_guard = native_frames.borrow_mut();
             let native = &mut native_guard[frame % serial_capacity];
-            if let Some(previous) = native.frame.take() {
+            if pool.is_empty() && let Some(previous) = native.frame.take() {
                 #[cfg(test)]
                 frame_event("release", previous);
                 for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) { encoder.release(previous as u64, surface).map_err(device)?; }
             }
             drop(release_profile);
-            let convert_start = (worker_limit > 1).then(Instant::now);
             let convert_profile = moda_engine::prof::span("canvas.output.encoder_convert");
-            for surface in &native.surfaces {
+            for surface in native.surfaces.iter().filter(|_| pool.is_empty()) {
                 match &surface.texture {
                     Some(destination) => target.finish(&renderer, &mut command, destination, &instant.request, Some(&slot.frame)).map_err(device)?,
                     None => surface.record_copy(&mut command, &slot.frame),
@@ -3307,19 +4057,24 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             }
             drop(convert_profile);
             drop(native_guard);
-            let convert_ms = convert_start.map_or(0., |start| start.elapsed().as_secs_f64() * 1000.);
+            let submit_start = automatic.then(Instant::now);
             if diagnostics { slot.diagnostic_gpu = moda_engine::gpu_profile::end_frame(&mut command); }
             #[cfg(feature = "frame-profile")]
             crate::frame_profile::count("queue_submissions", 1);
-            let submission = renderer.queue.submit([command.finish()]);
+            let submission = command.submit(&renderer.queue);
+            let submitted = automatic.then(Instant::now);
+            // Native completion owns synchronization with VT. Queue it immediately,
+            // then build later frames while GPU/codec/writer retain these bounded slots.
+            // Readback still validates every exposure before the output can finish.
+            if pool.is_empty() && completion_handoff { handoff(frame, slot, &mut encoders, false, &submission)?; }
             drop(output_profile);
             drop(frame_profile);
-            if let Some(start) = output_start {
-                // Compositor input decode and conversion are worker-local frame work;
-                // only slot release and submission remain serial output overhead here.
-                let ms = frame_host_ms + convert_ms;
-                if frame == 0 { cold_host_ms = ms; } else { host_ms += ms; host_samples += 1; }
-                delivery_ms.set(delivery_ms.get() + (start.elapsed().as_secs_f64() * 1000. - convert_ms).max(0.));
+            if let (Some(draw), Some(output), Some(submit), Some(end)) = (draw_start, output_start, submit_start, submitted) {
+                // Serial conversion writes the native ring; with replicas that
+                // conversion and ordered handoff both run during collection.
+                slot.work.plan_ms = (draw - frame_start).as_secs_f64() * 1000.;
+                slot.work.draw_ms = ((output - draw) + (end - submit)).as_secs_f64() * 1000.;
+                slot.work.output_ms = ((submit - output) + end.elapsed()).as_secs_f64() * 1000.;
             }
             if diagnostics { slot.diagnostic_host = moda_engine::prof::take_capture(); }
             if gpu_profile && !diagnostics {
@@ -3335,16 +4090,18 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             }
             pending.push_back((frame, time, frame_start, Some(submission)));
         }
-        while let Some(frame) = pending.pop_front() { collect(frame, &mut slots, &mut encoders, &pool, workers, in_flight)?; }
+        while let Some(frame) = pending.pop_front() { collect(frame, &mut slots, &mut encoders, &pool, workers, in_flight, &mut schedule)?; }
         Ok(())
         })();
-        if result.as_ref().err().is_some_and(|error| error.downcast_ref::<wgpu::optional_allocations::Refused>().is_some()) {
+        if result.as_ref().err().is_some_and(|error| crate::failure::cause::<wgpu::optional_allocations::Refused>(error).is_some()) {
             stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer)?;
             retry_from = accepted.get();
+            target.engine.publish_masks(false);
             workers = 1;
-            if let Some(serial) = serial_slots.take() { slots = serial; }
+            slots.truncate(serial_capacity);
             in_flight = slots.len();
             crate::gpu_memory::wait(&renderer.device, &renderer.queue, &renderer.errors, None)?;
+            if let Some(host) = &host_memory { host.release_workers(lane_claims.drain(..).sum()); }
             memory_refused = true;
             if diagnostics { eprintln!("canvas concurrency: memory reservation refused; retry serial at frame {retry_from}"); }
             continue;
@@ -3353,6 +4110,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         return result;
         }
     });
+    target.engine.publish_masks(false);
     // Join all output workers even when a render or another destination failed.
     let png_finished: Vec<_> = png_writers.into_iter().chain(raw_writers).map(|writer| writer.finish()).collect();
     result?;
@@ -3390,7 +4148,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let mut pending_metadata = Vec::new();
     let render_settings = serde_json::json!({"profile": profile_record, "resolution": [w, h], "frames": frames, "canvas": true});
     for path in out.iter().filter(|_| output_run.is_some()) {
-        let meta_path = if is_video(path) || is_png(path) || is_exr(path) { shot::sidecar(path, "meta.json") } else { path.join("meta.json") };
+        let meta_path = shot::sidecar_path(path, "meta.json");
         // The exposure report and the display's name describe the frame encoded for the display: PNG and video.
         // An EXR holds the picture a reader takes, unclamped, and names its colour itself.
         let viewed = !is_exr(path);
@@ -3402,6 +4160,9 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             "version": 3, "fps": fps, "frames": frame_rows, "object_ids": {},
             "warnings": warnings.snapshot(), "profile": profile_record, "render_settings": render_settings, "canvas": {"size": [w, h]},
         });
+        if shot::mp4_destination(path) && let Some(identity) = &export_identity {
+            shot::export_identity::record(&mut meta, identity, path)?;
+        }
         if let Some(summary) = shot::exposure_summary(&frame_exposures).filter(|_| viewed) {
             meta["exposure"] = summary.clone();
             exposures.push(serde_json::json!({"output": path, "exposure": summary}));
@@ -3462,8 +4223,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     if output_run.is_some() {
         let mut timing_paths = Vec::new();
         for path in &out {
-            let timing_path = if is_video(path) || is_png(path) || is_exr(path) { shot::sidecar(path, "timings.json") } else { path.join("timings.json") };
-            std::fs::write(&timing_path, serde_json::value_to_vec_pretty(&report)?)?;
+            let timing_path = shot::write_sidecar(path, "timings.json", &serde_json::value_to_vec_pretty(&report)?)?;
             timing_paths.push(timing_path);
         }
         if let Some(sidecars) = report["sidecars"].as_array_mut() {
@@ -3477,533 +4237,16 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
 }
 
 #[cfg(test)]
-mod kept_identity_tests {
-    use super::*;
-
-    /// A kept canvas serves the scenes whose sorted JSON is the same text, under the same directory, and no other.
-    #[test]
-    fn a_kept_canvas_serves_exactly_the_scenes_with_the_same_content() -> Result<()> {
-        let documents = [
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}]}"#,
-            // The same document with its keys in another order.
-            r#"{"nodes":[
-                {"fill":"red","d":"M0 0H20V20H0Z","type":"path","name":"a"},
-                {"children":[{"fill":"blue","name":"b","d":"M30 0H50V20H30Z","type":"path"}],"name":"g"}],
-                "render":{"resolution":[100,100]},"composition":{"space":"2d"},"version":2}"#,
-            // A paint, a geometry, a name, a placement in the tree, an order, a render setting, a track.
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"lime"},
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V21H0Z","fill":"red"},
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"g","children":[{"name":"c","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"},
-                {"name":"g","children":[]}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]},
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,101]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}]}"#,
-            r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[100,100]},"nodes":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"g","children":[{"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"blue"}]}],
-                "animation":[{"tracks":[{"path":["nodes","a","opacity"],"keys":[[0,1],[1,0]]}]}]}"#,
-        ];
-        let scenes = documents.iter().map(|document| Scene::from_json(document.as_bytes())).collect::<Result<Vec<_>>>()?;
-        let base = Path::new("/a");
-        let mut shared = 0;
-        for (i, a) in scenes.iter().enumerate() {
-            for (j, b) in scenes.iter().enumerate() {
-                let same = serde_json::to_vec(a)? == serde_json::to_vec(b)?;
-                assert_eq!(Kept::identity(a, base)? == Kept::identity(b, base)?, same, "documents {i} and {j}");
-                shared += usize::from(same && i != j);
-            }
-        }
-        // Only the reordered document shares, and every edit is its own scene.
-        assert_eq!(shared, 2);
-        // The directory the scene's files resolve against is part of what was built.
-        assert_ne!(Kept::identity(&scenes[0], base)?, Kept::identity(&scenes[0], Path::new("/b"))?);
-        Ok(())
-    }
-}
+#[path = "canvas_kept_identity_tests.rs"]
+mod kept_identity_tests;
 
 #[cfg(test)]
-mod text_qa_tests {
-    use super::*;
-
-    fn document(content: &str, extra: serde_json::Value) -> Result<Document> {
-        let mut node = serde_json::json!({"name":"title","type":"text","content":content,
-            "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf","font-size":40});
-        node.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2,"composition":{"space":"2d"},"nodes":[node]
-        }))?)?;
-        Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))
-    }
-
-    #[test]
-    fn text_shadows_have_a_capable_owner() -> Result<()> {
-        for (content, font) in [("مرحبا", "NotoSansArabic-Regular.ttf"), ("AB", "LiberationSans-Regular.ttf")] {
-            let doc = document(content, serde_json::json!({
-                "font": format!("../vork-std/tests/fonts/{font}"), "filter":"drop-shadow(8px 4px 0px red)"
-            }))?;
-            let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-            let nodes = doc.items.iter().map(|item| &item.node).collect::<Vec<_>>();
-            let lowered = crate::canvas_draw::document(&doc.page, &nodes, &frame.values)?;
-            // Vector and raster text alike: the group's captured picture casts the shadow, from the text's own alpha.
-            let owner = lowered["nodes"].as_array().unwrap().iter().find(|n| n["effects"].as_array().is_some_and(|fx| !fx.is_empty())).unwrap();
-            assert_eq!(owner["type"], "group", "{content}: {lowered}");
-            assert_eq!(owner["effects"][0]["type"], "filter-shadow", "{content}: {lowered}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn text_units_preserve_unicode_spaces_and_blank_lines() -> Result<()> {
-        for content in ["A\u{a0}\u{a0}B", "\u{2007}A\u{202f}", "A\n\nB"] {
-            let doc = document(content, serde_json::json!({"white-space":"pre-line"}))?;
-            let text = doc.items[0].text.as_ref().unwrap();
-            assert_eq!(text.code_points, content.chars().count(), "{content:?}");
-            assert_eq!(text.units[&TextUnit::Glyphs].len(), v2::unit_ranges(content, TextUnit::Glyphs).len(), "{content:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn preserved_unicode_glyph_targets_reach_the_draw() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2,"composition":{"space":"2d"},
-            "nodes":[{"name":"title","type":"text","content":"A\u{a0}\u{a0}B",
-                "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf","font-size":40}],
-            "animation":[{"tracks":[{"path":["nodes","title","glyphs",3,"translation"],"keys":[[0,[30,0,0]]]}]}]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let first = frame.batches().next().unwrap();
-        assert_eq!(first.spec.unit_transforms[3].off[0], 30.);
-        assert_eq!(first.spec.unit_transforms[2].off[0], 0.);
-        Ok(())
-    }
-
-    #[test]
-    fn sanitized_controls_do_not_lose_the_following_ink_box() -> Result<()> {
-        let content = format!("A{}B", "\u{2060}".repeat(16));
-        let doc = document(&content, serde_json::json!({}))?;
-        let boxes = doc.items[0].text.as_ref().unwrap().layout.vector.as_ref().unwrap().code_point_boxes(content.chars().count());
-        assert!(boxes[17].is_some(), "B keeps its authored character index after sanitization");
-        Ok(())
-    }
-
-    #[test]
-    fn variable_weight_ink_boxes_use_the_drawn_instance() -> Result<()> {
-        let make = |extra: serde_json::Value| {
-            let mut node = serde_json::json!({"font":"../moda-text/tests/fonts/NotoSans-WeightSubset.ttf"});
-            node.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            document("Hamburgefonts", node)
-        };
-        let regular = make(serde_json::json!({}))?;
-        let heavy = make(serde_json::json!({"font-weight":800}))?;
-        let explicit = make(serde_json::json!({"font-variation-settings":"'wght' 800"}))?;
-        let boxes = |doc: &Document| doc.items[0].text.as_ref().unwrap().layout.vector.as_ref().unwrap().code_point_boxes("Hamburgefonts".chars().count());
-        assert_ne!(boxes(&regular), boxes(&heavy));
-        assert_eq!(boxes(&heavy), boxes(&explicit));
-        Ok(())
-    }
-
-    #[test]
-    fn emoji_presentation_refuses_before_rendering() {
-        for text in ["🙂", "A ☃ B", "©\u{fe0f}"] {
-            let error = match document(text, serde_json::json!({})) {
-                Ok(_) => panic!("emoji presentation must not silently disappear: {text:?}"),
-                Err(error) => format!("{error:#}"),
-            };
-            assert_eq!(error, "node \"title\": emoji presentation is not built yet");
-        }
-        assert!(document("©\u{fe0e}", serde_json::json!({})).is_ok());
-    }
-
-    #[test]
-    fn emoji_presentation_across_styled_runs_refuses() {
-        for content in [
-            serde_json::json!([{"content":"©","fill":"blue"},{"content":"\u{fe0f}","fill":"red"}]),
-            serde_json::json!([{"content":"1","fill":"blue"},{"content":"\u{fe0f}","fill":"red"},{"content":"\u{20e3}","fill":"green"}]),
-        ] {
-            let error = match document("", serde_json::json!({"content":content})) {
-                Ok(_) => panic!("emoji presentation across styles must refuse"),
-                Err(error) => format!("{error:#}"),
-            };
-            assert_eq!(error, "node \"title\": emoji presentation is not built yet");
-        }
-        assert!(document("", serde_json::json!({"content":[
-            {"content":"©","fill":"blue"},{"content":"\u{fe0e}","fill":"red"}
-        ]})).is_ok());
-        assert!(document("", serde_json::json!({"white-space":"pre-line","content":[
-            {"content":"©\n","fill":"blue"},{"content":"\u{fe0f}","fill":"red"}
-        ]})).is_ok());
-    }
-
-    #[test]
-    fn emoji_presentation_created_by_sanitization_refuses() {
-        for separator in ["\u{2060}", "\u{feff}", "\u{200c}"] {
-            for content in [
-                serde_json::json!(format!("A©{separator}\u{fe0f}B")),
-                serde_json::json!([{"content":"A©","fill":"blue"},
-                    {"content":format!("{separator}\u{fe0f}B"),"fill":"red"}]),
-            ] {
-                let error = match document("", serde_json::json!({"content":content})) {
-                    Ok(_) => panic!("sanitization must not bypass the emoji refusal: {separator:?}"),
-                    Err(error) => format!("{error:#}"),
-                };
-                assert_eq!(error, "node \"title\": emoji presentation is not built yet");
-            }
-        }
-    }
-
-    #[test]
-    fn text_presentation_across_styled_runs_stays_text() {
-        let catalog = moda_text::catalog::Catalog::from_catalog_json(&serde_json::json!({}));
-        let paragraphs = moda_text::parser::parse_rich_text_to_paragraphs(
-            "<p><span style='color: blue'>A✈</span><span style='color: red'>\u{fe0e}B</span></p>"
-        );
-        let runs = moda_text::runs::map_paragraphs_to_msdf_runs(&paragraphs, &catalog);
-        assert!(runs.iter().all(|run| run.kind == moda_text::runs::RunKind::Text), "{runs:?}");
-        assert_eq!(runs.iter().map(|run| run.text.as_str()).collect::<String>(), "A✈B");
-        for run in &runs {
-            assert_eq!(run.color, if run.text.contains('B') { "red" } else { "blue" });
-        }
-    }
-
-    #[test]
-    fn emoji_classification_ignores_style_boundaries() {
-        use moda_text::{emoji::Segment, runs::RunKind};
-        let catalog = moda_text::catalog::Catalog::from_catalog_json(&serde_json::json!({}));
-        for text in ["A✈\u{fe0e}B", "©\u{fe0f}", "1\u{fe0f}\u{20e3}", "👍🏽", "👩\u{200d}💻", "🇺🇸", "🏴\u{e0067}\u{e0062}\u{e007f}"] {
-            let expected = moda_text::emoji::split_text_into_segments(text);
-            for split in text.char_indices().skip(1).map(|(i, _)| i) {
-                let paragraphs = moda_text::parser::parse_rich_text_to_paragraphs(&format!(
-                    "<p><span style='color: blue'>{}</span><span style='color: red'>{}</span></p>",
-                    &text[..split], &text[split..]
-                ));
-                let runs = moda_text::runs::map_paragraphs_to_msdf_runs(&paragraphs, &catalog);
-                let mut actual = Vec::new();
-                for run in runs {
-                    match (run.kind, actual.last_mut()) {
-                        (RunKind::Text, Some(Segment::Text(previous))) => previous.push_str(&run.text),
-                        (RunKind::Text, _) => actual.push(Segment::Text(run.text)),
-                        (RunKind::Emoji, _) => {
-                            assert_eq!(run.color, "blue", "emoji uses its base's style");
-                            actual.push(Segment::Emoji(run.text));
-                        }
-                    }
-                }
-                let mut canonical = Vec::new();
-                for segment in &expected {
-                    match (segment, canonical.last_mut()) {
-                        (Segment::Text(text), Some(Segment::Text(previous))) => previous.push_str(text),
-                        _ => canonical.push(segment.clone()),
-                    }
-                }
-                assert_eq!(actual, canonical, "{text:?} split at byte {split}");
-            }
-        }
-    }
-
-    #[test]
-    fn missing_glyph_refusal_identifies_character() {
-        let error = match document("A \u{10ffff} B", serde_json::json!({})) {
-            Ok(_) => panic!("missing glyph must refuse instead of drawing notdef"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert_eq!(error.lines().count(), 1, "{error}");
-        for part in ["node \"title\"", "\\u{10ffff}"] {
-            assert!(error.contains(part), "{error}");
-        }
-        assert!(!error.contains("lane"), "{error}");
-    }
-
-    #[test]
-    fn complex_text_stroke_refuses_without_internal_lane_details() {
-        let error = match document("مرحبا", serde_json::json!({
-            "font":"../vork-std/tests/fonts/NotoSansArabic-Regular.ttf", "stroke":"red","stroke-width":1
-        })) {
-            Ok(_) => panic!("complex text strokes are not built"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert!(error.contains("node \"title\""), "{error}");
-        assert!(error.contains("not built yet"), "{error}");
-        assert_eq!(error.lines().count(), 1, "{error}");
-        assert!(!error.contains("Moda") && !error.contains("tier"), "{error}");
-    }
-}
+#[path = "canvas_text_qa_tests.rs"]
+mod text_qa_tests;
 
 #[cfg(test)]
-mod paint_tests {
-    use super::*;
-
-    #[test]
-    fn scrolling_rich_text_through_path_clips_plans_without_refusal() -> Result<()> {
-        // Reduced from the author-trial feed: nested scrolling rows, rich
-        // spans, and an SVG clip whose bounds do not begin at the origin.
-        for path in ["M0 80 h960 v460 h-960 Z", "M0 80 H960 L0 540 Z"] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version":2, "composition":{"space":"2d"},
-                "render":{"resolution":[960,540], "duration":4},
-                "nodes":[
-                    {"type":"path", "name":"feed-clip", "d":path, "fill":"white"},
-                    {"name":"feed", "clip-path":"feed-clip", "children":[
-                        {"name":"scroll", "children":[
-                            {"name":"row", "children":[
-                                {"type":"text", "content":[{"content":"starred "}, {"content":"codehike"}],
-                                    "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                                    "font-size":16, "translation":[108,49,0], "fill":"black"}
-                            ]}
-                        ]}
-                    ]}
-                ],
-                "animation":[{"tracks":[{"path":["nodes","scroll","translation"],
-                    "keys":[[0,[0,-100,0]],[1,[0,50,0]],[2.9,[0,490,0]],[3,[0,50,0]]]}]}]
-            }))?)?;
-            let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-            for time in [2.9, 1., 0., 3., 2.9] {
-                let frame = doc.snapshot(&vork_time::Request::Numeric(time))?;
-                doc.plan_snapshot(&frame, &[]).with_context(|| format!("clip {path}, time {time}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn text_paints_and_geometry_clips_use_the_host_layout() -> Result<()> {
-        for fill in ["none", "linear-gradient(to right, red, blue)", "conic-gradient(red, blue)"] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version": 2, "composition": {"space": "2d"},
-                "render": {"resolution": [512, 256]},
-                "nodes": [
-                    {"type": "path", "d": "M0 0H512V256H0Z", "fill": "lime", "clip-path": "title"},
-                    {"type": "text", "name": "title", "content": "AB", "font-size": 80,
-                        "font": "../vork-std/tests/fonts/LiberationSans-Regular.ttf", "fill": fill,
-                        "stroke": "red", "stroke-width": 8, "opacity": 0.2},
-                    {"type":"text", "name":"other", "content":"AB", "font-size":80,
-                        "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf", "fill":"blue"}
-                ],
-                "animation": [{"tracks": [
-                    {"path": ["nodes", "title", "glyphs", 1, "translation"], "keys": [[0, [300, 0, 0]]]},
-                    {"path": ["nodes", "title", "glyphs", 1, "opacity"], "keys": [[0, 0.4]]},
-                    {"path": ["nodes", "other", "glyphs", 1, "translation"], "keys": [[0, [-50, 0, 0]]]},
-                    {"path": ["nodes", "other", "glyphs", 1, "fill"], "keys": [[0, "green"]]}
-                ]}]
-            }))?)?;
-            let document = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-            let frame = document.snapshot(&vork_time::Request::Numeric(0.))?;
-            let clip = frame.batches().find(|draw| draw.item == 1 && draw.sub == frame.values[1].texts).unwrap();
-            assert_eq!(clip.spec.unit_transforms[1].off, [300., 0.]);
-            assert_eq!(clip.spec.fill_override.as_deref(), Some("white"));
-            assert!(clip.spec.stroke_color.is_none());
-            assert!(clip.spec.unit_transforms.iter().all(|x| x.opacity == 1.));
-            let plan = document.plan_snapshot(&frame, &[])?;
-            assert!(plan.masks.iter().any(|mask| mask.size[0] > 300.), "moved glyphs must extend the capture beyond the layout box");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn fractional_text_unit_opacity_composes_fill_and_stroke() -> Result<()> {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for level in ["glyphs", "words", "lines"] {
-            for content in [serde_json::json!("I"), serde_json::json!([
-                {"content":"A", "stroke":"red"}, {"content":"B", "stroke":"blue"}
-            ])] {
-                for opacity in [0., 0.5, 1.] {
-                    let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                        "version":2, "composition":{"space":"2d"},
-                        "nodes":[{"type":"text", "name":"title", "content":content,
-                            "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                            "fill":"black", "stroke":"black", "stroke-width":10}],
-                        "animation":[{"tracks":[{"path":["nodes","title",level,0,"opacity"],
-                            "keys":[[0,opacity]]}]}]
-                    }))?)?;
-                    let doc = Document::new(&scene, base)?;
-                    let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                    assert_eq!(!frame.values[0].text_composition.is_empty(), opacity == 0.5);
-                    if opacity == 0.5 {
-                        use crate::canvas_draw::TextPart;
-                        let TextPart::Group { opacity, children } = &frame.values[0].text_composition[0] else {
-                            panic!("the faded {level} must compose as a group");
-                        };
-                        assert_eq!(*opacity, 0.5);
-                        assert!(!children.is_empty());
-                        assert!(frame.batches().flat_map(|d| d.spec.unit_transforms.iter())
-                            .all(|x| x.opacity == 0. || x.opacity == 1.));
-                        let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
-                        let document = crate::canvas_draw::document(&doc.page, &nodes, &frame.values)?;
-                        assert!(document["nodes"].as_array().unwrap().iter().any(|node|
-                            node["type"] == "group" && node["opacity"] == 0.5));
-                        doc.plan_snapshot(&frame, &[])?;
-                    }
-                }
-            }
-        }
-        for (fill, stroke, width) in [("black", "none", 10), ("none", "black", 10), ("black", "black", 0),
-            ("transparent", "black", 10), ("black", "transparent", 10)] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version":2, "composition":{"space":"2d"},
-                "nodes":[{"type":"text", "name":"title", "content":"I",
-                    "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                    "fill":fill, "stroke":stroke, "stroke-width":width}],
-                "animation":[{"tracks":[{"path":["nodes","title","glyphs",0,"opacity"],"keys":[[0,0.5]]}]}]
-            }))?)?;
-            assert!(Document::new(&scene, base)?.snapshot(&vork_time::Request::Numeric(0.))?.values[0].text_composition.is_empty());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn equal_text_unit_opacities_keep_independent_pictures() -> Result<()> {
-        use crate::canvas_draw::TextPart;
-        for (level, content) in [("glyphs", "HH"), ("words", "H H"), ("lines", "H H")] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version":2, "composition":{"space":"2d"},
-                "nodes":[{"type":"text", "name":"title", "content":content,
-                    "white-space":"pre-line", "font-size":100,
-                    "width":if level == "lines" { Some(100) } else { None::<u32> },
-                    "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                    "fill":"white", "stroke":"white", "stroke-width":4}],
-                "animation":[{"tracks":[
-                    {"path":["nodes","title",level,0,"opacity"], "keys":[[0,0.5]]},
-                    {"path":["nodes","title",level,1,"opacity"], "keys":[[0,0.5]]},
-                    {"path":["nodes","title",level,1,"translation"],
-                        "keys":[[0,if level == "lines" { [0,-115,0] } else { [-70,0,0] }]]}
-                ]}]
-            }))?)?;
-            let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-            let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-            let groups: Vec<_> = frame.values[0].text_composition.iter().filter_map(|part| {
-                if let TextPart::Group { opacity, children } = part { Some((*opacity, children)) } else { None }
-            }).collect();
-            // Two overlapping solid pictures at 0.5 must source-over to 0.75, not 0.5.
-            assert_eq!(groups.len(), 2, "separately faded {level} need independent pictures");
-            for (opacity, children) in groups {
-                assert_eq!(opacity, 0.5);
-                assert!(!children.is_empty());
-            }
-            doc.plan_snapshot(&frame, &[])?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn unit_opacity_batches_share_layout_payloads() -> Result<()> {
-        // Independent opacity pictures must not duplicate the full layout payloads.
-        let count = 512;
-        for equal in [true, false] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version":2, "composition":{"space":"2d"},
-                "nodes":[{"type":"text", "name":"title", "content":"A".repeat(count),
-                    "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf", "font-size":12,
-                    "width":1000, "fill":"white", "stroke":"black", "stroke-width":1}],
-                "animation":[{"tracks": (0..count).map(|i| serde_json::json!({
-                    "path":["nodes","title","glyphs",i,"opacity"],
-                    "keys":[[0,if equal || i % 2 == 0 { 0.5 } else { 0.25 }]]
-                })).collect::<Vec<_>>()}]
-            }))?)?;
-            let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-            let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-            assert_eq!(frame.batches().count(), count);
-            let first = &frame.batches().next().unwrap().spec;
-            assert_eq!(first.unit_transforms.len(), count);
-            for draw in frame.batches() {
-                assert!(Arc::ptr_eq(&first.html, &draw.spec.html));
-                assert!(Arc::ptr_eq(&first.unit_transforms, &draw.spec.unit_transforms));
-                assert!(Arc::ptr_eq(&first.unit_groups, &draw.spec.unit_groups));
-                assert!(Arc::ptr_eq(&first.unit_fill, &draw.spec.unit_fill));
-            }
-            assert_eq!(frame.batches().map(|d| d.spec.unit_range.as_ref().unwrap().len()).sum::<usize>(), count);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn nested_text_opacity_and_seeks_keep_composition() -> Result<()> {
-        use crate::canvas_draw::TextPart;
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"},
-            "nodes":[{"type":"text", "name":"title", "content":"AB CD", "font-size":80,
-                "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                "fill":"white", "stroke":"black", "stroke-width":8},
-                {"type":"text", "name":"steady", "content":"AB CD", "font-size":80,
-                    "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                    "fill":"blue", "stroke":"red", "stroke-width":4}],
-            "animation":[{"tracks":[
-                {"path":["nodes","steady","glyphs",0,"translation"], "keys":[[0,[25,0,0]]]},
-                {"path":["nodes","steady","words",0,"opacity"], "keys":[[0,0.8]]},
-                {"path":["nodes","title","glyphs",0,"translation"], "keys":[[0,[0,0,0]],[1,[10,0,0]]]},
-                {"path":["nodes","title","lines",0,"opacity"], "keys":[[0,0.5],[1,1]]},
-                {"path":["nodes","title","words",0,"opacity"], "keys":[[0,0.4],[1,1]]},
-                {"path":["nodes","title","glyphs",0,"opacity"], "keys":[[0,0.3],[1,1]]},
-                {"path":["nodes","title","glyphs",1,"fill"], "keys":[[0,"red"]]},
-                {"path":["nodes","title","glyphs",1,"stroke"], "keys":[[0,"blue"]]}
-            ]}]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
-        let mut steady_spec = None;
-        for time in [0., 0., 0.5, 1., 0.5, 0.] {
-            let frame = doc.snapshot(&vork_time::Request::Numeric(time))?;
-            let steady = frame.batches().find(|draw| draw.item == 1).unwrap();
-            if let Some(previous) = &steady_spec { assert!(Arc::ptr_eq(previous, &steady.spec)); }
-            steady_spec = Some(steady.spec.clone());
-            assert_eq!(frame.values[1].text_revision, 1);
-            assert_eq!(steady.spec.unit_transforms[0].off, [25., 0.]);
-            let title = frame.batches().find(|draw| draw.item == 0).unwrap();
-            assert!((title.spec.unit_transforms[0].off[0] - time as f32 * 10.).abs() < 1e-5);
-            if time == 0. {
-                let TextPart::Group { opacity: line, children } = &frame.values[0].text_composition[0] else { panic!("line") };
-                let TextPart::Group { opacity: word, children } = &children[0] else { panic!("word") };
-                let TextPart::Group { opacity: glyph, .. } = &children[0] else { panic!("glyph") };
-                for (actual, expected) in [(*line, 0.5), (*word, 0.4), (*glyph, 0.3)] {
-                    assert!((actual - expected).abs() < 1e-6);
-                }
-            }
-            assert_eq!(frame.values[0].text_composition.is_empty(), time == 1.);
-            doc.plan_snapshot(&frame, &[])?;
-            doc.retained.borrow().as_ref().unwrap().assert_fresh(&doc.page, &nodes, &frame.values);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn css_text_paints_reach_moda_as_rgba() -> Result<()> {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests");
-        for paint in ["rgb(100%, 0%, 0%)", "rgb(255 0 0)", "RGB(255 0 0 / 100%)",
-            "hsl(1turn 100% 50%)", "hwb(0 0% 0%)", "red", "#f00"] {
-            for content in [serde_json::json!("Hello"), serde_json::json!([{"content":"Hello", "fill":paint,"stroke":paint}])] {
-                let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                    "version": 2, "composition": {"space": "2d"}, "nodes": [{
-                        "type": "text", "name":"title", "content": content, "font": "fonts/LiberationSans-Regular.ttf",
-                        "fill": paint, "stroke": paint
-                    }], "animation":[{"tracks":[{"path":["nodes","title","glyphs",0,"fill"],"keys":[[0,paint]]}]}]
-                }))?)?;
-                let document = Document::new(&scene, &base)?;
-                let text = document.items[0].text.as_ref().unwrap();
-                assert!(text.fill.iter().all(|p| *p == PaintSource::Color([1., 0., 0., 1.])), "{paint}");
-                assert_eq!(text.stroke, text.fill, "{paint}");
-                // The colours reach Moda with the draw, not in the layout's HTML.
-                assert!(text.spec.run_colors.iter().all(|colour| *colour == [1., 0., 0., 1.]), "{paint}: {:?}", text.spec.run_colors);
-                assert!(!text.spec.html.contains("color:"), "{paint}: {}", text.spec.html);
-                assert!(document.snapshot(&vork_time::Request::Numeric(0.))?.batches().next().is_some());
-            }
-        }
-        Ok(())
-    }
-}
+#[path = "canvas_paint_tests.rs"]
+mod paint_tests;
 
 #[cfg(test)]
 mod canvas_regressions {
@@ -4087,6 +4330,28 @@ mod canvas_regressions {
         for (space, expected) in [("sRGB", false), ("Display P3", false), ("Linear Rec.709", true), ("Linear Rec.2020", true), ("ACEScg", true)] {
             assert_eq!(float(json!({"version": 2, "composition": {"space": "2d", "color_space": space}, "render": {"resolution": [32, 32]}, "nodes": shape}))?,
                 expected, "{space}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires real GPU and pinned Slang"]
+    fn fitted_image_edges_keep_their_pixels_under_pan_and_crop() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let scene = dir.path().join("scene.json");
+        let out = dir.path().join("frame.png");
+        image::GrayImage::from_pixel(24, 16, image::Luma([255])).save(dir.path().join("white.png"))?;
+        for (x, y, view) in [(0, 0, [0, 0, 96, 72]), (5, 3, [0, 0, 96, 72]), (16, 12, [12, 8, 72, 56])] {
+            let document = json!({"version": 2, "composition": {"space": "2d", "viewBox": view},
+                "render": {"resolution": [view[2], view[3]], "background": "black"}, "images": {"white": {"file": "white.png"}},
+                "nodes": [{"type": "path", "d": "M0 0h33v23h-33Z", "translation": [x, y, 0], "fill": {"image": "white", "fit": "contain"}}]});
+            std::fs::write(&scene, serde_json::to_vec(&document)?)?;
+            crate::shot::Shot { scene: scene.clone(), out: vec![out.clone().into()], ..Default::default() }.render()?;
+            let (left, top) = (x - view[0], y - view[1]);
+            for (px, py, pixel) in image::open(&out)?.to_rgb8().enumerate_pixels() {
+                let covered = (left..left + 33).contains(&px) && (top + 1..=top + 22).contains(&py);
+                assert_eq!(pixel.0, [if covered { 255 } else { 0 }; 3], "view {view:?} at ({px},{py})");
+            }
         }
         Ok(())
     }
@@ -4188,6 +4453,20 @@ mod canvas_regressions {
         let centre = (16 * 32 + 16) * 4;
         let codes = |colour: [f32; 3]| colour.map(|v| (v.clamp(0., 1.) * 255.).round() as u8);
         let near = |pixel: &[u8], expected: [u8; 3], within: u8| pixel[3] == 255 && pixel[..3].iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= within);
+        let masked_group = json!({"version":2,"composition":{"space":"2d"},
+            "render":{"resolution":[32,32],"background":"black"},"nodes":[
+                {"mask":"cut","children":[
+                    {"type":"path","d":"M0 0H32V32H0Z","fill":"red"},
+                    {"type":"path","d":"M0 0H32V32H0Z","fill":"blue"}]},
+                {"name":"cut","type":"path","d":"M0 0H32V32H0Z","fill":"black","mask-type":"alpha","opacity":0.5}]});
+        let (masked, _) = render("group-alpha-mask", &masked_group, None)?;
+        assert!(near(&masked[centre..][..4], [0, 0, 128], 1), "group mask: {:?}", &masked[centre..][..4]);
+        let mut isolated = masked_group.clone();
+        isolated["nodes"][0]["children"] = json!([{"isolation":"isolate","children":masked_group["nodes"][0]["children"]}]);
+        isolated["nodes"][1]["fill"] = json!("white");
+        isolated["nodes"][1]["mask-type"] = json!("luminance");
+        let (masked, _) = render("isolated-luminance-mask", &isolated, None)?;
+        assert!(near(&masked[centre..][..4], [0, 0, 128], 1), "isolated mask child: {:?}", &masked[centre..][..4]);
         let decode = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
         let encode = |c: f32| if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1. / 2.4) - 0.055 };
         let alpha = 128f32 / 255.;
@@ -4403,9 +4682,22 @@ mod canvas_regressions {
                 "encoder frame {frame} had no rendering to overlap before release: {events:?}");
         }
         assert!(events.iter().any(|&(event, _)| event == "release"), "exercise ring reuse");
-        // Frames stay in flight: a frame reaches the encoder only after its successor was drawn.
-        for (at, &(_, frame)) in events.iter().enumerate().filter(|(_, (event, frame))| *event == "push" && frame + 1 < 9) {
-            assert!(events[..at].contains(&("draw", frame + 1)), "frame {frame} was accepted before frame {} was drawn: {events:?}", frame + 1);
+        if cfg!(target_os = "macos") {
+            // Handoff must arm GPU completion before host acceptance/readback.
+            // Three submissions can occupy the existing ring before the first collection.
+            let first_collect = events.iter().position(|e| *e == ("collect", 0)).unwrap();
+            for frame in 0..crate::constants::FRAMES_IN_FLIGHT {
+                assert!(events[..first_collect].contains(&("draw", frame)), "ring did not fill: {events:?}");
+            }
+            for frame in 0..9 {
+                let push = events.iter().position(|e| *e == ("push", frame)).unwrap();
+                let collect = events.iter().position(|e| *e == ("collect", frame)).unwrap();
+                assert!(push < collect, "frame {frame} waited for readback before handoff: {events:?}");
+            }
+        } else {
+            for (at, &(_, frame)) in events.iter().enumerate().filter(|(_, (event, frame))| *event == "push" && frame + 1 < 9) {
+                assert!(events[..at].contains(&("draw", frame + 1)), "frame {frame} was accepted before frame {} was drawn: {events:?}", frame + 1);
+            }
         }
         drop(shot);
         std::fs::remove_dir_all(root)?;
@@ -4487,6 +4779,24 @@ mod canvas_regressions {
     }
 
     #[test]
+    fn masked_group_blends_its_whole_picture() {
+        let doc = document(json!([
+            {"name":"picture","mask":"cut","mix-blend-mode":"hue","isolation":"isolate","children":[
+                {"type":"path","d":"M0 0H100V100H0Z","fill":"red"},
+                {"type":"path","d":"M0 0H50V100H0Z","fill":"blue"}]},
+            {"name":"cut","type":"path","d":"M0 0H100V100H0Z","fill":"black","mask-type":"alpha"}
+        ]), json!([]));
+        let picture = drawing(&doc);
+        let nodes = picture["nodes"].as_array().unwrap();
+        let outer = nodes.iter().find(|n| n["id"] == "n0").unwrap();
+        assert_eq!(outer["blendMode"], "hue");
+        assert_eq!(outer["isolation"], "isolate");
+        assert_eq!(outer["children"], json!(["n0.alpha-group"]));
+        assert_eq!(nodes.iter().filter(|n| n.get("blendMode").is_some_and(|mode| mode != "normal")).count(), 1);
+        assert!(nodes.iter().any(|n| n["maskType"] == "alpha"));
+    }
+
+    #[test]
     fn luminance_mask_does_not_paint_referenced_definitions() {
         let doc = document(json!([
             {"name":"picture", "type":"path", "d":"M0 0H100V100H0Z", "fill":"red", "mask":"mask-group"},
@@ -4504,1605 +4814,13 @@ mod canvas_regressions {
 }
 
 #[cfg(test)]
-mod retained_tests {
-    use super::*;
-
-    fn css_document(nodes: serde_json::Value, animation: serde_json::Value) -> Document {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"},
-            "render":{"resolution":[100,100]}, "nodes":nodes, "animation":animation
-        })).unwrap()).unwrap();
-        Document::new(&scene, Path::new(".")).unwrap()
-    }
-
-    #[test]
-    fn css_blur_refuses_beyond_the_target_pixel_limit() -> Result<()> {
-        for group in [false, true] {
-            for (sigma, scale, refuses) in [
-                (100., 1., false), (100.01, 1., true), (500., 1., true),
-                (1e30, 1., true), (50., 2., false), (50.01, 2., true),
-                (200., 0.5, false),
-            ] {
-                let mut node = serde_json::json!({"name":"shape", "type":"path",
-                    "d":"M0 0H120V80H0Z", "fill":"red"});
-                if group { node = serde_json::json!({"name":"group", "children":[node]}); }
-                node["filter"] = serde_json::json!(format!("blur({sigma}px)"));
-                node["scale"] = serde_json::json!([scale, scale, 1.]);
-                let doc = css_document(serde_json::json!([node]), serde_json::json!([]));
-                let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                let result = doc.plan_snapshot(&frame, &[]);
-                if refuses {
-                    let error = result.err().expect("oversized blur must refuse before rendering").to_string();
-                    assert!(error.contains("layer blur sigma exceeds 100 target pixels"), "{error}");
-                    assert!(!error.contains('\n'), "{error}");
-                } else {
-                    result?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn css_nested_blurs_keep_every_capture_and_validate_the_parent() -> Result<()> {
-        use moda_engine::seams::DrawItem;
-        fn captures(items: &[DrawItem]) -> usize {
-            items.iter().map(|item| match item {
-                DrawItem::LayerBlurComposite { group, .. } => 1 + captures(&group.items),
-                _ => 0,
-            }).sum()
-        }
-        for depth in [2, 3, 4] {
-            for oversized in [false, true] {
-                let mut node = serde_json::json!({"name":"shape", "type":"path",
-                    "d":"M20 20H80V80H20Z", "fill":"red", "filter":"blur(1px)"});
-                for level in 1..depth {
-                    node = serde_json::json!({"name":format!("parent{level}"),
-                        "filter":if oversized && level == depth - 1 {"blur(500px)"} else {"blur(2px)"},
-                        "children":[node]});
-                }
-                let doc = css_document(serde_json::json!([node]), serde_json::json!([]));
-                let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                let result = doc.plan_snapshot(&frame, &[]);
-                if oversized {
-                    let error = result.err().expect("oversized parent blur must refuse").to_string();
-                    assert!(error.contains("layer blur sigma exceeds 100 target pixels"), "{error}");
-                    assert!(!error.contains('\n'), "{error}");
-                } else {
-                    assert_eq!(captures(&result?.items), depth);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn css_blur_uses_small_nonzero_transform_scales() -> Result<()> {
-        for scale in [0.000001, 0.00005, 0.0001, 0.0002] {
-            for group in [false, true] {
-                let extent = 50. / scale;
-                let mut node = serde_json::json!({"name":"scaled", "type":"path",
-                    "d":format!("M0 0H{extent}V{extent}H0Z"), "fill":"red"});
-                if group { node = serde_json::json!({"name":"group", "children":[node]}); }
-                node["scale"] = serde_json::json!([scale, scale, 1.]);
-                node["filter"] = serde_json::json!("blur(200px)");
-                let doc = css_document(serde_json::json!([node]), serde_json::json!([]));
-                let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                doc.plan_snapshot(&frame, &[])?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn css_blur_refuses_visible_anisotropy_instead_of_dropping_an_axis() -> Result<()> {
-        // Both axis orders, ordinary scales, inherited shear, and the review's
-        // tiny-scale input exercise the shared leaf and subtree planner.
-        for scale in [[0.00005, 1., 1.], [1., 0.00005, 1.], [0.5, 1., 1.]] {
-            for group in [false, true] {
-                for sigma in [2., 200.] {
-                    let mut node = serde_json::json!({"name":"shape", "type":"path",
-                        "d":format!("M0 0H{}V{}H0Z", 50. / scale[0], 50. / scale[1]),
-                        "fill":"red"});
-                    if group { node = serde_json::json!({"name":"group", "children":[node]}); }
-                    node["scale"] = serde_json::json!(scale);
-                    node["filter"] = serde_json::json!(format!("blur({sigma}px)"));
-                    let doc = css_document(serde_json::json!([node]), serde_json::json!([]));
-                    let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                    let error = doc.plan_snapshot(&frame, &[]).err()
-                        .expect("visible anisotropic blur must refuse").to_string();
-                    assert!(error.contains("layer blur"), "{error}");
-                    assert!(error.contains("uniform") || error.contains("reduce"), "{error}");
-                    assert!(!error.contains('\n'), "{error}");
-                }
-            }
-        }
-        // Rotated nonuniform ancestors produce shear; the leaf's local scale
-        // alone cannot identify whether its projected blur is isotropic.
-        let doc = css_document(serde_json::json!([{"name":"parent", "scale":[2.,1.,1.],
-            "children":[{"name":"child", "rotation":[0.,0.,0.38268343,0.9238795],
-                "type":"path", "d":"M0 0H40V40H0Z", "fill":"red", "filter":"blur(2px)"}]}]),
-            serde_json::json!([]));
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let error = doc.plan_snapshot(&frame, &[]).err().expect("sheared blur must refuse").to_string();
-        assert!(error.contains("uniform"), "{error}");
-        Ok(())
-    }
-
-    #[test]
-    fn css_blur_keeps_conformal_and_invisible_transforms() -> Result<()> {
-        for scale in [[0.00005, 0.00005, 1.], [-1., 1., 1.], [1., 1., 1.],
-            [0.00005, 0.0001, 1.]] {
-            let doc = css_document(serde_json::json!([{"name":"shape", "type":"path",
-                "d":"M0 0H50V50H0Z", "fill":"red", "scale":scale,
-                "rotation":[0.,0.,0.38268343,0.9238795], "filter":"blur(2px)"}]),
-                serde_json::json!([]));
-            let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-            doc.plan_snapshot(&frame, &[])?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn css_blur_visibility_uses_the_larger_reach_at_the_cutoff() -> Result<()> {
-        // The reaches straddle 0.5px within projection-rounding tolerance.
-        // Accepting this near-conformal transform must still retain its blur.
-        let doc = css_document(serde_json::json!([{"name":"shape", "type":"path",
-            "d":"M0 0H300V300H0Z", "fill":"red", "scale":[0.1666,0.1667,1.],
-            "filter":"blur(1px)"}]), serde_json::json!([]));
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let plan = doc.plan_snapshot(&frame, &[])?;
-        assert!(plan.items.iter().any(|item| matches!(item,
-            moda_engine::seams::DrawItem::LayerBlurComposite { .. })),
-            "the larger reach is visible, so the blur must remain");
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn held_root_picture_matches_fresh_draws_after_edits() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let engine = crate::canvas_draw::Engine::new(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        let reference = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        let doc = css_document(serde_json::json!([
-            {"name":"shape", "type":"path", "d":"M10 10H60V60H10Z", "fill":"red"},
-            {"name":"other", "type":"path", "d":"M40 40H90V90H40Z", "fill":"blue", "opacity":0.5}
-        ]), serde_json::json!([]));
-        for step in [0, 1, 2, 3, 0] {
-            let mut frame = doc.snapshot(&vork_time::Request::Numeric(step as f32))?;
-            match step {
-                1 => frame.values[0].transform.translation[0] = 13.,
-                2 => frame.values[1].opacity = 0.2,
-                3 => frame.background = Some([0., 1., 0., 1.]),
-                _ => {},
-            }
-            let plan = doc.plan_snapshot(&frame, &[])?;
-            let expected = reference.render_to_texture(&plan)?;
-            let expected = moda_engine::readback::read_texture_rgba(
-                &renderer.device, &renderer.queue, &expected, 100, 100)?;
-            // First render may populate a resource cache. A second draw must
-            // establish a stable held picture, and the third must reuse it.
-            for _ in 0..2 { engine.render_to_texture(&plan)?; }
-            let before = engine.profile_counters();
-            let actual = engine.render_to_texture(&plan)?;
-            let after = engine.profile_counters();
-            assert_eq!(after["picture_hits"].as_u64(), before["picture_hits"].as_u64().map(|v| v + 1));
-            assert_eq!(before["bundle_replays"], after["bundle_replays"]);
-            let actual = moda_engine::readback::read_texture_rgba(
-                &renderer.device, &renderer.queue, &actual, 100, 100)?;
-            assert_eq!(actual, expected, "step {step}");
-        }
-        assert_eq!(reference.profile_counters()["picture_hits"], 0);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn css_nested_blurs_match_composed_gaussians_and_tiny_scale_renders() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        let render = |node: serde_json::Value| -> Result<Vec<u8>> {
-            let nodes = if node.is_array() { node } else { serde_json::json!([node]) };
-            let doc = css_document(nodes, serde_json::json!([]));
-            let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-            let texture = engine.render_to_texture(&doc.plan_snapshot(&frame, &[])?)?;
-            moda_engine::readback::read_texture_rgba(
-                &renderer.device, &renderer.queue, &texture, 100, 100)
-        };
-        let square = || serde_json::json!({"name":"shape", "type":"path",
-            "d":"M20 20H80V80H20Z", "fill":"red"});
-        // Independent Gaussian convolutions add their variances. Compare associated
-        // RGBA with explicit tolerances for finite kernels and capture quantization.
-        for (sigmas, combined) in [(vec![3., 4.], 5.), (vec![1., 2., 2.], 3.)] {
-            let mut nested = square();
-            nested["filter"] = serde_json::json!(format!("blur({}px)", sigmas[0]));
-            for (level, sigma) in sigmas.iter().enumerate().skip(1) {
-                nested = serde_json::json!({"name":format!("parent{level}"),
-                    "filter":format!("blur({sigma}px)"), "children":[nested]});
-            }
-            let actual = render(nested)?;
-            let mut reference = square();
-            reference["filter"] = serde_json::json!(format!("blur({combined}px)"));
-            let expected = render(reference)?;
-            let max = actual.iter().zip(&expected).map(|(a,b)| a.abs_diff(*b)).max().unwrap();
-            let rmse = (actual.iter().zip(&expected).map(|(a,b)| (*a as f64 - *b as f64).powi(2))
-                .sum::<f64>() / actual.len() as f64).sqrt();
-            assert!(max <= 12 && rmse <= 3., "{sigmas:?}: max={max}, RMSE={rmse}");
-        }
-        // The child's clip is sampled before the parent blur, while the mask
-        // above the parent clips the final filtered result.
-        let masked = render(serde_json::json!([
-            {"name":"parent", "filter":"blur(4px)", "clip-path":"top", "children":[
-                {"name":"child", "filter":"blur(3px)", "clip-path":"left", "children":[square()]}]},
-            {"name":"left", "type":"path", "d":"M0 0H50V100H0Z"},
-            {"name":"top", "type":"path", "d":"M0 0H100V50H0Z"}
-        ]))?;
-        let alpha = |x: usize, y: usize| masked[(y * 100 + x) * 4 + 3];
-        assert!(alpha(51, 40) > 0, "parent blur spreads past the child's clip");
-        assert_eq!(alpha(40, 51), 0, "outer clip masks the parent result");
-        assert!(alpha(40, 40) > 200, "interior remains visible");
-        let scaled = render(serde_json::json!({"name":"scaled", "type":"path",
-            "d":"M0 0H1000000V1000000H0Z", "fill":"red",
-            "scale":[0.00005,0.00005,1.], "filter":"blur(200px)"}))?;
-        let reference = render(serde_json::json!({"name":"reference", "type":"path",
-            "d":"M0 0H50V50H0Z", "fill":"red"}))?;
-        assert_eq!(scaled, reference, "0.01 target-pixel sigma preserves the square");
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn css_gradients_ignore_fully_transparent_stop_rgb() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        for kind in ["linear-gradient(to right,", "radial-gradient(", "conic-gradient("] {
-            let mut reference: Option<Vec<u8>> = None;
-            for stop in ["rgba(0,0,255,0)", "rgba(255,0,0,0)", "transparent"] {
-                let doc = css_document(serde_json::json!([{"name":"shape", "type":"path",
-                    "d":"M0 0H100V100H0Z", "fill":format!("{kind}{stop}, blue)")}]), serde_json::json!([]));
-                let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-                let texture = engine.render_to_texture(&doc.plan_snapshot(&frame, &[])?)?;
-                let rgba = moda_engine::readback::read_texture_rgba(
-                    &renderer.device, &renderer.queue, &texture, 100, 100)?;
-                if let Some(expected) = &reference {
-                    let max = rgba.iter().zip(expected.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
-                    assert!(max <= 1, "{kind}{stop}: hidden RGB changed pixels by {max}");
-                } else {
-                    assert!(rgba.chunks_exact(4).any(|p| p[3] > 32 && p[3] < 224), "exercise translucent pixels");
-                    reference = Some(rgba);
-                }
-            }
-        }
-        // Nonzero alpha at both ends must also be associated during interpolation.
-        let doc = css_document(serde_json::json!([{"name":"shape", "type":"path",
-            "d":"M0 0H100V100H0Z",
-            "fill":"linear-gradient(to right, rgba(255,0,0,0.25), rgba(0,0,255,0.75))"}]), serde_json::json!([]));
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let texture = engine.render_to_texture(&doc.plan_snapshot(&frame, &[])?)?;
-        let rgba = moda_engine::readback::read_texture_rgba(
-            &renderer.device, &renderer.queue, &texture, 100, 100)?;
-        let pixel = &rgba[(50 * 100 + 50) * 4..][..4];
-        for (actual, expected) in pixel.iter().zip([32u8, 0, 97, 128]) {
-            assert!(actual.abs_diff(expected) <= 2, "premultiplied midpoint: {pixel:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn retained_picture_outputs_survive_later_draws() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version": 2, "composition": {"space": "2d"},
-            "render": {"resolution": [32, 32]},
-            "nodes": [{"name":"shape", "type":"path", "d":"M0 0H16V32H0Z", "fill":"red"}]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new("."))?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        let mut frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let first = engine.render_to_texture(&doc.plan_snapshot(&frame, &[])?)?;
-        let read = |texture: &wgpu::Texture| moda_engine::readback::read_texture_rgba(
-            &renderer.device, &renderer.queue, texture, 32, 32);
-        let expected = read(&first)?;
-        frame.values[doc.by_name["shape"]].transform.translation[0] = 16.;
-        let second = engine.render_to_texture(&doc.plan_snapshot(&frame, &[])?)?;
-        assert_ne!(read(&second)?, expected, "the second drawing must change");
-        assert_eq!(read(&first)?, expected, "a deferred consumer must still see the first drawing");
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn text_filters_follow_glyph_alpha_for_every_paint() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let dir = std::env::temp_dir().join(format!("vork-text-filter-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(dir.join("paint.png"))?;
-        let font = dir.join("font.ttf");
-        std::fs::write(&font, include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"))?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        // Large glyphs: the counters of the O and the gaps of the H must be wider than twice the widest reach
-        // probed below plus the shadow's offset, or no pixel is far enough from both the ink and its shadow to
-        // be a hole and the oracle probes nothing.
-        const W: i32 = 512;
-        const H: i32 = 320;
-        for fill in [serde_json::json!("red"),
-            serde_json::json!("linear-gradient(to right, red, blue)"),
-            serde_json::json!({"image":"paint"})] {
-            let render = |filter: &str| -> Result<Vec<u8>> {
-                let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                    "version":2, "composition":{"space":"2d"},
-                    "render":{"resolution":[W,H]},
-                    "images":{"paint":{"file":"paint.png"}},
-                    "nodes":[{"type":"text", "content":"OHO", "font":font,
-                        "font-size":160, "translation":[24,16,0], "fill":fill, "filter":filter}]
-                }))?)?;
-                let doc = Document::new(&scene, &dir)?;
-                doc.install_images()?;
-                let pictures = Pictures::new(&renderer, &doc, &dir, true)?;
-                let texture = doc.draw(&engine, &pictures, &renderer, &vork_time::Request::Numeric(0.), None)?;
-                let rgba = moda_engine::readback::read_texture_rgba(
-                    &renderer.device, &renderer.queue, &texture, W as u32, H as u32)?;
-                Ok(rgba.chunks_exact(4).map(|p| p[3]).collect())
-            };
-            let source = render("none")?;
-            assert!(source.iter().any(|a| *a > 250), "text must render");
-            let bounds = source.iter().enumerate().filter(|(_, a)| **a > 0)
-                .fold([W, H, 0, 0], |[x0, y0, x1, y1], (i, _)| {
-                    let (x, y) = (i as i32 % W, i as i32 / W);
-                    [x0.min(x), y0.min(y), x1.max(x), y1.max(y)]
-                });
-            let sample = |x: i32, y: i32| -> u8 {
-                if (0..W).contains(&x) && (0..H).contains(&y) {
-                    source[(y * W + x) as usize]
-                } else { 0 }
-            };
-            for (filter, shadow, radius) in [
-                ("drop-shadow(12px 8px 0px black)", true, 2),
-                ("drop-shadow(12px 8px 4px black)", true, 14),
-                ("blur(2px)", false, 8),
-                ("drop-shadow(12px 8px 0px black) blur(2px)", true, 8),
-            ] {
-                let alpha = render(filter)?;
-                assert!(alpha.iter().any(|a| *a > 128), "{fill} {filter}: text must remain visible");
-                let mut holes = 0;
-                let mut shadow_pixels = 0;
-                let mut halo_pixels = 0;
-                for y in bounds[1]..=bounds[3] + if shadow { 8 } else { 0 } {
-                    for x in bounds[0]..=bounds[2] + if shadow { 12 } else { 0 } {
-                        // Allow the finite Gaussian reach (3 sigma), plus two
-                        // pixels for the different text/mask antialiasing paths.
-                        let supported = (-radius..=radius).any(|dy| (-radius..=radius).any(|dx|
-                            sample(x + dx, y + dy) > 0
-                                || (shadow && sample(x + dx - 12, y + dy - 8) > 0)));
-                        let actual = alpha[(y * W + x) as usize];
-                        if !supported {
-                            holes += 1;
-                            assert!(actual <= 3, "{fill} {filter}: glyph hole/background ({x},{y}) has alpha {actual}");
-                        }
-                        if !shadow && sample(x, y) == 0 && actual > 3 { halo_pixels += 1; }
-                        if shadow && sample(x, y) == 0 && sample(x - 12, y - 8) > 250 {
-                            shadow_pixels += usize::from(actual > 80);
-                        }
-                    }
-                }
-                assert!(holes > 100, "{fill} {filter}: the oracle must probe glyph holes and inter-glyph gaps, and probed {holes}");
-                if shadow { assert!(shadow_pixels > 100, "{fill} {filter}: the offset glyphs must cast a visible shadow ({shadow_pixels} pixels)"); }
-                else { assert!(halo_pixels > 100, "{fill} {filter}: blur must spread beyond the glyph edges ({halo_pixels} pixels)"); }
-            }
-        }
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn parent_shadows_follow_glyph_alpha_through_nested_filters() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let dir = std::env::temp_dir().join(format!("vork-nested-text-filter-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(dir.join("paint.png"))?;
-        std::fs::write(dir.join("font.ttf"), include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"))?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        for fill in [serde_json::json!("red"),
-            serde_json::json!("linear-gradient(to right, red, blue)"),
-            serde_json::json!("radial-gradient(red, blue)"),
-            serde_json::json!("conic-gradient(red, blue, red)"),
-            serde_json::json!({"image":"paint"})] {
-            for depth in [1, 3] {
-                let render = |shadow: bool| -> Result<Vec<u8>> {
-                    let mut child = serde_json::json!({"name":"text", "type":"text", "content":"OHO",
-                        "font":"font.ttf", "font-size":80, "translation":[24,16,0], "fill":fill,
-                        "filter":"blur(2px)"});
-                    for level in 1..depth {
-                        child = serde_json::json!({"name":format!("filter-{level}"),
-                            "filter":"blur(0.5px)", "children":[child]});
-                    }
-                    let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                        "version":2, "composition":{"space":"2d"}, "render":{"resolution":[640,160]},
-                        "images":{"paint":{"file":"paint.png"}},
-                        "nodes":[{"name":"parent", "filter":if shadow {"drop-shadow(300px 0px 0px black)"} else {"none"},
-                            "children":[child]}]
-                    }))?)?;
-                    let doc = Document::new(&scene, &dir)?;
-                    doc.install_images()?;
-                    let pictures = Pictures::new(&renderer, &doc, &dir, true)?;
-                    let texture = doc.draw(&engine, &pictures, &renderer, &vork_time::Request::Numeric(0.), None)?;
-                    let rgba = moda_engine::readback::read_texture_rgba(
-                        &renderer.device, &renderer.queue, &texture, 640, 160)?;
-                    Ok(rgba.chunks_exact(4).map(|p| p[3]).collect())
-                };
-                let source = render(false)?;
-                let shadow = render(true)?;
-                let mut holes = 0;
-                let mut ink = 0;
-                // The far offset isolates the shadow. Probe holes and glyph cores
-                // away from antialiasing/blur edges, independently of paint RGB.
-                for y in 24..100usize {
-                    for x in 24..220usize {
-                        let supported = (-2..=2isize).any(|dy| (-2..=2isize).any(|dx| {
-                            let (sx, sy) = (x as isize + dx, y as isize + dy);
-                            sx >= 0 && sy >= 0 && source[sy as usize * 640 + sx as usize] > 0
-                        }));
-                        let actual = shadow[y * 640 + x + 300];
-                        if !supported {
-                            holes += 1;
-                            assert!(actual <= 3, "{fill} depth {depth}: shadow fills glyph hole/gap at {x},{y}: {actual}");
-                        }
-                        // The source is already blurred; its strokes need not
-                        // contain fully opaque pixels. Probe 75% coverage.
-                        if source[y * 640 + x] > 192 {
-                            ink += 1;
-                            assert!(actual > 80, "{fill} depth {depth}: missing glyph shadow at {x},{y}");
-                        }
-                    }
-                }
-                assert!(holes > 100, "must exercise holes and gaps");
-                assert!(ink > 100, "{fill} depth {depth}: only {ink} high-coverage probes; max source alpha {:?}", source.iter().max());
-            }
-        }
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn rich_text_clip_keeps_exact_shape_with_offscreen_siblings() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let dir = std::env::temp_dir().join(format!("vork-rich-clip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("font.ttf"), include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"))?;
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"}, "render":{"resolution":[240,100]},
-            "nodes":[
-                {"name":"triangle", "type":"path", "d":"M20 20 H60 L20 60 Z", "fill":"white"},
-                {"clip-path":"triangle", "children":[
-                    {"type":"text", "content":"H", "font":"font.ttf", "font-size":80, "fill":"red"},
-                    {"type":"text", "content":[{"content":"hidden "},{"content":"rich text"}],
-                        "font":"font.ttf", "font-size":20, "translation":[0,-100,0]}]},
-                {"type":"text", "content":"H", "font":"font.ttf", "font-size":80,
-                    "translation":[120,0,0], "fill":"red"}]
-        }))?)?;
-        let doc = Document::new(&scene, &dir)?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        let pictures = Pictures::new(&renderer, &doc, &dir, true)?;
-        for _ in 0..2 {
-            let texture = doc.draw(&engine, &pictures, &renderer, &vork_time::Request::Numeric(0.), None)?;
-            let rgba = moda_engine::readback::read_texture_rgba(
-                &renderer.device, &renderer.queue, &texture, 240, 100)?;
-            let alpha = |x: usize, y: usize| rgba[(y * 240 + x) * 4 + 3];
-            assert!(alpha(46, 25) > 192, "mask removed interior glyph coverage");
-            assert!(alpha(46, 55) <= 3, "glyph leaked outside triangle but inside its bounding box");
-            assert!(alpha(166, 25) > 192 && alpha(166, 55) > 192, "unclipped reference must contain both probes");
-        }
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn ancestor_shadows_follow_masks_at_every_composite_and_paint_depth() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let dir = std::env::temp_dir().join(format!("vork-composite-mask-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(dir.join("paint.png"))?;
-        std::fs::write(dir.join("font.ttf"), include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf"))?;
-        let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-        for text in [false, true] {
-        for fill in [serde_json::json!("red"),
-            serde_json::json!("linear-gradient(to right, red, blue)"),
-            serde_json::json!("radial-gradient(red, blue)"),
-            serde_json::json!("conic-gradient(red, blue, red)"),
-            serde_json::json!({"image":"paint"})] {
-            for paint_depth in 0..4 {
-                for leaf_filter in [false, true] {
-                    // One tile per subset of masks. Paint may precede deeper
-                    // masks; those must not leak back to an earlier sibling.
-                    let mut nodes = Vec::new();
-                    for placements in 0..16 {
-                        let mut child = None;
-                        for level in (0..4).rev() {
-                            let mut children = Vec::new();
-                            if level == paint_depth {
-                                let mut paint = if text {
-                                    serde_json::json!({"type":"text", "content":"H", "font":"font.ttf", "font-size":80})
-                                } else { serde_json::json!({"type":"path", "d":"M0 0H80V80H0Z"}) };
-                                paint["fill"] = fill.clone();
-                                paint["filter"] = serde_json::json!(if leaf_filter { "blur(2px)" } else { "none" });
-                                children.push(paint);
-                            }
-                            if let Some(child) = child { children.push(child); }
-                            let mut group = serde_json::json!({"filter":"blur(0.5px)", "children":children});
-                            if placements & (1 << level) != 0 { group["clip-path"] = serde_json::json!("triangle"); }
-                            child = Some(group);
-                        }
-                        nodes.push(serde_json::json!({"translation":[(placements % 4) * 240, (placements / 4) * 100, 0],
-                            "filter":"drop-shadow(120px 0px 0px black)", "children":[child.unwrap()]}));
-                    }
-                    nodes.push(serde_json::json!({"name":"triangle", "type":"path",
-                        "d":"M20 20H60L20 60Z", "fill":"white"}));
-                    let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                        "version":2, "composition":{"space":"2d"}, "render":{"resolution":[960,400]},
-                        "images":{"paint":{"file":"paint.png"}}, "nodes":nodes
-                    }))?)?;
-                    let doc = Document::new(&scene, &dir)?;
-                    doc.install_images()?;
-                    let pictures = Pictures::new(&renderer, &doc, &dir, true)?;
-                    // A second draw exercises retained plans/resources as well.
-                    for _ in 0..2 {
-                        let texture = doc.draw(&engine, &pictures, &renderer, &vork_time::Request::Numeric(0.), None)
-                            .with_context(|| format!("{fill} text {text} depth {paint_depth} leaf {leaf_filter}"))?;
-                        let rgba = moda_engine::readback::read_texture_rgba(
-                            &renderer.device, &renderer.queue, &texture, 960, 400)?;
-                        for placements in 0..16usize {
-                            let alpha = |x, y| rgba[(((placements / 4) * 100 + y) * 960
-                                + (placements % 4) * 240 + 120 + x) * 4 + 3];
-                            assert!(alpha(46, 25) > 192, "missing shadow: {fill} text {text} depth {paint_depth}, masks {placements}");
-                            let clipped = placements & ((1 << (paint_depth + 1)) - 1) != 0;
-                            if clipped {
-                                assert!(alpha(46, 55) <= 3,
-                                    "mask lost: {fill} text {text} depth {paint_depth}, masks {placements}, leaf {leaf_filter}");
-                            } else {
-                                assert!(alpha(46, 55) > 192,
-                                    "sibling mask leaked: {fill} text {text} depth {paint_depth}, masks {placements}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        }
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires real GPU and pinned Slang"]
-    fn image_and_conic_strokes_draw_only_the_outline() -> Result<()> {
-        let renderer = Renderer::new()?;
-        let dir = std::env::temp_dir().join(format!("vork-paint-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
-        std::fs::create_dir(&dir)?;
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(dir.join("paint.png"))?;
-        for paint in [serde_json::json!({"image": "paint"}), serde_json::json!("conic-gradient(red, blue, red)")] {
-            let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-                "version": 2, "composition": {"space": "2d"}, "render": {"resolution": [128, 128]},
-                "images": {"paint": {"file": "paint.png"}},
-                "nodes": [{"type": "path", "d": "M32 32H96V96H32Z", "fill": "none", "stroke": paint, "stroke-width": 8}]
-            }))?)?;
-            let doc = Document::new(&scene, &dir)?;
-            doc.install_images()?;
-            let engine = crate::canvas_draw::Engine::new_picture(&renderer, false, v2::WorkingColorSpace::Srgb)?;
-            let pictures = Pictures::new(&renderer, &doc, &dir, true)?;
-            let texture = doc.draw(&engine, &pictures, &renderer, &vork_time::Request::Numeric(0.), None)?;
-            let rgba = moda_engine::readback::read_texture_rgba(&renderer.device, &renderer.queue, &texture, 128, 128)?;
-            let alpha = |x: usize, y: usize| rgba[(y * 128 + x) * 4 + 3];
-            assert!(alpha(32, 64) > 250, "the paint must cover the stroke centre");
-            assert_eq!(alpha(64, 64), 0, "a stroke must leave the interior empty");
-            assert_eq!(alpha(20, 64), 0, "a stroke must not paint outside its width");
-        }
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn retained_canvas_updates_match_fresh_scene() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version": 2, "composition": {"space": "2d"},
-            "nodes": [
-                {"name":"solid", "type":"path", "d":"M0 0H30V30H0Z", "fill":"lime", "children":[
-                    {"name":"nested-clip", "type":"path", "d":"M0 0H20V20H0Z"}
-                ]},
-                {"name":"clipped", "type":"path", "d":"M0 0H40V40H0Z", "fill":"blue", "clip-path":"nested-clip"},
-                {"name":"clip", "type":"path", "d":"M0 0H50V50H0Z"},
-                {"name":"group", "clip-path":"clip", "children":[
-                    {"name":"shape", "type":"path", "d":"M0 0H100V100H0Z", "fill":"red",
-                     "stroke":"blue", "stroke-width":3, "stroke-dasharray":[4,2], "paint-order":"stroke"},
-                    {"name":"text", "type":"text", "content":"Cache", "font-size":20,
-                     "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf"}
-                ]}
-            ]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let nodes: Vec<_> = doc.items.iter().map(|i| &i.node).collect();
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let mut values = frame.values.clone();
-        let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-        for step in 0..20 {
-            for (i, value) in values.iter_mut().enumerate() {
-                value.transform.translation[0] = (step * (i + 1)) as f32;
-                value.transform.scale[0] = if step == 7 { 0. } else { 1. + step as f32 * 0.1 };
-                value.opacity = (step % 5) as f32 * 0.2;
-                value.visible = step % 4 != 0;
-                if let Some(path) = &mut value.path {
-                    path.stroke_width = (step % 3) as f32;
-                    path.stroke_dashoffset = step as f32 * 0.5;
-                    path.fill_opacity = 0.3 + step as f32 * 0.01;
-                }
-            }
-            retained.update(&doc.page, &nodes, &values)?;
-            retained.assert_fresh(&doc.page, &nodes, &values);
-        }
-        retained.update(&doc.page, &nodes, &frame.values)?;
-        retained.assert_fresh(&doc.page, &nodes, &frame.values);
-        Ok(())
-    }
-
-    /// An image or conic stroke is drawn through its coverage, with its picture in a rectangle around it. Its
-    /// width and the paint opacities are fields of the nodes it already has: they are written in place, and the
-    /// canvas is not lowered again.
-    #[test]
-    fn coverage_strokes_follow_their_values_without_an_install() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version": 2, "composition": {"space": "2d"},
-            "nodes": [
-                {"name":"ring", "type":"path", "d":"M32 32H96V96H32Z", "fill":"red",
-                 "stroke":"conic-gradient(red, blue, red)", "stroke-width":8},
-                {"name":"still", "type":"path", "d":"M0 0H10V10H0Z", "fill":"lime"}
-            ]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let nodes: Vec<_> = doc.items.iter().map(|i| &i.node).collect();
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let mut values = frame.values.clone();
-        let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-        for step in 1..8 {
-            let path = values[doc.by_name["ring"]].path.as_mut().unwrap();
-            path.stroke_width = 2. + step as f32;
-            path.fill_opacity = 1. - step as f32 * 0.1;
-            path.stroke_opacity = 0.2 + step as f32 * 0.1;
-            retained.update(&doc.page, &nodes, &values)?;
-            retained.assert_fresh(&doc.page, &nodes, &values);
-        }
-        let counters: serde_json::Value = serde_json::from_str(&retained.profile_counters())?;
-        assert!(counters["scene_installs"] == 0 && counters["row_write_frames"] == 7, "values are written into rows: {counters}");
-        Ok(())
-    }
-
-    #[test]
-    fn indexed_canvas_batches_match_fresh_nested_and_clipped_plans() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"}, "nodes":[
-                {"name":"g","children":[
-                    {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                    {"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"linear-gradient(blue, lime)"}]},
-                {"name":"mask","type":"path","d":"M0 0H80V80H0Z"},
-                {"name":"clipped","type":"path","d":"M0 0H100V100H0Z","fill":"blue","clip-path":"mask"}
-            ]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new("."))?;
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
-        let mut values = frame.values.clone();
-        let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(|_,_,_,_,_,_,_,_| Ok(None));
-        let mut previous_plan = crate::canvas_draw::plan(&mut retained, &doc.page, builder.clone())?;
-        let counter = |r: &crate::canvas_draw::Retained, name: &str| -> u64 {
-            serde_json::from_str::<serde_json::Value>(&r.profile_counters()).unwrap()[name].as_u64().unwrap()
-        };
-        for (edits, content, patches) in [
-            (vec![("g",11.),("a",3.)], false, true),
-            (vec![("a",0.),("g",0.)], false, true),
-            // The fade crosses opaque, so the planner prepares `a` again; `b` follows its recipe.
-            (vec![("a",5.),("g",2.)], true, true),
-            // The generated clip copy is under the translated wrapper, so its
-            // mask changes too. Recorded units update the mask and rebuild its
-            // consumers in place, retaining the rest of the plan.
-            (vec![("clipped",7.)], false, true),
-            (vec![("mask",9.)], false, true),
-        ] {
-            let changes_mask = edits.iter().any(|(name, _)| matches!(*name, "clipped" | "mask"));
-            let before = counter(&retained, "incr_patch_hits");
-            if content {
-                values[doc.by_name["a"]].opacity = 0.5;
-                retained.update(&doc.page, &nodes, &values)?;
-            }
-            // More than one update before planning must preserve the whole batch.
-            for (name, x) in edits {
-                values[doc.by_name[name]].transform.translation[0] = x;
-                retained.update(&doc.page, &nodes, &values)?;
-            }
-            let actual = crate::canvas_draw::plan(&mut retained, &doc.page, builder.clone())?;
-            if changes_mask {
-                assert_ne!(actual.masks, previous_plan.masks, "translated clip geometry must update the mask plan");
-            }
-            assert_eq!(counter(&retained, "incr_patch_hits") - before, u64::from(patches));
-            let mut fresh = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-            let expected = crate::canvas_draw::plan(&mut fresh, &doc.page, builder.clone())?;
-            assert_eq!(format!("{:?}", *actual), format!("{:?}", *expected));
-            previous_plan = actual;
-        }
-        Ok(())
-    }
-
-    /// The oracle for typed placement writes: after every random batch of moves, turns, scales and fades, the
-    /// retained scene equals a freshly written one and the retained plan equals a freshly built one.
-    /// `uniform` names the nodes whose scale stays uniform (a blurred node refuses any other).
-    fn placement_oracle(nodes: serde_json::Value, names: &[&str], leaves: &[&str], uniform: &[&str], group_fades: bool) -> Result<serde_json::Value> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"}, "nodes": nodes}))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let nodes: Vec<_> = doc.items.iter().map(|item| &item.node).collect();
-        let fonts = doc.fonts.clone();
-        let draws: HashMap<_, _> = frame.batches().map(|d| ((d.item, d.sub), d.clone())).collect();
-        let builder: crate::canvas_draw::CanvasTextBuilder = std::rc::Rc::new(move |item, sub, model, z, clip, scale, opacity, _| {
-            let mut placed: Draw = draws.get(&(item, sub)).context("a text batch the frame did not plan")?.clone();
-            placed.model = model;
-            Arc::make_mut(&mut placed.spec).opacity = opacity;
-            fonts.build(&placed, z, clip, scale)
-        });
-        let mut values = frame.values.clone();
-        let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-        crate::canvas_draw::plan(&mut retained, &doc.page, builder.clone())?;
-        let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 40) as f32 / (1u32 << 24) as f32 };
-        for step in 0..400 {
-            let batches = 1 + (next() * 3.) as usize;
-            for _ in 0..batches {
-                let name = names[(next() * names.len() as f32) as usize % names.len()];
-                let leaf = leaves.contains(&name);
-                let value = &mut values[doc.by_name[name]];
-                match (next() * 5.) as u32 {
-                    0 => value.transform.translation[0] = (next() * 200. - 100.).round() / 4.,
-                    1 => value.transform.translation[1] = next() * 60. - 30.,
-                    2 => { let half = next() * std::f32::consts::PI; *value.transform.rotation_mut() = [0., 0., half.sin(), half.cos()]; }
-                    // Within and across tessellation bands, mirrored now and then.
-                    3 => {
-                        let scale = 0.4 + next() * 3.;
-                        let other = [if next() < 0.2 { -scale } else { scale }, 0.4 + next() * 3., 1.];
-                        value.transform.scale = if uniform.contains(&name) { [scale, scale, 1.] } else { other };
-                    }
-                    // A group that fades composites its children (not a placement): now and then only.
-                    _ if leaf => value.opacity = if next() < 0.2 { 1. } else { 0.05 + next() * 0.9 },
-                    _ if group_fades => value.opacity = if next() < 0.15 { 0.5 } else { 1. },
-                    _ => value.transform.translation[0] = next() * 8.,
-                }
-                // More than one update before planning must preserve the whole batch.
-                retained.update(&doc.page, &nodes, &values)?;
-            }
-            retained.assert_fresh(&doc.page, &nodes, &values);
-            let actual = crate::canvas_draw::plan(&mut retained, &doc.page, builder.clone())?;
-            let mut fresh = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-            let expected = crate::canvas_draw::plan(&mut fresh, &doc.page, builder.clone())?;
-            assert_eq!(format!("{:?}", *actual), format!("{:?}", *expected), "step {step}");
-        }
-        Ok(serde_json::from_str(&retained.profile_counters())?)
-    }
-
-    #[test]
-    fn typed_placements_match_fresh_scenes_and_plans_over_random_edits() -> Result<()> {
-        // Plain paths and groups: nearly every frame follows recipes.
-        let plain = placement_oracle(serde_json::json!([
-            {"name":"g","children":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"linear-gradient(blue, lime)"},
-                {"name":"h","children":[
-                    {"name":"c","type":"path","d":"M0 0C10 0 20 10 20 20S0 30 0 20Z","fill":"#336699","opacity":0.5},
-                    {"name":"d","type":"path","d":"M5 5H9V9H5Z","fill":"#102030"}]}]},
-            {"name":"lone","type":"path","d":"M60 60H90V90H60Z","fill":"#ffcc00cc"}
-        ]), &["g", "a", "b", "h", "c", "d", "lone"], &["a", "b", "c", "d", "lone"], &[], false)?;
-        assert!(plain["placement_frames"].as_u64().unwrap() > 400 && plain["row_write_frames"] == 0 && plain["scene_installs"] == 0, "placements are written typed: {plain}");
-        assert!(plain["incr_placement_nodes"].as_u64().unwrap() > 200, "recipes follow placements: {plain}");
-        // Strokes, clips, text and fading groups: recipes where they hold, the planner elsewhere.
-        let mixed = placement_oracle(serde_json::json!([
-            {"name":"g","children":[
-                {"name":"a","type":"path","d":"M0 0H20V20H0Z","fill":"red","stroke":"#00ff0080","stroke-width":2},
-                {"name":"b","type":"path","d":"M30 0H50V20H30Z","fill":"linear-gradient(blue, lime)"},
-                {"name":"h","children":[
-                    {"name":"c","type":"path","d":"M0 0C10 0 20 10 20 20S0 30 0 20Z","fill":"#336699","opacity":0.5}]}]},
-            {"name":"lone","type":"path","d":"M60 60H90V90H60Z","fill":"#ffcc00cc"},
-            {"name":"mask","type":"path","d":"M0 0H80V80H0Z"},
-            {"name":"clipped","type":"path","d":"M0 0H100V100H0Z","fill":"blue","clip-path":"mask"},
-            {"name":"text","type":"text","content":"Move","font-size":20,
-             "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf"}
-        ]), &["g", "a", "b", "h", "c", "lone", "clipped", "mask", "text"], &["a", "b", "c", "lone"], &[], true)?;
-        assert!(mixed["placement_frames"].as_u64().unwrap() > 100, "placements are written typed: {mixed}");
-        assert!(mixed["incr_placement_nodes"].as_u64().unwrap() > 30, "recipes follow placements: {mixed}");
-        // A blurred node and a fading group are units: they are planned whole when they or their content move,
-        // and the plain nodes beside them keep following recipes.
-        let units = placement_oracle(serde_json::json!([
-            {"name":"soft","type":"path","d":"M0 0H30V30H0Z","fill":"#cc3366","filter":"blur(3px)"},
-            {"name":"fade","opacity":0.5,"children":[
-                {"name":"in","type":"path","d":"M40 0H60V20H40Z","fill":"blue"},
-                {"name":"in2","type":"path","d":"M50 10H70V30H50Z","fill":"lime"}]},
-            {"name":"free","type":"path","d":"M60 60H90V90H60Z","fill":"#ffcc00"},
-            {"name":"g","children":[
-                {"name":"m","type":"path","d":"M0 40H20V60H0Z","fill":"red"},
-                {"name":"n","type":"path","d":"M20 40H40V60H20Z","fill":"#102030"}]}
-        ]), &["soft", "fade", "in", "free", "g", "m", "n", "free", "m", "n"], &["free", "m", "n"], &["soft"], false)?;
-        assert!(units["incr_placement_nodes"].as_u64().unwrap() > 20, "plain nodes beside units follow recipes: {units}");
-        Ok(())
-    }
-
-    /// Sparse placement frames through evaluation, the scene write and the plan: unchanged bodies before and
-    /// between moved ones, a parent move, frames the recipes decline (a band change, a colour change), and a
-    /// frame evaluated but never planned (so the next frame's moved-items list has a stale base).
-    #[test]
-    fn sparse_placement_frames_plan_like_fresh_documents() -> Result<()> {
-        let source = serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"},
-            "nodes":[
-                {"name":"still0","type":"path","d":"M0 0H10V10H0Z","fill":"#111111"},
-                {"name":"g","children":[
-                    {"name":"a","type":"path","d":"M20 0H30V10H20Z","fill":"red"},
-                    {"name":"still1","type":"path","d":"M40 0H50V10H40Z","fill":"#222222"},
-                    {"name":"b","type":"path","d":"M60 0C70 0 70 10 60 10Z","fill":"blue"}]},
-                {"name":"still2","type":"path","d":"M80 0H90V10H80Z","fill":"#333333"}],
-            "animation":[{"tracks":[
-                {"path":["nodes","g","translation"],"keys":[[0,[0,0,0]],[1,[0,0,0]],[2,[30,12,0]]]},
-                {"path":["nodes","a","translation"],"keys":[[0,[0,0,0]],[1,[9,3,0]],[3,[9,3,0]]]},
-                {"path":["nodes","b","scale"],"keys":[[0,[1,1,1]],[2,[1,1,1]],[3,[5,5,1]]]},
-                {"path":["nodes","still2","fill"],"keys":[[0,[0.2,0.2,0.2,1]],[1.4,[0.2,0.2,0.2,1]],[1.6,[1,0,0,1]],[3,[1,0,0,1]]]}
-            ]}]
-        }))?;
-        let document = || Document::new(&Scene::from_json(&source).unwrap(), Path::new("."));
-        let kept = document()?;
-        // (time, plan it): an unplanned frame leaves the scene one revision behind the next frame's base.
-        for (time, planned) in [(0., true), (0.2, true), (0.5, true), (0.5, true), (0.9, true), (1.2, true), (1.3, false),
-            (1.35, true), (1.5, true), (1.7, true), (2.2, true), (2.6, true), (2.9, true), (0.4, true), (0.6, true)] {
-            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
-            if !planned { continue; }
-            let plan = kept.plan_snapshot(&frame, &[])?;
-            let fresh = document()?;
-            let fresh_frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
-            let expected = fresh.plan_snapshot(&fresh_frame, &[])?;
-            assert_eq!(format!("{:?}", *plan), format!("{:?}", *expected), "time {time}");
-        }
-        let counters: serde_json::Value = serde_json::from_str(&kept.retained.borrow().as_ref().unwrap().profile_counters())?;
-        assert!(counters["placement_frames"].as_u64().unwrap() >= 6, "moves are written sparsely: {counters}");
-        assert!(counters["incr_placement_nodes"].as_u64().unwrap() >= 4, "recipes follow them: {counters}");
-        Ok(())
-    }
-
-    #[test]
-    fn retained_shadow_offsets_follow_each_transform_occurrence() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version": 2, "composition": {"space": "2d", "viewBox": [0, 0, 200, 100], "preserveAspectRatio": "none"},
-            "render": {"resolution": [400, 300]},
-            "nodes": [
-                {"name":"mask", "type":"path", "d":"M0 0H50V50H0Z", "fill":"white",
-                 "filter":"drop-shadow(3px 5px 2px red) blur(1px)"},
-                {"name":"clip", "type":"path", "d":"M0 0H50V50H0Z"},
-                {"name":"parent", "children":[
-                    {"name":"shape", "type":"path", "d":"M0 0H40V30H0Z", "fill":"red",
-                     "filter":"drop-shadow(8px 4px 0px blue)"},
-                    {"name":"split", "type":"path", "d":"M0 0H40V30H0Z", "fill":"red",
-                     "stroke":"blue", "stroke-width":2, "paint-order":"stroke",
-                     "clip-path":"clip", "mask":"mask", "filter":"drop-shadow(8px 4px 0px lime)"},
-                    {"name":"text", "type":"text", "content":"A", "font-size":24,
-                     "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                     "filter":"drop-shadow(8px 4px 0px lime)"},
-                    {"name":"batched", "type":"text", "font-size":24, "stroke-width":2,
-                     "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf",
-                     "content":[{"content":"A", "stroke":"red"}, {"content":"B", "stroke":"blue"}],
-                     "filter":"drop-shadow(8px 4px 0px lime)"},
-                    {"name":"group", "filter":"drop-shadow(8px 4px 0px blue)", "children":[
-                        {"type":"path", "d":"M0 0H40V30H0Z", "fill":"red"}
-                    ]}
-                ]},
-                {"name":"other", "scale":[3,2,1], "mask":"mask", "children":[
-                    {"type":"path", "d":"M0 0H40V30H0Z", "fill":"blue"}
-                ]}
-            ]
-        }))?)?;
-        let doc = Document::new(&scene, Path::new(env!("CARGO_MANIFEST_DIR")))?;
-        let nodes: Vec<_> = doc.items.iter().map(|i| &i.node).collect();
-        let frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        assert!(frame.values[doc.by_name["batched"]].texts > 1);
-        // Isolate own, ancestor and mask-instance changes; seek back after each edit.
-        for name in ["shape", "split", "text", "batched", "group", "parent", "other", "mask"] {
-            let mut values = frame.values.clone();
-            let mut retained = crate::canvas_draw::Retained::new(&doc.page, &nodes, &values)?;
-            let i = doc.by_name[name];
-            for (scale, angle) in [([2., 3., 1.], 0.), ([2., 3., 1.], 1.2), ([-1., 2., 1.], -0.7)] {
-                values[i].transform.scale = scale;
-                values[i].transform.rotation = Some(glam::Quat::from_rotation_z(angle).to_array());
-                retained.update(&doc.page, &nodes, &values)?;
-                retained.assert_fresh(&doc.page, &nodes, &values);
-            }
-            // Rebuilding the hierarchy must refresh the effect bindings as well.
-            values[i].visible = false;
-            retained.update(&doc.page, &nodes, &values)?;
-            values[i].visible = true;
-            retained.update(&doc.page, &nodes, &values)?;
-            retained.update(&doc.page, &nodes, &frame.values)?;
-            retained.assert_fresh(&doc.page, &nodes, &frame.values);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn text_cache_reuses_placement_and_invalidates_content_and_scale() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
-            "version":2, "composition":{"space":"2d"}, "nodes":[
-                {"name":"shown", "type":"text", "content":"Cache", "font-size":40,
-                 "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf"},
-                {"visible":false, "children":[
-                    {"type":"text", "content":"Hidden", "font-size":40,
-                     "font":"../vork-std/tests/fonts/LiberationSans-Regular.ttf"}
-                ]}
-            ]
-        }))?)?;
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let doc = Document::new(&scene, base)?;
-        let mut frame = doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        let again = doc.snapshot(&vork_time::Request::Numeric(1.))?;
-        assert_eq!(frame.batches().count(), 1);
-        assert!(Arc::ptr_eq(&frame.batches().next().unwrap().spec, &again.batches().next().unwrap().spec));
-        let index = doc.by_name["shown"];
-        let texts = |plan: &moda_engine::seams::CoveragePlan| plan.items.iter().filter_map(|item| {
-            if let moda_engine::seams::DrawItem::Text(batch) = item { Some(batch.clone()) } else { None }
-        }).collect::<Vec<_>>();
-        for step in 0..5 {
-            match step {
-                1 => frame.values[index].transform.translation[0] = 17.,
-                2 => {
-                    Arc::make_mut(&mut frame.draws[index][0].spec).fill_override = Some("red".into());
-                    frame.values[index].text_revision += 1;
-                }
-                3 => frame.values[index].transform.scale[0] = 0.7,
-                4 => frame.values[index].opacity = 0.3,
-                _ => {}
-            }
-            let cached = doc.plan_snapshot(&frame, &[])?;
-            let fresh = Document::new(&scene, base)?.plan_snapshot(&frame, &[])?;
-            assert_eq!(texts(&cached).len(), 1);
-            assert_eq!(texts(&cached), texts(&fresh), "step {step}");
-            let (hits, misses) = doc.retained.borrow().as_ref().unwrap().text_cache_counts();
-            // Placement and node-group opacity reuse glyphs; content and scale rebuild them.
-            assert_eq!(hits, u64::from(step >= 1) + u64::from(step >= 4));
-            assert_eq!(misses, if step == 0 { 1 } else { step.min(3) });
-        }
-        Ok(())
-    }
-
-    /// Full animation oracle and CPU-only planning benchmark, with external qualification scenes.
-    #[test]
-    #[ignore = "requires VORK_CANVAS_CORPUS pointing at the external canvas qualification scenes"]
-    fn retained_canvas_corpus() -> Result<()> {
-        let root = PathBuf::from(std::env::var("VORK_CANVAS_CORPUS")?);
-        let mut ports: Vec<_> = std::fs::read_dir(&root)?.collect::<std::io::Result<Vec<_>>>()?;
-        ports.sort_by_key(|p| p.file_name());
-        for port in ports {
-            let path = port.path().join("port.json");
-            if !path.exists() || port.file_name().to_string_lossy().starts_with("05-") { continue; }
-            let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-            let duration = json["render"]["duration"].as_f64().unwrap_or(1.);
-            let fps = json["render"]["fps"].as_f64().unwrap_or(30.);
-            let scene = Scene::from_json(&serde_json::to_vec(&json)?)?;
-            let doc = Document::new(&scene, &port.path())?;
-            let nodes: Vec<_> = doc.items.iter().map(|i| &i.node).collect();
-            crate::canvas_draw::install_images(&nodes, &[])?;
-            let frames = (duration * fps).round() as usize;
-            let mut elapsed = std::time::Duration::ZERO;
-            for f in (0..frames).chain((0..frames).rev().step_by(17)) {
-                let start = Instant::now();
-                let frame = doc.snapshot(&vork_time::Request::Frame(f as u32, scene.render.fps))?;
-                let _plan = doc.plan_snapshot(&frame, &[])?;
-                elapsed += start.elapsed();
-                let nodes: Vec<_> = doc.items.iter().enumerate().map(|(i,item)|frame.nodes[i].as_deref().unwrap_or(&item.node)).collect();
-                let mut page=doc.page.clone();page.background=frame.background;
-                doc.retained.borrow().as_ref().unwrap().assert_fresh(&page, &nodes, &frame.values);
-            }
-            eprintln!("{}: {:.3} ms/plan ({frames} forward frames plus reverse seeks)", port.file_name().to_string_lossy(), elapsed.as_secs_f64() * 1000. / (frames + frames.div_ceil(17)) as f64);
-        }
-        Ok(())
-    }
-}
+#[path = "canvas_retained_tests.rs"]
+mod retained_tests;
 
 #[cfg(test)]
-mod style_tests {
-    use super::*;
-    use serde_json::json;
-    fn doc(node:serde_json::Value,tracks:serde_json::Value)->Document {
-        let scene=Scene::from_json(&serde_json::to_vec(&json!({"version":2,"composition":{"space":"2d"},"nodes":[node],"animation":[{"tracks":tracks}]})).unwrap()).unwrap();
-        Document::new(&scene,Path::new(".")).unwrap()
-    }
-    fn drawing(doc:&Document,time:f32)->serde_json::Value {
-        let frame=doc.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-        let nodes:Vec<_>=doc.items.iter().enumerate().map(|(i,n)|frame.nodes[i].as_deref().unwrap_or(&n.node)).collect();
-        crate::canvas_draw::document(&doc.page,&nodes,&frame.values).unwrap()
-    }
-    /// A group that collapses to zero scale in the frame its text child loses a keyed glyph: the group is
-    /// evaluated first whatever the track order, so the child's batches are not built against a parent that
-    /// no longer draws. The kept document equals a fresh one.
-    #[test]
-    fn a_collapsing_parent_is_evaluated_before_its_changed_child() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node=json!({"name":"g","children":[{"name":"n","type":"text","content":"AB","font":font}]});
-        let child=[json!({"path":["nodes","n","content"],"keys":[[0,"AB"],[1,"A"]],"interpolation":"STEP"}),
-            json!({"path":["nodes","n","glyphs",1,"opacity"],"keys":[[0,0.25]]})];
-        let parent=json!({"path":["nodes","g","scale"],"keys":[[0,[1,1,1]],[1,[0,0,1]]],"interpolation":"STEP"});
-        for child_first in [true, false] {
-            let tracks=if child_first {json!([child[0],child[1],parent])} else {json!([parent,child[0],child[1]])};
-            let kept=doc(node.clone(),tracks.clone());
-            assert!(kept.snapshot(&vork_time::Request::Numeric(0.)).unwrap().batches().next().is_some(), "child_first={child_first}");
-            let frame=kept.snapshot(&vork_time::Request::Numeric(1.)).expect("a collapsed group's text is not built");
-            let fresh=doc(node.clone(),tracks).snapshot(&vork_time::Request::Numeric(1.)).unwrap();
-            // The kept document's text cache has a revision and a composition from the frame that drew the text;
-            // that identity is not picture content.
-            for (kept, fresh) in frame.values.iter().zip(&fresh.values) {
-                assert!(kept.transform==fresh.transform && kept.opacity==fresh.opacity && kept.visible==fresh.visible
-                    && kept.texts==fresh.texts && kept.path==fresh.path, "child_first={child_first}");
-            }
-            assert_eq!(frame.batches().count(), 0, "child_first={child_first}");
-        }
-    }
-
-    #[test]
-    fn keyed_layout_piece_bounds_use_sampled_text() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        for (unit, content) in [("glyphs", "AB"), ("words", "A B"), ("lines", "A\nB")] {
-            for owned in [false, true] {
-                let node=json!({"name":"n","type":"text","content":"A","font":font,"white-space":"pre-line"});
-                let prefix=if owned {vec![]} else {vec!["nodes", "n"]};
-                let mut content_path=prefix.clone();content_path.push("content");
-                let mut piece_path=prefix;piece_path.extend([unit,"1","opacity"]);
-                let tracks=json!([
-                    {"path":content_path,"keys":[[0,content],[1,"A"]],"interpolation":"STEP"},
-                    {"path":piece_path,"keys":[[0,0.25]]}
-                ]);
-                let animated=if owned {
-                    let mut node=node.clone();node["animation"]=json!([{"tracks":tracks}]);doc(node,json!([]))
-                } else {doc(node.clone(),tracks)};
-                let mut expected=node;expected["content"]=json!(content);
-                let expected=doc(expected,json!([{"path":["nodes","n",unit,1,"opacity"],"keys":[[0,0.25]]}]));
-                for time in [-1.,0.,0.75] {assert_eq!(drawing(&animated,time),drawing(&expected,time), "{unit}, owned={owned}");}
-                let error=animated.snapshot(&vork_time::Request::Numeric(1.)).err().expect("sampled short text must refuse").to_string();
-                assert!(error.contains("index 1 is past the end"), "{error}");
-                let mut restored = drawing(&animated,0.);
-                let mut reference = drawing(&expected,0.);
-                // A seek rebuilds text and advances its cache revision; that identity is not picture content.
-                for picture in [&mut restored, &mut reference] {
-                    for node in picture["nodes"].as_array_mut().unwrap() {
-                        if let Some(binding) = node.get_mut("vorkText") { binding[2] = json!(0); }
-                        if let Some(paint) = node.get_mut("vorkPaint") { *paint = json!(0); }
-                    }
-                }
-                assert_eq!(restored,reference);
-            }
-        }
-    }
-
-    #[test]
-    fn frames_are_classified_by_the_largest_changed_track_kind() {
-        let doc = doc(serde_json::json!({"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":"#ff0000"}), serde_json::json!([
-            {"path":["nodes","p","translation"],"keys":[[0,[0,0,0]],[1,[10,0,0]],[2,[10,0,0]],[3,[10,0,0]],[4,[10,0,0]]]},
-            {"path":["nodes","p","opacity"],"keys":[[0,[1]],[1,[1]],[2,[0.5]],[3,[0.5]],[4,[0.5]]]},
-            {"path":["nodes","p","fill"],"keys":[[0,[1,0,0,1]],[2,[1,0,0,1]],[3,[0,0,1,1]],[4,[0,0,1,1]]]},
-            {"path":["nodes","p","stroke-width"],"keys":[[0,[0]],[3,[0]],[4,[2]]]}
-        ]));
-        assert_eq!(doc.kinds, [ChangeKind::Placement, ChangeKind::Placement, ChangeKind::PaintValue, ChangeKind::Content].map(Some));
-        // First frame, a move, a hold, a fade, a colour change, a stroke change.
-        for time in [0., 0.5, 0.5, 1.5, 2.5, 3.5] { doc.snapshot(&vork_time::Request::Numeric(time)).unwrap(); }
-        assert_eq!(doc.change_counters(), serde_json::json!({"unchanged":1,"placement":2,"paint_value":1,"content":1,"structure":1}));
-    }
-
-    /// A frame that only moves nodes is evaluated for those nodes alone; it equals a full evaluation.
-    #[test]
-    fn placement_frames_match_full_evaluation() {
-        let node = json!({"name":"g","children":[
-            {"name":"a","type":"path","d":"M0 0H10V10H0Z","fill":"red"},
-            {"name":"b","type":"path","d":"M0 0H10V10H0Z","fill":"blue"},
-            {"name":"still","type":"path","d":"M0 0H10V10H0Z","fill":"lime"}]});
-        let tracks = json!([
-            {"path":["nodes","g","translation"],"keys":[[0,[0,0,0]],[2,[40,10,0]]]},
-            {"path":["nodes","a","scale"],"keys":[[0,[1,1,1]],[1,[2,0.5,1]],[2,[1,1,1]]]},
-            {"path":["nodes","b","opacity"],"keys":[[0,[1]],[2,[0.2]]]},
-            {"path":["nodes","b","translation"],"keys":[[0,[0,0,0]],[1,[5,5,0]],[2,[5,5,0]]]}]);
-        let kept = doc(node.clone(), tracks.clone());
-        let mut placed = 0;
-        for step in [0, 3, 7, 8, 8, 12, 20, 15, 1] {
-            let time = step as f32 / 10.;
-            let before = kept.change_counters()["placement"].as_u64().unwrap();
-            let frame = kept.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            // A placement frame evaluates the items its changed tracks name.
-            if kept.change_counters()["placement"].as_u64().unwrap() > before {
-                let (items, _) = kept.changed_items(&kept.samples.borrow());
-                placed += 1;
-                assert!(!items.iter().any(|(item, _)| *item == kept.by_name["still"]), "a node no track moves is not visited");
-            }
-            let fresh = doc(node.clone(), tracks.clone()).snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            assert!(frame.values == fresh.values, "time {time}");
-        }
-        assert!(placed >= 6, "moves are evaluated sparsely: {placed}");
-    }
-
-    /// A text node whose fill or stroke alone changes keeps its text and takes new paints: the kept document's
-    /// node, values and batches equal a fresh document's at every time, flat colours and a gradient alike, and
-    /// its layout and unit tables are the ones it had (it is not built again).
-    #[test]
-    fn a_text_fill_change_repaints_the_kept_text() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node=json!({"name":"n","type":"text","content":[{"content":"A"},{"content":"B","fill":"lime"}],"font":font,"fill":"red","stroke":"black","stroke-width":1});
-        let tracks=json!([
-            {"path":["nodes","n","fill"],"keys":[[0,"red"],[1,"blue"],[2,"linear-gradient(red, blue)"],[3,"none"]],"interpolation":"STEP"},
-            {"path":["nodes","n","stroke"],"keys":[[0,"black"],[1.5,"white"]],"interpolation":"STEP"}]);
-        let kept=doc(node.clone(),tracks.clone());
-        let mut layout=None;
-        for time in [0.,0.5,1.,1.5,2.,3.,1.,0.] {
-            let frame=kept.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            let fresh_doc=doc(node.clone(),tracks.clone());
-            let fresh=fresh_doc.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            let specs=|frame:&Snapshot| frame.batches().map(|draw| (draw.sub, draw.spec.run_colors.clone(), draw.spec.fill_override.clone(), draw.spec.stroke_color.clone(), draw.spec.html.clone())).collect::<Vec<_>>();
-            assert!(specs(&frame)==specs(&fresh), "time {time}");
-            assert!(frame.values[0].text_composition==fresh.values[0].text_composition && frame.values[0].texts==fresh.values[0].texts, "time {time}");
-            let (kept_text,fresh_text)=(kept.styles.borrow(),fresh_doc.styles.borrow());
-            if let (Some(a),Some(b))=(kept_text[0].as_ref().and_then(|s|s.text.as_ref()),fresh_text[0].as_ref().and_then(|s|s.text.as_ref())) {
-                assert!(a.fill==b.fill && a.stroke==b.stroke && a.spec.run_colors==b.spec.run_colors, "time {time}");
-                // One layout through every repaint, and the same unit tables: a text built again would have its own.
-                let first=layout.get_or_insert_with(||(a.layout.clone(),a.units.clone()));
-                assert!(Arc::ptr_eq(&first.0,&a.layout) && Arc::ptr_eq(&first.1,&a.units), "time {time}");
-            }
-        }
-    }
-
-    #[test]
-    fn text_paint_revisions_keep_geometry_and_match_fresh_plans() -> Result<()> {
-        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node = json!({"name":"n","type":"text","content":"Paint","font":font,"font-size":32,"fill":"red",
-            "stroke":"blue","stroke-width":2});
-        let tracks = json!([
-            {"path":["nodes","n","fill"],"keys":[[0,"red"],[1,"green"],[2,"blue"]]},
-            {"path":["nodes","n","stroke"],"keys":[[0,"blue"],[1,"red"],[2,"lime"]]}]);
-        let kept = doc(node.clone(), tracks.clone());
-        let mut content = None;
-        let mut last_paint = 0;
-        for time in [0., 0.25, 0.75, 1.5, 0.25] {
-            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
-            let revision = frame.values[0].text_revision;
-            assert_eq!(*content.get_or_insert(revision), revision);
-            assert!(frame.values[0].text_paint_revision > last_paint);
-            last_paint = frame.values[0].text_paint_revision;
-            let actual = kept.plan_snapshot(&frame, &[])?;
-            let fresh = doc(node.clone(), tracks.clone());
-            let fresh_frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
-            let expected = fresh.plan_snapshot(&fresh_frame, &[])?;
-            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items), "time {time}");
-            if time != 0. {
-                assert!(actual.items.iter().any(|item| matches!(item, moda_engine::seams::DrawItem::Text(b) if b.content_key.is_none())), "paint patches bypass content preparation");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn text_paint_and_path_placement_share_the_incremental_writer() -> Result<()> {
-        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node = json!({"name":"group","children":[
-            {"name":"n","type":"text","content":"Paint","font":font,"font-size":32,"fill":"red"},
-            {"name":"p","type":"path","d":"M0 50H20V70H0Z","fill":"blue"}]});
-        let tracks = json!([
-            {"path":["nodes","n","fill"],"keys":[[0,"red"],[1,"green"]]},
-            {"path":["nodes","p","translation"],"keys":[[0,[0,0,0]],[1,[20,0,0]]]}]);
-        let kept = doc(node.clone(), tracks.clone());
-        let mut geometry: Option<moda_text::vector::VectorNodeOps> = None;
-        for time in [0., 0.25, 0.75, 0.25] {
-            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
-            let actual = kept.plan_snapshot(&frame, &[])?;
-            let fresh = doc(node.clone(), tracks.clone());
-            let frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
-            let expected = fresh.plan_snapshot(&frame, &[])?;
-            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items));
-            let batch = actual.items.iter().find_map(|item| match item {
-                moda_engine::seams::DrawItem::Text(b) => Some(b), _ => None,
-            }).unwrap();
-            let vector = batch.vector.as_ref().unwrap();
-            if let Some(old) = &geometry {
-                assert!(batch.content_key.is_none(), "mixed writes must repaint text");
-                assert!(Arc::ptr_eq(&old.curve_points, &vector.curve_points));
-                for (a,b) in old.ops.iter().zip(&vector.ops) {
-                    assert!(Arc::ptr_eq(&a.records, &b.records));
-                    assert!(Arc::ptr_eq(&a.tris, &b.tris));
-                }
-            }
-            geometry = Some(vector.clone());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn glyph_fill_repaints_kept_batches_when_coverage_is_unchanged() -> Result<()> {
-        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node = json!({"name":"n","type":"text","content":"AB","font":font,"font-size":32,"fill":"red"});
-        let tracks = json!([{ "path":["nodes","n","glyphs",0,"fill"],"keys":[[0,"blue"],[1,"green"]]}]);
-        let kept = doc(node.clone(), tracks.clone());
-        let mut content = None;
-        let mut geometry: Vec<moda_text::vector::VectorNodeOps> = Vec::new();
-        for time in [0., 0.25, 0.75, 0.25] {
-            let frame = kept.snapshot(&vork_time::Request::Numeric(time))?;
-            assert_eq!(*content.get_or_insert(frame.values[0].text_revision), frame.values[0].text_revision);
-            let actual = kept.plan_snapshot(&frame, &[])?;
-            let fresh = doc(node.clone(), tracks.clone());
-            let frame = fresh.snapshot(&vork_time::Request::Numeric(time))?;
-            let expected = fresh.plan_snapshot(&frame, &[])?;
-            assert_eq!(format!("{:?}", actual.items), format!("{:?}", expected.items));
-            let batches: Vec<_> = actual.items.iter().filter_map(|item| match item {
-                moda_engine::seams::DrawItem::Text(b) => Some(b), _ => None,
-            }).collect();
-            if !geometry.is_empty() {
-                for (old, batch) in geometry.iter().zip(&batches) {
-                    assert!(batch.content_key.is_none());
-                    for (a,b) in old.ops.iter().zip(&batch.vector.as_ref().unwrap().ops) {
-                        assert!(Arc::ptr_eq(&a.records, &b.records));
-                    }
-                }
-            }
-            geometry = batches.iter().map(|b| b.vector.as_ref().unwrap().clone()).collect();
-        }
-        Ok(())
-    }
-
-    /// A snapshot planned by another document is that snapshot's state, not the other document's own latest, even
-    /// when both have taken as many snapshots.
-    #[test]
-    fn a_snapshot_is_planned_as_its_own_state_by_any_document() {
-        let node = json!({"name":"n","type":"path","d":"M0 0H10V10H0Z","fill":"red"});
-        let tracks = json!([{"path":["nodes","n","translation"],"keys":[[0,[0,0,0]],[1,[20,0,0]]]}]);
-        let (a, b) = (doc(node.clone(), tracks.clone()), doc(node, tracks));
-        let early = a.snapshot(&vork_time::Request::Numeric(0.)).unwrap();
-        let late = b.snapshot(&vork_time::Request::Numeric(1.)).unwrap();
-        assert_ne!(early.values[0].transform.translation[0], late.values[0].transform.translation[0]);
-        // `b` plans `a`'s snapshot: its scene holds the early state, as a fresh document's would.
-        b.plan_snapshot(&early, &[]).unwrap();
-        let nodes: Vec<_> = b.items.iter().map(|item| &item.node).collect();
-        b.retained.borrow().as_ref().unwrap().assert_fresh(&b.page, &nodes, &early.values);
-    }
-
-    /// A world's picture is given by a plan and kept in the evaluated table: a frame that then moves another
-    /// item evaluates in place, keeps the picture, and passes the check against a whole evaluation.
-    #[test]
-    fn a_worlds_picture_stays_in_the_table_across_frames() -> Result<()> {
-        let scene = Scene::from_json(&serde_json::to_vec(&json!({"version": 2, "composition": {"space": "2d"}, "render": {"resolution": [32, 32]},
-            "buffers": {"p": {"type": "vec3", "data": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]}},
-            "geometry": {"g": {"attributes": {"POSITION": "p"}}},
-            "nodes": [
-                {"name": "shot", "composition": {"space": "3d"}, "children": [
-                    {"type": "camera", "name": "cam", "translation": [0, 0, 5]}, {"type": "mesh", "name": "tri", "geometry": "g"}]},
-                {"name": "box", "type": "path", "d": "M0 0H8V8H0Z", "fill": "red"}],
-            "animation": [{"tracks": [{"path": ["nodes", "box", "translation"], "keys": [[0, [0, 0, 0]], [1, [10, 0, 0]]]}]}]}))?)?;
-        let doc = Document::new(&scene, Path::new("."))?;
-        let world = doc.worlds[0].item;
-        doc.snapshot(&vork_time::Request::Numeric(0.))?;
-        // What a plan does with the world's picture.
-        let picture = Some(("picture".to_string(), [32, 32]));
-        doc.evaluated.borrow_mut().as_mut().unwrap().state.values[world].world = picture.clone();
-        let moved = doc.snapshot(&vork_time::Request::Numeric(0.5))?;
-        assert_eq!(doc.change_counters()["placement"], json!(1), "the box alone moves");
-        assert!(moved.values[world].world == picture, "the table keeps the picture");
-        assert_eq!(moved.values[doc.by_name["box"]].transform.translation[0], 5.);
-        Ok(())
-    }
-
-    #[test]
-    fn solid_colour_tracks_are_paint_values_however_they_are_spelled() {
-        let kinds = |fill: &str, keys: serde_json::Value| doc(serde_json::json!({"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":fill}),
-            serde_json::json!([{"path":["nodes","p","fill"],"keys":keys}])).kinds.clone();
-        assert_eq!(kinds("red", serde_json::json!([[0,[1,0,0,1]],[1,[0,0,1,1]]])), [Some(ChangeKind::PaintValue)]);
-        assert_eq!(kinds("red", serde_json::json!([[0,"red"],[1,"blue"]])), [Some(ChangeKind::PaintValue)]);
-        // A key that is not a colour, or a rest paint that is not one, changes the paint's kind.
-        assert_eq!(kinds("red", serde_json::json!([[0,"red"],[1,"linear-gradient(red, blue)"]])), [Some(ChangeKind::Content)]);
-        assert_eq!(kinds("linear-gradient(red, blue)", serde_json::json!([[0,"red"],[1,"blue"]])), [Some(ChangeKind::Content)]);
-        assert_eq!(kinds("none", serde_json::json!([[0,"red"],[1,"blue"]])), [Some(ChangeKind::Content)]);
-    }
-
-    #[test]
-    fn gradients_of_one_form_are_paint_values() {
-        let doc = |fill: &str, tracks: serde_json::Value| doc(serde_json::json!({"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":fill}), tracks);
-        let fill = |keys: serde_json::Value, step: bool| if step { serde_json::json!([{"path":["nodes","p","fill"],"keys":keys,"interpolation":"STEP"}]) }
-            else { serde_json::json!([{"path":["nodes","p","fill"],"keys":keys}]) };
-        let gradient = "linear-gradient(red, blue)";
-        // A stop's colour and the gradient's angle change; type, interpolation and stop count do not.
-        let stops = doc(gradient, fill(serde_json::json!([[0,gradient],[1,"linear-gradient(green, blue)"]]), false));
-        assert_eq!(stops.kinds, [Some(ChangeKind::PaintValue)]);
-        for time in [0., 0.25, 0.5] { stops.snapshot(&vork_time::Request::Numeric(time)).unwrap(); }
-        assert_eq!(stops.change_counters(), serde_json::json!({"unchanged":0,"placement":0,"paint_value":2,"content":0,"structure":1}));
-        assert_eq!(doc(gradient, fill(serde_json::json!([[0,gradient],[1,"linear-gradient(90deg, red, blue)"]]), false)).kinds, [Some(ChangeKind::PaintValue)]);
-        // Another type, another stop count, or a colour at rest: the paint's form changes.
-        assert_eq!(doc(gradient, fill(serde_json::json!([[0,gradient],[1,"radial-gradient(red, blue)"]]), true)).kinds, [Some(ChangeKind::Content)]);
-        assert_eq!(doc(gradient, fill(serde_json::json!([[0,gradient],[1,"linear-gradient(red, green, blue)"]]), true)).kinds, [Some(ChangeKind::Content)]);
-        assert_eq!(doc("red", fill(serde_json::json!([[0,gradient],[1,"linear-gradient(green, blue)"]]), false)).kinds, [Some(ChangeKind::Content)]);
-        // Opacity scales the paint that is there, whatever its form.
-        let opacity = serde_json::json!([{"path":["nodes","p","fill-opacity"],"keys":[[0,[1]],[1,[0]]]}]);
-        assert_eq!(doc(gradient, opacity.clone()).kinds, [Some(ChangeKind::PaintValue)]);
-        assert_eq!(doc("red", opacity).kinds, [Some(ChangeKind::PaintValue)]);
-    }
-
-    #[test]
-    fn a_paint_another_layer_can_change_the_form_of_is_content_on_every_track() {
-        let scene = Scene::from_json(&serde_json::to_vec(&json!({"version":2,"composition":{"space":"2d"},
-            "nodes":[{"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":"red"}],
-            "animation":[
-                {"tracks":[{"path":["nodes","p","fill"],"keys":[[0,"red"],[1,"blue"]]}]},
-                {"tracks":[{"path":["nodes","p","fill"],"keys":[[0,"red"],[1,"linear-gradient(red, blue)"]],"interpolation":"STEP"}]}]})).unwrap()).unwrap();
-        assert_eq!(Document::new(&scene, Path::new(".")).unwrap().kinds, [Some(ChangeKind::Content); 2]);
-    }
-
-    #[test]
-    fn layer_weight_tracks_keep_the_kind_of_what_they_drive() {
-        let scene = |driven: serde_json::Value| {
-            let scene = Scene::from_json(&serde_json::to_vec(&json!({"version":2,"composition":{"space":"2d"},
-                "nodes":[{"name":"p","type":"path","d":"M0 0H10V10H0Z","fill":"red"}],
-                "animation":[
-                    {"tracks":[{"path":["animation","driven","weight"],"keys":[[0,[0]],[1,[1]]]}]},
-                    {"name":"driven","tracks":[driven]}]})).unwrap()).unwrap();
-            Document::new(&scene, Path::new(".")).unwrap()
-        };
-        let moved = scene(json!({"path":["nodes","p","translation"],"keys":[[0,[10,0,0]],[1,[10,0,0]]]}));
-        assert_eq!(moved.kinds, [None, Some(ChangeKind::Placement)]);
-        for time in [0.25, 0.5, 0.75] { moved.snapshot(&vork_time::Request::Numeric(time)).unwrap(); }
-        assert_eq!(moved.change_counters(), json!({"unchanged":0,"placement":2,"paint_value":0,"content":0,"structure":1}));
-        let widened = scene(json!({"path":["nodes","p","stroke-width"],"keys":[[0,[4]],[1,[4]]]}));
-        for time in [0.25, 0.5, 0.75] { widened.snapshot(&vork_time::Request::Numeric(time)).unwrap(); }
-        assert_eq!(widened.change_counters(), json!({"unchanged":0,"placement":0,"paint_value":0,"content":2,"structure":1}));
-    }
-
-    #[test]
-    fn shared_inputs_keep_independent_frame_histories_across_threads() -> Result<()> {
-        fn picture(document: &Document, time: f32) -> (serde_json::Value, Vec<(Arc<moda_text::ops::TextNodeSpec>, [f32; 16])>) {
-            let frame = document.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            let nodes: Vec<_> = document.items.iter().enumerate().map(|(i, n)| frame.nodes[i].as_deref().unwrap_or(&n.node)).collect();
-            let mut picture = crate::canvas_draw::document(&document.page, &nodes, &frame.values).unwrap();
-            // Each retained history has its own cache revision. Compare picture
-            // content and the bound text specs, not those history-local stamps.
-            for node in picture["nodes"].as_array_mut().unwrap() {
-                if let Some(binding) = node.get_mut("vorkText") { binding[2] = json!(0); }
-                if let Some(paint) = node.get_mut("vorkPaint") { *paint = json!(0); }
-            }
-            (picture, frame.batches().map(|draw| (draw.spec.clone(), draw.model)).collect())
-        }
-        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let scene = Scene::from_json(&serde_json::to_vec(&json!({
-            "version":2,"composition":{"space":"2d"},
-            "nodes":[{"name":"g","active":[0,3],"children":[
-                {"name":"p","type":"path","d":"M0 0H20V20H0Z","fill":"red"},
-                {"name":"t","type":"text","content":"AB","font":font}
-            ]}],
-            "animation":[{"tracks":[
-                {"path":["nodes","p","translation"],"keys":[[0,[0,0,0]],[2,[25,15,0]]]},
-                {"path":["nodes","t","content"],"keys":[[0,"AB"],[1,"CD"]],"interpolation":"STEP"},
-                {"path":["nodes","g","opacity"],"keys":[[0,1],[2,0.4]]}
-            ]}]
-        }))?)?;
-        let original = Document::new(&scene, Path::new("."))?;
-        let expected: Vec<_> = (0..32).map(|frame| {
-            picture(&Document::new(&scene, Path::new(".")).unwrap(), frame as f32 / 8.)
-        }).collect();
-        for count in [1, 2, 4, 8] {
-            std::thread::scope(|scope| {
-                let mut joins = Vec::new();
-                for lane in 0..count {
-                    let prepared = original.prepared.clone();
-                    let scene = &scene;
-                    let expected = &expected;
-                    joins.push(scope.spawn(move || -> Result<()> {
-                        let worker = Document::from_prepared(prepared, crate::canvas_draw::Media::new(scene, Path::new("."))?);
-                        for frame in (lane..32).step_by(count).chain((lane..32).step_by(count).rev()) {
-                            assert_eq!(picture(&worker, frame as f32 / 8.), expected[frame], "workers {count}, frame {frame}");
-                            worker.plan(&[])?;
-                        }
-                        let held_before = worker.changes.get()[0];
-                        worker.frame(&vork_time::Request::Numeric(lane as f32 / 8.))?;
-                        assert_eq!(worker.changes.get()[0], held_before + 1, "unchanged samples retain their history");
-                        Ok(())
-                    }));
-                }
-                for join in joins { join.join().unwrap().unwrap(); }
-            });
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn sampled_state_reuses_holds_and_matches_fresh_reverse_seeks() {
-        let node=json!({"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red"});
-        let tracks=json!([
-            {"path":["nodes","n","translation"],"keys":[[0,[0,0,0]],[1,[20,0,0]]],"interpolation":"STEP"},
-            {"path":["nodes","n","opacity"],"keys":[[0,1],[1,0.4]],"interpolation":"STEP"}
-        ]);
-        let retained=doc(node.clone(),tracks.clone());
-        let first=retained.snapshot(&vork_time::Request::Numeric(0.)).unwrap();
-        let held=retained.snapshot(&vork_time::Request::Numeric(0.5)).unwrap();
-        assert!(first.values == held.values);
-        assert_eq!(retained.change_counters()["unchanged"], json!(1), "a held frame evaluates nothing");
-        for time in [0.75,1.,2.,0.25,1.,0.] {
-            let fresh=doc(node.clone(),tracks.clone());
-            assert_eq!(drawing(&retained,time),drawing(&fresh,time),"time {time}");
-        }
-        // A consumer's edited test frame cannot change another snapshot or
-        // trick the retained planner's state identity check.
-        let mut edited=retained.snapshot(&vork_time::Request::Numeric(0.)).unwrap();
-        edited.values[0].transform.translation[0]=17.;
-        assert_eq!(first.values[0].transform.translation[0],0.);
-    }
-
-    #[test]
-    fn sampled_state_tracks_clock_presence_and_recovers_after_errors() {
-        let node=json!({"name":"parent","active":[1,3],"children":[
-            {"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red"}]});
-        let retained=doc(node.clone(),json!([]));
-        for time in [0.,0.5,1.,2.,3.,2.,0.] {
-            assert_eq!(drawing(&retained,time),drawing(&doc(node.clone(),json!([])),time));
-        }
-        let a=retained.snapshot(&vork_time::Request::Numeric(1.)).unwrap();
-        let b=retained.snapshot(&vork_time::Request::Numeric(2.)).unwrap();
-        assert!(a.values == b.values,"local time alone does not change node values");
-
-        let retained=doc(json!({"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red"}),json!([
-            {"path":["nodes","n","translation"],"keys":[[0,[0,0,0]],[1,[0,0,10]]],"interpolation":"STEP"}
-        ]));
-        let good=retained.snapshot(&vork_time::Request::Numeric(0.)).unwrap();
-        assert!(retained.snapshot(&vork_time::Request::Numeric(1.)).is_err());
-        let recovered=retained.snapshot(&vork_time::Request::Numeric(0.)).unwrap();
-        assert_eq!(good.values[0].transform,recovered.values[0].transform);
-        assert_eq!(retained.change_counters()["structure"], json!(2), "a failed evaluation discards the table: the next frame evaluates every item");
-    }
-
-    #[test]
-    fn keyed_whitespace_and_width_defer_static_piece_bounds() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        for (field, rest, sampled, unit, index) in [
-            ("white-space",json!("pre-line"),json!("normal"),"glyphs",2),
-            ("width",json!(1000),json!(20),"lines",1),
-        ] {
-            let mut node=json!({"name":"n","type":"text","content":"A\nB","font":font});node[field]=rest;
-            let animated=doc(node.clone(),json!([
-                {"path":["nodes","n",field],"keys":[[0,sampled]]},
-                {"path":["nodes","n",unit,index,"opacity"],"keys":[[0,0.5]]}
-            ]));
-            node[field]=sampled;
-            let expected=doc(node,json!([{"path":["nodes","n",unit,index,"opacity"],"keys":[[0,0.5]]}]));
-            assert_eq!(drawing(&animated,0.),drawing(&expected,0.),"{field}");
-        }
-    }
-
-    #[test]
-    fn css_background_defaults_to_continuous_interpolation() {
-        let scene=Scene::from_json(br##"{"version":2,"composition":{"space":"2d"},"render":{"background":"red"},"nodes":[],"animation":[{"tracks":[{"path":["render","background"],"keys":[[0,"red"],[2,"blue"]]}]}]}"##).unwrap();
-        let doc=Document::new(&scene,Path::new(".")).unwrap();
-        assert_eq!(doc.snapshot(&vork_time::Request::Numeric(1.)).unwrap().background,Some([0.5,0.,0.5,1.]));
-    }
-
-    #[test]
-    fn animated_path_filter_and_paint_match_an_authored_midpoint() {
-        let node=json!({"name":"n","type":"path","d":"M0 0H10V10H0Z","fill":"red","stroke":"white","stroke-width":2});
-        let animated=doc(node.clone(),json!([
-            {"path":["nodes","n","d"],"keys":[[0,"M0 0H10V10H0Z"],[2,"M0 0H30V50H0Z"]]},
-            {"path":["nodes","n","filter"],"keys":[[0,"none"],[2,"blur(8px)"]]},
-            {"path":["nodes","n","fill"],"keys":[[0,"red"],[2,"blue"]]},
-            {"path":["nodes","n","stroke-width"],"keys":[[0,2],[2,6]]}
-        ]));
-        let mut midpoint=node;midpoint["d"]=json!("M0 0H20V30H0Z");midpoint["filter"]=json!("blur(4px)");midpoint["fill"]=json!("rgb(127.5 0 127.5)");midpoint["stroke-width"]=json!(4);
-        assert_eq!(drawing(&animated,1.),drawing(&doc(midpoint,json!([])),1.));
-        for time in [0.,0.5,1.,1.,2.,0.] {
-            let frame=animated.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            let nodes:Vec<_>=animated.items.iter().enumerate().map(|(i,n)|frame.nodes[i].as_deref().unwrap_or(&n.node)).collect();
-            let mut retained=animated.retained.borrow_mut();
-            match retained.as_mut(){Some(r)=>r.update(&animated.page,&nodes,&frame.values).unwrap(),None=>*retained=Some(crate::canvas_draw::Retained::new(&animated.page,&nodes,&frame.values).unwrap())};
-            retained.as_ref().unwrap().assert_fresh(&animated.page,&nodes,&frame.values);
-        }
-    }
-    #[test]
-    fn keyed_clip_geometry_updates_every_reference() {
-        let animated=doc(json!({"name":"root","children":[
-            {"name":"clip","type":"path","d":"M0 0H10V10H0Z"},
-            {"name":"a","type":"path","d":"M0 0H40V40H0Z","fill":"red","clip-path":"clip"},
-            {"name":"b","type":"path","d":"M0 0H40V40H0Z","fill":"blue","clip-path":"clip","translation":[50,0,0]}
-        ]}),json!([{"path":["nodes","clip","d"],"keys":[[0,"M0 0H10V10H0Z"],[2,"M0 0H30V30H0Z"]]}]));
-        for time in [0.,0.5,1.,2.,0.] {
-            let frame=animated.snapshot(&vork_time::Request::Numeric(time)).unwrap();
-            let nodes:Vec<_>=animated.items.iter().enumerate().map(|(i,n)|frame.nodes[i].as_deref().unwrap_or(&n.node)).collect();
-            let mut retained=animated.retained.borrow_mut();
-            match retained.as_mut(){Some(r)=>r.update(&animated.page,&nodes,&frame.values).unwrap(),None=>*retained=Some(crate::canvas_draw::Retained::new(&animated.page,&nodes,&frame.values).unwrap())};
-            retained.as_ref().unwrap().assert_fresh(&animated.page,&nodes,&frame.values);
-        }
-    }
-
-    #[test]
-    fn disabled_filter_layer_restores_authored_filter() {
-        let scene=Scene::from_json(&serde_json::to_vec(&json!({"version":2,"composition":{"space":"2d"},"nodes":[{"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red"}],"animation":[
-            {"tracks":[{"path":["animation","effect","weight"],"keys":[[0,1],[1,0]]},{"path":["nodes","n","fill-rule"],"keys":[[0,"evenodd"]]}]},
-            {"name":"effect","tracks":[{"path":["nodes","n","filter"],"keys":[[0,"blur(4px)"]]}]}
-        ]})).unwrap()).unwrap();
-        let animated=Document::new(&scene,Path::new(".")).unwrap();
-        let rest=doc(json!({"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red","fill-rule":"evenodd"}),json!([]));
-        let _=drawing(&animated,0.);
-        assert_eq!(drawing(&animated,1.),drawing(&rest,1.));
-    }
-    #[test]
-    fn text_settings_start_from_typed_defaults() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node=json!({"name":"n","type":"text","content":"Keys","font":font});
-        let animated=doc(node.clone(),json!([
-            {"path":["nodes","n","font-variation-settings"],"keys":[[0,"normal"],[2,"normal"]]},
-            {"path":["nodes","n","font-feature-settings"],"keys":[[0,"normal"],[2,"normal"]]}
-        ]));
-        assert_eq!(drawing(&animated,1.),drawing(&doc(node,json!([])),1.));
-    }
-    #[test]
-    fn text_node_and_glyph_gradients_use_interpolated_stops() {
-        let font=Path::new(env!("CARGO_MANIFEST_DIR")).join("../vork-std/tests/fonts/LiberationSans-Regular.ttf");
-        let node=json!({"name":"n","type":"text","content":"A","font":font,"fill":"linear-gradient(red, blue)"});
-        let keys=json!([[0,"linear-gradient(red, blue)"],[2,"linear-gradient(blue, red)"]]);
-        let animated=doc(node.clone(),json!([{"path":["nodes","n","fill"],"keys":keys}]));
-        let _=animated.snapshot(&vork_time::Request::Numeric(1.)).unwrap();
-        let styles=animated.styles.borrow();
-        let text=styles[0].as_ref().unwrap().text.as_ref().unwrap();
-        let expected=crate::canvas_draw::gradient_paint("linear-gradient(rgb(127.5 0 127.5), rgb(127.5 0 127.5))",[0.,0.,text.size[0],text.size[1]]).unwrap();
-        assert_eq!(text.fill[0],PaintSource::Moda(expected.clone()));
-        let glyph=doc(node,json!([
-            {"path":["nodes","n","glyphs",0,"fill"],"keys":[[0,"linear-gradient(red 0px, blue 10px)"],[2,"linear-gradient(blue 0px, red 30px)"]]},
-            {"path":["nodes","n","font-size"],"keys":[[0,16],[2,32]]}
-        ]));
-        let frame=glyph.snapshot(&vork_time::Request::Numeric(1.)).unwrap();
-        fn paints(parts:&[crate::canvas_draw::TextPart])->Vec<moda_scene::value::Value> {
-            parts.iter().flat_map(|part|match part {
-                crate::canvas_draw::TextPart::Paint{paint,..}=>vec![paint.clone()],
-                crate::canvas_draw::TextPart::Group{children,..}=>paints(children),
-                _=>Vec::new(),
-            }).collect()
-        }
-        let styles=glyph.styles.borrow();let text=styles[0].as_ref().unwrap().text.as_ref().unwrap();
-        let expected=crate::canvas_draw::gradient_paint("linear-gradient(rgb(127.5 0 127.5) 0px, rgb(127.5 0 127.5) 20px)",[0.,0.,text.size[0],text.size[1]]).unwrap();
-        let mut actual=paints(&frame.values[0].text_composition);
-        assert!((actual[0]["stops"][1]["offset"].as_f64().unwrap()-expected["stops"][1]["offset"].as_f64().unwrap()).abs()<1e-12);
-        actual[0]["stops"][1]["offset"]=expected["stops"][1]["offset"].clone();
-        assert_eq!(actual,vec![expected]);
-    }
-    #[test]
-    fn gradients_interpolate_stops_and_node_clocks_drive_styles() {
-        let node=json!({"name":"n","type":"path","time":{"speed":2},"d":"M0 0H100V100H0Z","fill":"linear-gradient(red, blue)",
-            "animation":[{"tracks":[{"path":["fill"],"keys":[[0,"linear-gradient(red, blue)"],[2,"linear-gradient(blue, red)"]]}]}]});
-        let animated=doc(node,json!([]));
-        let static_doc=doc(json!({"name":"n","type":"path","d":"M0 0H100V100H0Z","fill":"linear-gradient(rgb(127.5 0 127.5), rgb(127.5 0 127.5))"}),json!([]));
-        assert_eq!(drawing(&animated,0.5),drawing(&static_doc,0.5));
-    }
-}
+#[path = "canvas_style_tests.rs"]
+mod style_tests;
 
 #[cfg(test)]
-mod nesting_tests {
-    use super::*;
-    /// A canvas nested to the stated depth is read, built, evaluated and hashed on a scene thread, as the command
-    /// thread and the hashing worker do it.
-    #[test]
-    fn a_canvas_nested_to_the_stated_depth_builds_and_hashes() {
-        let groups = vork_scene::MAX_NODE_DEPTH;
-        let mut text = String::from(r#"{"version":2,"composition":{"space":"2d"},"render":{"resolution":[64,64]},"nodes":["#);
-        for depth in 0..groups { text.push_str(&format!(r#"{{"name":"g{depth}","children":["#)); }
-        text.push_str(r##"{"type":"path","name":"leaf","d":"M0 0H16V16H0Z","fill":"#38bdf8"}"##);
-        for _ in 0..groups { text.push_str("]}"); }
-        text.push_str(r#"],"animation":[{"tracks":[{"path":["nodes","leaf","translation"],"keys":[[0,[0,0,0]],[1,[8,0,0]]]}]}]}"#);
-        let built = vork_scene::scene_thread().spawn(move || -> Result<(usize, Option<usize>)> {
-            let scene = Scene::from_json(text.as_bytes())?;
-            let document = Document::new(&scene, Path::new("."))?;
-            document.frame(&vork_time::Request::Numeric(0.5))?;
-            let hashed = std::thread::scope(|scope| {
-                vork_scene::scene_thread().spawn_scoped(scope, || Kept::identity(&scene, Path::new("."))).unwrap().join().unwrap()
-            })?;
-            ensure!(hashed == Kept::identity(&scene, Path::new("."))?, "the scene hashes the same on any scene thread");
-            Ok((document.items.len(), document.rest[groups].parent))
-        }).unwrap().join().unwrap().unwrap();
-        assert_eq!(built, (groups + 1, Some(groups - 1)));
-    }
-}
+#[path = "canvas_nesting_tests.rs"]
+mod nesting_tests;

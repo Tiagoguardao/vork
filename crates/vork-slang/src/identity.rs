@@ -71,27 +71,34 @@ impl InputIdentity {
         }
         Some(ClosedInputIdentity { identity: self.identity.clone(), roots: roots.len(), missing })
     }
-    pub fn valid(&self) -> bool { self.current() }
-    fn current(&self) -> bool {
-        // Failed searches commonly probe hundreds of module names below one
-        // missing include directory. Resolve that parent once for this check;
-        // existing directories still use the exact original filesystem query.
-        let mut parents = BTreeMap::new();
-        for (query, value) in &self.observations {
-            if query.op == 2 && value.is_none() && query.path.is_absolute() && let Some(parent) = query.path.parent() {
-                *parents.entry(parent).or_insert(0usize) += 1;
+    /// Verify that all receipts can describe one installation. Different stages
+    /// may read different files, but must agree on every shared resolver query.
+    pub fn verify_all<'a>(receipts: impl IntoIterator<Item = &'a Self>) -> Result<()> {
+        let mut receipts = receipts.into_iter();
+        let Some(first) = receipts.next() else { return Ok(()) };
+        let Some(second) = receipts.next() else { return Ok(()) };
+        let mut seen: BTreeMap<_, _> = first.observations.iter().collect();
+        for receipt in std::iter::once(second).chain(receipts) {
+            for (query, value) in &receipt.observations {
+                if let Some(previous) = seen.insert(query, value) {
+                    ensure!(previous == value, "Slang filesystem observation {} changed during compilation; retry the command", query.path.display());
+                }
             }
         }
-        let missing = |parent: &Path| fs::metadata(parent)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        let absent: std::collections::BTreeSet<_> = parents.into_iter()
-            .filter_map(|(parent, count)| (count >= 8 && missing(parent)).then_some(parent)).collect();
-        self.observations.iter().all(|(query, value)| {
-            (query.op == 2 && value.is_none() && query.path.parent().is_some_and(|parent| absent.contains(parent)))
-                || filesystem::fingerprint(query, &filesystem::observe(query)) == *value
-        }) && absent.iter().all(|parent| missing(parent))
-        // No absence survives this validation. A new include directory, even
-        // one appearing during the check, must force compiler resolution.
+        Ok(())
+    }
+    /// Preserve both resolver paths when equal executable identities share a bin.
+    pub fn merge_alias(&mut self, alias: Self) -> Result<()> {
+        ensure!(self.identity == alias.identity, "material alias has a different compiler identity");
+        self.verify(&alias)?;
+        self.supplied_only &= alias.supplied_only;
+        self.observations.extend(alias.observations);
+        Ok(())
+    }
+
+    pub fn valid(&self) -> bool { self.current() }
+    fn current(&self) -> bool {
+        current_observations(&self.observations)
     }
     /// A portable proof key must cover every resolver input of code generation.
     /// Native composition separately permits target-only inputs through `verify`.
@@ -110,6 +117,87 @@ impl InputIdentity {
         }
         Ok(())
     }
+}
+
+/// Shared resolver queries for one installed generation. Stage identities remain
+/// separate cache keys, but a path is revalidated only once for the generation.
+#[derive(Default, Debug)]
+pub struct InstalledInputs {
+    source_bytes: BTreeMap<PathBuf, Vec<u8>>,
+    observations: filesystem::Observations,
+}
+impl InstalledInputs {
+    /// The supplied root module was read by the renderer before Slang ran.
+    pub fn record_source(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let path = std::env::current_dir()?.join(path);
+        let canonical = filesystem::observe(&filesystem::Query { op: 1, path: path.clone() })
+            .context("resolve installed program source")?;
+        for (op, value) in [(0, blake3::hash(bytes).as_bytes().to_vec()),
+            (1, canonical)] {
+            let query = filesystem::Query { op, path: path.clone() };
+            self.insert(&query, &Some(value))?;
+        }
+        Ok(())
+    }
+    pub fn record(&mut self, receipt: &InputIdentity) -> Result<()> {
+        for (query, value) in &receipt.observations { self.insert(query, value)?; }
+        Ok(())
+    }
+    fn insert(&mut self, query: &filesystem::Query, value: &Option<Vec<u8>>) -> Result<()> {
+        if let Some(previous) = self.observations.get(query) {
+            ensure!(previous == value, "Slang filesystem observation {} changed during installation; retry the command", query.path.display());
+        } else {
+            if query.op == 0 && let Some(hash) = value {
+                let bytes = filesystem::RevisionFiles::read(&query.path)?;
+                ensure!(blake3::hash(&bytes).as_bytes().as_slice() == hash,
+                    "program source {} changed during installation; retry the command", query.path.display());
+                self.source_bytes.insert(query.path.clone(), bytes);
+            }
+            self.observations.insert(query.clone(), value.clone());
+        }
+        Ok(())
+    }
+    /// Compare the filesystem that caused an open to fail with later edits.
+    pub fn live_stamp(&self) -> blake3::Hash {
+        let mut hash = blake3::Hasher::new();
+        for query in self.observations.keys() {
+            match filesystem::fingerprint(query, &filesystem::observe(query)) {
+                Some(value) => { hash.update(&(value.len() as u64).to_le_bytes()); hash.update(&value); }
+                None => { hash.update(&u64::MAX.to_le_bytes()); }
+            }
+        }
+        hash.finalize()
+    }
+    pub fn revision(&self) -> filesystem::RevisionFiles {
+        let mut files = self.observations.clone();
+        for (path, bytes) in &self.source_bytes {
+            files.insert(filesystem::Query { op: 0, path: path.clone() }, Some(bytes.clone()));
+        }
+        filesystem::RevisionFiles::new(files)
+    }
+    pub fn valid(&self) -> bool { current_observations(&self.observations) }
+}
+
+fn current_observations(observations: &filesystem::Observations) -> bool {
+    // Failed searches commonly probe hundreds of module names below one
+    // missing include directory. Resolve that parent once for this check;
+    // existing directories still use the exact original filesystem query.
+    let mut parents = BTreeMap::new();
+    for (query, value) in observations {
+        if query.op == 2 && value.is_none() && query.path.is_absolute() && let Some(parent) = query.path.parent() {
+            *parents.entry(parent).or_insert(0usize) += 1;
+        }
+    }
+    let missing = |parent: &Path| filesystem::RevisionFiles::current().is_live() && fs::metadata(parent)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let absent: std::collections::BTreeSet<_> = parents.into_iter()
+        .filter_map(|(parent, count)| (count >= 8 && missing(parent)).then_some(parent)).collect();
+    observations.iter().all(|(query, value)| {
+        (query.op == 2 && value.is_none() && query.path.parent().is_some_and(|parent| absent.contains(parent)))
+            || filesystem::fingerprint(query, &filesystem::observe(query)) == *value
+    }) && absent.iter().all(|parent| missing(parent))
+    // No absence survives this validation. A new include directory, even
+    // one appearing during the check, must force compiler resolution.
 }
 
 pub(super) struct Snapshot {
@@ -684,6 +772,24 @@ mod tests {
     }
 
     #[test]
+    fn folded_alias_keeps_its_own_missing_probe() -> Result<()> {
+        let work = Workspace::new()?;
+        let roots = [work.0.join("first"), work.0.join("second")];
+        for root in &roots { fs::create_dir(root)?; }
+        let alias = ClosedInputIdentity {
+            identity: vec![1],
+            roots: 1,
+            missing: vec![(0, vec!["helper.slang".into()])],
+        };
+        let mut folded = alias.relocate(&roots[..1]).unwrap();
+        folded.merge_alias(alias.relocate(&roots[1..]).unwrap())?;
+        assert!(folded.valid());
+        fs::write(roots[1].join("helper.slang"), "")?;
+        assert!(!folded.valid());
+        Ok(())
+    }
+
+    #[test]
     fn proof_capture_rejects_import_changes_between_passes() -> Result<()> {
         let work=Workspace::new()?;
         let helper=work.0.join("helper.slang");
@@ -911,6 +1017,10 @@ mod tests {
             "new higher-priority file must invalidate"
         );
         assert_ne!(edited.compile()?, shadowed.compile()?);
+        let before = edited.receipt();
+        let after = shadowed.receipt();
+        InputIdentity::verify_all([&before, &before])?;
+        assert!(InputIdentity::verify_all([&before, &after]).is_err());
         }
         Ok(())
     }

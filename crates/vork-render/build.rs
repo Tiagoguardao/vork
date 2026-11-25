@@ -29,7 +29,88 @@ fn hash_tree(path: &Path, hash: &mut blake3::Hasher) {
         }
     }
 }
+// Local builds may use installed headers. Distribution builds supply their pinned tree.
+fn mac_ffmpeg(decoder: &mut cc::Build) -> Option<(Vec<std::path::PathBuf>, String)> {
+    if let Ok(av) = pkg_config::Config::new().range_version("60".."64")
+        .cargo_metadata(false).probe("libavformat")
+    {
+        let major = av.version.split('.').next().unwrap();
+        // Local-only. Distribution builds bypass pkg-config and never embed this prefix.
+        if let Ok(dir) = pkg_config::get_variable("libavformat", "libdir") {
+            decoder.define("VORK_LOCAL_AV_LIBDIR", Some(format!("{dir:?}").as_str()));
+            return Some((av.include_paths, format!("{major}:local-first")));
+        }
+        return Some((av.include_paths, major.to_owned()));
+    }
+    for prefix in ["/opt/homebrew/opt/ffmpeg", "/usr/local/opt/ffmpeg"] {
+        let prefix = Path::new(prefix);
+        let include = prefix.join("include");
+        let header = include.join("libavformat/version_major.h");
+        println!("cargo:rerun-if-changed={}", header.display());
+        let Ok(version) = fs::read_to_string(header) else { continue };
+        let major = version.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next()? == "#define" && words.next()? == "LIBAVFORMAT_VERSION_MAJOR")
+                .then(|| words.next()?.parse::<u32>().ok()).flatten()
+        });
+        if let Some(major) = major.filter(|v| (60..64).contains(v)) {
+            return Some((vec![include], major.to_string()));
+        }
+    }
+    None
+}
+fn build_hwdecode() {
+    println!("cargo:rustc-check-cfg=cfg(vork_nvdecode)");
+    println!("cargo:rustc-check-cfg=cfg(vork_vtdecode)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=native/hwdecode");
+        let mut decoder = cc::Build::new();
+        println!("cargo:rerun-if-env-changed=VORK_MAC_DIST_AV_HEADERS");
+        let avformat = if let Some(include) = std::env::var_os("VORK_MAC_DIST_AV_HEADERS") {
+            let major = "63";
+            decoder.include(include).define("VORK_DIST_AVFORMAT_MAJOR", major);
+            major.to_owned()
+        } else if let Some((includes, avformat)) = mac_ffmpeg(&mut decoder) {
+            decoder.includes(includes);
+            avformat
+        } else {
+            println!("cargo:warning=FFmpeg headers unavailable, using portable footage reader");
+            return;
+        };
+        // The Metal compiler receives a string with no filesystem include path.
+        let shader = include_str!("native/hwdecode/nv12.metal")
+            .replace("#include \"nv12.h\"", include_str!("native/hwdecode/nv12.h"));
+        fs::write(Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("nv12.metal"), shader).unwrap();
+        decoder.file("native/hwdecode/reference.c").file("native/hwdecode/decoder.c").compile("vork_vtdecode");
+        cc::Build::new().flag("-fobjc-arc").files(["native/hwdecode/metal.m", "native/hwdecode/metal_vectors.m"]).compile("vork_vtplanes");
+        for framework in ["Metal", "Foundation", "CoreVideo"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+        println!("cargo:rustc-cfg=vork_vtdecode");
+        println!("cargo:rustc-env=VORK_NATIVE_FOOTAGE_READER=videotoolbox:{avformat}");
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") { return; }
+    println!("cargo:rerun-if-changed=../vork-encode/native/nvcodec");
+    let dir = "native/hwdecode";
+    println!("cargo:rerun-if-changed={dir}");
+    // libav structures are versioned. A build without the tested headers keeps
+    // the portable reader. The shared libraries are resolved at runtime.
+    let Ok(av) = pkg_config::Config::new().range_version("60".."61")
+        .cargo_metadata(false).probe("libavformat") else { return };
+    let ptx = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("nv12.ptx");
+    let result = std::process::Command::new("clang++").args([
+        "-O2", "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
+        "--cuda-gpu-arch=sm_75", "-S", "native/hwdecode/nv12.cu", "-o",
+    ]).arg(ptx).status();
+    if !result.is_ok_and(|s| s.success()) { return; }
+    cc::Build::new().includes(av.include_paths).file("native/hwdecode/reference.c").file("native/hwdecode/nvdec.c").compile("vork_nvdecode");
+    println!("cargo:rustc-cfg=vork_nvdecode");
+    println!("cargo:rustc-env=VORK_NATIVE_FOOTAGE_READER=nvdec:60");
+}
 fn main() {
+    build_hwdecode();
+    println!("cargo:rustc-env=VORK_BUILD_PROFILE={}", std::env::var("PROFILE").unwrap());
     // Explicit opt-in: directory layout must not change test admission.
     println!("cargo:rustc-check-cfg=cfg(vork_private_tests)");
     println!("cargo:rerun-if-changed=build.rs");
@@ -134,4 +215,29 @@ fn main() {
         hash.update(value.as_bytes());
     }
     println!("cargo:rustc-env=VORK_BUILD_ID={}", hash.finalize());
+
+    // Export proof also covers local edits to the canvas, sound and output
+    // implementations. These sources are separate from renderer cache inputs.
+    for tree in [
+        "native/hwdecode",
+        "../moda-assets/src",
+        "../moda-color/src",
+        "../moda-engine/src",
+        "../moda-plain-text/src",
+        "../moda-scene/src",
+        "../moda-shaders/src",
+        "../moda-shaders/wgsl",
+        "../moda-text/src",
+        "../moda-text-draw/src",
+        "../vork-audio/src",
+        "../vork-encode/native",
+        "../vork-encode/src",
+        "../vork-media/src",
+        "../vork-splat/src",
+        "../vork-time/src",
+    ] {
+        println!("cargo:rerun-if-changed={tree}");
+        hash_tree(Path::new(tree), &mut hash);
+    }
+    println!("cargo:rustc-env=VORK_EXPORT_BUILD_ID={}", hash.finalize());
 }

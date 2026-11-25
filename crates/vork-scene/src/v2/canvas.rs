@@ -279,9 +279,9 @@ const NOT_BUILT: &str = "2D is not built yet in a 3D world; put it in a canvas (
 /// the space of its children: `3d` in a canvas makes a world, `2d` in a world a canvas (§7).
 pub(super) fn refuse_unbuilt(document: &serde_json::Value) -> Result<()> {
     fn composition(value: &serde_json::Value, path: &str) -> Result<()> {
-        ensure!(value.get("display").is_none(), "{path}.display: use composition.view; see vork help upgrade");
+        ensure!(value.get("display").is_none(), "{}", crate::migration::message("composition.display", &[("path", path)]));
         ensure!(!value.is_object() || value.get("space").is_some(),
-            "{path}.space is required: write \"3d\" for a world (what a scene without a composition is) or \"2d\" for a canvas; see vork help upgrade");
+            "{}", crate::migration::message("composition.space", &[("path", path)]));
         ensure!(!value.get("view").is_some_and(serde_json::Value::is_null),
             "{path}.view: null is not a view; omit it for the local default");
         if value.get("space").and_then(serde_json::Value::as_str) == Some("3d") {
@@ -343,7 +343,7 @@ pub(super) fn refuse_unbuilt(document: &serde_json::Value) -> Result<()> {
                 }
             }
             if !canvas {
-                for field in ["opacity", "clip-path", "mask", "filter"] {
+                for field in ["opacity", "clip-path", "mask", "mask-type", "mix-blend-mode", "isolation", "filter"] {
                     ensure!(node.get(field).is_none(), "{here}.{field}: {NOT_BUILT}");
                 }
             }
@@ -351,7 +351,8 @@ pub(super) fn refuse_unbuilt(document: &serde_json::Value) -> Result<()> {
                 "path" if !canvas => bail!("{here}: type \"path\": a path in a 3D world is not built yet; put it in a canvas (composition {{space: \"2d\"}}), or extrude it with std extrude"),
                 "text" if !canvas => bail!("{here}: type \"text\": text in a 3D world is not built yet; put it in a canvas (composition {{space: \"2d\"}})"),
                 "text" | "path" | "node" => {}
-                other if canvas => bail!("{here}: type {other:?}: a 2D canvas holds group, text and path nodes; {other} in a canvas is not built yet; put it in a world (composition {{space: \"3d\"}})"),
+                "group" if canvas => bail!("{here}: type \"group\": use type \"node\" for a canvas group, or omit type"),
+                other if canvas => bail!("{here}: type {other:?}: a 2D canvas accepts node (group), text and path types; {other} in a canvas is not built yet; put it in a world (composition {{space: \"3d\"}})"),
                 _ => {}
             }
             if kind == "text" {

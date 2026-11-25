@@ -106,6 +106,24 @@ export type Node = TransformNode | MeshNode | AssetNode | CameraNode | LightNode
  * Like a scene layer it keeps its own clock: source time = offset + node time * speed.
  */
 export type NodeLayer = NodeTrackLayer | NodeClipLayer;
+export type Isolation = "auto" | "isolate";
+export type MixBlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "color-dodge"
+  | "color-burn"
+  | "hard-light"
+  | "soft-light"
+  | "difference"
+  | "exclusion"
+  | "hue"
+  | "saturation"
+  | "color"
+  | "luminosity";
 /**
  * An authored rotation: a glTF quaternion or a tagged Euler triple.
  */
@@ -618,7 +636,7 @@ export interface TransformNode {
   composition?: Composition | null;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   /**
@@ -629,12 +647,18 @@ export interface TransformNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   /**
    * 2D canvas only: the node's whole picture, children included, placed once (CSS opacity).
@@ -736,7 +760,7 @@ export interface MeshNode {
   composition?: Composition | null;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   geometry: NameOr5;
@@ -749,13 +773,19 @@ export interface MeshNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
   materials?: NameOr[];
+  "mix-blend-mode"?: MixBlendMode;
   morph_weights?: {
     [k: string]: number;
   };
@@ -827,7 +857,7 @@ export interface AssetNode {
   file: string;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   /**
@@ -838,15 +868,21 @@ export interface AssetNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
   materials?: {
     [k: string]: NameOr;
   };
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   nodes?: {
     [k: string]: AssetNodeOverrides;
@@ -921,7 +957,7 @@ export interface CameraNode {
   composition?: Composition | null;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   focus_object?: string | null;
@@ -933,13 +969,19 @@ export interface CameraNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
   material?: NameOr | null;
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   /**
    * 2D canvas only: the node's whole picture, children included, placed once (CSS opacity).
@@ -1006,7 +1048,7 @@ export interface LightNode {
   energy?: number | null;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   illuminates?: string[] | null;
@@ -1019,12 +1061,17 @@ export interface LightNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
   /**
    * Environment radiance material instance.
    */
@@ -1033,6 +1080,7 @@ export interface LightNode {
    * Physical world fog material on an environment light.
    */
   medium?: NameOr | null;
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   /**
    * 2D canvas only: the node's whole picture, children included, placed once (CSS opacity).
@@ -1107,7 +1155,7 @@ export interface TextNode {
   fill?: Paint;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   font: FontFiles;
@@ -1124,15 +1172,21 @@ export interface TextNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   "letter-spacing"?: number;
   light_link_tags?: string[];
   "line-break"?: LineBreak;
   "line-height"?: LineHeight;
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   /**
    * 2D canvas only: the node's whole picture, children included, placed once (CSS opacity).
@@ -1228,7 +1282,7 @@ export interface PathNode {
   "fill-rule"?: FillRule;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
-   * Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+   * The blur length is the Gaussian standard deviation before transforms.
    */
   filter?: string | null;
   /**
@@ -1239,12 +1293,18 @@ export interface PathNode {
    * Cycles shadow catcher. Combined treats this surface as a holdout.
    */
   is_shadow_catcher?: boolean;
+  isolation?: Isolation;
   light_link_tags?: string[];
   /**
-   * 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+   * 2D canvas only: the named node's picture masks this node, drawn in this node's
    * coordinates (SVG mask, userSpaceOnUse).
    */
   mask?: string | null;
+  /**
+   * How this picture supplies coverage when another node references it as a mask.
+   */
+  "mask-type"?: "luminance" | "alpha";
+  "mix-blend-mode"?: MixBlendMode;
   name?: string;
   /**
    * 2D canvas only: the node's whole picture, children included, placed once (CSS opacity).

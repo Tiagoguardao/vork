@@ -35,6 +35,23 @@ pub type DeviceDescriptor<'a> = wgt::DeviceDescriptor<Label<'a>>;
 static_assertions::assert_impl_all!(DeviceDescriptor<'_>: Send, Sync);
 
 impl Device {
+    /// Whether native core has invalidated this device. Device loss has its own
+    /// callback and does not appear in validation, allocation or internal scopes.
+    pub fn is_lost(&self) -> bool {
+        #[cfg(wgpu_core)]
+        if let Some(device) = self.inner.as_core_opt() { return device.is_lost(); }
+        false
+    }
+
+    /// Native allocation requirement for an image with this descriptor. Returns
+    /// None on backends without a query or when the device rejects the descriptor.
+    pub fn texture_binding_size(&self, desc: &TextureDescriptor<'_>) -> Option<u64> {
+        #[cfg(wgpu_core)]
+        if let Some(device) = self.inner.as_core_opt() { return device.texture_binding_size(desc); }
+        let _ = desc;
+        None
+    }
+
     #[cfg(custom)]
     /// Returns custom implementation of Device (if custom backend and is internally T)
     pub fn as_custom<T: custom::DeviceInterface>(&self) -> Option<&T> {

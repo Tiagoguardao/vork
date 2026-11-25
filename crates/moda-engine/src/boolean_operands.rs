@@ -7,7 +7,6 @@
 //! for drawing calls it once before its first load: the wasm module's start function and
 //! `moda-render`'s `main`.
 
-use crate::tess::moda_engine_path_types::PathCmd;
 use moda_scene::blend::BlendPathPoint as P;
 use moda_scene::types::RawNode;
 use moda_scene::Scene;
@@ -16,9 +15,7 @@ use moda_scene::Scene;
 pub fn install_scene_seams() {
     moda_scene::boolean_node::install_operand_outliner(operand_outline);
     moda_scene::boolean_node::install_font_generation(crate::text_draw::text_host_generation);
-    moda_scene::text_warp::install_text_outliner(crate::text_warp::text_warp_outlines);
-    moda_scene::generator::install_surface_sink(generator_surface);
-    moda_scene::expansion::install_table_text_measurer(crate::text_metrics::table_text_height);
+
     moda_assets::svg::install_fontdb_provider(Box::new(svg_image_fontdb));
 }
 
@@ -45,41 +42,6 @@ fn svg_image_fontdb() -> Option<std::sync::Arc<moda_assets::svg::FontDatabase>> 
     Some(db)
 }
 
-/// A generator's painted output (live-nodes §14.4) into the surface registry: its tiles replace the node's.
-fn generator_surface(id: &str, w: u32, h: u32, tiles: &[(u32, u32, &[u8])]) {
-    crate::surface::clear_tiles(id);
-    let tiles: Vec<(u32, u32, Option<&[u8]>)> = tiles.iter().map(|&(x, y, t)| (x, y, Some(t))).collect();
-    crate::surface::upload_tiles(id, w, h, &tiles);
-}
-
-fn cmds_to_points(cmds: &[PathCmd]) -> Vec<P> {
-    cmds.iter()
-        .map(|c| match *c {
-            PathCmd::Move { x, y } => P::Move { x, y },
-            PathCmd::Line { x, y } => P::Line { x, y },
-            PathCmd::Curve { x, y, cp1, cp2 } => P::Curve { x, y, cp1, cp2 },
-            PathCmd::Quadratic { x, y, cp } => P::Quadratic { x, y, cp },
-            PathCmd::Arc {
-                x,
-                y,
-                rx,
-                ry,
-                x_axis_rotation,
-                large_arc,
-                sweep,
-            } => P::Arc {
-                x,
-                y,
-                rx,
-                ry,
-                x_axis_rotation,
-                large_arc,
-                sweep,
-            },
-        })
-        .collect()
-}
-
 /// Node-local outline of a rectangle, ellipse, polygon, star or rich text node, as drawn:
 /// a `distort` (perspective / skew / 3D tilt) warps it the way the renderer does (flattened
 /// and projected, `tess::shape_paths::warp_path_cmds`).
@@ -88,14 +50,9 @@ pub fn operand_outline(scene: &Scene, node: &RawNode) -> Option<Vec<P>> {
     let Some(distort) = crate::paint::node_distort(node) else {
         return Some(outline);
     };
-    let cmds: Vec<PathCmd> = outline
-        .iter()
-        .map(crate::tess::path_cmd_from_blend_point)
-        .collect();
     // A warp that fails (a degenerate outline) keeps the unwarped outline, as the renderer does.
     Some(
-        crate::tess::shape_paths::warp_path_cmds(&cmds, &distort.local)
-            .map(|warped| cmds_to_points(&warped))
+        crate::tess::shape_paths::warp_path_cmds(&outline, &distort.local)
             .unwrap_or(outline),
     )
 }
@@ -137,7 +94,7 @@ pub(crate) fn undistorted_outline(scene: &Scene, node: &RawNode) -> Option<Vec<P
         "richtext" => return text_outline(scene, node),
         _ => return None,
     };
-    Some(cmds_to_points(&cmds))
+    Some(cmds)
 }
 
 /// The glyph outlines of a rich text node, node-local px, as the vector text engine draws

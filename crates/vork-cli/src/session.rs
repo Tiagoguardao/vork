@@ -189,5 +189,6 @@ pub fn run(gpu: Option<vork_render::GpuSelection>) -> Result<()> {
     drop(stdout);
     std::io::stderr().flush()?;
     worker.finish_pipeline_save();
+    worker.close();
     vork_render::shot::exit_process(0)
 }

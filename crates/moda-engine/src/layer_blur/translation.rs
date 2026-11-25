@@ -13,13 +13,13 @@ pub(crate) fn pixel_translation(m: &[f32; 16]) -> bool {
 // Remove the residual f32 projection error using that same grid convention.
 pub(crate) fn eligible(g: &LayerBlurGroup) -> bool {
     let [x, y, w, h] = g.region_canvas;
-    [x, y].iter().all(|v| v.is_finite() && (v - v.round()).abs() < 1e-3 && v.abs() < 8_388_608.0)
+    g.filters.source_raster.is_none() && [x, y].iter().all(|v| v.is_finite() && (v - v.round()).abs() < 1e-3 && v.abs() < 8_388_608.0)
         && (w - g.width_px as f64).abs() < 1e-3 && (h - g.height_px as f64).abs() < 1e-3
         && matches!(g.filters.blur, Some(crate::seams::BlurFilter::Uniform { .. }))
         && g.masks.is_empty() && g.coverage.is_empty()
-        && !g.filters.motion && g.filters.texture.is_none() && g.filters.noise.is_empty()
+        && g.filters.color_matrices.is_empty() && g.filters.texture.is_none() && g.filters.noise.is_empty()
         && g.filters.feather.is_none() && g.filters.shadow.is_none()
-        && g.filters.drop_shadows.is_empty() && g.filters.shaders.is_empty()
+        && g.filters.drop_shadows.is_empty()
         && g.items.iter().all(|i| matches!(i, DrawItem::Body { paint: BodyPaint::Solid, mask: None, instance, .. }
             if pixel_translation(&instance.model_matrix)))
 }

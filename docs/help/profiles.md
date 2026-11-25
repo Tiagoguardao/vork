@@ -23,7 +23,7 @@ Raster previs uses analytic lights and environment approximations. When emissive
 materials can light other surfaces, it enables low-sample raster ray lighting and
 warns that indirect light, reflections and transmission may be noisy or incomplete.
 When available, fast GPU denoising cleans up emissive previews; --set denoise=false
-retains the raw estimate. Use std/final or std/path for exact lighting.
+retains the raw estimate. Use std/final for delivery or std/path for more complete light transport.
 Hair uses complete-camera path transport automatically, including render-image
 captures. Promoted views keep the sample budget and default to denoising;
 --set denoise=false turns it off. Glass and water retain final’s raster transport.

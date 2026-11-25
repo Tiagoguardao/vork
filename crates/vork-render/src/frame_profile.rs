@@ -113,7 +113,8 @@ mod tests {
         count("queue_submissions", 2);
         ACTIVE.with(|a| a.borrow_mut().push(Ledger::default()));
         {
-            let _span = span("scene_evaluation");
+            profile_span!(_span, "scene_evaluation");
+            assert!(ACTIVE.with(|a| a.borrow().last().unwrap().spans_ms.is_empty()));
             count("queue_submissions", 3);
         }
         let child = ACTIVE.with(|a| a.borrow_mut().pop().unwrap());

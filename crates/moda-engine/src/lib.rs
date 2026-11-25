@@ -11,12 +11,10 @@
 //!
 //! See SEAMS.md for the frozen cross-track contract.
 
-pub mod agent_fill;
 pub mod backdrop;
 pub mod boolean_operands;
-pub mod brush_artwork;
 pub(crate) mod camera_slot;
-pub mod color;
+pub use moda_scene::color;
 pub mod cull;
 /// vork: moda-text-draw's copy (the same file); see PROVENANCE.md.
 pub use moda_text_draw::depth;
@@ -25,16 +23,14 @@ pub mod effects;
 pub mod export_scale;
 pub mod external_texture;
 pub mod frame;
+mod geometry_bounds;
 pub mod gpu_profile;
 pub mod layer_blur;
-pub mod motion_capture;
 pub mod paint;
 pub mod pixel;
 pub mod prof;
 pub(crate) mod prepared_rows;
 mod plan_items;
-pub mod mesh_paint;
-pub mod pattern_paint;
 pub mod readback;
 pub mod residency;
 pub mod scratch;
@@ -45,10 +41,8 @@ pub mod surface;
 pub mod tess;
 pub mod text_area;
 pub mod text_draw;
-pub mod text_extract;
 pub mod text_geometry;
 pub mod text_metrics;
-pub mod text_warp;
 /// vork: moda-text-draw's copy (the same file); see PROVENANCE.md.
 pub use moda_text_draw::vec_arena_cache;
 

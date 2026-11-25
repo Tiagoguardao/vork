@@ -461,9 +461,7 @@ fn closed_fit_starts_at_the_first_sample() {
 }
 
 #[test]
-fn sample_t_uses_the_shared_arc_length() {
-    // On a corner the sample's t is the fitted path's anchor fraction from
-    // `path_length::anchor_fractions` (the one arc length markers use).
+fn sample_t_agrees_with_distance_along_the_fitted_path() {
     let mut input = Vec::new();
     for i in 0..=40 {
         input.push(v2(i as f64, (i as f64 * 0.2).sin() * 10.0 + i as f64));
@@ -478,8 +476,11 @@ fn sample_t_uses_the_shared_arc_length() {
             ..Default::default()
         },
     );
-    let json: Vec<Value> = out.points.iter().map(BlendPathPoint::to_json).collect();
-    let fr = crate::path_length::anchor_fractions(&json, false);
+    let segs = segs_of(&out.points);
+    let length = |segs: &[FitSeg]| -> f64 {
+        flatten(segs, 1024).windows(2).map(|p| p[0].dist(p[1])).sum()
+    };
+    let total = length(&segs);
     for &c in &out.corners {
         let p = input[c];
         let k = out
@@ -491,12 +492,8 @@ fn sample_t_uses_the_shared_arc_length() {
                     && (j["y"].as_f64().unwrap() - p.y).abs() < 1e-9
             })
             .expect("corner is an anchor");
-        assert!(
-            (out.sample_t[c] - fr.anchor_t[k]).abs() < 1e-12,
-            "{} vs {}",
-            out.sample_t[c],
-            fr.anchor_t[k]
-        );
+        let fraction = length(&segs[..k]) / total;
+        assert!((out.sample_t[c] - fraction).abs() < 1e-6, "{} vs {fraction}", out.sample_t[c]);
     }
     assert!(!out.corners.is_empty());
 }

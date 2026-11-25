@@ -121,7 +121,7 @@ impl ViewState {
         let (mut dependencies,_)=crate::compositor::dependencies(&s.compositor,&settings.compositor);
         if !capture {dependencies=s.main_outputs;}
         dependencies.images &= s.graph.views.image_renders().next().is_some();
-        let view_graph=crate::graph::Graph::for_outputs(&s.plan,!capture && s.readback.any(),Some(dependencies))?;
+        let view_graph=crate::graph::Graph::for_view(&s.plan,!capture && s.readback.any(),dependencies,&settings.settings)?;
         use crate::graph::Pass;
         let raster=view_graph.runs(Pass::Depth) || view_graph.runs(Pass::Visibility) || view_graph.runs(Pass::Forward);
         let scene_work=raster || view_graph.runs(Pass::Path) || view_graph.runs(Pass::Shade);

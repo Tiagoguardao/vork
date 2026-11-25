@@ -27,9 +27,8 @@
 use anyhow::{bail, Result};
 use moda_scene::types::RawNode;
 use moda_scene::Scene;
-use std::cell::RefCell;
 
-use super::plan::{node_canvas_aabb, PlanCtx, Rect};
+use super::plan::{PlanCtx, Rect};
 use crate::seams::{BackdropOp, BackdropSplit, BlendMode, CoverageSource, INFINITE_CLIP};
 
 /// The split-composited blend mode a node asks for, if any (`BlendMode::split_id`). Every mode but normal,
@@ -66,8 +65,8 @@ pub fn is_blend_unit_leaf(node: &RawNode) -> bool {
 /// ([`is_blend_unit_leaf`]) or a layer-filter capture's composite quad (the filtered body is blended as a whole).
 /// `None` for normal blending and every other node.
 pub fn composite_blend_split(node: &RawNode) -> Option<u32> {
-    let mode = BlendMode::from_node_value(node.str("blendMode"));
-    if mode == BlendMode::Normal {
+    let mode = BlendMode::from_node_value(Some(node.str("blendMode")?));
+    if mode == BlendMode::Normal && node.str("isolation") != Some("isolate") {
         return None;
     }
     (is_blend_subtree_node(node)
@@ -94,14 +93,10 @@ pub fn filter_composite_fixed_blend(
         BlendMode::Multiply if !transparent => CaptureBlend::Multiply,
         _ => return None,
     };
-    // A moving frame's motion unit (`crate::motion_capture`) that is a group or a frame with children: its whole
-    // subtree is the capture, so its mode blends the composite as it would the group's split.
-    let motion_subtree = is_blend_subtree_node(node) && crate::motion_capture::is_unit(id);
-    if (is_blend_subtree_node(node) && !motion_subtree)
+    if is_blend_subtree_node(node)
         || is_blend_unit_leaf(node)
         || !crate::layer_blur::has_active_layer_filter(node)
-        || !(motion_subtree
-            || matches!(crate::paint::layers::plan(node), crate::paint::layers::LayerPlan::Single(_)))
+        || !matches!(crate::paint::layers::plan(node), crate::paint::layers::LayerPlan::Single(_))
     {
         return None;
     }
@@ -136,6 +131,11 @@ pub fn filter_composite_fixed_blend(
 /// composite blends with a fixed-function state ([`filter_composite_fixed_blend`]).
 pub fn composite_blend_split_in(scene: &Scene, id: &str, transparent: bool) -> Option<u32> {
     let node = scene.effective_node(id)?;
+    composite_split_for_node(scene, node, transparent)
+}
+
+fn composite_split_for_node(scene: &Scene, node: &RawNode, transparent: bool) -> Option<u32> {
+    let id = node.id();
     let split = composite_blend_split(node)?;
     filter_composite_fixed_blend(scene, id, transparent)
         .is_none()
@@ -166,11 +166,13 @@ pub fn page_splits_are_stacks_only(scene: &Scene, page_id: &str, transparent: bo
 /// Source contribution to the page's analytic-body eligibility. Shared by cold planning and its
 /// retained derived-input proof; the target's eligibility changes when the last contribution leaves.
 pub(crate) fn node_precludes_shape_sdf(scene: &Scene, id: &str, transparent: bool) -> bool {
-    scene.effective_node(id).is_some_and(|node| {
-        moda_scene::scene::is_opacity_group(node)
-            || split_blend_mode_over(node, transparent).is_some()
-            || composite_blend_split_in(scene, id, transparent).is_some()
-    })
+    scene.effective_node(id).is_some_and(|n| precludes_shape_sdf(scene, n, transparent))
+}
+
+pub(crate) fn precludes_shape_sdf(scene: &Scene, node: &RawNode, transparent: bool) -> bool {
+    moda_scene::scene::is_opacity_group(node)
+        || split_blend_mode_over(node, transparent).is_some()
+        || composite_split_for_node(scene, node, transparent).is_some()
 }
 
 pub fn canvas_root_has_split_blend(scene: &Scene) -> bool {
@@ -189,82 +191,13 @@ pub fn canvas_root_has_split_blend_over(scene: &Scene, transparent: bool) -> boo
 /// composite's), or its paint stack's (E3.1 P6).
 pub(crate) fn node_splits(scene: &Scene, id: &str, transparent: bool) -> bool {
     scene.effective_node(id).is_some_and(|n| {
-        moda_scene::scene::is_opacity_group(n)
-            || split_blend_mode_over(n, transparent).is_some()
-            || composite_blend_split_in(scene, id, transparent).is_some()
+        precludes_shape_sdf(scene, n, transparent)
             || crate::paint::layers::stack_needs_split(
                 n,
                 scene.ancestor_opacity_product(id),
                 transparent,
             )
     })
-}
-
-/// Whether the node's canvas AABB bounds everything it draws. A warp is not in `node_canvas_aabb` (see its note), so
-/// a warped node uses the whole target instead.
-fn aabb_is_tight(node: &RawNode) -> bool {
-    crate::paint::node_distort(node).is_none()
-}
-
-/// The `BlendBegin` / `BlendEnd` pair wrapping an overlay node's body, or `None` to leave the node on its
-/// fixed-function fallback (not a split blend, or nothing of it lands on the target).
-pub fn compute_blend_splits(
-    scene: &Scene,
-    node: &RawNode,
-    ctx: &PlanCtx,
-) -> Option<(BackdropSplit, BackdropSplit)> {
-    let mode = split_blend_mode_over(node, ctx.transparent_target)?;
-    split_pair(scene, node, ctx, BackdropOp::BlendEnd { mode })
-}
-
-/// A `BlendBegin` / `StackEnd` pair over `node`'s region (E3.1 P6): a paint stack's transparency group, or one
-/// blended layer of it. `mode` is [`BlendMode::exact_split_id`]; `opacity` scales the group. `None` when nothing
-/// of the node lands on the target.
-pub fn compute_stack_splits(
-    scene: &Scene,
-    node: &RawNode,
-    ctx: &PlanCtx,
-    mode: BlendMode,
-    opacity: f64,
-) -> Option<(BackdropSplit, BackdropSplit)> {
-    split_pair(
-        scene,
-        node,
-        ctx,
-        BackdropOp::StackEnd {
-            mode: mode.exact_split_id(),
-            opacity: opacity.clamp(0.0, 1.0) as f32,
-        },
-    )
-}
-
-/// A `GroupBegin` / `StackEnd` pair over `node`'s region (E3.1 P6): a paint stack drawn onto the backdrop as a
-/// non-isolated group, faded by the node's `opacity`. `None` when nothing of the node lands on the target.
-pub fn compute_group_splits(
-    scene: &Scene,
-    node: &RawNode,
-    ctx: &PlanCtx,
-    opacity: f64,
-) -> Option<(BackdropSplit, BackdropSplit)> {
-    split_pair_from(
-        scene,
-        node,
-        ctx,
-        BackdropOp::GroupBegin,
-        BackdropOp::StackEnd {
-            mode: crate::seams::STACK_FADE_MODE,
-            opacity: opacity.clamp(0.0, 1.0) as f32,
-        },
-    )
-}
-
-fn split_pair(
-    scene: &Scene,
-    node: &RawNode,
-    ctx: &PlanCtx,
-    end: BackdropOp,
-) -> Option<(BackdropSplit, BackdropSplit)> {
-    split_pair_from(scene, node, ctx, BackdropOp::BlendBegin, end)
 }
 
 /// A `BlendBegin` / `BlendEnd` pair blending everything drawn between them with split mode `mode`
@@ -276,23 +209,7 @@ pub(crate) fn compute_region_blend_splits(
     bounds: Option<Rect>,
     mode: u32,
 ) -> Option<(BackdropSplit, BackdropSplit)> {
-    let projected = bounds
-        .and_then(|b| ctx.project_rect(&b))
-        .filter(|p| p.finite())
-        // 2px for antialiased edges.
-        .map(|p| Rect {
-            x: p.x - 2.0,
-            y: p.y - 2.0,
-            w: p.w + 4.0,
-            h: p.h + 4.0,
-        });
-    split_pair_in(
-        node,
-        ctx,
-        projected,
-        BackdropOp::BlendBegin,
-        BackdropOp::BlendEnd { mode },
-    )
+    painted_split_pair(node, ctx, bounds, BackdropOp::BlendBegin, BackdropOp::BlendEnd { mode })
 }
 
 /// A `BlendBegin` / `StackEnd` pair compositing everything drawn between them as one layer, faded by `opacity`, with
@@ -305,64 +222,18 @@ pub(crate) fn compute_region_fade_splits(
     mode: u32,
     opacity: f64,
 ) -> Option<(BackdropSplit, BackdropSplit)> {
-    let projected = bounds
-        .and_then(|b| ctx.project_rect(&b))
-        .filter(|p| p.finite())
-        .map(|p| Rect {
-            x: p.x - 2.0,
-            y: p.y - 2.0,
-            w: p.w + 4.0,
-            h: p.h + 4.0,
-        });
-    split_pair_in(
-        node,
-        ctx,
-        projected,
-        BackdropOp::BlendBegin,
-        BackdropOp::StackEnd {
-            mode,
-            opacity: opacity.clamp(0.0, 1.0) as f32,
-        },
-    )
+    let begin = if mode == crate::seams::STACK_FADE_MODE { BackdropOp::GroupBegin } else { BackdropOp::BlendBegin };
+    painted_split_pair(node, ctx, bounds, begin, BackdropOp::StackEnd {
+        mode, opacity: opacity.clamp(0., 1.) as f32,
+    })
 }
 
-fn split_pair_from(
-    scene: &Scene,
-    node: &RawNode,
-    ctx: &PlanCtx,
-    begin: BackdropOp,
-    end: BackdropOp,
+/// Project the emitted paint once. All isolation pairs use the same AA fringe.
+fn painted_split_pair(
+    node: &RawNode, ctx: &PlanCtx, bounds: Option<Rect>, begin: BackdropOp, end: BackdropOp,
 ) -> Option<(BackdropSplit, BackdropSplit)> {
-    let mut projected = None;
-    if aabb_is_tight(node) {
-        if let (Some(bounds), Some(affine)) = (
-            node_canvas_aabb(scene, node),
-            scene.node_canvas_affine(node.id()),
-        ) {
-            // A stroke reaches up to its full width outside the geometry (outside alignment); widths are local
-            // units, so scale by the larger affine axis. Every stroke layer draws, so the widest one pads.
-            let axis = (affine.a.hypot(affine.b)).max(affine.c.hypot(affine.d));
-            let pad = crate::paint::layers::widest_stroke(node)
-                .map_or(0.0, |s| s.width)
-                .max(0.0)
-                * axis;
-            let padded = Rect {
-                x: bounds.x - pad,
-                y: bounds.y - pad,
-                w: bounds.w + pad * 2.0,
-                h: bounds.h + pad * 2.0,
-            };
-            if let Some(p) = ctx.project_rect(&padded).filter(|p| p.finite()) {
-                // 2px for antialiased edges.
-                projected = Some(Rect {
-                    x: p.x - 2.0,
-                    y: p.y - 2.0,
-                    w: p.w + 4.0,
-                    h: p.h + 4.0,
-                });
-            }
-        }
-    }
+    let projected = bounds.and_then(|b| ctx.project_rect(&b)).filter(|p| p.finite())
+        .map(|p| Rect { x: p.x - 2., y: p.y - 2., w: p.w + 4., h: p.h + 4. });
     split_pair_in(node, ctx, projected, begin, end)
 }
 
@@ -408,7 +279,7 @@ fn split_pair_in(
     let fade = matches!(end, BackdropOp::StackEnd { mode, .. } if mode == 0 || mode == crate::seams::STACK_FADE_MODE);
     let [x0, y0, x1, y1] = match landed {
         Some(rect) => rect,
-        None if fade => [0.0; 4],
+        None if fade || is_blend_subtree_node(node) => [0.0; 4],
         None => return None,
     };
     Some((
@@ -441,7 +312,7 @@ pub(crate) fn isolation_split(node_id: &str, op: BackdropOp, [x0, y0, x1, y1]: [
 /// Whether a split is half of a FADE pair: what is drawn between the two composites as one layer, scaled by an
 /// opacity, with plain source-over. A faded group's `BlendBegin` / `StackEnd` at mode 0
 /// ([`compute_region_fade_splits`]) and a paint-stack group's `GroupBegin` / `StackEnd` at
-/// `STACK_FADE_MODE` (`compute_group_splits`). A begin is shared with the blend pairs, whose end carries a blend
+/// `STACK_FADE_MODE`. A begin is shared with the blend pairs, whose end carries a blend
 /// mode: a list is all fades when every one of its splits passes this.
 pub(crate) fn is_fade_split(split: &BackdropSplit) -> bool {
     matches!(split.op, BackdropOp::BlendBegin | BackdropOp::GroupBegin) || is_fade_end(split)
@@ -536,7 +407,7 @@ pub(crate) fn isolation_rect(bounds: Option<Rect>, region_canvas: [f64; 4], widt
 // ---------------------------------------------------------------------------
 
 /// Engine-owned (hand-authored) WGSL: no TS renderer counterpart to extract from.
-const BLEND_WGSL: &str = r#"
+pub(super) const BLEND_WGSL: &str = r#"
 struct BlendUniforms {
   // Region origin in target px, blend mode, the source's opacity (a paint-stack group's; 1 otherwise).
   origin: vec2<f32>,
@@ -678,29 +549,138 @@ fn blend(mode: u32, cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let texel = vec2<i32>(floor(pos.xy - u.origin));
+  return composite(texel, u32(u.mode + 0.5), u.opacity);
+}
+
+fn composite(texel: vec2<i32>, mode: u32, opacity: f32) -> vec4<f32> {
   let b = textureLoad(backdropTex, texel, 0);
   let current = textureLoad(sourceTex, texel, 0);
   // A non-isolated paint-stack group (GroupBegin … StackEnd): the layers drew onto the backdrop; fade them.
-  if (u32(u.mode + 0.5) == 16u) {
-    return b + (current - b) * u.opacity;
+  if (mode == 16u) {
+    return b + (current - b) * opacity;
   }
-  let s = current * u.opacity;
+  let s = current * opacity;
   let cb = select(vec3<f32>(0.0), b.rgb / b.a, b.a > 0.0);
   let cs = select(vec3<f32>(0.0), s.rgb / s.a, s.a > 0.0);
-  let mixed = blend(u32(u.mode + 0.5), clamp(cb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(cs, vec3<f32>(0.0), vec3<f32>(1.0)));
+  let mixed = select(blend(mode, clamp(cb, vec3<f32>(0.0), vec3<f32>(1.0)),
+                           clamp(cs, vec3<f32>(0.0), vec3<f32>(1.0))), cs, mode == 0u);
   let co = s.rgb * (1.0 - b.a) + b.rgb * (1.0 - s.a) + s.a * b.a * mixed;
-  return vec4<f32>(clamp(co, vec3<f32>(0.0), vec3<f32>(1.0)), s.a + b.a * (1.0 - s.a));
+  // The blend function uses bounded colours. The uncovered source and
+  // backdrop retain their working-space range on a floating-point page.
+  return vec4<f32>(co, s.a + b.a * (1.0 - s.a));
+}
+
+struct RegionVertex {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) address: vec4<u32>,
+  @location(1) @interpolate(flat) opacity: f32,
+};
+fn rectCorner(i: u32, rect: vec4<f32>) -> vec2<f32> {
+  let x = i == 1u || i == 4u || i == 5u;
+  let y = i == 2u || i == 3u || i == 5u;
+  return vec2<f32>(select(rect.x, rect.z, x), select(rect.y, rect.w, y));
+}
+@vertex
+fn vs_region(@builtin(vertex_index) i: u32, @location(0) rect: vec4<f32>,
+             @location(1) address: vec4<u32>, @location(2) opacity: f32) -> RegionVertex {
+  return RegionVertex(vec4<f32>(rectCorner(i, rect), 0., 1.), address, opacity);
+}
+struct GatherVertex {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) address: vec4<u32>,
+  @location(1) @interpolate(flat) pitch_count: vec2<u32>,
+};
+@vertex
+fn vs_gather(@builtin(vertex_index) i: u32, @location(1) address: vec4<u32>,
+             @location(3) atlas: vec3<u32>) -> GatherVertex {
+  let first = address.w;
+  let last = first + atlas.z - 1u;
+  let top = first / atlas.x;
+  let bottom = last / atlas.x;
+  let single = top == bottom;
+  let box = vec4<f32>(f32(select(0u, first % atlas.x, single)), f32(top),
+                      f32(select(atlas.x, last % atlas.x + 1u, single)), f32(bottom + 1u));
+  let uv = rectCorner(i, box) / vec2<f32>(atlas.xy);
+  return GatherVertex(vec4<f32>(uv * vec2<f32>(2., -2.) + vec2<f32>(-1., 1.), 0., 1.),
+                      address, atlas.xz);
+}
+@fragment
+fn fs_gather(v: GatherVertex) -> @location(0) vec4<f32> {
+  let p = vec2<u32>(v.pos.xy);
+  let local = p.y * v.pitch_count.x + p.x - v.address.w;
+  if (local >= v.pitch_count.y) { discard; }
+  let src = v.address.xy + vec2<u32>(local % v.address.z, local / v.address.z);
+  return textureLoad(sourceTex, src, 0);
+}
+@fragment
+fn fs_region(v: RegionVertex) -> @location(0) vec4<f32> {
+  let p = vec2<u32>(v.pos.xy) - v.address.xy;
+  let linear = v.address.w + p.y * v.address.z + p.x;
+  let pitch = textureDimensions(sourceTex).x;
+  return composite(vec2<i32>(i32(linear % pitch), i32(linear / pitch)), 0u, v.opacity);
 }
 "#;
 
+/// Copy destinations for one render or nested capture. A begin holds its backdrop
+/// until the matching composite. Later splits may reuse both inputs in queue order.
+pub struct BlendStack<'a> {
+    pub(crate) reads: crate::scratch::EncoderReads,
+    pub(super) scratch: &'a crate::scratch::ScratchPool,
+    admit: Option<&'a dyn Fn(u64)>,
+    regions: Vec<(crate::scratch::PageTexture, [u32; 4])>,
+    backdrop: Option<crate::scratch::PageTexture>,
+    source: Option<crate::scratch::PageTexture>,
+}
+
+// All runs in an opacity packet replay in queue order. Reserve one snapshot pair for the page,
+// or width classes when they use fewer texels (e.g. alternating wide and tall text regions).
+// The tallest member of a power-of-two width class is wider than half the class maximum.
+// Thus a class costs less than twice that member's texels, with at most one pair per width bit.
+// A single envelope wins whenever it occupies fewer texels than these classes together.
+pub(super) fn snapshot_extents(sizes: impl Iterator<Item = [u32; 2]>) -> std::collections::BTreeMap<u32, [u32; 2]> {
+    let mut classes = std::collections::BTreeMap::new();
+    let mut page = [0, 0];
+    for [w, h] in sizes {
+        let extent = classes.entry(w.next_power_of_two()).or_insert([0u32; 2]);
+        *extent = [extent[0].max(w), extent[1].max(h)];
+        page = [page[0].max(w), page[1].max(h)];
+    }
+    let area = |[w, h]: [u32; 2]| u64::from(w) * u64::from(h);
+    if !classes.is_empty() && area(page) <= classes.values().copied().map(area).sum::<u64>() {
+        classes.clear();
+        classes.insert(0, page);
+    }
+    classes
+}
+
+impl<'a> BlendStack<'a> {
+    pub(crate) fn new(scratch: &'a crate::scratch::ScratchPool, admit: Option<&'a dyn Fn(u64)>) -> Self {
+        Self { scratch, admit, reads: Default::default(), regions: Vec::new(), backdrop: None, source: None }
+    }
+
+    pub(super) fn snapshot(&self, device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32,
+        label: &str, extra_usage: wgpu::TextureUsages) -> crate::scratch::PageTexture {
+        let desc = wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | extra_usage, view_formats: &[],
+        };
+        if let Some(admit) = self.admit {
+            let bytes = device.texture_binding_size(&desc).unwrap_or_else(|| moda_text_draw::device::estimated_texture_bytes(
+                desc.size, desc.dimension, desc.format, desc.mip_level_count, desc.sample_count));
+            admit(bytes);
+        }
+        self.scratch.page_texture(device, &desc, self.admit.is_none())
+    }
+}
+
 pub struct BlendExec {
+    isolation: std::sync::OnceLock<super::isolation::Pipelines>,
     clear: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     frame_format: wgpu::TextureFormat,
-    /// The backdrops saved by `BlendBegin`s, each consumed by its matching end. A stack: a paint-stack group
-    /// (E3.1 P6) nests its blended layers' splits inside its own.
-    saved: RefCell<Vec<(wgpu::Texture, [u32; 4])>>,
 }
 
 impl BlendExec {
@@ -784,41 +764,30 @@ impl BlendExec {
             })
         };
         BlendExec {
+            isolation: Default::default(),
             clear: pipeline("Blend Split Clear", &empty_layout, "fs_clear"),
             composite: pipeline("Blend Split Composite", &composite_layout, "fs_composite"),
             bgl,
             frame_format,
-            saved: RefCell::new(Vec::new()),
         }
     }
 
-    /// Drop any saved backdrop (a frame that failed between a begin and its end); called before a frame's splits.
-    pub fn reset(&self) {
-        self.saved.borrow_mut().clear();
+    pub(crate) fn isolation(&self, device: &wgpu::Device, samples: u32) -> &super::isolation::Pipelines {
+        self.isolation.get_or_init(|| super::isolation::Pipelines::new(device, self.frame_format, samples))
     }
 
     fn copy_out(
         &self,
+        saved: &BlendStack<'_>,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::Texture,
         [x, y, w, h]: [u32; 4],
+        spare: Option<crate::scratch::PageTexture>,
         label: &str,
-    ) -> wgpu::Texture {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.frame_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    ) -> crate::scratch::PageTexture {
+        let snapshot = spare.filter(|s| s.view.texture().width() == w && s.view.texture().height() == h)
+            .unwrap_or_else(|| saved.snapshot(device, self.frame_format, w, h, label, wgpu::TextureUsages::empty()));
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: target,
@@ -827,7 +796,7 @@ impl BlendExec {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &tex,
+                texture: snapshot.view.texture(),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -838,7 +807,7 @@ impl BlendExec {
                 depth_or_array_layers: 1,
             },
         );
-        tex
+        snapshot
     }
 
     /// A pass over the region: into `msaa_view` resolving into `target_view` when the frame is multisampled (so the
@@ -882,6 +851,7 @@ impl BlendExec {
     #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &self,
+        saved: &mut BlendStack,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -902,18 +872,24 @@ impl BlendExec {
         let region = [x, y, w, h];
         match split.op {
             BackdropOp::BlendBegin => {
-                let backdrop =
-                    self.copy_out(device, encoder, target, region, "Blend Split Backdrop");
-                self.saved.borrow_mut().push((backdrop, region));
+                let spare = saved.backdrop.take();
+                let backdrop = self.copy_out(
+                    saved, device, encoder, target, region, spare, "Blend Split Backdrop",
+                );
+                saved.reads.track(saved.scratch, backdrop.view.texture());
+                saved.regions.push((backdrop, region));
                 let mut pass = Self::region_pass(encoder, target_view, msaa_view, region);
                 pass.set_pipeline(&self.clear);
                 pass.draw(0..3, 0..1);
             }
             BackdropOp::GroupBegin => {
                 // Saved, not cleared: the group's layers draw onto the backdrop.
-                let backdrop =
-                    self.copy_out(device, encoder, target, region, "Stack Group Backdrop");
-                self.saved.borrow_mut().push((backdrop, region));
+                let spare = saved.backdrop.take();
+                let backdrop = self.copy_out(
+                    saved, device, encoder, target, region, spare, "Stack Group Backdrop",
+                );
+                saved.reads.track(saved.scratch, backdrop.view.texture());
+                saved.regions.push((backdrop, region));
             }
             BackdropOp::BlendEnd { .. } | BackdropOp::StackEnd { .. } => {
                 let (mode, opacity) = match split.op {
@@ -921,13 +897,18 @@ impl BlendExec {
                     BackdropOp::BlendEnd { mode } => (mode, 1.0),
                     _ => unreachable!(),
                 };
-                let Some((backdrop, saved_region)) = self.saved.borrow_mut().pop() else {
+                let Some((backdrop, saved_region)) = saved.regions.pop() else {
                     bail!("blend split end for '{}' without a begin", split.node_id);
                 };
                 if saved_region != region {
                     bail!("blend split regions differ for '{}'", split.node_id);
                 }
-                let source = self.copy_out(device, encoder, target, region, "Blend Split Source");
+                let spare = saved.source.take();
+                let source = self.copy_out(
+                    saved, device, encoder, target, region, spare, "Blend Split Source",
+                );
+                saved.reads.track(saved.scratch, backdrop.view.texture());
+                saved.reads.track(saved.scratch, source.view.texture());
                 let uniforms: [f32; 4] = [x as f32, y as f32, mode as f32, opacity];
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Blend Split Uniforms"),
@@ -936,8 +917,6 @@ impl BlendExec {
                     mapped_at_creation: false,
                 });
                 queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&uniforms));
-                let backdrop_view = backdrop.create_view(&Default::default());
-                let source_view = source.create_view(&Default::default());
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Blend Split BG"),
                     layout: &self.bgl,
@@ -948,11 +927,11 @@ impl BlendExec {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&backdrop_view),
+                            resource: wgpu::BindingResource::TextureView(&backdrop.view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&source_view),
+                            resource: wgpu::BindingResource::TextureView(&source.view),
                         },
                     ],
                 });
@@ -960,6 +939,9 @@ impl BlendExec {
                 pass.set_pipeline(&self.composite);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.draw(0..3, 0..1);
+                drop(pass);
+                saved.backdrop = Some(backdrop);
+                saved.source = Some(source);
             }
             _ => bail!("not a blend split"),
         }
@@ -988,6 +970,15 @@ mod tests {
     }
 
     #[test]
+    fn recorded_text_snapshots_share_extents_across_runs() {
+        let repeated = [[900, 12], [10, 800], [870, 14], [9, 820]];
+        let sizes = super::snapshot_extents(repeated.into_iter().cycle().take(4000));
+        assert_eq!(sizes.values().copied().collect::<Vec<_>>(), [[10, 820], [900, 14]]);
+        let sizes = super::snapshot_extents([[600, 80], [400, 85], [70, 90]].into_iter());
+        assert_eq!(sizes.into_values().collect::<Vec<_>>(), [[600, 90]]);
+    }
+
+    #[test]
     fn overlay_reference_matches_spec_values() {
         // Opaque: Cb 0.25 (dark → multiply 2·Cb·Cs), Cb 0.75 (light → screen), Cs 0.5 is identity.
         let o = overlay_ref([0.25, 0.75, 0.5, 1.0], [0.8, 0.8, 0.5, 1.0]);
@@ -1008,7 +999,7 @@ mod tests {
     }
 
     /// The shader's `fs_composite` for color-dodge (6) / color-burn (7) / linear-burn (17) / linear-dodge (18), in
-    /// f32 with the same branch and clamp order: unpremultiply, clamp Cb / Cs to [0, 1], B per channel, premultiplied source-over, clamp.
+    /// f32 with the same branch and clamp order: unpremultiply, clamp Cb / Cs to [0, 1], B per channel, premultiplied source-over.
     fn dodge_burn_shader(mode: u32, b: [f32; 4], current: [f32; 4], opacity: f32) -> [f32; 4] {
         let s = current.map(|v| v * opacity);
         let mut out = [0.0f32; 4];
@@ -1027,7 +1018,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let co = s[i] * (1.0 - b[3]) + b[i] * (1.0 - s[3]) + s[3] * b[3] * mixed;
-            out[i] = co.clamp(0.0, 1.0);
+            out[i] = co;
         }
         out[3] = s[3] + b[3] * (1.0 - s[3]);
         out

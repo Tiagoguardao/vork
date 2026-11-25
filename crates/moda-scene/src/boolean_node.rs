@@ -228,7 +228,7 @@ pub fn path_local_points(node: &RawNode) -> Option<Vec<PathPoint>> {
     }
     Some(crate::path_geom::round_corners::round_path_corners_with(
         &parsed,
-        node.bool("closed").unwrap_or(false),
+        node.path_closure(),
         &corners,
     ))
 }

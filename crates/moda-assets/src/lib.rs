@@ -25,7 +25,6 @@ pub mod fetch;
 pub mod pattern;
 pub mod probe;
 pub mod report;
-pub mod shader_image;
 pub mod sizing;
 pub mod source;
 pub mod svg;
@@ -73,27 +72,10 @@ pub fn decode_pattern_bytes(
                 src: report::sanitized_asset_ref(src),
                 coverage_permille: img.coverage_permille,
                 cause: img.blank_cause.to_string(),
-                shader_image: false,
             });
         }
     }
     prepared
-}
-
-/// M4e shader-image analog of [`decode_pattern_bytes`] (`fetch::load_job`'s
-/// shader arm): the bytes run through the `imageProcessing.ts` port. Empty
-/// bytes are legal — the production `!source.src` arm never fetches.
-pub fn decode_shader_image_bytes(
-    src: &str,
-    bytes: &[u8],
-    processing: &moda_shaders::runtime::image_processing::Processing,
-) -> anyhow::Result<moda_shaders::runtime::image_processing::PreparedShaderImage> {
-    shader_image::load_shader_image(
-        src,
-        bytes,
-        source::is_likely_svg(src),
-        processing,
-    )
 }
 
 /// One asset request from the scene scan ([`collect_pattern_requests`]).
@@ -106,11 +88,7 @@ pub struct PrefetchRequest {
     pub src: String,
     /// Desired min raster size (SVG only; `computeMinRasterSizeForPatternFill`).
     pub min_raster_size: Option<(u32, u32)>,
-    /// M4e: when set, this is a SHADER-IMAGE request (image-backed procedural
-    /// fill): the bytes run through `imageProcessing.ts`'s port instead of
-    /// the pattern pipeline, and the result lands in the store's
-    /// shader-image map keyed by `moda_shaders::runtime::image_resource_key`.
-    pub shader_processing: Option<moda_shaders::runtime::image_processing::Processing>,
+
     /// Requesting node id (WF5 r3 resource report attribution).
     pub node_id: Option<String>,
 }
@@ -142,6 +120,8 @@ pub enum AssetEntry {
     /// pulled from the installed `ExternalImageUploader` at bind time, keyed
     /// by the store key.
     LoadedExternal(ExternalImageMeta),
+    /// Immutable device-local footage pixels. Snapshots retain the texture.
+    DeviceFrame(ExternalImageMeta, Arc<wgpu::Texture>),
     /// Committed failure (remote URL, decode error, missing file) →
     /// rose placeholder.
     Failed,
@@ -175,15 +155,26 @@ pub struct ExternalImageMeta {
 #[derive(Debug, Clone, Default)]
 pub struct AssetStore {
     entries: HashMap<String, AssetEntry>,
-    shader_images: HashMap<String, shader_image::ShaderImageEntry>,
 }
 
 impl AssetStore {
+    pub(crate) fn same_layout(&self, other: &Self) -> bool {
+        self.entries.len() == other.entries.len() && self.entries.iter().all(|(key, entry)| {
+            match (entry, other.entries.get(key)) {
+                (AssetEntry::Loaded(a), Some(AssetEntry::Loaded(b))) => Arc::ptr_eq(a, b) || a.same_layout(b),
+                (AssetEntry::LoadedExternal(a), Some(AssetEntry::LoadedExternal(b))) => a == b,
+                (AssetEntry::DeviceFrame(a, _), Some(AssetEntry::DeviceFrame(b, _))) =>
+                    a.width == b.width && a.height == b.height && a.scale_factor == b.scale_factor,
+                (AssetEntry::Failed, Some(AssetEntry::Failed)) => true,
+                _ => false,
+            }
+        })
+    }
+
     /// Whether every resource has the same identity. Cloning a store does not write its resources:
     /// decoded payloads are immutable Arcs, and external pixels carry an explicit upload generation.
     pub(crate) fn same_resources(&self, other: &Self) -> bool {
         self.entries.len() == other.entries.len()
-            && self.shader_images.len() == other.shader_images.len()
             && self.entries.iter().all(|(key, entry)| match (entry, other.entries.get(key)) {
                 (AssetEntry::Loaded(a), Some(AssetEntry::Loaded(b))) => Arc::ptr_eq(a, b),
                 (AssetEntry::LoadedExternal(a), Some(AssetEntry::LoadedExternal(b))) => {
@@ -191,19 +182,14 @@ impl AssetStore {
                         && a.scale_factor.0.to_bits() == b.scale_factor.0.to_bits()
                         && a.scale_factor.1.to_bits() == b.scale_factor.1.to_bits()
                 }
+                (AssetEntry::DeviceFrame(a, _), Some(AssetEntry::DeviceFrame(b, _))) => a == b,
                 (AssetEntry::Failed, Some(AssetEntry::Failed)) => true,
-                _ => false,
-            })
-            && self.shader_images.iter().all(|(key, entry)| match (entry, other.shader_images.get(key)) {
-                (shader_image::ShaderImageEntry::Loaded(a), Some(shader_image::ShaderImageEntry::Loaded(b))) => Arc::ptr_eq(a, b),
-                (shader_image::ShaderImageEntry::Fallback, Some(shader_image::ShaderImageEntry::Fallback)) => true,
                 _ => false,
             })
     }
 
     pub fn extend(&mut self, other: AssetStore) {
         self.entries.extend(other.entries);
-        self.shader_images.extend(other.shader_images);
     }
 
     pub fn insert(&mut self, src: String, entry: AssetEntry) {
@@ -216,23 +202,12 @@ impl AssetStore {
         self.entries.insert(src, AssetEntry::LoadedExternal(meta));
     }
 
-    /// M4e: settled shader-image entry under its resource key.
-    pub fn insert_shader_image(&mut self, key: String, entry: shader_image::ShaderImageEntry) {
-        self.shader_images.insert(key, entry);
-    }
-
-    /// M4e: lookup by production resource key. `None` = never requested
-    /// (callers treat as the manager's fallback entry, like Fallback).
-    pub fn shader_image(&self, key: &str) -> Option<&shader_image::ShaderImageEntry> {
-        self.shader_images.get(key)
-    }
-
     pub fn len(&self) -> usize {
-        self.entries.len() + self.shader_images.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.shader_images.is_empty()
+        self.entries.is_empty()
     }
 
     /// `getImageFillState` (`WebGPUTextureManager.ts:445-459`): never
@@ -241,7 +216,7 @@ impl AssetStore {
     /// heap).
     pub fn fill_state(&self, src: &str) -> ImageFillState {
         match self.entries.get(src) {
-            Some(AssetEntry::Loaded(_)) | Some(AssetEntry::LoadedExternal(_)) => {
+            Some(AssetEntry::Loaded(_)) | Some(AssetEntry::LoadedExternal(_)) | Some(AssetEntry::DeviceFrame(_, _)) => {
                 ImageFillState::Loaded
             }
             Some(AssetEntry::Failed) => ImageFillState::Failed,
@@ -253,7 +228,7 @@ impl AssetStore {
     pub fn dimensions(&self, src: &str) -> Option<(u32, u32)> {
         match self.entries.get(src) {
             Some(AssetEntry::Loaded(i)) => Some((i.width, i.height)),
-            Some(AssetEntry::LoadedExternal(m)) => Some((m.width, m.height)),
+            Some(AssetEntry::LoadedExternal(m) | AssetEntry::DeviceFrame(m, _)) => Some((m.width, m.height)),
             _ => None,
         }
     }
@@ -262,7 +237,7 @@ impl AssetStore {
     pub fn scale_factor(&self, src: &str) -> Option<(f64, f64)> {
         match self.entries.get(src) {
             Some(AssetEntry::Loaded(i)) => Some(i.scale_factor),
-            Some(AssetEntry::LoadedExternal(m)) => Some(m.scale_factor),
+            Some(AssetEntry::LoadedExternal(m) | AssetEntry::DeviceFrame(m, _)) => Some(m.scale_factor),
             _ => None,
         }
     }
@@ -281,7 +256,7 @@ impl AssetStore {
     /// lane). `None` for heap/failed/never-requested sources.
     pub fn external(&self, src: &str) -> Option<&ExternalImageMeta> {
         match self.entries.get(src) {
-            Some(AssetEntry::LoadedExternal(m)) => Some(m),
+            Some(AssetEntry::LoadedExternal(m) | AssetEntry::DeviceFrame(m, _)) => Some(m),
             _ => None,
         }
     }

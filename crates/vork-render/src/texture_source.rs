@@ -25,10 +25,25 @@ pub(crate) fn for_image(mut error: anyhow::Error, name: &str) -> anyhow::Error {
         && declared.image.is_none() { declared.image = Some(name.to_owned()); }
     error
 }
-/// Where a file failed to decode. An unreadable colour description names its own fix; anything else is a damaged file.
-pub(crate) fn decode_context(error: anyhow::Error, what: &str, path: &std::path::Path) -> anyhow::Error {
+/// Keep the path separate so a session can name the authored file after decoding a private revision.
+#[derive(Debug)]
+pub(crate) struct DecodeLocation {
+    pub(crate) path: PathBuf,
+    what: &'static str,
+    damaged: bool,
+}
+impl std::fmt::Display for DecodeLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.what, self.path.display())?;
+        if self.damaged {
+            write!(f, "; restore a valid image or correct its path")?;
+        }
+        Ok(())
+    }
+}
+pub(crate) fn decode_context(error: anyhow::Error, what: &'static str, path: &std::path::Path) -> anyhow::Error {
     let damaged = !error.is::<DeclaredColour>();
-    error.context(format!("{what} {}{}", path.display(), if damaged {"; restore a valid image or correct its path"} else {""}))
+    error.context(DecodeLocation { path: path.to_owned(), what, damaged })
 }
 pub(crate) fn missing_image(path: &std::path::Path) -> image::DynamicImage {
     crate::warnings::dropped("missing_image", serde_json::json!({"file":path}),

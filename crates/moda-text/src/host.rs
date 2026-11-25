@@ -217,6 +217,7 @@ pub struct TextHost {
     vector_files: HashMap<String, String>,
     manifest: Value,
     emoji_dir: PathBuf,
+    canvas_engine: OnceLock<Arc<crate::degraded::DegradedEngine>>,
     /// decoded emoji cache: cluster → premultiplied RgbaImage (the browser
     /// uploads premultiplied — `copyExternalImageSafe(premultipliedAlpha:
     /// true)`; resvg/tiny-skia output is premultiplied already). Byte-capped
@@ -290,6 +291,7 @@ impl TextHost {
             root: fonts_root.to_path_buf(),
             vector_files: crate::vector::manifest_files(&manifest),
             manifest,
+            canvas_engine: OnceLock::new(),
             emoji_dir: fonts_root.join("emoji"),
             emoji_cache: Mutex::new(ByteLruCache::new(
                 emoji_cap_bytes(),
@@ -319,6 +321,11 @@ impl TextHost {
     /// concurrent directory writer cannot change the set between text systems.
     pub fn degraded_engine(&self) -> crate::degraded::DegradedEngine {
         crate::degraded::build_catalog_engine_from_snapshot(&self.root, &self.manifest)
+    }
+
+    /// The scene catalog plus a system colour face when the scene supplies none.
+    pub fn canvas_engine(&self) -> &Arc<crate::degraded::DegradedEngine> {
+        self.canvas_engine.get_or_init(|| Arc::new(crate::degraded::build_host_engine(&self.root, &self.manifest, true)))
     }
 
     /// Compare against the manifest snapshot already loaded by this host, without
@@ -415,24 +422,6 @@ mod tests {
     use super::*;
     use crate::test_fixtures::oracle_fonts_root;
 
-    /// The host hands out a vector store over its OWN vendored snapshot,
-    /// so the store's `MANIFEST.files` and the host's `catalog` can never be two
-    /// different dirs. Asserted through the store's ability to RESOLVE a catalog
-    /// variant, not through a getter — a getter with no production caller could not
-    /// fail if this regressed.
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/catalog.json, MANIFEST.json and families-index.json"]
-    fn hands_out_a_vector_store_over_its_own_snapshot() {
-        let host = TextHost::load(&oracle_fonts_root()).expect("host load");
-        let store = host.vector_font_store_lenient();
-        assert!(
-            store
-                .font_for_variant(&host.catalog, "Inter", 400, "normal", None)
-                .is_some(),
-            "the host's own store must resolve the host's own catalog"
-        );
-    }
-
     #[test]
     fn emoji_filename_strips_vs16_and_zero_pads() {
         // VS16 stripped; codepoints below 0x1000 zero-padded to 4 digits (Noto
@@ -466,55 +455,4 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/emoji and catalog metadata"]
-    fn emoji_rasterizes_at_intrinsic_size() {
-        let host = TextHost::load(&oracle_fonts_root()).expect("host load");
-        let img = host.emoji_rgba("🎨").expect("vendored emoji svg");
-        assert_eq!((img.width, img.height), (128, 128));
-        // A cluster with no loose SVG AND no installed provider (this test does
-        // not install one — the `_provider_serves...` test uses a distinct
-        // cluster) → None (browser bakes a transparent placeholder).
-        assert!(host.emoji_rgba("\u{1F9F1}").is_none());
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/catalog.json, MANIFEST.json and families-index.json"]
-    fn emoji_miss_invokes_the_recorder_fresh_and_cached() {
-        // The planning site drops unrenderable emoji, so the miss must be
-        // reported from `emoji_rgba` itself — on both the fresh resolve and the
-        // negative-cache hit (the report resets per render but the cache
-        // outlives it). A distinct cluster keeps other tests' misses out of the
-        // count.
-        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        install_emoji_miss_recorder(Box::new(|c| SEEN.lock().unwrap().push(c.to_string())));
-        let host = TextHost::load(&oracle_fonts_root()).expect("host load");
-        let cluster = "\u{1FAE9}"; // shaking-face — not vendored, no provider bytes
-        assert!(host.emoji_rgba(cluster).is_none()); // fresh miss
-        assert!(host.emoji_rgba(cluster).is_none()); // cached-None miss
-        let n = SEEN
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|c| *c == cluster)
-            .count();
-        assert!(n >= 2, "recorded the fresh AND the cached miss, got {n}");
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture oracle/fonts/catalog.json, MANIFEST.json and families-index.json"]
-    fn emoji_provider_serves_loose_dir_miss() {
-        // The installed provider (native lanes: the bundled Noto pack) is
-        // consulted only when the loose dir / VFS has no bytes for the cluster.
-        // A distinct cluster keeps this from perturbing the `is_none()` check
-        // above (the provider answers only its own cluster).
-        install_emoji_bytes_provider(Box::new(|cluster: &str| {
-            (cluster == "\u{1F9CA}").then(|| {
-                br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>"#.to_vec()
-            })
-        }));
-        let host = TextHost::load(&oracle_fonts_root()).expect("host load");
-        let img = host.emoji_rgba("\u{1F9CA}").expect("provider-served emoji");
-        assert_eq!((img.width, img.height), (10, 10));
-    }
 }

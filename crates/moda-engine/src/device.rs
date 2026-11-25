@@ -83,6 +83,9 @@ impl BackendChoice {
 
 #[derive(Clone)]
 pub struct GpuContext {
+    /// Standalone contexts own their canvas compiler. Embedded contexts use the renderer’s registration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub pipeline_device: Option<std::sync::Arc<moda_text_draw::device::PipelineDevice>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
@@ -111,7 +114,7 @@ pub struct GpuContext {
     /// [`GpuContext::max_sample_count_for`].
     pub max_sample_count_bgra: u32,
     /// The [`GpuContext::max_sample_count`] intersection computed for an `Rgba16Float` MSAA color attachment
-    /// (still ∩ `Depth24Plus`): the pixel graph's float capture engine (motion-model.md §10.1).
+    /// with `Depth24Plus` for float captures.
     pub max_sample_count_f16: u32,
     /// Whether the PRESENTATION surface can be a `COPY_SRC` source.
     /// NOT a raw capability read — it's forced on for wasm32 (browsers back
@@ -295,6 +298,8 @@ impl GpuContext {
             compute_max_sample_count(&adapter, wgpu::TextureFormat::Rgba16Float);
 
         Ok(GpuContext {
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_device: Some(std::sync::Arc::new(moda_text_draw::device::PipelineDevice::new(&device, None))),
             device,
             queue,
             adapter_info,
@@ -335,11 +340,12 @@ impl GpuContext {
         limits.max_texture_dimension_2d = limits
             .max_texture_dimension_2d
             .max(16384.min(adapter.limits().max_texture_dimension_2d));
+        limits.max_multiview_view_count = adapter.limits().max_multiview_view_count;
         let timestamps =
             profile || std::env::var("MODA_GPU_TIMESTAMPS").is_ok_and(|value| value == "1") || crate::prof::gpu();
         wgpu::DeviceDescriptor {
             required_limits: limits,
-            required_features: Self::timestamp_features(
+            required_features: (adapter.features() & (wgpu::Features::MULTIVIEW | wgpu::Features::MULTISAMPLE_ARRAY)) | Self::timestamp_features(
                 adapter.get_info().backend,
                 adapter.features(),
                 timestamps,
@@ -477,6 +483,8 @@ impl GpuContext {
             })
             .unwrap_or(false);
         Ok(GpuContext {
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline_device: Some(std::sync::Arc::new(moda_text_draw::device::PipelineDevice::new(&device, None))),
             device,
             queue,
             adapter_info,
@@ -643,5 +651,108 @@ mod tests {
         )));
         let wrapped = anyhow::anyhow!("inner").context("GPU device init");
         assert!(!is_device_lost_error(&wrapped));
+    }
+}
+
+
+/// Readers only inspect published values. A failed attempt stays scalar and can
+/// be retried after the driver has had time to recover from allocation pressure.
+#[derive(Default)]
+enum Attempt {
+    #[default]
+    Idle,
+    Building,
+    Failed(std::time::Instant),
+}
+
+impl Attempt {
+    fn may_start(&self) -> bool {
+        match self {
+            Self::Idle => true,
+            Self::Building => false,
+            Self::Failed(at) => at.elapsed() >= std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+struct Publication<T> {
+    ready: std::sync::OnceLock<T>,
+    attempt: std::sync::Mutex<Attempt>,
+}
+
+pub(crate) struct OptionalPipeline<T>(std::sync::OnceLock<std::sync::Arc<Publication<T>>>);
+
+impl<T> Default for OptionalPipeline<T> {
+    fn default() -> Self { Self(Default::default()) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + 'static> OptionalPipeline<T> {
+    pub(crate) fn request(&self, device: &wgpu::Device, family: &'static str,
+        hint: impl FnOnce() -> Option<String> + Send + 'static,
+        build: impl FnOnce(&wgpu::Device, Option<&wgpu::PipelineCache>) -> anyhow::Result<T> + Send + 'static) {
+        let slot = self.0.get_or_init(|| std::sync::Arc::new(Publication {
+            ready: Default::default(), attempt: Default::default(),
+        }));
+        if slot.ready.get().is_some() { return; }
+        {
+            let mut attempt = slot.attempt.lock().unwrap();
+            if !attempt.may_start() || slot.ready.get().is_some() { return; }
+            *attempt = Attempt::Building;
+        }
+        let result = slot.clone();
+        let compiler = moda_text_draw::device::OptionalCompiler::new(device);
+        let worker = compiler.clone();
+        if compiler.enqueue(move || {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.compile(family, build)));
+            if let Ok(Ok(pipeline)) = built {
+                if let Some(hint) = hint() { worker.remember_capture_hint(&hint); }
+                let _ = result.ready.set(pipeline);
+            }
+            else { *result.attempt.lock().unwrap() = Attempt::Failed(std::time::Instant::now()); }
+        }).is_err() {
+            *slot.attempt.lock().unwrap() = Attempt::Failed(std::time::Instant::now());
+        }
+    }
+}
+
+impl<T> OptionalPipeline<T> {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn request(&self, _: &wgpu::Device, _: &'static str, _: impl FnOnce() -> Option<String>,
+        _: impl FnOnce(&wgpu::Device, Option<&wgpu::PipelineCache>) -> anyhow::Result<T>) {}
+
+    pub(crate) fn failed(&self) -> bool {
+        self.0.get().is_some_and(|s| s.ready.get().is_none() && matches!(*s.attempt.lock().unwrap(), Attempt::Failed(_)))
+    }
+
+    pub(crate) fn ready(&self) -> Option<&T> { self.0.get()?.ready.get() }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static VARIANT_DRAWS: std::cell::RefCell<std::collections::HashSet<&'static str>> = Default::default();
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod optional_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a working GPU adapter"]
+    fn failed_capture_pipeline_can_be_published_after_recovery() {
+        let gpu = GpuContext::new(BackendChoice::Auto).unwrap();
+        let slot = OptionalPipeline::<u32>::default();
+        slot.request(&gpu.device, "retry test", || None, |_, _| anyhow::bail!("temporary pressure"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !slot.failed() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        while slot.ready().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            slot.request(&gpu.device, "retry test", || None, |_, _| Ok(7));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(slot.ready(), Some(&7));
     }
 }

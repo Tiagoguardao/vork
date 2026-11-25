@@ -1000,53 +1000,6 @@ mod tests {
         assert!((poly[4][1] - (20.0 - t / 2.0)).abs() < 1e-6);
     }
 
-    /// The TS twin (`decorations.ts` `decorationShapes` / `decorationPolygons`) reads the same fixture
-    /// (packages/editor/test/decorationStyles.test.ts): both lanes draw the same shapes. `MODA_WRITE_DECORATION_FIXTURE=1`
-    /// rewrites it.
-    #[test]
-    #[ignore = "needs unported Moda fixture decoration-shapes.json"]
-    fn shapes_match_the_shared_fixture() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/decoration-shapes.json");
-        let mut cases = Vec::new();
-        for (style, underline) in [
-            (DecorationLineStyle::Solid, true),
-            (DecorationLineStyle::Double, true),
-            (DecorationLineStyle::Double, false),
-            (DecorationLineStyle::Dotted, true),
-            (DecorationLineStyle::Dashed, true),
-            (DecorationLineStyle::Wavy, true),
-            (DecorationLineStyle::Wavy, false),
-        ] {
-            for (t, x1, x2, origin) in [(1.0, 0.0, 37.5, 0.0), (2.5, 12.25, 61.0, 3.0), (0.5, 5.0, 19.0, 5.0)] {
-                let r = DecorationRect {
-                    x1,
-                    x2,
-                    y: 30.0,
-                    thickness: t,
-                    color: String::new(),
-                    paint: None,
-                    line_style: style,
-                    underline,
-                };
-                let polys = decoration_polygons(&decoration_shapes(&r, 7.0, origin));
-                cases.push(serde_json::json!({
-                    "rect": { "x1": x1, "x2": x2, "y": 30.0, "thickness": t, "lineStyle": style.css(), "underline": underline },
-                    "offsetX": 7.0, "originX": origin,
-                    "polygons": polys.iter().map(|p| p.iter().map(|q| [round6(q[0]), round6(q[1])]).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                }));
-            }
-        }
-        let json = serde_json::to_string(&serde_json::json!({ "cases": cases })).unwrap() + "\n";
-        if std::env::var_os("MODA_WRITE_DECORATION_FIXTURE").is_some() {
-            std::fs::write(&path, &json).unwrap();
-            return;
-        }
-        let pinned = std::fs::read_to_string(&path).expect("native/fixtures/decoration-shapes.json");
-        let a: serde_json::Value = serde_json::from_str(&pinned).unwrap();
-        let b: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(a, b, "decoration shapes changed: rewrite the fixture and check the TS twin");
-    }
-
     fn round6(v: f64) -> f64 {
         (v * 1e6).round() / 1e6
     }

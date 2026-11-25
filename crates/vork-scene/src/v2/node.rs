@@ -1,4 +1,42 @@
 use super::*;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MaskType {
+    #[default]
+    Luminance,
+    Alpha,
+}
+
+impl MaskType {
+    fn is_luminance(&self) -> bool { *self == Self::Luminance }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MixBlendMode {
+    #[default]
+    Normal,
+    Multiply, Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn,
+    HardLight, SoftLight, Difference, Exclusion, Hue, Saturation, Color, Luminosity,
+}
+
+impl MixBlendMode {
+    fn is_normal(&self) -> bool { *self == Self::Normal }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    #[default]
+    Auto,
+    Isolate,
+}
+
+impl Isolation {
+    fn is_auto(&self) -> bool { *self == Self::Auto }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Node {
     #[serde(default)]
@@ -36,15 +74,25 @@ pub struct Node {
     #[serde(default, rename = "clip-path", skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-source" = "SVG 2 / CSS Masking clip-path", "x-help-path" = "node.clip-path", "x-help" = "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself"))]
     pub clip_path: Option<String>,
-    /// 2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's
+    /// 2D canvas only: the named node's picture masks this node, drawn in this node's
     /// coordinates (SVG mask, userSpaceOnUse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-source" = "SVG 2 / CSS Masking mask (luminance)", "x-help-path" = "node.mask", "x-help" = "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself"))]
+    #[schemars(extend("x-source" = "SVG 2 / CSS Masking mask", "x-help-path" = "node.mask", "x-help" = "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node; it is not painted itself"))]
     pub mask: Option<String>,
+    /// How this picture supplies coverage when another node references it as a mask.
+    #[serde(default, rename = "mask-type", skip_serializing_if = "MaskType::is_luminance")]
+    #[schemars(extend("default" = "luminance", "x-source" = "CSS Masking mask-type", "x-help-path" = "node.mask-type", "x-help" = "luminance|alpha"))]
+    pub mask_type: MaskType,
+    #[serde(default, rename = "mix-blend-mode", skip_serializing_if = "MixBlendMode::is_normal")]
+    #[schemars(extend("default" = "normal", "x-source" = "CSS Compositing and Blending mix-blend-mode", "x-help-path" = "node.mix-blend-mode", "x-help" = "normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity"))]
+    pub mix_blend_mode: MixBlendMode,
+    #[serde(default, skip_serializing_if = "Isolation::is_auto")]
+    #[schemars(extend("default" = "auto", "x-source" = "CSS Compositing and Blending isolation", "x-help-path" = "node.isolation", "x-help" = "auto|isolate"))]
+    pub isolation: Isolation,
     /// 2D canvas only: CSS filter functions over the node's picture, in order.
-    /// Layer blur refuses sigma above 100 target pixels after accumulated transforms.
+    /// The blur length is the Gaussian standard deviation before transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-source" = "CSS Filter Effects filter", "x-help-path" = "node.filter", "x-help" = "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses"))]
+    #[schemars(extend("x-source" = "CSS Filter Effects filter", "x-help-path" = "node.filter", "x-help" = "string|null; 2D; blur(), brightness(), contrast(), drop-shadow(), grayscale(), hue-rotate(), invert(), opacity(), saturate(), sepia(); nonzero lengths require px; blur length is the Gaussian standard deviation before transforms"))]
     pub filter: Option<String>,
     /// Sound source and gain over this node's complete subtree mix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +505,9 @@ impl Node {
             // The node's own fields are read from the document as they stand.
             "filter" => self.filter = serde_json::from_value(value.clone())?,
             "clip-path" => self.clip_path = serde_json::from_value(value.clone())?,
+            "isolation" => self.isolation = serde_json::from_value(value.clone())?,
+            "mix-blend-mode" => self.mix_blend_mode = serde_json::from_value(value.clone())?,
+            "mask-type" => self.mask_type = serde_json::from_value(value.clone())?,
             "mask" => self.mask = serde_json::from_value(value.clone())?,
             _ => match &mut self.kind {
                 NodeKind::Text { content, font, font_size, font_weight, font_style, font_variation_settings, font_feature_settings,
@@ -497,6 +548,9 @@ impl Node {
             opacity: self.opacity,
             clip_path: self.clip_path.clone(),
             mask: self.mask.clone(),
+            mask_type: self.mask_type,
+            isolation: self.isolation,
+            mix_blend_mode: self.mix_blend_mode,
             filter: self.filter.clone(),
             audio: self.audio.clone(),
             active: self.active.clone(),
@@ -627,7 +681,7 @@ mod fit_defaults_tests {
 #[serde(deny_unknown_fields)]
 pub struct Audio {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-source" = "vork sound source", "x-help-path" = "node.audio.file", "x-help" = "file-path|null; mono/stereo; relative to scene; omitted = children only"))]
+    #[schemars(extend("x-source" = "vork sound source", "x-help-path" = "node.audio.file", "x-help" = "file-path|null; mono/stereo; relative to scene; omitted = movie soundtracks and children"))]
     pub file: Option<String>,
     #[serde(default = "canvas::one", deserialize_with = "super::numeric")]
     #[schemars(extend("x-source" = "Web Audio GainNode", "x-help-path" = "node.audio.gain", "x-help" = "number; linear amplitude over source plus children; default 1; keyable"))]

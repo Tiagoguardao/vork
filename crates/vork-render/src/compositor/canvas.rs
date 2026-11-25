@@ -14,7 +14,7 @@ use vork_time::exact::Germ;
 /// entry's context are the identity and zero, and `ctx.samples` is one: a canvas is drawn once, through no
 /// camera.
 pub(crate) struct CanvasGraph {
-    programs: std::collections::HashMap<String, Program>,
+    prepared: std::sync::Arc<CanvasGraphPrograms>,
     size: [u32; 2],
     fps: vork_time::Time,
     /// The drawn picture as the graph's first image, written by `ingest` each draw.
@@ -22,8 +22,6 @@ pub(crate) struct CanvasGraph {
     /// The last image: the graph's result at the picture's size.
     output: wgpu::Buffer,
     dispatches: Vec<graph::Dispatch>,
-    ingest: wgpu::ComputePipeline,
-    publish: wgpu::ComputePipeline,
     /// This draw's context.
     uniform: wgpu::Buffer,
     /// Animated input words by material.
@@ -37,6 +35,21 @@ pub(crate) struct CanvasGraph {
     /// own diagnostics (`draw`).
     errors: crate::display_program::ErrorWord,
 }
+/// Immutable program installation shared by the graph's frame lanes. Each
+/// instance binds its own writable images, uniforms and decoder state.
+pub(crate) struct CanvasGraphPrograms {
+    programs: std::collections::HashMap<String, Program>,
+    ingest: wgpu::ComputePipeline,
+    publish: wgpu::ComputePipeline,
+    files: Vec<(String, FileInput)>,
+}
+
+enum FileInput {
+    /// Published by the serial graph before admission. A single-frame file never changes.
+    Still(wgpu::TextureView),
+    Media(crate::footage::FileInput),
+}
+
 /// One image file a live entry reads: the resident texture a world's media image has, holding the encoding
 /// the canvas blends in.
 struct ImageInput {
@@ -53,44 +66,16 @@ const INGEST: &str = "@group(0) @binding(0) var source: texture_2d<f32>;
 
 impl CanvasGraph {
     /// The graph of canvas `scene`, or `None` when its composition authors none.
-    pub(crate) fn new(r: &Renderer, scene: &Scene, base: &Path) -> Result<Option<Self>> {
+    pub(crate) fn new(r: &Renderer, scene: &Scene, base: &Path, opened: &crate::footage::Opened) -> Result<Option<Self>> {
         let names = scene.compositor();
         if names.is_empty() { return Ok(None); }
-        let opened = crate::footage::Opened::default();
-        let programs = install_own(r, scene, base, &opened)?;
-        let size = scene.render.resolution;
-        let fps = scene.render.fps;
-        let bytes = u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES;
+        let [width, height] = scene.render.resolution;
+        let bytes = u64::from(width) * u64::from(height) * constants::ACCUMULATION_PIXEL_BYTES;
         let limits = r.device.limits();
         ensure!(bytes <= u64::from(limits.max_storage_buffer_binding_size) && bytes <= limits.max_buffer_size,
             crate::gpu_memory::device_limit("canvas compositor picture", format_args!("{bytes} bytes"),
                 format_args!("storage binding={} bytes, buffer={} bytes", limits.max_storage_buffer_binding_size, limits.max_buffer_size), "reduce the canvas resolution"));
-        let buffer = |label: &str, size: u64, usage: wgpu::BufferUsages| crate::gpu_memory::buffer(&r.device, &wgpu::BufferDescriptor {
-            label: Some(label), size, usage, mapped_at_creation: false,
-        });
-        let pixels = buffer("canvas compositor picture", bytes, wgpu::BufferUsages::STORAGE);
-        let uniform = buffer("canvas compositor context", std::mem::size_of::<Uniform>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-        let inputs = FrameInputs::new(&programs, r, names);
-        // Each image a live entry reads: a file (the scene refuses a rendered image), a still as a sequence of
-        // one frame. The colour decoder converts whatever the file or its declaration says into the encoding
-        // the canvas blends in, and the texture keeps it.
-        let working = scene.composition.as_ref().map_or(vork_scene::v2::WorkingColorSpace::Srgb, vork_scene::v2::Composition::working_space);
-        let mut images = Vec::new();
-        let mut views = std::collections::BTreeMap::new();
-        for name in image_reads(&programs, names) {
-            let image = &scene.images[&name];
-            let file = image.file.as_ref().with_context(|| format!("composition.compositor: image {name} is rendered; a 2D canvas's compositor reads image files"))?;
-            let path = base.join(file);
-            let installed = (|| -> Result<_> {
-                let source = if crate::footage::is_media(&path) { opened.source(&path)? }
-                    else { crate::footage::Source::Sequence { files: vec![path.clone()], fps: None } };
-                crate::footage::Installed::from_source(r, &name, source, image.time.clone(), working, false, image.color_space, fps)
-            })().with_context(|| format!("composition.compositor: image {name} ({})", path.display()))?;
-            views.insert(name.clone(), (installed.view.clone(), images::associated_file(image)));
-            images.push(ImageInput { name, installed });
-        }
-        let (output, dispatches) = record_images(images::Sources::Canvas(&views), &programs, r, &uniform, &pixels, names, &inputs.buffers, size,
-            Normalization::None, graph::Pass::Compositor, buffer)?;
+        let programs = install_own(r, scene, base, opened)?;
         let pipeline = |label: &str, source: String| {
             let module = crate::timing::shader_module(&r.device, wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) });
             // Through the persistent pipeline cache; the compiler chooses `cache`.
@@ -111,47 +96,120 @@ impl CanvasGraph {
     if (!all(abs(value) <= vec4<f32>(3.402823466e38))) {{ atomicMax(&errors[0], {code}u); value = vec4<f32>(0.0); }}
     textureStore(picture, vec2<i32>(p.xy), clamp(value, vec4<f32>(-65504.0), vec4<f32>(65504.0)));
 }}", code = vork_slang::registry::DISPLAY_NONFINITE));
-        Ok(Some(Self { programs, size, fps, pixels, output, dispatches, ingest, publish, uniform, inputs, images, changes: Default::default(),
-            errors: crate::display_program::ErrorWord::new(r, "canvas compositor errors") }))
+        // Each image a live entry reads: a file (the scene refuses a rendered image), a still as a sequence of
+        // one frame. The colour decoder converts whatever the file or its declaration says into the encoding
+        // the canvas blends in, and the texture keeps it.
+        let working = scene.composition.as_ref().map_or(vork_scene::v2::WorkingColorSpace::Srgb, vork_scene::v2::Composition::working_space);
+        let mut images = Vec::new();
+        let mut views = std::collections::BTreeMap::new();
+        let mut files = Vec::new();
+        for name in image_reads(&programs, names) {
+            let image = &scene.images[&name];
+            let file = image.file.as_ref().with_context(|| format!("composition.compositor: image {name} is rendered; a 2D canvas's compositor reads image files"))?;
+            let path = base.join(file);
+            let installed = (|| -> Result<_> {
+                let source = if crate::footage::is_media(&path) { opened.canvas_source(&path, image.color_space)? }
+                    else { crate::footage::Source::Sequence { files: vec![path.clone()], fps: None } };
+                crate::footage::Installed::from_source(r, &name, source, image.time.clone(), working, false, image.color_space, scene.render.fps)
+            })().with_context(|| format!("composition.compositor: image {name} ({})", path.display()))?;
+            let file = if crate::footage::is_media(&path) { FileInput::Media(installed.file_input()) }
+                else { FileInput::Still(installed.view.clone()) };
+            files.push((name.clone(), file));
+            views.insert(name.clone(), (installed.view.clone(), images::associated_file(image)));
+            images.push(ImageInput { name, installed });
+        }
+        let prepared = std::sync::Arc::new(CanvasGraphPrograms { programs, ingest, publish, files });
+        Ok(Some(Self::bind(r, scene, prepared, images, views)?))
+    }
+
+    pub(crate) fn programs(&self) -> std::sync::Arc<CanvasGraphPrograms> {
+        self.prepared.clone()
+    }
+
+    pub(crate) fn from_programs(r: &Renderer, scene: &Scene, prepared: std::sync::Arc<CanvasGraphPrograms>) -> Result<Self> {
+        let mut images = Vec::new();
+        let mut views = std::collections::BTreeMap::new();
+        for (name, file) in &prepared.files {
+            let image = &scene.images[name];
+            let view = match file {
+                FileInput::Still(view) => view.clone(),
+                FileInput::Media(input) => {
+                    let installed = crate::footage::Installed::from_file(r, name, image.time.clone(), input);
+                    let view = installed.view.clone();
+                    images.push(ImageInput { name: name.clone(), installed });
+                    view
+                }
+            };
+            views.insert(name.clone(), (view, images::associated_file(image)));
+        }
+        Self::bind(r, scene, prepared, images, views)
+    }
+
+    fn bind(r: &Renderer, scene: &Scene, prepared: std::sync::Arc<CanvasGraphPrograms>, images: Vec<ImageInput>,
+        views: std::collections::BTreeMap<String, (wgpu::TextureView, bool)>) -> Result<Self> {
+        let names = scene.compositor();
+        let programs = &prepared.programs;
+        let size = scene.render.resolution;
+        let fps = scene.render.fps;
+        let bytes = u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES;
+        let buffer = |label: &str, size: u64, usage: wgpu::BufferUsages| crate::gpu_memory::buffer(&r.device, &wgpu::BufferDescriptor {
+            label: Some(label), size, usage, mapped_at_creation: false,
+        });
+        let pixels = buffer("canvas compositor picture", bytes, wgpu::BufferUsages::STORAGE);
+        let uniform = buffer("canvas compositor context", std::mem::size_of::<Uniform>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let inputs = FrameInputs::new(programs, r, names);
+        let (output, dispatches) = record_images(images::Sources::Canvas(&views), programs, r, &uniform, &pixels, names, &inputs.buffers, size,
+            Normalization::None, graph::Pass::Compositor, buffer)?;
+        Ok(Self { prepared, size, fps, pixels, output, dispatches, uniform, inputs, images, changes: Default::default(),
+            errors: crate::display_program::ErrorWord::new(r, "canvas compositor errors") })
     }
 
     /// Run the graph over `source`, the canvas's drawn float picture, at the picture's local instant `request`,
     /// and return its result as a float picture of the same form: a texture of this draw's own, since its
     /// readers are recorded in commands submitted later. `instants` holds each image input's instant by name
-    /// (`canvas::Document` evaluates them with the frame). The graph's commands are submitted here, after the
-    /// drawing that made `source`. `errors`: the shader diagnostics of the frame the picture is drawn for, which
+    /// (`canvas::Document` evaluates them with the frame). The graph's commands follow the
+    /// drawing that made `source`, in its frame submission when a prefix is open. `errors`: the shader diagnostics of the frame the picture is drawn for, which
     /// that frame refuses where it is collected; without them the graph's own word, cleared here and read
     /// through `errors` or `check`.
-    pub(crate) fn draw(&self, r: &Renderer, source: &wgpu::Texture, request: &vork_time::Request, instants: &[(String, Germ)],
-        errors: Option<&wgpu::Buffer>) -> Result<wgpu::Texture> {
+    pub(crate) fn draw(&self, r: &Renderer, source: &wgpu::Texture, request: &vork_time::Request, output_index: Option<u32>, instants: &[(String, Germ)],
+        errors: Option<&wgpu::Buffer>, prefix: Option<&mut moda_engine::scratch::FramePrefix>) -> Result<wgpu::Texture> {
         let mut changes = self.changes.borrow_mut();
-        let drawn = self.record(r, source, request, instants, errors, &mut changes);
+        let drawn = self.record(r, source, request, output_index, instants, errors, &mut changes);
         // A failed draw submitted nothing: what it recorded as published is not on the GPU.
         if drawn.is_err() { *changes = Default::default(); }
-        drawn
+        let (picture, commands) = drawn?;
+        if let Some(prefix) = prefix {
+            prefix.append(commands);
+        } else {
+            r.queue.submit([commands]);
+        }
+        Ok(picture)
     }
-    fn record(&self, r: &Renderer, source: &wgpu::Texture, request: &vork_time::Request, instants: &[(String, Germ)],
-        errors: Option<&wgpu::Buffer>, changes: &mut crate::values::ChangeTracker) -> Result<wgpu::Texture> {
+    fn record(&self, r: &Renderer, source: &wgpu::Texture, request: &vork_time::Request, output_index: Option<u32>, instants: &[(String, Germ)],
+        errors: Option<&wgpu::Buffer>, changes: &mut crate::values::ChangeTracker) -> Result<(wgpu::Texture, wgpu::CommandBuffer)> {
         ensure!(source.format() == wgpu::TextureFormat::Rgba16Float && [source.width(), source.height()] == self.size,
             "a canvas compositor reads the canvas's float picture");
         let time = request.numeric()?;
-        // The frame's number, as a world's frame has it: the nearest frame to the instant.
-        let identity = request.exact()?.scale(&vork_time::exact::decimal(&self.fps.to_string())?)
-            .add(&Germ::point(vork_time::exact::decimal("1/2")?)).floor();
-        let index = u32::try_from(identity).context("frame index exceeds u32 identity capacity")?;
+        // Two exactly representable words carry a numbered output's u32 to
+        // Slang. An image sampled by a world keeps the world's numeric frame
+        // uniform at its own local clock, including its precision at large times.
+        let (frame_lo, frame_hi) = match output_index {
+            Some(index) => ((index & 0xffff) as f32, (index >> 16) as f32),
+            None => (request.nearest_frame(self.fps)? as f32, 0.),
+        };
         let [w, h] = self.size;
         let mut frame = Uniform::zeroed();
         frame.view = glam::Mat4::IDENTITY;
         frame.composite_projection = glam::Mat4::IDENTITY;
         // One finished sample at the instant: nothing accumulates, and the shutter is closed.
         frame.temporal = [0., 1., 0., 0.];
-        frame.scene = [time, index as f32, 0., self.fps.as_f32()];
+        frame.scene = [time, frame_lo, frame_hi, self.fps.as_f32()];
         frame.display = [0., w as f32, h as f32, 0.];
         frame.composite_shutter = [time; 4];
         frame.composite_step = [0., 1., 1., 1.];
         changes.upload(&self.uniform, 0, bytemuck::bytes_of(&frame));
         // Sampled at the exact request, as the canvas's own tracks are.
-        self.inputs.publish(&self.programs, changes, |animation, words| animation.words_request(request, time, words))?;
+        self.inputs.publish(&self.prepared.programs, changes, |animation, words| animation.words_request(request, time, words))?;
         let picture = crate::gpu_memory::texture(&r.device, &wgpu::TextureDescriptor {
             label: Some("canvas composited picture"), size: source.size(), mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba16Float,
@@ -177,20 +235,19 @@ impl CanvasGraph {
         let groups = [w.div_ceil(8), h.div_ceil(8), 1];
         let source = source.create_view(&Default::default());
         let ingest = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("canvas compositor ingest"), layout: &self.ingest.get_bind_group_layout(0),
+            label: Some("canvas compositor ingest"), layout: &self.prepared.ingest.get_bind_group_layout(0),
             entries: &[entry(0, wgpu::BindingResource::TextureView(&source)), entry(1, self.pixels.as_entire_binding())],
         });
-        graph::Dispatch::new(&self.ingest, ingest, groups).encode_packet(&mut encoder, false);
+        graph::Dispatch::new(&self.prepared.ingest, ingest, groups).encode_packet(&mut encoder, false);
         for dispatch in &self.dispatches { dispatch.encode_packet(&mut encoder, false); }
         let target = picture.create_view(&Default::default());
         let publish = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("canvas compositor publish"), layout: &self.publish.get_bind_group_layout(0),
+            label: Some("canvas compositor publish"), layout: &self.prepared.publish.get_bind_group_layout(0),
             entries: &[entry(0, self.output.as_entire_binding()), entry(1, wgpu::BindingResource::TextureView(&target)),
                 entry(2, errors.unwrap_or(self.errors.buffer()).as_entire_binding())],
         });
-        graph::Dispatch::new(&self.publish, publish, groups).encode_packet(&mut encoder, false);
-        r.queue.submit([encoder.finish()]);
-        Ok(picture)
+        graph::Dispatch::new(&self.prepared.publish, publish, groups).encode_packet(&mut encoder, false);
+        Ok((picture, encoder.finish()))
     }
     /// The graph's own error word (four bytes) after the last `draw` without a frame's diagnostics. Copy it
     /// before the next `draw` clears it, and `display_program::refuse` it where the frame is collected.

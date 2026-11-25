@@ -34,8 +34,14 @@ pub fn bounded(all: bool, skip_warmup: bool, verbose: bool, gpu: Option<vork_ren
         Ok(None)
     })();
     drop(file);
+    // The worker records WARMING only after required checks succeed.
+    let stage = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
     if let Some(status) = result? {
+        if stage.trim() == WARMING {
+            output!("Shader warmup did not complete ({status}); completed cache entries are retained. Rendering works and compiles the remaining pipelines on demand. If this repeats, the GPU driver's shader compiler is failing on one pipeline: update the driver, and use `vork setup --skip-warmup` to check the installation without warming.");
+            return Ok(());
+        }
         // Preserve the worker’s diagnostic and typed CLI failure code.
         std::process::exit(status.code().unwrap_or(1));
     }

@@ -672,6 +672,12 @@ pub struct Texture {
 }
 
 impl Texture {
+    /// Device-reported storage of this texture.
+    pub fn binding_size(&self) -> u64 {
+        use objc2_metal::MTLResource;
+        self.raw.allocatedSize() as u64
+    }
+
     pub fn raw_handle(&self) -> &ProtocolObject<dyn MTLTexture> {
         &self.raw
     }

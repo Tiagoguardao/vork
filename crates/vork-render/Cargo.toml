@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
+vork-media = { path = "../vork-media" }
 vork-audio = { path = "../vork-audio" }
 urlencoding = "2"
 vork-time = { path = "../vork-time" }
@@ -30,14 +31,17 @@ glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 gltf = { version = "1.4", features = ["extras", "KHR_lights_punctual", "KHR_texture_transform", "extensions", "KHR_materials_transmission", "KHR_materials_volume", "KHR_materials_ior", "KHR_materials_emissive_strength"] }
 blake3 = "1"
+sha2 = "0.10"
 # Avoid zero-filling worst-case compression output; retain checked, safe cache reads.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 memmap2 = "0.9"
 pollster = "0.4"
+tempfile = "3"
 serde_json = { package = "vork-json", path = "../vork-json" }
 png = "0.18"
 moxcms = { version = "=0.8.1", features = ["extended_range"] }
 exr = { version = "1.74", default-features = false }
+rayon = "1.12"
 libc = "0.2"
 libloading = "0.8"
 vork-encode = { path = "../vork-encode" }
@@ -49,7 +53,6 @@ lzma-rs = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 texture2ddecoder = "0.1.2"
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11"] }
 serde = { version = "1", features = ["derive"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
@@ -60,9 +63,12 @@ intel_tex_2 = "0.5.0"
 ash = "0.38"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
 objc2-metal = "0.3"
 
 [build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 vork-slang = { path = "../vork-slang" }
 blake3 = "1"
 serde_json = { package = "vork-json", path = "../vork-json" }
@@ -87,3 +93,6 @@ required-features = ["test-support"]
 [dev-dependencies.vork-render]
 path = "."
 features = ["test-support"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }

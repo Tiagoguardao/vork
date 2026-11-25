@@ -68,8 +68,7 @@ pub const MAX_RESULT_POINTS: usize = 10_000;
 /// The input side of `MAX_RESULT_POINTS`, and the tessellator's per-path cap:
 /// an operand the renderer would truncate is not an operand worth solving.
 pub(crate) const MAX_POINTS_PER_OPERAND: usize = MAX_RESULT_POINTS;
-/// 1,600 operands of 20 cubics each; the polygon lane flattens and folds them
-/// in well under a second (`large_tests::bench_large_inputs`).
+/// Budget for 1,600 operands of 20 cubics each.
 pub(crate) const MAX_TOTAL_CUBICS: usize = 32_000;
 /// Cross-operand point budget, checked before any point is converted.
 ///
@@ -693,12 +692,7 @@ pub(crate) fn check_output_finite(points: &[PathPoint]) -> Result<(), BooleanErr
     Ok(())
 }
 
-/// Bounds ship in the envelope too, and `Bounds::include` reduces with
-/// `f64::min` / `f64::max`, which *skip* NaN rather than propagating it — so a
-/// partially non-finite region yields finite-looking bounds wrapped around it,
-/// and nothing about the envelope would look wrong. `check_output_finite` runs
-/// first and already rejects such a region; this states that dependency instead
-/// of leaving the envelope's correctness resting on a NaN-skipping reduction.
+/// Check the final numeric envelope before serializing a boolean result.
 pub(crate) fn check_bounds_finite(b: &Bounds) -> Result<(), BooleanError> {
     if [b.min_x, b.min_y, b.max_x, b.max_y]
         .iter()
@@ -799,79 +793,10 @@ fn region_min(regions: &[Region]) -> Option<(f64, f64)> {
 
 /// Tight bounds of the solved region: per-cubic extrema, not the control hull.
 pub(crate) fn region_bounds(region: &Region) -> Option<Bounds> {
-    let mut b = Bounds {
-        min_x: f64::INFINITY,
-        min_y: f64::INFINITY,
-        max_x: f64::NEG_INFINITY,
-        max_y: f64::NEG_INFINITY,
-    };
-    for (start, segments) in region {
-        let mut p0 = *start;
-        b.include(p0.0, p0.1);
-        for (c1, c2, p3) in segments {
-            b.include(p3.0, p3.1);
-            for t in cubic_extrema(p0.0, c1.0, c2.0, p3.0) {
-                b.include(
-                    cubic_at(p0.0, c1.0, c2.0, p3.0, t),
-                    cubic_at(p0.1, c1.1, c2.1, p3.1, t),
-                );
-            }
-            for t in cubic_extrema(p0.1, c1.1, c2.1, p3.1) {
-                b.include(
-                    cubic_at(p0.0, c1.0, c2.0, p3.0, t),
-                    cubic_at(p0.1, c1.1, c2.1, p3.1, t),
-                );
-            }
-            p0 = *p3;
-        }
-    }
-    // Still at the `INFINITY` sentinels means the region held no segment at
-    // all — `None` is "nothing to bound", not "the bounds came out bad". A
-    // region whose *contents* are non-finite is `check_output_finite`'s job,
-    // and `check_bounds_finite` pins what this returns either way.
-    if b.min_x.is_finite() && b.min_y.is_finite() {
-        Some(b)
-    } else {
-        None
-    }
-}
-
-fn cubic_at(a: f64, b: f64, c: f64, d: f64, t: f64) -> f64 {
-    let mt = 1.0 - t;
-    mt * mt * mt * a + 3.0 * mt * mt * t * b + 3.0 * mt * t * t * c + t * t * t * d
-}
-
-/// Roots of the cubic's derivative inside (0, 1) on one axis.
-fn cubic_extrema(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
-    // B'(t)/3 = (−a+3b−3c+d)t² + 2(a−2b+c)t + (b−a)
-    let qa = -a + 3.0 * b - 3.0 * c + d;
-    let qb = 2.0 * (a - 2.0 * b + c);
-    let qc = b - a;
-    let mut roots = Vec::new();
-    let mut push = |t: f64| {
-        if t.is_finite() && t > 0.0 && t < 1.0 {
-            roots.push(t);
-        }
-    };
-    if qa.abs() < 1e-12 {
-        if qb.abs() >= 1e-12 {
-            push(-qc / qb);
-        }
-        return roots;
-    }
-    let disc = qb * qb - 4.0 * qa * qc;
-    if disc < 0.0 {
-        return roots;
-    }
-    let sq = disc.sqrt();
-    // Citardauq form: adding same-signed terms avoids the catastrophic
-    // cancellation the textbook formula suffers when |qb| ≈ sq (a nearly
-    // straight cubic, which is most of what a boolean result is made of).
-    let sign = if qb < 0.0 { -1.0 } else { 1.0 };
-    let q = -0.5 * (qb + sign * sq);
-    push(q / qa);
-    if q != 0.0 {
-        push(qc / q);
-    }
-    roots
+    use crate::blend::BlendPathPoint::{Curve, Move};
+    crate::path_geom::bounds::path_bounds(region.iter().flat_map(|(start, segments)| {
+        std::iter::once(Move { x: start.0, y: start.1 }).chain(segments.iter().map(|(c1, c2, p)| {
+            Curve { x: p.0, y: p.1, cp1: (c1.0, c1.1), cp2: (c2.0, c2.1) }
+        }))
+    }))
 }

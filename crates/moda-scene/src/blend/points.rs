@@ -1,5 +1,6 @@
 //! Path points: the PathNode JSON `points` shape, and flattening to a polyline.
 
+use crate::path_geom::arc::{arc_endpoint_to_center, ArcCenterParams, ArcParams};
 use crate::transform;
 use crate::value::{json, Value};
 
@@ -7,7 +8,7 @@ use crate::value::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// PathNode point (`core/scene/nodes.ts` PathPoint), JSON-backed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BlendPathPoint {
     Move {
         x: f64,
@@ -171,69 +172,6 @@ impl BlendPathPoint {
     }
 }
 
-/// `arcEndpointToCenter` (`core/svg/arcUtils.ts:36-148`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn arc_endpoint_to_center(
-    x1: f64,
-    y1: f64,
-    rx_in: f64,
-    ry_in: f64,
-    x_axis_rotation: f64,
-    large_arc: bool,
-    sweep: bool,
-    x2: f64,
-    y2: f64,
-) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
-    let phi = x_axis_rotation * std::f64::consts::PI / 180.0;
-    if x1 == x2 && y1 == y2 {
-        return None;
-    }
-    if rx_in == 0.0 || ry_in == 0.0 {
-        return None;
-    }
-    let mut rx = rx_in.abs();
-    let mut ry = ry_in.abs();
-
-    let (cos_phi, sin_phi) = (phi.cos(), phi.sin());
-    let dx = (x1 - x2) / 2.0;
-    let dy = (y1 - y2) / 2.0;
-    let x1p = cos_phi * dx + sin_phi * dy;
-    let y1p = -sin_phi * dx + cos_phi * dy;
-
-    let lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
-    if lambda > 1.0 {
-        let s = lambda.sqrt();
-        rx *= s;
-        ry *= s;
-    }
-    let rx_sq = rx * rx;
-    let ry_sq = ry * ry;
-    let mut sq = (rx_sq * ry_sq - rx_sq * y1p * y1p - ry_sq * x1p * x1p)
-        / (rx_sq * y1p * y1p + ry_sq * x1p * x1p);
-    sq = sq.max(0.0);
-    let coef = if large_arc != sweep { 1.0 } else { -1.0 } * sq.sqrt();
-    let cxp = coef * (rx * y1p / ry);
-    let cyp = coef * (-(ry * x1p) / rx);
-    let cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) / 2.0;
-    let cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) / 2.0;
-
-    let ux = (x1p - cxp) / rx;
-    let uy = (y1p - cyp) / ry;
-    let vx = (-x1p - cxp) / rx;
-    let vy = (-y1p - cyp) / ry;
-    let theta1 = uy.atan2(ux);
-    let n2 = ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt();
-    let dot = ux * vx + uy * vy;
-    let cross = ux * vy - uy * vx;
-    let mut dtheta = if cross >= 0.0 { 1.0 } else { -1.0 } * (dot / n2).clamp(-1.0, 1.0).acos();
-    if !sweep && dtheta > 0.0 {
-        dtheta -= 2.0 * std::f64::consts::PI;
-    } else if sweep && dtheta < 0.0 {
-        dtheta += 2.0 * std::f64::consts::PI;
-    }
-    Some((cx, cy, rx, ry, theta1, dtheta, phi))
-}
-
 const DEFAULT_CURVE_SEGMENTS: usize = 16;
 
 /// `flattenPathToPolyline` (`core/utils/pathSampling.ts:11-103`).
@@ -313,19 +251,13 @@ pub fn flatten_path_to_polyline(points: &[BlendPathPoint], closed: bool) -> Vec<
                 }
                 Some(c) => {
                     // tessellateArc (arcUtils.ts:149-189), 8 segs/quadrant.
-                    match arc_endpoint_to_center(
-                        c.0,
-                        c.1,
-                        *rx,
-                        *ry,
-                        *x_axis_rotation,
-                        *large_arc,
-                        *sweep,
-                        *x,
-                        *y,
-                    ) {
+                    let arc = ArcParams {
+                        rx: *rx, ry: *ry, x_axis_rotation: *x_axis_rotation,
+                        large_arc: *large_arc, sweep: *sweep, x: *x, y: *y,
+                    };
+                    match arc_endpoint_to_center(c.0, c.1, &arc) {
                         None => result.push((*x, *y)),
-                        Some((cx, cy, rx, ry, theta1, dtheta, phi)) => {
+                        Some(ArcCenterParams { cx, cy, rx, ry, theta1, dtheta, phi }) => {
                             let num_segments = ((dtheta.abs() / std::f64::consts::FRAC_PI_2) * 8.0)
                                 .ceil()
                                 .max(1.0) as usize;

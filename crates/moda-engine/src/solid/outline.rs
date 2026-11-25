@@ -1,11 +1,10 @@
 //! A layer's filled outline as flat contours, in its own coordinates, for extrusion (motion-model.md §12.6 phase 2).
 //!
-//! Shapes (rectangles with their corner radii, ellipses with their arcs, polygons, stars and paths, vector networks
-//! included) come from the renderer's own path builders; text from the vector text engine's glyph outlines, a fill
+//! Shapes (rectangles with their corner radii, ellipses with their arcs, polygons, stars and paths) come from the renderer's own path builders; text from the vector text engine's glyph outlines, a fill
 //! per colour run; a group or frame is its children's outlines through their transforms, each in its own colour.
 //!
 //! A visible stroke is a part of its own, in the stroke's colour, after (on top of) the fill: the stroke's outline
-//! (`tess::outline::stroke_contours`, with its width, caps, joins and width profile), clipped to the shape for an
+//! (with its width, caps and joins), clipped to the shape for an
 //! inside / outside stroke. A line is its body's outline plus its arrowheads. Dashes, brushes and text strokes are
 //! not extruded (a dashed stroke extrudes solid; a text's stroke is left out).
 
@@ -13,6 +12,7 @@ use moda_scene::types::{Affine, RawNode};
 use moda_scene::Scene;
 
 use crate::tess::moda_engine_path_types::PathCmd;
+use crate::tess::{PathClosure, PathContours};
 
 /// Filled contours of one colour (straight sRGB, 0–1).
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +45,10 @@ fn flatten_cubic(out: &mut Vec<[f64; 2]>, p0: [f64; 2], c1: [f64; 2], c2: [f64; 
 /// Cleanup removes exact repeats only: `tol` bounds curve error in the caller's units,
 /// and consumers apply their own output-precision policy to the flattened contours.
 pub fn flatten(cmds: &[PathCmd], tol: f64) -> Vec<Vec<[f64; 2]>> {
+    flatten_with_min_points(cmds, tol, 3)
+}
+
+fn flatten_with_min_points(cmds: &[PathCmd], tol: f64, minimum: usize) -> Vec<Vec<[f64; 2]>> {
     let mut out: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut cur: Vec<[f64; 2]> = Vec::new();
     let mut at = [0.0, 0.0];
@@ -58,7 +62,7 @@ pub fn flatten(cmds: &[PathCmd], tol: f64) -> Vec<Vec<[f64; 2]>> {
         while c.len() > 1 && c.first() == c.last() {
             c.pop();
         }
-        if c.len() >= 3 {
+        if c.len() >= minimum {
             out.push(c);
         }
     };
@@ -112,10 +116,6 @@ pub fn flatten(cmds: &[PathCmd], tol: f64) -> Vec<Vec<[f64; 2]>> {
     }
     finish(&mut cur, &mut out);
     out
-}
-
-fn blend_to_cmds(points: &[moda_scene::blend::BlendPathPoint]) -> Vec<PathCmd> {
-    points.iter().map(crate::tess::path_cmd_from_blend_point).collect()
 }
 
 /// `#rgb[a]`, `#rrggbb[aa]`, `rgb()` / `rgba()` as straight sRGB 0–1.
@@ -201,38 +201,54 @@ fn simplify(contours: Vec<Vec<[f64; 2]>>) -> Vec<Vec<[f64; 2]>> {
 
 /// The node's stroke along `cmds` (its outline, node-local) as a part in the stroke colour (see the module docs).
 /// A closed shape's inside / outside stroke is a centred stroke twice as wide clipped to the inside / outside.
-fn stroke_shape(node: &RawNode, cmds: &[PathCmd], closed: bool) -> Option<Shape> {
+fn stroke_shape<'a>(node: &RawNode, cmds: &'a [PathCmd], closure: impl Into<PathClosure<'a>>) -> Option<Shape> {
     use i_overlay::core::fill_rule::FillRule;
     use i_overlay::core::overlay_rule::OverlayRule;
     use i_overlay::float::simplify::SimplifyShape;
     use i_overlay::float::single::SingleFloatOverlay;
     let (color, width) = stroke_color(node)?;
     let style = moda_scene::paint::node_stroke_style(node);
-    let align = if closed { style.align.as_deref() } else { None };
-    let aligned = matches!(align, Some("inside" | "outside"));
-    let band = crate::tess::outline::stroke_contours(
-        node,
-        cmds,
-        closed,
-        if aligned { 2.0 * width } else { width },
-        None,
-        None,
-        true,
-        TOLERANCE,
-    );
-    let band = simplify(band);
-    let contours = if aligned && !band.is_empty() {
-        let even_odd = node.str("fillRule") == Some("evenodd");
-        let region: Vec<Vec<[f64; 2]>> = flatten(cmds, TOLERANCE)
-            .simplify_shape(if even_odd { FillRule::EvenOdd } else { FillRule::NonZero })
-            .into_iter()
-            .flatten()
-            .collect();
-        let rule = if align == Some("outside") { OverlayRule::Difference } else { OverlayRule::Intersect };
-        band.overlay(&region, rule, FillRule::NonZero).into_iter().flatten().filter(|c| c.len() >= 3).collect()
-    } else {
-        band
-    };
+    let align = style.align.as_deref();
+    let mut centered = Vec::new();
+    let mut aligned = Vec::new();
+    for contour in PathContours::new(cmds, closure).iter() {
+        let clip = contour.closed && matches!(align, Some("inside" | "outside"));
+        let band = uniform_stroke_contours(
+            node,
+            contour.points,
+            contour.closed,
+            if clip { 2.0 * width } else { width },
+            None,
+            None,
+            TOLERANCE,
+        );
+        if clip {
+            aligned.extend(band);
+        } else {
+            centered.extend(band);
+        }
+    }
+    if aligned.is_empty() {
+        let contours = simplify(centered);
+        return (!contours.is_empty()).then_some(Shape { contours, color });
+    }
+    let even_odd = node.str("fillRule") == Some("evenodd");
+    let region: Vec<Vec<[f64; 2]>> = flatten(cmds, TOLERANCE)
+        .simplify_shape(if even_odd { FillRule::EvenOdd } else { FillRule::NonZero })
+        .into_iter()
+        .flatten()
+        .collect();
+    let rule = if align == Some("outside") { OverlayRule::Difference } else { OverlayRule::Intersect };
+    let mut contours: Vec<_> = simplify(aligned)
+        .overlay(&region, rule, FillRule::NonZero)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.len() >= 3)
+        .collect();
+    if !centered.is_empty() {
+        contours.extend(centered);
+        contours = simplify(contours);
+    }
     (!contours.is_empty()).then_some(Shape { contours, color })
 }
 
@@ -242,9 +258,7 @@ fn line_shape(node: &RawNode) -> Option<Shape> {
     let (color, _) = stroke_color(node)?;
     let mut spec = ltp::LineSpec::from_json(|k| node.json_field(k));
     spec.dash = None;
-    if crate::tess::outline::needs_outline(node, |_| None::<&moda_scene::value::Value>) {
-        crate::tess::outline::outlined_line_spec(node, &mut spec);
-    }
+
     let parts = if spec.has_arrows() {
         let mut v = vec![ltp::convert_line_body(&spec)];
         v.extend(ltp::convert_arrow_heads(&spec));
@@ -256,14 +270,13 @@ fn line_shape(node: &RawNode) -> Option<Shape> {
     for part in &parts {
         match part.kind {
             ltp::LinePartKind::ArrowFill => contours.extend(flatten(&part.cmds, TOLERANCE)),
-            kind if part.stroke_width > 0.0 => contours.extend(crate::tess::outline::stroke_contours(
+            _ if part.stroke_width > 0.0 => contours.extend(uniform_stroke_contours(
                 node,
                 &part.cmds,
                 part.closed,
                 part.stroke_width,
                 part.line_cap.as_deref(),
                 part.line_join.as_deref(),
-                kind == ltp::LinePartKind::Body,
                 TOLERANCE,
             )),
             _ => {}
@@ -347,7 +360,7 @@ fn collect(scene: &Scene, id: &str, to_root: Option<&Affine>, out: &mut Vec<Shap
         "path" => {
             let cmds = crate::tess::path_cmds_for_node(node);
             out.push(Shape { contours: place(flatten(&cmds, TOLERANCE)), color: node_color(node) });
-            if let Some(s) = stroke_shape(node, &cmds, node.bool("closed") == Some(true)) {
+            if let Some(s) = stroke_shape(node, &cmds, node.path_closure()) {
                 out.push(Shape { contours: place(s.contours), color: s.color });
             }
         }
@@ -365,12 +378,11 @@ fn collect(scene: &Scene, id: &str, to_root: Option<&Affine>, out: &mut Vec<Shap
                 }
                 let mut color = f.color;
                 color[3] *= f.opacity;
-                out.push(Shape { contours: place(flatten(&blend_to_cmds(&pts), TOLERANCE)), color });
+                out.push(Shape { contours: place(flatten(&pts, TOLERANCE)), color });
             }
         }
         _ => {
-            if let Some(pts) = crate::boolean_operands::undistorted_outline(scene, node) {
-                let cmds = blend_to_cmds(&pts);
+            if let Some(cmds) = crate::boolean_operands::undistorted_outline(scene, node) {
                 out.push(Shape { contours: place(flatten(&cmds, TOLERANCE)), color: node_color(node) });
                 if let Some(s) = stroke_shape(node, &cmds, true) {
                     out.push(Shape { contours: place(s.contours), color: s.color });
@@ -503,4 +515,18 @@ mod tests {
         assert_eq!(parse_color("#0f08"), Some([0.0, 1.0, 0.0, 8.0 * 17.0 / 255.0]));
         assert_eq!(parse_color("rgba(255, 0, 0, 0.5)"), Some([1.0, 0.0, 0.0, 0.5]));
     }
+}
+
+fn uniform_stroke_contours(node: &RawNode, cmds: &[PathCmd], closed: bool, width: f64,
+    cap: Option<&str>, join: Option<&str>, tolerance: f64) -> Vec<Vec<[f64; 2]>> {
+    use i_overlay::mesh::float::stroke::offset::StrokeOffset;
+    use i_overlay::mesh::float::style::{LineCap, LineJoin, StrokeStyle};
+    if !(width.is_finite() && width > 0.0) { return Vec::new(); }
+    let stroke = moda_scene::paint::node_stroke_style(node);
+    let half = width / 2.0;
+    let step = (2.0 * (1.0 - (tolerance / half.max(tolerance)).min(1.0)).acos()).clamp(0.02, 1.0);
+    let cap = match cap.or(stroke.cap.as_deref()) { Some("round") => LineCap::Round(step), Some("square") => LineCap::Square, _ => LineCap::Butt };
+    let join = match join.or(stroke.join.as_deref()) { Some("round") => LineJoin::Round(step), Some("bevel") => LineJoin::Bevel, _ => LineJoin::Miter(2.0 * (1.0 / node.miter_limit().max(1.0)).asin()) };
+    let style = StrokeStyle::new(width).start_cap(cap.clone()).end_cap(cap).line_join(join);
+    flatten_with_min_points(cmds, tolerance, 2).into_iter().flat_map(|p| p.stroke(style.clone(), closed).into_iter().flatten()).collect()
 }

@@ -259,31 +259,4 @@ mod tests {
         assert!(super::variation_axes(&inter).is_empty());
     }
 
-    /// A GSUB/GPOS 1.1 table (FeatureVariations: most variable fonts, 18 of the bundled faces) parses. The version
-    /// check read 1.1 as minor 0x1000, so these faces failed to parse and their text fell back to the raster tier,
-    /// which draws no text on a path.
-    #[test]
-    #[ignore = "needs unported Moda fixture Archivo[wdth,wght].ttf with GSUB 1.1"]
-    fn layout_tables_version_1_1_parse() {
-        let bytes = std::sync::Arc::new(
-            read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../../packages/editor/public/fonts/google/archivo/Archivo[wdth,wght].ttf"
-            ))
-            .unwrap(),
-        );
-        let gsub = bytes
-            .windows(4)
-            .position(|w| w == b"GSUB")
-            .expect("GSUB in the table directory");
-        let off = u32::from_be_bytes(bytes[gsub + 8..gsub + 12].try_into().unwrap()) as usize;
-        assert_eq!(
-            &bytes[off..off + 4],
-            &[0, 1, 0, 1],
-            "the fixture's GSUB is version 1.1"
-        );
-        assert!(crate::vector::OtjsFont::parse(&bytes).is_ok());
-        let wght: [super::Variation; 1] = [("wght".into(), 600.0)];
-        assert!(crate::vector::OtjsFont::parse_instance(&bytes, &wght).is_ok());
-    }
 }

@@ -78,8 +78,7 @@ const LOSS_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 /// an L4). Each slice therefore submits an empty batch, and the loss arrives as
 /// an error within a few slices. The target is fixed before the first slice.
 pub(crate) fn wait(device: &wgpu::Device, queue: &wgpu::Queue, errors: &Errors, submission: Option<wgpu::SubmissionIndex>) -> Result<()> {
-        #[cfg(feature = "frame-profile")]
-        let _profile = crate::frame_profile::span("gpu_wait");
+        profile_span!(_profile, "gpu_wait");
     #[cfg(feature = "frame-profile")]
     crate::frame_profile::count("gpu_wait_calls", 1);
     let target = submission.unwrap_or_else(|| crate::command_finish::Segments::flush(queue));

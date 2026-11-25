@@ -22,29 +22,20 @@
 //! `core/geometry/roundPathCorners.ts`), NOT a local KAPPA construction.
 
 use super::moda_engine_path_types::PathCmd;
-use super::path_cmd_from_blend_point;
 #[cfg(test)]
 use moda_scene::shape_outline::ellipse_vertex_at_angle;
 pub use moda_scene::shape_outline::{MAX_SHAPE_VERTICES, MIN_VISIBLE_CORNER_RADIUS};
 
 type P = [f64; 2];
 
-// The star / polygon converters live in `moda_scene::shape_outline` (the live
-// geometry effects read shape outlines at scene resolution); these wrap them
-// in the tessellator's command type.
-
-fn to_cmds(points: Vec<moda_scene::blend::BlendPathPoint>) -> Vec<PathCmd> {
-    points.iter().map(path_cmd_from_blend_point).collect()
-}
-
 /// `roundClosedVertexRing` (`utils/path/closedShapePath.ts`): round every corner
 /// of a closed vertex ring through the shared rounder. Radii below
 /// `MIN_VISIBLE_CORNER_RADIUS` stay sharp.
 pub fn rounded_ring_path(vertices: &[P], corner_radius: f64) -> Vec<PathCmd> {
-    to_cmds(moda_scene::shape_outline::rounded_ring(
+    moda_scene::shape_outline::rounded_ring(
         vertices,
         corner_radius,
-    ))
+    )
 }
 
 /// `convertStarToPathNode` geometry (`starToPathPoints` with x = w/2,
@@ -58,13 +49,13 @@ pub fn star_to_path_cmds(
     inner_radius_ratio: Option<f64>,
     corner_radius: f64,
 ) -> Vec<PathCmd> {
-    to_cmds(moda_scene::shape_outline::star_outline(
+    moda_scene::shape_outline::star_outline(
         width,
         height,
         num_points,
         inner_radius_ratio,
         corner_radius,
-    ))
+    )
 }
 
 /// `convertPolygonToPathNode` geometry (`polygonToPathPoints` with center
@@ -75,12 +66,12 @@ pub fn polygon_to_path_cmds(
     sides: f64,
     corner_radius: f64,
 ) -> Vec<PathCmd> {
-    to_cmds(moda_scene::shape_outline::polygon_outline(
+    moda_scene::shape_outline::polygon_outline(
         width,
         height,
         sides,
         corner_radius,
-    ))
+    )
 }
 
 // ---------------------------------------------------------------------------

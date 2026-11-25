@@ -9,44 +9,12 @@
 //!
 //! `Extended_Pictographic` membership is the vendored table in `ext_pict.rs`,
 //! generated from the same Node runtime that produced the oracle dumps, so
-//! membership is bit-identical to V8's `\p{…}`. Regional-indicator PAIRS
-//! cluster greedily left-to-right (platform RI-pairing semantics) when their
-//! waved-flag SVG ships (`flags.rs`, generated from the emoji pack and
-//! mirrored to the CDN); an unshipped pair (e.g. 🇽🇽) and a lone regional
-//! indicator stay text so they never request a 404 SVG. Tag-sequence
-//! subdivision flags (🏴󠁧󠁢󠁳󠁣󠁴󠁿 = U+1F3F4 + a tag run terminated by U+E007F)
-//! cluster the same way, gated on `flags.rs`'s `VALID_TAG_SEQUENCES`; a
-//! sequence whose SVG doesn't ship degrades to the bare 🏴, whose SVG does.
+//! membership follows the Unicode table. Regional-indicator pairs and terminated tag
+//! sequences reach the font intact, including sequences absent from the SVG pack.
 //!
-//! A LONE pictograph is gated the same way, against `flags.rs`'s
-//! `SHIPPED_SINGLE_EMOJI`: the property spans far more codepoints than Noto
-//! draws, and routing an undrawable one to the image lane renders blank space
-//! (`ops.rs` drops the quad, layout keeps the advance). Uncovered ones demote to
-//! text and reach the font + script-fallback chain instead. Gating on the
-//! SHIPPED SET rather than on `Extended_Pictographic` also keeps the outcome
-//! stable across Unicode versions — see Q-131.
-//!
-//! Codepoints that are `Emoji=Yes, Emoji_Presentation=No` default to TEXT and become
-//! emoji only with VS16. Noto ships an SVG for ~120 of them, so
-//! `ships_single_codepoint_emoji` is true and the demote-to-text hatch above cannot save
-//! them: each leaves the text run, drops its node off the vector engine, and paints as
-//! fixed Noto artwork ignoring the run's family, weight and fill. That once
-//! reached a customer through TM, whose artwork is fixed grey.
-//!
-//! `TEXT_PRESENTATION_OVERRIDES` below is the answer, and it is HAND-CURATED rather than
-//! derived from the Unicode property: that property also covers the heart, the
-//! warning sign, the aeroplane, the sun and the scissors, which users type wanting the
-//! picture. The line drawn instead — a MARK SET IN RUNNING TEXT (punctuation, list bullet,
-//! arrow, check, card suit) is text; anything DEPICTING AN OBJECT stays emoji.
-//!
-//! Two tests hold it up: `text_presentation_overrides_ts_mirror_is_identical` pins the
-//! hand-mirrored TS and Rust tables together, and
-//! `every_text_presentation_override_resolves_without_declining_the_node`
-//! (`vector::script_fallback`) proves each entry actually resolves once it is text, so
-//! widening the table cannot silently trade a colour image for a whole-node decline.
+//! Single pictographs follow Unicode Emoji_Presentation unless VS15 or VS16 selects a presentation.
 
 use crate::ext_pict::EXT_PICT_RANGES;
-use crate::flags::{is_valid_flag_pair, is_valid_tag_sequence, ships_single_codepoint_emoji};
 
 /// The base of a tag-sequence subdivision flag (🏴 U+1F3F4).
 const TAG_FLAG_BASE: char = '\u{1F3F4}';
@@ -69,6 +37,13 @@ fn is_keycap_base(c: char) -> bool {
 /// matched explicitly (emoji.ts `RI_PAIR`).
 fn is_regional_indicator(cp: u32) -> bool {
     (0x1F1E6..=0x1F1FF).contains(&cp)
+}
+
+/// When no colour font covers a flag pair the regional indicators can draw as text.
+pub(crate) fn regional_pair(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next(), chars.next()), (Some(a), Some(b), None)
+        if is_regional_indicator(a as u32) && is_regional_indicator(b as u32))
 }
 
 /// Tag characters (U+E0020–E007F) — the payload of a tag-sequence subdivision
@@ -99,6 +74,7 @@ fn tag_run_end(chars: &[char], from: usize) -> Option<usize> {
 /// skin-tone modifier then an optional variation selector. Shared by the base
 /// element and each ZWJ-joined element.
 fn consume_element_trailers(chars: &[char], i: &mut usize) {
+    if *i < chars.len() && chars[*i] == '\u{fe0f}' { *i += 1; }
     if *i < chars.len() && is_skin_tone_modifier(chars[*i] as u32) {
         *i += 1;
     }
@@ -131,110 +107,18 @@ pub enum Segment {
     Emoji(String),
 }
 
-/// `TEXT_PRESENTATION_OVERRIDES` (`utils/msdf/emoji.ts`) — hand-mirrored, and pinned to it
-/// by `text_presentation_overrides_ts_mirror_is_identical`. Add a codepoint to BOTH: that
-/// test fails on either side alone.
-///
-/// Unicode marks a large set `Emoji=Yes, Emoji_Presentation=No`: emoji-capable but TEXT by
-/// default, becoming emoji only with VS16. Noto ships an SVG for ~120 of them, so
-/// `ships_single_codepoint_emoji` is true and the demote-to-text hatch never fires — each
-/// one leaves the text run, drops its node off the vector engine, and paints as fixed Noto
-/// artwork ignoring the run's family, weight and fill. That once reached a
-/// customer through TM, whose artwork is fixed grey.
-///
-/// HAND-CURATED, not the Unicode property: that set also holds the heart, the
-/// warning sign, the aeroplane, the sun and the scissors — pictographs users type wanting
-/// the picture. The line we draw instead: a MARK SET IN RUNNING TEXT (punctuation, a list
-/// bullet, an arrow, a check) belongs here; anything DEPICTING AN OBJECT stays emoji.
-///
-/// U+203C and U+2049 are MEASURED OUT: they classify `Unknown`, so they get an empty
-/// fallback chain, and a font without the glyph would decline the whole node to Canvas2D.
-/// U+3030 is left out for lack of demonstrated benefit: adding and removing it produced
-/// byte-identical renders.
-///
-/// Sorted — `is_text_presentation_override` binary-searches it, and the test asserts the
-/// ordering so a careless insert cannot silently go unfound.
-pub(crate) const TEXT_PRESENTATION_OVERRIDES: &[u32] = &[
-    0x00A9, // (c) COPYRIGHT SIGN
-    0x00AE, // (R) REGISTERED SIGN
-    0x2122, // TM TRADE MARK SIGN            — the customer case
-    0x2194, // <-> LEFT RIGHT ARROW
-    0x2195, // UP DOWN ARROW
-    0x2196, // NORTH WEST ARROW
-    0x2197, // NORTH EAST ARROW
-    0x2198, // SOUTH EAST ARROW
-    0x2199, // SOUTH WEST ARROW
-    0x21A9, // LEFTWARDS ARROW WITH HOOK
-    0x21AA, // RIGHTWARDS ARROW WITH HOOK
-    0x25AA, // BLACK SMALL SQUARE            — list bullet
-    0x25AB, // WHITE SMALL SQUARE            — list bullet
-    0x25B6, // BLACK RIGHT-POINTING TRIANGLE — list marker
-    0x25C0, // BLACK LEFT-POINTING TRIANGLE  — list marker
-    0x25FB, // WHITE MEDIUM SQUARE
-    0x25FC, // BLACK MEDIUM SQUARE
-    0x2611, // BALLOT BOX WITH CHECK         — checklist
-    0x2660, // BLACK SPADE SUIT
-    0x2663, // BLACK CLUB SUIT
-    0x2665, // BLACK HEART SUIT
-    0x2666, // BLACK DIAMOND SUIT
-    0x2714, // HEAVY CHECK MARK              — the "done" bullet
-    0x2716, // HEAVY MULTIPLICATION X
-    0x2733, // EIGHT SPOKED ASTERISK         — footnote mark
-    0x2734, // EIGHT POINTED BLACK STAR      — footnote mark
-    0x27A1, // BLACK RIGHTWARDS ARROW
-    0x2934, // ARROW POINTING RIGHTWARDS THEN CURVING UPWARDS
-    0x2935, // ARROW POINTING RIGHTWARDS THEN CURVING DOWNWARDS
-    0x2B05, // LEFTWARDS BLACK ARROW
-    0x2B06, // UPWARDS BLACK ARROW
-    0x2B07, // DOWNWARDS BLACK ARROW
-];
-
-/// True when `cp` defaults to TEXT presentation and so needs VS16 to be an emoji.
-fn is_text_presentation_override(cp: u32) -> bool {
-    TEXT_PRESENTATION_OVERRIDES.binary_search(&cp).is_ok()
-}
-
-/// `isEmojiAfterOverrides` (`utils/msdf/emoji.ts`).
-fn is_emoji_after_overrides(cluster: &str) -> bool {
-    let mut cps = cluster.chars().map(|c| c as u32);
-    let Some(base) = cps.next() else {
-        return false;
-    };
-    let has_vs16 = cluster.chars().any(|c| c == '\u{FE0F}');
-    if is_text_presentation_override(base) {
-        return has_vs16;
-    }
-    let mut significant = cluster.chars().filter(|c| !is_variation_selector(*c));
-    let lone = significant.next().filter(|_| significant.next().is_none());
-    // A lone pictograph with VS15 (U+FE0E) and no VS16 asks for TEXT presentation, as
-    // Unicode defines the selector: it goes to the font + script-fallback chain, where
-    // `split_text_into_segments` drops its selector. On the image lane the selector
-    // reached the colour face, which maps no glyph for it: the cluster drew nothing and
-    // failed export (✈ + VS15). Mirrors `isEmojiAfterOverrides` (emoji.ts).
-    if lone.is_some() && !has_vs16 && cluster.chars().any(|c| c == '\u{FE0E}') {
-        return false;
-    }
-    // A LONE pictograph whose SVG doesn't ship would draw NOTHING: the planning
-    // site (`ops.rs`) drops the emoji quad on an `emoji_rgba` miss while layout
-    // keeps its ~1em box, so the glyph becomes blank space — and the browser lane
-    // bakes the same transparent hole. Demote it to text instead, so it flows
-    // through the font + script-fallback chain like any other symbol. Exactly the
-    // rule an unshipped flag pair already follows, one codepoint wider.
-    //
-    // `Extended_Pictographic` covers far more than Noto draws: ~1.4k codepoints
-    // ship a single-codepoint SVG, and the property's non-emoji pictographs (⚑
-    // U+2691, ★ U+2605, ♪ U+266A, the chess pieces, the dice, the mahjong tiles)
-    // have none. Gating on the SHIPPED SET rather than the property also keeps
-    // this independent of the runtime's Unicode version, which is what actually
-    // decides which of those the segmenter even offers here.
-    //
-    // Single-codepoint clusters ONLY (variation selectors ride along — they are
-    // stripped from the Noto filename). A keycap, skin-toned, flag or ZWJ cluster
-    // resolves to a MULTI-codepoint filename this table does not describe, and its
-    // parts cannot be reshaped as text anyway.
-    match lone {
-        Some(only) => ships_single_codepoint_emoji(only as u32),
-        None => true,
+fn emoji_presentation(cluster: &str) -> bool {
+    use unicode_properties::emoji::{EmojiStatus, UnicodeEmoji};
+    let mut chars = cluster.chars();
+    let Some(base) = chars.next() else { return false };
+    if !base.is_emoji_char() { return false; }
+    match chars.next() {
+        Some('\u{fe0e}') => false,
+        Some(_) => true,
+        None => matches!(base.emoji_status(), EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent),
     }
 }
 
@@ -291,11 +175,7 @@ pub(crate) fn split_text_into_segments_with_ranges(input: &str) -> Vec<(std::ops
                 continue;
             }
         }
-        // Regional-indicator pair (emoji.ts `RI_PAIR` alternative): greedy
-        // left-to-right pairing. A pair with a shipped waved-flag SVG becomes
-        // an emoji cluster; an unshipped pair is consumed but demoted to text
-        // (mirrors the regex, which matches ANY pair before the validity
-        // gate). A lone RI falls through as plain text below.
+        // Offer each complete pair to the run’s font.
         if is_regional_indicator(chars[i] as u32) {
             if i + 1 < chars.len() && is_regional_indicator(chars[i + 1] as u32) {
                 let start = i;
@@ -303,11 +183,7 @@ pub(crate) fn split_text_into_segments_with_ranges(input: &str) -> Vec<(std::ops
                 if start > last {
                     push_text(&mut out, last..start);
                 }
-                if is_valid_flag_pair(chars[start] as u32, chars[start + 1] as u32) {
-                    out.push((start..i, Segment::Emoji(chars[start..i].iter().collect())));
-                } else {
-                    push_text(&mut out, start..i);
-                }
+                out.push((start..i, Segment::Emoji(chars[start..i].iter().collect())));
                 last = i;
             } else {
                 i += 1;
@@ -333,16 +209,7 @@ pub(crate) fn split_text_into_segments_with_ranges(input: &str) -> Vec<(std::ops
                 if start > last {
                     push_text(&mut out, last..start);
                 }
-                // Only GB-ENG/SCT/WLS ship. For anything else Unicode prescribes
-                // drawing the base flag and ignoring the tags — and 🏴 has its own
-                // SVG, so it stays on the image lane instead of being stranded in
-                // text (the unshipped-RI-pair rule) where the native host carries no
-                // color-emoji face.
-                out.push((start..run_end, Segment::Emoji(if is_valid_tag_sequence(&cluster) {
-                    cluster
-                } else {
-                    TAG_FLAG_BASE.to_string()
-                })));
+                out.push((start..run_end, Segment::Emoji(cluster)));
                 i = run_end;
                 last = i;
                 continue;
@@ -362,7 +229,7 @@ pub(crate) fn split_text_into_segments_with_ranges(input: &str) -> Vec<(std::ops
         if start > last {
             push_text(&mut out, last..start);
         }
-        if is_emoji_after_overrides(&m) {
+        if emoji_presentation(&m) {
             out.push((start..i, Segment::Emoji(m)));
         } else {
             push_text(&mut out, start..i);
@@ -388,10 +255,10 @@ pub(crate) fn text_segment(span: &[char]) -> Option<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags::ships_single_codepoint_emoji;
 
     #[test]
     fn copyright_needs_vs16() {
-        // `TEXT_PRESENTATION_OVERRIDES` (`utils/msdf/emoji.ts`).
         assert_eq!(
             split_text_into_segments("©"),
             vec![Segment::Text("©".to_string())]
@@ -400,134 +267,6 @@ mod tests {
             split_text_into_segments("©\u{FE0F}"),
             vec![Segment::Emoji("©\u{FE0F}".to_string())]
         );
-    }
-
-    #[test]
-    fn text_presentation_overrides_is_sorted() {
-        // `is_text_presentation_override` binary-searches the table, so an
-        // out-of-order insert would simply never be found — a silent no-op that
-        // reintroduces the mis-render for that codepoint.
-        let mut sorted = TEXT_PRESENTATION_OVERRIDES.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted,
-            TEXT_PRESENTATION_OVERRIDES.to_vec(),
-            "TEXT_PRESENTATION_OVERRIDES must stay sorted and duplicate-free"
-        );
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture packages/editor/src/utils/msdf/emoji.ts"]
-    fn text_presentation_overrides_ts_mirror_is_identical() {
-        // This table is HAND-mirrored from emoji.ts — unlike the
-        // generated flag tables, nothing regenerates it. Drift means the browser
-        // and an export of the same canvas disagree about whether a codepoint is
-        // emoji, so one of them paints Noto artwork where the other paints a font
-        // glyph. The 4.1b back-pointer in emoji.ts points here; this is the check
-        // that makes the pointer mean something.
-        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .join("packages/editor/src/utils/msdf/emoji.ts");
-        let src =
-            std::fs::read_to_string(&ts_path).unwrap_or_else(|e| panic!("read {ts_path:?}: {e}"));
-        let block = src
-            .split_once("const TEXT_PRESENTATION_OVERRIDES")
-            .expect("TEXT_PRESENTATION_OVERRIDES not found in emoji.ts")
-            .1
-            .split_once("]);")
-            .expect("unterminated TEXT_PRESENTATION_OVERRIDES literal")
-            .0;
-        let mut ts: Vec<u32> = Vec::new();
-        for line in block.lines() {
-            // Entry rows are `  0xNNNN, // NAME`. Prose in the surrounding comments
-            // cites codepoints as `U+NNNN`, never `0x`, so it cannot parse as an entry.
-            let Some(rest) = line.trim().strip_prefix("0x") else {
-                continue;
-            };
-            let Some((hex, _)) = rest.split_once(',') else {
-                continue;
-            };
-            if let Ok(cp) = u32::from_str_radix(hex.trim(), 16) {
-                ts.push(cp);
-            }
-        }
-        assert!(
-            ts.len() >= 30,
-            "parsed only {} entries from emoji.ts — parser out of step with the table?",
-            ts.len()
-        );
-        // Compare as SETS, not sequences. The TS side is a `Set`, where order carries
-        // no meaning, and it is grouped semantically (legal marks, punctuation, arrows,
-        // bullets, checks, footnote marks, card suits) because that is what makes it
-        // reviewable. The Rust side must be SORTED because `is_text_presentation_override`
-        // binary-searches it — an invariant `text_presentation_overrides_is_sorted` owns.
-        // Comparing sequences here would force one of those two properties to give way.
-        let mut ts_sorted = ts.clone();
-        ts_sorted.sort_unstable();
-        let mut rs_sorted = TEXT_PRESENTATION_OVERRIDES.to_vec();
-        rs_sorted.sort_unstable();
-        assert_eq!(
-            ts_sorted, rs_sorted,
-            "utils/msdf/emoji.ts TEXT_PRESENTATION_OVERRIDES drifted from the Rust mirror \
-             in emoji.rs — the two are hand-kept and must be edited together"
-        );
-        assert_eq!(
-            ts.len(),
-            ts_sorted
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            "emoji.ts TEXT_PRESENTATION_OVERRIDES has a duplicate entry"
-        );
-    }
-
-    #[test]
-    fn typographic_marks_are_text_and_pictographs_stay_emoji() {
-        // Every override is a MARK, and must set in the run's own font…
-        for &cp in TEXT_PRESENTATION_OVERRIDES {
-            let ch = char::from_u32(cp).expect("valid scalar");
-            let bare = ch.to_string();
-            assert_eq!(
-                split_text_into_segments(&bare),
-                vec![Segment::Text(bare.clone())],
-                "U+{cp:04X} must be TEXT on its own"
-            );
-            // …while VS16 still opts explicitly into the colour emoji.
-            let with_vs16 = format!("{ch}\u{FE0F}");
-            assert_eq!(
-                split_text_into_segments(&with_vs16),
-                vec![Segment::Emoji(with_vs16.clone())],
-                "U+{cp:04X} with VS16 must still be EMOJI"
-            );
-        }
-
-        // …and the pictographs deliberately left OUT stay on the emoji lane. This is
-        // the half that stops a future "just derive it from Emoji_Presentation=No"
-        // change: that property would sweep all of these in and turn a heart, a
-        // warning sign and an aeroplane into monochrome font glyphs.
-        for cp in [
-            0x2764_u32, // heart
-            0x26A0,     // warning sign
-            0x2708,     // aeroplane
-            0x2600,     // sun
-            0x2702,     // scissors
-            0x2603,     // snowman
-            0x2709,     // envelope
-            0x2699,     // gear
-            0x2139,     // information source — deliberately excluded, see emoji.ts
-            0x2744,     // snowflake — deliberately excluded
-        ] {
-            let ch = char::from_u32(cp).expect("valid scalar");
-            let bare = ch.to_string();
-            assert_eq!(
-                split_text_into_segments(&bare),
-                vec![Segment::Emoji(bare.clone())],
-                "U+{cp:04X} is a pictograph and must stay EMOJI"
-            );
-        }
     }
 
     #[test]
@@ -684,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             split_text_into_segments("\u{2708}"),
-            vec![Segment::Emoji("\u{2708}".to_string())]
+            vec![Segment::Text("\u{2708}".to_string())]
         );
     }
 
@@ -747,27 +486,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pairs_and_lone_regional_indicators_stay_text() {
-        // 🇽🇽 has no shipped flag SVG — the pair is consumed (greedy) but
-        // demoted to text, rendering via the fallback text lane instead of a
-        // transparent hole.
+    fn all_pairs_reach_the_font_and_lone_indicators_stay_text() {
         let xx = "\u{1F1FD}\u{1F1FD}";
         assert_eq!(
             split_text_into_segments(xx),
-            vec![Segment::Text(xx.to_string())]
+            vec![Segment::Emoji(xx.to_string())]
         );
         // A lone regional indicator never clusters.
         assert_eq!(
             split_text_into_segments("\u{1F1FA}"),
             vec![Segment::Text("\u{1F1FA}".to_string())]
         );
-        // Greedy pairing consumes an invalid leading pair before a valid one
-        // could form off its second RI: 🇽🇺🇸 → XU (text) + lone S (text) —
-        // bit-identical to the TS regex, which matches ANY pair then demotes.
+        // Pair from the left even when a known country code begins at the second RI.
         assert_eq!(
             split_text_into_segments("\u{1F1FD}\u{1F1FA}\u{1F1F8}"),
             vec![
-                Segment::Text("\u{1F1FD}\u{1F1FA}".to_string()),
+                Segment::Emoji("\u{1F1FD}\u{1F1FA}".to_string()),
                 Segment::Text("\u{1F1F8}".to_string()),
             ]
         );
@@ -808,13 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn unshipped_tag_sequences_degrade_to_the_bare_flag() {
-        // Only GB-ENG/SCT/WLS ship. Unicode says draw the base flag and ignore
-        // unrecognized tags; 🏴 has its own SVG so it stays on the image lane.
+    fn all_terminated_tag_sequences_reach_the_font() {
+        // The font can supply this sequence even though the SVG pack omits it.
         let us_ca = "\u{1F3F4}\u{E0075}\u{E0073}\u{E0063}\u{E0061}\u{E007F}";
         assert_eq!(
             split_text_into_segments(us_ca),
-            vec![Segment::Emoji("\u{1F3F4}".to_string())]
+            vec![Segment::Emoji(us_ca.to_string())]
         );
         // An unterminated run (no U+E007F) is not a sequence: the base clusters
         // alone and the loose tag chars are stripped, never shaped.
@@ -861,129 +594,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs unported Moda fixture packages/editor/src/utils/msdf/emojiFlags.ts"]
-    fn flag_table_ts_mirror_is_identical() {
-        // The THIRD generated copy lives in the frontend
-        // (utils/msdf/emojiFlags.ts — the browser segmenter's membership
-        // gate). Parse its `\u{...}\u{...}` pair literals and pin them to the
-        // Rust table, so a partial regen or hand-edit can't make browser
-        // segmentation disagree with native clustering/assessment.
-        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .join("packages/editor/src/utils/msdf/emojiFlags.ts");
-        let src =
-            std::fs::read_to_string(&ts_path).unwrap_or_else(|e| panic!("read {ts_path:?}: {e}"));
-        // Entry lines are `  '\u{XXXX}\u{YYYY}…',`. Doc-comment examples start with
-        // `*` after trimming, so they never parse as entries — which is why the RI
-        // table reads as 259 here and not the 260 a naive grep reports.
-        let mut ts_pairs: Vec<(u32, u32)> = Vec::new();
-        let mut ts_tag_seqs: Vec<String> = Vec::new();
-        for line in src.lines() {
-            let Some(rest) = line.trim().strip_prefix("'\\u{") else {
-                continue;
-            };
-            let cps: Option<Vec<u32>> = rest
-                .split("\\u{")
-                .map(|p| u32::from_str_radix(p.split('}').next().unwrap_or(""), 16).ok())
-                .collect();
-            let Some(cps) = cps else { continue };
-            // Two codepoints = an RI pair; anything longer = a tag sequence.
-            if let [a, b] = cps[..] {
-                ts_pairs.push((a, b));
-            } else if cps.len() > 2 {
-                ts_tag_seqs.push(cps.iter().filter_map(|cp| char::from_u32(*cp)).collect());
-            }
-        }
-        let drifted = "utils/msdf/emojiFlags.ts drifted from the generated Rust tables — \
-             re-run `cargo run -p moda-fonts --example gen-flag-tables`";
-        assert_eq!(
-            ts_pairs,
-            crate::flags::VALID_FLAG_PAIRS.to_vec(),
-            "{drifted}"
-        );
-        assert_eq!(
-            ts_tag_seqs,
-            crate::flags::VALID_TAG_SEQUENCES.to_vec(),
-            "{drifted}"
-        );
-    }
-
-    #[test]
-    #[ignore = "needs unported Moda fixture packages/editor/src/utils/msdf/emojiFlags.ts"]
-    fn shipped_single_emoji_ts_mirror_is_identical() {
-        // Same drift guard as `flag_table_ts_mirror_is_identical`, for the
-        // coverage table — and it needs its OWN parser: that test reads
-        // `'\u{...}'` string entries, so it skips these `[0x…, 0x…],` numeric
-        // range rows entirely and would stay green through a partial regen.
-        //
-        // Drift here is not cosmetic. This table decides whether a lone
-        // pictograph goes to the SVG lane or the text lane, so a Rust/TS
-        // disagreement means the browser and an export of the same canvas
-        // disagree about whether a codepoint is emoji — and one of them draws
-        // nothing.
-        let ts_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .join("packages/editor/src/utils/msdf/emojiFlags.ts");
-        let src =
-            std::fs::read_to_string(&ts_path).unwrap_or_else(|e| panic!("read {ts_path:?}: {e}"));
-        let mut ts_ranges: Vec<(u32, u32)> = Vec::new();
-        for line in src.lines() {
-            // Entry rows are `  [0xLO, 0xHI],`. The doc comment's prose `[lo, hi]`
-            // has no `0x`, so it can never parse as an entry.
-            let Some(rest) = line.trim().strip_prefix("[0x") else {
-                continue;
-            };
-            let Some((lo, tail)) = rest.split_once(", 0x") else {
-                continue;
-            };
-            let Some(hi) = tail.strip_suffix("],") else {
-                continue;
-            };
-            match (u32::from_str_radix(lo, 16), u32::from_str_radix(hi, 16)) {
-                (Ok(lo), Ok(hi)) => ts_ranges.push((lo, hi)),
-                _ => continue,
-            }
-        }
-        assert!(
-            ts_ranges.len() > 100,
-            "parsed only {} ranges from emojiFlags.ts — parser out of step with the generator?",
-            ts_ranges.len()
-        );
-        assert_eq!(
-            ts_ranges,
-            crate::flags::SHIPPED_SINGLE_EMOJI.to_vec(),
-            "utils/msdf/emojiFlags.ts SHIPPED_SINGLE_EMOJI drifted from the generated Rust \
-             table — re-run `cargo run -p moda-fonts --example gen-flag-tables`"
-        );
-    }
-
-    #[test]
     fn symbol_codepoints_split_on_extended_pictographic() {
-        // The symbol-script fallback (`vector::script_fallback`) only ever sees
-        // what emoji segmentation leaves as TEXT, so the boundary between the
-        // two lanes is load-bearing: an Extended_Pictographic symbol must leave
-        // as an emoji cluster (image lane), a non-pictographic one must stay
-        // text (vector lane, where the Noto Sans Math / Symbols 2 chain covers
-        // it). Pin both sides.
-        //
-        // ✨ U+2728, ★ U+2605, ❤ U+2764, ⚕ U+2695 are all
-        // Extended_Pictographic despite living in the Misc Symbols / Dingbats
-        // blocks the symbol ranges claim. Membership alone no longer decides the
-        // lane, though: ★ ships no SVG, so the coverage gate demotes it back to
-        // text (`lone_pictographs_without_a_shipped_svg_stay_text`) — which is
-        // the fix, since as an emoji it drew nothing at all. The other three
-        // ship and stay on the image lane.
+        // All four are pictographs. Only the sparkles default to emoji presentation.
         assert_eq!(
             split_text_into_segments("\u{2728}\u{2605}\u{2764}\u{2695}"),
             vec![
                 Segment::Emoji("\u{2728}".to_string()),
                 Segment::Text("\u{2605}".to_string()),
-                Segment::Emoji("\u{2764}".to_string()),
-                Segment::Emoji("\u{2695}".to_string()),
+                Segment::Text("\u{2764}".to_string()),
+                Segment::Text("\u{2695}".to_string()),
             ]
         );
         // ✓ U+2713 and ☆ U+2606 are NOT Extended_Pictographic — one text
@@ -1051,33 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn lone_pictographs_with_a_shipped_svg_are_untouched() {
-        // The other half of the gate — the guarantee that this is additive.
-        // ✅ U+2705 shares a block with ⚑, 🀄 U+1F004 shares one with 🀀, and
-        // both ship, so both stay on the image lane.
-        for cluster in [
-            "\u{2705}",
-            "\u{1F004}",
-            "\u{2728}",
-            "\u{2764}",
-            "\u{2695}",
-            "🎨",
-        ] {
-            assert_eq!(
-                split_text_into_segments(cluster),
-                vec![Segment::Emoji(cluster.to_string())],
-                "{cluster:?} ships an SVG and must stay an emoji"
-            );
+    fn unicode_emoji_presentation_selects_colour() {
+        for cluster in ["✅", "🀄", "✨", "❤️", "⚕️", "🎨", "☑️"] {
+            assert_eq!(split_text_into_segments(cluster), vec![Segment::Emoji(cluster.into())]);
         }
-        // A VS16 does not change the resolved filename, so it must not change
-        // the verdict either: ☑ U+2611 ships, with or without the selector.
-        assert_eq!(
-            split_text_into_segments("\u{2611}\u{FE0F}"),
-            vec![Segment::Emoji("\u{2611}\u{FE0F}".to_string())]
-        );
-        // Multi-codepoint clusters resolve to filenames this table does not
-        // describe and must bypass the gate entirely: a skin-toned thumbs-up
-        // (👍🏻) and a ZWJ family both keep clustering.
+        for cluster in ["❤", "⚕", "☑", "☃", "✈"] {
+            assert_eq!(split_text_into_segments(cluster), vec![Segment::Text(cluster.into())]);
+        }
         let skin_toned = "\u{1F44D}\u{1F3FB}";
         assert_eq!(
             split_text_into_segments(skin_toned),

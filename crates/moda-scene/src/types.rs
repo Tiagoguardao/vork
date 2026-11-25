@@ -63,7 +63,7 @@ pub fn is_page_bg_id(id: &str) -> bool {
 /// deliberately-ahead entry declared in its `RUST_AHEAD_OF_TS` list. So a missing mirror
 /// fails the build, a typo here fails the build, and a declared forward-registration passes.
 ///
-pub const VALID_NODE_TYPES: [&str; 16] = [
+pub const VALID_NODE_TYPES: [&str; 12] = [
     "rectangle",
     "ellipse",
     "line",
@@ -76,20 +76,8 @@ pub const VALID_NODE_TYPES: [&str; 16] = [
     "polygon",
     "richtext",
     "blend",
-    "table",
-    "generated",
-    // A live generator (live-nodes.md §3): code + params; its drawn content is derived (`crate::generator`).
-    "generator",
-    // Raster paint layer (docs/design/raster-layers.md §4.3; spike). Hydration rewrites it as a rectangle whose
-    // one image fill samples the layer's surface texture (`normalize::normalize_paint_in_place`).
-    "paint",
 ];
 
-/// Legacy node types the browser knowingly skips (see `isValidNodeType` in
-/// `core/scene/Scene.ts` and its call site in the `nodes` setter).
-///
-/// `camera` is reserved by format 26 (motion-model.md §2.1, §12.6) and built later: a document holding one loads, and
-/// it draws nothing yet. (A flipbook is a `group` with a `flipbook` object since format 28, `crate::flipbook`.)
 pub const KNOWN_DROPPED_NODE_TYPES: [&str; 3] = ["text", "image", "camera"];
 
 // ---------------------------------------------------------------------------
@@ -107,6 +95,22 @@ pub fn lookup<'a>(map: &'a JsonMap, key: &str) -> Option<&'a Value> {
 #[inline]
 pub fn lookup_known(map: &JsonMap, key: crate::value::K) -> Option<&Value> {
     map.get_known(key)
+}
+
+/// Hot fields of a canvas row. Their positions in the ordered record remain valid
+/// across value writes, including copy-on-write detachment.
+#[derive(Clone, Copy)]
+pub(crate) enum PlacementField { X, Y, Rotation, ScaleX, ScaleY, Scale, SkewX, Opacity, Hidden }
+
+impl PlacementField {
+    fn key(self) -> crate::value::K {
+        use crate::value::K;
+        match self {
+            Self::X => K::X, Self::Y => K::Y, Self::Rotation => K::Rotation,
+            Self::ScaleX => K::ScaleX, Self::ScaleY => K::ScaleY, Self::Scale => K::Scale,
+            Self::SkewX => K::SkewX, Self::Opacity => K::Opacity, Self::Hidden => K::Hidden,
+        }
+    }
 }
 
 /// A scene node held as a raw ordered JSON object, exactly as the TS `Scene`
@@ -134,6 +138,7 @@ pub(crate) struct PaintMemo(
     std::sync::OnceLock<std::sync::Arc<[crate::paint::Stroke]>>,
     std::sync::OnceLock<std::sync::Arc<[crate::paint::Fill]>>,
     std::sync::OnceLock<std::sync::Arc<[crate::effect::Effect]>>,
+    std::sync::OnceLock<bool>,
 );
 
 impl std::fmt::Debug for PaintMemo {
@@ -181,6 +186,10 @@ impl PartialEq for NodeField<'_> {
 }
 
 impl RawNode {
+    pub(crate) fn share_layout(&mut self, pool: &mut crate::value::LayoutPool) {
+        if let Some(fields) = std::sync::Arc::get_mut(&mut self.0) { fields.share_layout(pool); }
+    }
+
     /// A node from its JSON object (points held as JSON; [`RawNode::compact`] stores them compactly).
     pub fn new(map: JsonMap) -> RawNode {
         RawNode(std::sync::Arc::new(map), None, PaintMemo::default())
@@ -201,7 +210,6 @@ impl RawNode {
 
     /// Replace the node's points with compact ones, shared as [`RawNode::with_shared_points`] shares them.
     pub fn set_shared_points(&mut self, points: std::sync::Arc<crate::path_points::CompactPoints>) {
-        self.2 = PaintMemo::default();
         std::sync::Arc::make_mut(&mut self.0).insert("points".into(), Value::Null);
         self.1 = Some(points);
     }
@@ -293,6 +301,11 @@ impl RawNode {
         std::sync::Arc::unwrap_or_clone(self.0)
     }
 
+    /// Immutable fields and geometry retained by deferred masks. Paint can be parsed again.
+    pub fn mask_snapshot(&self) -> Self {
+        Self(self.0.clone(), self.1.clone(), PaintMemo::default())
+    }
+
     /// A node derived from this one: `fields` (typically a changed copy of [`RawNode::fields`]) sharing this
     /// node's compact points while `fields` still holds their `"points": null` placeholder.
     pub fn with_fields(&self, fields: JsonMap) -> RawNode {
@@ -319,6 +332,32 @@ impl RawNode {
         lookup(&self.0, key).map(NodeField::Json)
     }
 
+    pub fn known_field_eq(&self, key: crate::value::K, value: &Value) -> bool {
+        if key == crate::value::K::Points {
+            if let Some(points) = self.compact_points() {
+                return value.as_array().is_some_and(|v| points.eq_json(v));
+            }
+        }
+        self.0.value_at(self.0.field_slot(key)) == Some(value)
+    }
+
+    pub(crate) fn set_known(&mut self, key: crate::value::K, value: Value) {
+        if key == crate::value::K::Points { self.1 = None; }
+        use crate::value::K;
+        match key {
+            K::Type => self.2 = PaintMemo::default(),
+            K::Fills => { self.2.1.take(); self.2.3.take(); }
+            K::Strokes => { self.2.0.take(); self.2.3.take(); }
+            K::Effects => { self.2.2.take(); }
+            K::AppearanceOrder => { self.2.3.take(); }
+            _ => {}
+        }
+        let at = self.0.field_slot(key);
+        let fields = std::sync::Arc::make_mut(&mut self.0);
+        if let Some(slot) = fields.value_at_mut(at) { *slot = value; }
+        else { fields.insert(key.into(), value); }
+    }
+
     pub fn field_eq_json(&self, key: &str, value: &Value) -> bool {
         self.get(key).is_some_and(|field| field.eq_json(value))
     }
@@ -334,6 +373,14 @@ impl RawNode {
 
     pub fn node_type(&self) -> &str {
         lookup_known(&self.0, crate::value::K::Type).and_then(Value::as_str).unwrap_or("")
+    }
+
+    pub(crate) fn placement_field(&self, field: PlacementField) -> Option<&Value> {
+        self.0.value_at(self.0.field_slot(field.key()))
+    }
+
+    pub(crate) fn placement_number(&self, field: PlacementField) -> Option<f64> {
+        self.placement_field(field).and_then(Value::as_f64)
     }
 
     /// A number field named by a known key (`f64` of its name, without comparing text).
@@ -373,10 +420,12 @@ impl RawNode {
     /// the number of `Value::from(f32)`, which reads back differently from the widened `f64` when numbers keep their text).
     ///
     /// Returns whether the field changed: a field that already holds this number is left as it is.
-    pub fn set_placement_number(&mut self, key: &str, value: crate::value::Number) -> bool {
-        debug_assert!(matches!(key, "x" | "y" | "rotation" | "scaleX" | "scaleY" | "opacity"));
+    pub(crate) fn set_placement_number(&mut self, key: crate::value::K, value: crate::value::Number) -> bool {
+        use crate::value::K;
+        debug_assert!(matches!(key, K::X | K::Y | K::Rotation | K::ScaleX | K::ScaleY | K::Opacity));
+        let at = self.0.field_slot(key);
         let map = std::sync::Arc::make_mut(&mut self.0);
-        match map.get_mut(key) {
+        match map.value_at_mut(at) {
             Some(Value::Number(held)) if *held == value => false,
             Some(slot) => {
                 *slot = Value::Number(value);
@@ -413,6 +462,22 @@ impl RawNode {
     /// The node's parsed effect list, parsed once (see `PaintMemo`).
     pub(crate) fn effects_memo(&self, parse: impl FnOnce() -> Vec<crate::effect::Effect>) -> std::sync::Arc<[crate::effect::Effect]> {
         self.2 .2.get_or_init(|| parse().into()).clone()
+    }
+
+    /// A single unmodified solid drawn as stored, at any inherited opacity. The
+    /// planner and body emitter read the same paint-stack classification.
+    pub fn plain_solid_fill(&self) -> bool {
+        use crate::paint::{self, Paint};
+        *self.2.3.get_or_init(|| {
+            if self.node_type() == "line" || self.has(crate::appearance::APPEARANCE_ORDER_KEY)
+                || !paint::node_strokes_shared(self).is_empty() { return false; }
+            let fills = paint::node_fills_shared(self);
+            let [fill] = &*fills else { return false; };
+            let Paint::Solid(_) = &fill.paint else { return false; };
+            fill.visible != Some(false) && fill.opacity.unwrap_or(1.) == 1.
+                && fill.blend_mode.as_deref().is_none_or(|b| b == "normal")
+                && fill.effects.as_ref().is_none_or(Vec::is_empty)
+        })
     }
 
     pub fn has(&self, key: &str) -> bool {
@@ -459,7 +524,11 @@ impl RawNode {
         if key == "points" && self.1.is_some() {
             return true; // an array
         }
-        match lookup(&self.0, key) {
+        Self::value_truthy(lookup(&self.0, key))
+    }
+
+    pub(crate) fn value_truthy(value: Option<&Value>) -> bool {
+        match value {
             None | Some(Value::Null) => false,
             Some(Value::Bool(b)) => *b,
             Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0 && !f.is_nan()).unwrap_or(false),
@@ -481,6 +550,24 @@ mod copy_on_write_tests {
 
     fn node() -> RawNode {
         RawNode::from_value(json!({"id":"P","type":"path","metadata":{"name":"P"},"points":[{"type":"move","x":1,"y":2}],"opacity":1})).unwrap()
+    }
+
+    #[test]
+    fn placement_slots_follow_field_insertions_and_removals() {
+        use crate::value::{K, Number};
+        let mut n = node();
+        assert_eq!(n.opacity(), 1.);
+        let original = n.clone();
+        n.remove("metadata");
+        n.set_placement_number(K::X, Number::from_f64(42.).unwrap());
+        n.set_placement_number(K::Opacity, Number::from_f64(0.25).unwrap());
+        assert_eq!(n.placement_number(PlacementField::X), Some(42.));
+        assert_eq!(n.f64("opacity"), Some(0.25));
+        n.fields_mut().shift_remove("opacity");
+        assert_eq!(n.opacity(), 1.);
+        assert_eq!(n.placement_number(PlacementField::X), Some(42.));
+        assert_eq!(original.placement_number(PlacementField::X), None);
+        assert_eq!(original.opacity(), 1.);
     }
 
     #[test]
@@ -613,7 +700,6 @@ mod copy_on_write_tests {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawPage(pub JsonMap);
 
-
 impl RawPage {
     pub fn id(&self) -> &str {
         self.0.get("id").and_then(Value::as_str).unwrap_or("")
@@ -679,23 +765,7 @@ pub struct SceneDocument {
     /// migration. Hierarchy via group/container `children` id refs.
     pub nodes: Vec<RawNode>,
     pub pages: Vec<RawPage>,
-    /// Document brush table (`brushes`, brushes.md §4.4): definition objects
-    /// with a string `id`, in document order. Read by the stroke outliner
-    /// (calligraphic nibs) through [`SceneDocument::brush`]. Shared, so a
-    /// clone of the document (one per exported frame, more with 3D layers)
-    /// doesn't copy the table's JSON; replace it whole to change it.
-    pub brushes: std::sync::Arc<Vec<Value>>,
-    /// A content hash per entry of `brushes` (same order), computed once at
-    /// hydration: render caches key on it instead of re-serialising brushes.
-    pub brush_hashes: Vec<u64>,
-    /// Document pattern table (`patterns`, E8.5, [`crate::pattern`]): definition objects with a string `id`,
-    /// in document order. Read by the engine's pattern paint through [`SceneDocument::pattern`]. Shared, as `brushes`.
-    pub patterns: std::sync::Arc<Vec<Value>>,
-    /// A content hash per entry of `patterns` (same order), computed once at hydration.
-    pub pattern_hashes: Vec<u64>,
-    /// Document code table (`code`, live-nodes.md §3.2): `CodeDef`s keyed by content hash (`b3:…`), read by
-    /// generator nodes ([`crate::generator`]).
-    pub code: crate::value::Map,
+
     pub config: SceneConfig,
     pub canvas_root_node_ids: Vec<NodeId>,
     /// 'vertical'|'horizontal'|'grid'|'pages'|'freeform'; absent => vertical
@@ -711,34 +781,34 @@ pub struct SceneDocument {
 }
 
 impl SceneDocument {
-    /// The brush definition with this id (the first, if ids repeat).
-    pub fn brush(&self, id: &str) -> Option<&Value> {
-        self.brushes
-            .iter()
-            .find(|b| b.get("id").and_then(Value::as_str) == Some(id))
+    /// Rendered masks keep this snapshot between draws. Its fields and compact geometry
+    /// suffice for reparsing paint when a capture is rendered.
+    pub fn mask_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        for node in &mut snapshot.nodes { node.2 = PaintMemo::default(); }
+        snapshot
     }
 
-    /// The pattern definition with this id (the first, if ids repeat).
-    pub fn pattern(&self, id: &str) -> Option<&Value> {
-        self.patterns
-            .iter()
-            .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
-    }
-
-    /// The content hash of the pattern with this id (see `pattern_hashes`).
-    pub fn pattern_hash(&self, id: &str) -> Option<u64> {
-        self.patterns
-            .iter()
-            .position(|p| p.get("id").and_then(Value::as_str) == Some(id))
-            .and_then(|i| self.pattern_hashes.get(i).copied())
-    }
-
-    /// The content hash of the brush with this id (see `brush_hashes`).
-    pub fn brush_hash(&self, id: &str) -> Option<u64> {
-        self.brushes
-            .iter()
-            .position(|b| b.get("id").and_then(Value::as_str) == Some(id))
-            .and_then(|i| self.brush_hashes.get(i).copied())
+    /// Allocations held by a document snapshot. The caller tracks shared field maps,
+    /// layouts and path points across all the snapshots retained by a page.
+    pub fn retained_heap(&self, first: &mut impl FnMut(usize) -> bool) -> usize {
+        use std::mem::size_of;
+        let strings = |v: &Vec<String>| v.capacity() * size_of::<String>() + v.iter().map(String::capacity).sum::<usize>();
+        let mut bytes = self.nodes.capacity() * size_of::<RawNode>() + self.pages.capacity() * size_of::<RawPage>()
+            + self.config.raw.retained_heap(first) + strings(&self.canvas_root_node_ids)
+            + strings(&self.unknown_envelope_keys) + self.layout_mode.as_ref().map_or(0, String::capacity)
+            + self.unknown_node_types.capacity() * size_of::<(String, String)>()
+            + self.unknown_node_types.iter().map(|(id, ty)| id.capacity() + ty.capacity()).sum::<usize>();
+        for page in &self.pages { bytes += page.0.retained_heap(first); }
+        for node in &self.nodes {
+            if first(std::sync::Arc::as_ptr(&node.0) as usize) {
+                bytes += 2 * size_of::<usize>() + size_of::<JsonMap>() + node.0.retained_heap(first);
+            }
+            if let Some(points) = &node.1 {
+                if first(std::sync::Arc::as_ptr(points) as usize) { bytes += 2 * size_of::<usize>() + std::mem::size_of_val(&**points) + points.heap_bytes(); }
+            }
+        }
+        bytes
     }
 }
 

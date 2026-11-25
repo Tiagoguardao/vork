@@ -12,6 +12,7 @@ use vork_scene::{Node, NodeKind, Scene, v2};
 
 /// The renderer's CPU inputs, with no material installation or device resources.
 pub(super) struct CpuScene {
+    pub opened: crate::footage::Opened,
     pub scene: Scene,
     pub base: PathBuf,
     pub buffers: buffers::SceneBuffers,
@@ -68,33 +69,21 @@ fn flatten(input: &[Node], parent: Option<usize>, out: &mut Vec<EvalNode>) {
     }
 }
 
+pub(super) fn load(path: &Path, base: &Path) -> Result<Scene> {
+    let bytes = std::fs::read(path).with_context(|| format!("read scene {}", path.display()))?;
+    let mut document = v2::diagnostics::read_document(&bytes)?;
+    let authored = serde_json::to_vec(&document)?;
+    vork_std::expand_scene(&mut document, base)?;
+    Scene::from_json_for_export(&serde_json::to_vec(&document)?, &authored, None)
+}
+
 impl CpuScene {
-    pub fn load(path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("read scene {}", path.display()))?;
-        let document = v2::diagnostics::read_document(&bytes)?;
-        Self::document(
-            document,
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )
-    }
-
-    pub fn document(mut document: Value, base: &Path) -> Result<Self> {
-        let authored = serde_json::to_vec(&document)?;
-        vork_std::expand_scene(&mut document, base)?;
-        let scene = Scene::from_json_for_export(&serde_json::to_vec(&document)?, &authored, None)?;
-        Self::new(scene, base)
-    }
-
-    pub fn new(mut scene: Scene, base: &Path) -> Result<Self> {
+    pub fn new(mut scene: Scene, base: &Path, opened: crate::footage::Opened) -> Result<Self> {
         ensure!(!scene.is_canvas(), "ask: answers about a 2D canvas are not built yet");
         let buffers = buffers::SceneBuffers::decode(&scene, base)?;
         let mut nodes = Vec::new();
         flatten(&scene.nodes, None, &mut nodes);
-        let mut animation =
-            animation::Plan::compile_with_buffers(&scene, base, Some(&buffers.data))?;
+        let mut animation = animation::Plan::compile_in(&scene, base, Some(&buffers.data), &opened)?;
         let mut assets = Vec::new();
         let mut imports = Vec::new();
         let mut cache = animation::SourceCache::default();
@@ -316,6 +305,7 @@ impl CpuScene {
         animation.mark_nodes(&mut nodes, 0)?;
         let targets = targets::Plan::compile(&mut nodes)?;
         Ok(Self {
+            opened,
             scene,
             base: base.to_owned(),
             buffers,

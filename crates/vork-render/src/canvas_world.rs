@@ -130,20 +130,39 @@ impl Convert {
 }
 
 /// A world inside a canvas: its scene installed on the canvas's device, and the frame slot it draws through.
+struct WorldRecording {
+    slot: Option<crate::FrameSlot>,
+    history: Arc<std::sync::Mutex<Option<crate::frame::RayHistory>>>,
+    preserve_rays: bool,
+}
+impl Drop for WorldRecording {
+    fn drop(&mut self) {
+        if self.preserve_rays {
+            if let Some(slot) = self.slot.take() {
+                *self.history.lock().unwrap() = slot.into_ray_history();
+            }
+        }
+    }
+}
+
 pub(crate) struct World {
     scene: crate::InstalledScene,
-    slot: crate::FrameSlot,
+    slot: crate::residency::Cache<std::sync::Mutex<WorldRecording>>,
+    ray_history: Arc<std::sync::Mutex<Option<crate::frame::RayHistory>>>,
+    preserve_rays: bool,
     pub size: [u32; 2],
     /// The viewed picture the canvas reads, and the pass that copies it out of the frame's staging planes.
     picture: wgpu::Texture,
     copy: wgpu::ComputePipeline,
 }
 impl World {
-    pub(crate) fn install(renderer: &crate::Renderer, scene: vork_scene::Scene, base: &Path) -> Result<Self> {
+    pub(crate) fn install(renderer: &crate::Renderer, scene: vork_scene::Scene, base: &Path, opened: &crate::footage::Opened) -> Result<Self> {
         let size = scene.render.resolution;
         // The world's view keeps its result floating point for the canvas (`display_program`).
-        let scene = renderer.install_with_options(scene, base, crate::InstallOptions { readback: Default::default(), view_picture: true, ..Default::default() })?;
-        let slot = scene.create_frame_slot(renderer, Default::default())?;
+        let variants = if matches!(scene.render.settings.integrator, vork_scene::Integrator::Path(_)) {
+            crate::pipelines::VariantCompile::Page
+        } else { Default::default() };
+        let scene = renderer.install_with_options(scene, base, crate::InstallOptions { opened: opened.clone(), readback: Default::default(), view_picture: true, variants, ..Default::default() })?;
         let picture = crate::gpu_memory::texture(&renderer.device, &wgpu::TextureDescriptor {
             label: Some("floating world view"), size: wgpu::Extent3d {width:size[0],height:size[1],depth_or_array_layers:1},
             mip_level_count:1, sample_count:1, dimension:wgpu::TextureDimension::D2, format:wgpu::TextureFormat::Rgba16Float,
@@ -164,18 +183,53 @@ impl World {
         let copy = renderer.compiler.compute_cached(&wgpu::ComputePipelineDescriptor {
             label:Some("floating world view"), layout:None,module:&module,entry_point:Some("main"),compilation_options:Default::default(),cache:None,
         });
-        Ok(Self { scene, slot, size, picture, copy })
+        let preserve_rays = crate::frame::RayHistory::supports(&scene);
+        Ok(Self { scene, slot: crate::residency::Cache::new(&renderer.residency),
+            ray_history: Arc::new(std::sync::Mutex::new(None)), preserve_rays, size, picture, copy })
     }
+    /// Hidden worlds retain their installation and cached backing, but do not
+    /// pin a camera working set. The device ledger can reclaim unleased backing
+    /// under pressure; a roomy device reuses it when the world becomes visible.
+    pub(crate) fn hide(&mut self) { self.slot.take(); }
+
     /// The world's viewed picture at `request`, its node's local time: straight alpha, the view's code values
     /// for sRGB with the world's output dither, unquantized and unclamped (RGBA16F), left on the GPU.
     pub(crate) fn draw(&mut self, renderer: &crate::Renderer, request: &vork_time::Request) -> Result<&wgpu::Texture> {
-        self.slot.profile = moda_engine::prof::capturing();
+        // Pin only while drawing and copying this world. Other worlds can reclaim
+        // this idle slot through the same ledger as its transient backing.
+        let retained = match self.slot.get() {
+            Some(slot) => slot,
+            None => {
+                let allocated = || renderer.device.generate_allocator_report()
+                    .map_or(0, |report| report.total_allocated_bytes);
+                let history = match self.ray_history.lock().unwrap().take() {
+                    Some(history) => Some(history),
+                    None if self.preserve_rays => Some(crate::frame::RayHistory::new(&self.scene, renderer)?),
+                    None => None,
+                };
+                // Ray history survives this cache entry. Its initial allocation
+                // must not inflate the bytes an eviction claims to release.
+                let before = allocated();
+                let cached_before = renderer.residency.retained_bytes();
+                let slot = crate::FrameSlot::resume_ray_history(&self.scene, renderer, Default::default(), history)?;
+                let cached_growth = renderer.residency.retained_bytes().saturating_sub(cached_before);
+                // Shared transient backings have their own ledger entries.
+                // Do not count them again just because this slot pins them.
+                let bytes = allocated().saturating_sub(before).saturating_sub(cached_growth);
+                self.slot.insert(std::sync::Mutex::new(WorldRecording {
+                    slot: Some(slot), history: self.ray_history.clone(), preserve_rays: self.preserve_rays,
+                }), bytes)
+            }
+        };
+        let mut guard = retained.lock().unwrap();
+        let slot = guard.slot.as_mut().expect("resident world recording");
+        slot.profile = moda_engine::prof::capturing();
         let paused = moda_engine::prof::capturing().then(moda_engine::gpu_profile::pause);
         loop {
-            let drawn = self.slot.submit_outputs(&self.scene, renderer, request.clone(), crate::ReadbackOutputs::default())
+            let drawn = slot.submit_outputs(&self.scene, renderer, request.clone(), crate::ReadbackOutputs::default())
                 .and_then(|()| {
                     let _wait = moda_engine::prof::span("canvas.output.wait_readback");
-                    self.slot.collect(renderer).map(|output| {
+                    slot.collect(renderer).map(|output| {
                         if moda_engine::prof::capturing() { moda_engine::prof::capture_add("canvas.world_gpu", output.timing.gpu_ms); }
                     })
                 }).map_err(crate::failure::device);
@@ -184,16 +238,16 @@ impl World {
                 Err(error) => {
                     let Some(redo) = error.downcast_ref::<crate::FrameRedo>() else { return Err(error) };
                     let demand = redo.0;
-                    self.scene.redo_frame(renderer, std::slice::from_mut(&mut self.slot), demand, 0).map_err(crate::failure::device)?;
+                    self.scene.redo_frame(renderer, std::slice::from_mut(slot), demand, 0).map_err(crate::failure::device)?;
                 }
             }
         }
         drop(paused);
         let params = crate::init(&renderer.device,"world picture planes",bytemuck::cast_slice(&[
-            self.slot.view.post.display_base.expect("world view staging"),self.size[0],self.size[1],0u32]),wgpu::BufferUsages::UNIFORM);
+            slot.view.post.display_base.expect("world view staging"),self.size[0],self.size[1],0u32]),wgpu::BufferUsages::UNIFORM);
         let target=self.picture.create_view(&Default::default());
         let group=renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("world picture"),layout:&self.copy.get_bind_group_layout(0),entries:&[
-            crate::entry(0,self.slot.view.post.pixels.as_entire_binding()),crate::entry(1,wgpu::BindingResource::TextureView(&target)),crate::entry(2,params.as_entire_binding()),
+            crate::entry(0,slot.view.post.pixels.as_entire_binding()),crate::entry(1,wgpu::BindingResource::TextureView(&target)),crate::entry(2,params.as_entire_binding()),
         ]});
         let mut encoder=renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {label:Some("world picture")});
         {
@@ -219,6 +273,7 @@ impl World {
 /// world. The document holds Moda's text and engine state, which stay on that thread.
 #[derive(Clone)]
 pub(crate) struct Picture {
+    opened: crate::footage::Opened,
     id: u64,
     node: String,
     scene: Arc<vork_scene::Scene>,
@@ -245,10 +300,10 @@ thread_local! {
 impl Picture {
     /// The picture of canvas node `node`, whose document is `scene`. Its text lays out now, so a canvas that
     /// cannot be drawn is refused at install.
-    pub(crate) fn new(renderer: &crate::Renderer, node: &str, scene: vork_scene::Scene, base: &Path) -> Result<Self> {
+    pub(crate) fn new(renderer: &crate::Renderer, node: &str, scene: vork_scene::Scene, base: &Path, opened: &crate::footage::Opened) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let picture = Self { id, node: node.to_string(), scene: Arc::new(scene), base: Arc::new(base.to_path_buf()), _held: Arc::new(Held(id)) };
+        let picture = Self { opened: opened.clone(), id, node: node.to_string(), scene: Arc::new(scene), base: Arc::new(base.to_path_buf()), _held: Arc::new(Held(id)) };
         picture.with_state(|state| {
             state.worlds = Some(crate::canvas::Pictures::new(renderer, &state.document, base, true)?);
             Ok(())
@@ -266,7 +321,7 @@ impl Picture {
         let mut state = match state {
             Some(state) => state,
             None => {
-                let document = crate::canvas::Document::new(&self.scene, &self.base)?;
+                let document = crate::canvas::Document::new_with_paints(&self.scene, &self.base, None, &self.opened)?;
                 document.install_images()?;
                 State { document, engine: None, convert: Convert::default(), worlds: None }
             }

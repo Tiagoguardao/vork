@@ -327,6 +327,12 @@ impl CommandEncoder {
         );
     }
 
+    /// Run when this encoder's commands are submitted, with their actual fence.
+    /// Dropping the commands before submission drops the callback.
+    pub fn on_submitted(&self, callback: impl FnOnce(SubmissionIndex) + Send + 'static) {
+        self.actions.lock().submission_callbacks.push(alloc::boxed::Box::new(callback));
+    }
+
     impl_deferred_command_buffer_actions!();
 
     /// Get the [`wgpu_hal`] command encoder from this `CommandEncoder`.
@@ -527,3 +533,6 @@ impl CommandEncoder {
         );
     }
 }
+
+#[cfg(all(test, wgpu_core, feature = "vulkan", feature = "wgsl", not(target_arch = "wasm32")))]
+mod pre_pass_tests;

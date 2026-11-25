@@ -81,3 +81,7 @@ available under MIT).
 - `src/ops.rs`: compare text content independently of supplied run/stroke colours without copying specs.
   `src/vector/ops.rs`: triangle and analytic-record arrays are shared immutable geometry, as curve points
   already are; consumers borrow their slices and paint copies share their allocations.
+
+- Cleanup audit C removes tests ignored for absent, unported Moda font/oracle fixtures.
+  Removed capability: running those fixture-specific regressions from this checkout; no text
+  layout or drawing capability changes. Vertical, ruby and text-on-path support stays intact.

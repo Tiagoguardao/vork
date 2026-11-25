@@ -10,6 +10,10 @@ This preserves the cue's instant independently of render FPS. A cue between
 frames appears on the first sampled frame at or after its start and disappears
 on the first at or after its end. Set white-space to pre-line to keep explicit
 line breaks; width controls wrapping. Fonts are explicit .ttf/.otf files.
+For repeatable emoji artwork, include a colour face in the font list, for example
+["CaptionSans.ttf", "NotoColorEmoji.ttf"]. Canvas tries the base character's font list in order for
+the complete sequence, then looks for a fallback colour face. The selected
+artwork supplies the advance and the visible bounds used for glyph animation.
 
 Example: examples/animation-recipes/captions.py reads plain UTF-8 SRT, preserves
 multiline cues, clears gaps, and emits one text node and a STEP content track.

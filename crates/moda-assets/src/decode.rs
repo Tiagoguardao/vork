@@ -53,11 +53,23 @@ pub struct PreparedImage {
 }
 
 impl PreparedImage {
+    pub(crate) fn same_layout(&self, other: &Self) -> bool {
+        self.width == other.width && self.height == other.height
+            && self.natural_width == other.natural_width && self.natural_height == other.natural_height
+            && self.scale_factor == other.scale_factor && self.straight == other.straight
+            && self.is_svg == other.is_svg
+    }
+
+
     /// An image made in memory (the pixel graph's sink images): premultiplied sRGB RGBA8, `width × height`,
     /// uploaded as it is (no sizing policy, scale factor 1).
     pub fn from_premultiplied(rgba_premul: Vec<u8>, width: u32, height: u32) -> Self {
-        let total = width as u64 * height as u64;
         let covered = rgba_premul.chunks_exact(4).filter(|p| p[3] != 0).count() as u64;
+        Self::from_premultiplied_with_coverage(rgba_premul, width, height, covered)
+    }
+
+    /// Construct from associated pixels whose nontransparent count is already known.
+    pub fn from_premultiplied_with_coverage(rgba_premul: Vec<u8>, width: u32, height: u32, covered: u64) -> Self {
         Self {
             width,
             height,
@@ -68,7 +80,7 @@ impl PreparedImage {
             straight: false,
             is_svg: false,
             icc_applied: false,
-            coverage_permille: coverage_permille(covered, total),
+            coverage_permille: coverage_permille(covered, u64::from(width) * u64::from(height)),
             blank_cause: "",
         }
     }
@@ -166,28 +178,25 @@ pub fn decode_raster(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, bool)> {
     // `from-image`), and the header sniffs report the upright size, so the pixels are turned here too.
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
 
-    let (mut rgba, mut w, mut h) = match decode_jpeg_turbo(bytes) {
-        Some(out) => out,
-        None => {
-            // Same contract as the `into_decoder` arm: stable "image decode:"
-            // prefix, positive sniff INSIDE the context. A decoder that
-            // constructs (intact header chunks) and then trips a FORMAT error
-            // in the pixel stream of a COMPLETE file is corrupt at rest, and
-            // Chromium's `createImageBitmap` rejects the same bytes.
-            let img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
-                let sniff = sniff_corrupt_complete_raster(bytes, &e);
-                match sniff {
-                    Some(kind) => anyhow::Error::new(BrowserUndecodable {
-                        kind,
-                        stage: "decode",
-                        source: e,
-                    }),
-                    None => anyhow::Error::new(e).context("image decode"),
-                }
-            })?;
-            let (w, h) = (img.width(), img.height());
-            (img.into_rgba8().into_raw(), w, h)
-        }
+    let (mut rgba, mut w, mut h) = {
+        // Same contract as the `into_decoder` arm: stable "image decode:"
+        // prefix, positive sniff INSIDE the context. A decoder that
+        // constructs (intact header chunks) and then trips a FORMAT error
+        // in the pixel stream of a COMPLETE file is corrupt at rest, and
+        // Chromium's `createImageBitmap` rejects the same bytes.
+        let img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
+            let sniff = sniff_corrupt_complete_raster(bytes, &e);
+            match sniff {
+                Some(kind) => anyhow::Error::new(BrowserUndecodable {
+                    kind,
+                    stage: "decode",
+                    source: e,
+                }),
+                None => anyhow::Error::new(e).context("image decode"),
+            }
+        })?;
+        let (w, h) = (img.width(), img.height());
+        (img.into_rgba8().into_raw(), w, h)
     };
 
     if orientation != image::metadata::Orientation::NoTransforms {
@@ -382,47 +391,6 @@ fn png_is_structurally_complete(bytes: &[u8]) -> bool {
         }
         off = end;
     }
-}
-
-/// Chromium-parity JPEG decode: mozjpeg (libjpeg-turbo) with the Blink
-/// settings — JDCT_ISLOW + fancy upsampling (the libjpeg defaults). Returns
-/// `None` for non-JPEG bytes or any decode failure (the caller falls back to
-/// the image crate, which also covers CMYK/exotic colorspaces).
-/// mozjpeg is vendored C (no wasm32 build, needs the platform SDK on mobile)
-/// and rides the `jpeg-parity` feature; without it the image-crate fallback
-/// (the `not(feature = "jpeg-parity")` stub below + `decode_raster`'s `None`
-/// path) decodes JPEG.
-#[cfg(feature = "jpeg-parity")]
-fn decode_jpeg_turbo(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    // mozjpeg signals errors by panicking (libjpeg setjmp/longjmp translated
-    // to unwinds); contain them like `moda-engine/src/encode.rs::encode_jpeg`.
-    std::panic::catch_unwind(|| -> Option<(Vec<u8>, u32, u32)> {
-        let mut d = mozjpeg::Decompress::new_mem(bytes).ok()?;
-        d.dct_method(mozjpeg::DctMethod::IntegerSlow);
-        d.do_fancy_upsampling(true);
-        let mut started = d.rgba().ok()?;
-        let (w, h) = (started.width(), started.height());
-        let px: Vec<[u8; 4]> = started.read_scanlines().ok()?;
-        started.finish().ok()?;
-        if px.len() != w * h {
-            return None;
-        }
-        Some((bytemuck::cast_vec(px), w as u32, h as u32))
-    })
-    .ok()
-    .flatten()
-}
-
-/// Without `jpeg-parity` (mobile cross-compile lane: mozjpeg-sys is a C
-/// build script needing the platform SDK), every JPEG falls through to the
-/// image crate's decoder in [`decode_raster`] — within ±4/255 of
-/// libjpeg-turbo (quirk Q-93). Fine on device; never for server-parity lanes.
-#[cfg(not(feature = "jpeg-parity"))]
-fn decode_jpeg_turbo(_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    None
 }
 
 /// ICC → sRGB in place on straight-alpha RGBA8 (alpha passes through).
@@ -784,34 +752,6 @@ mod tests {
             "unparseable ICC → not applied; decode still succeeds"
         );
         assert_eq!(&px[..4], &[10, 20, 30, 255]);
-    }
-
-    /// Q-93: JPEG bytes must route through the libjpeg-turbo decoder (the
-    /// Chromium decode path) and never the image crate's zune-jpeg; PNG bytes
-    /// must NOT take the turbo path.
-    #[cfg(feature = "jpeg-parity")]
-    #[test]
-    fn jpeg_routes_through_libjpeg_turbo() {
-        let img = image::RgbImage::from_fn(16, 16, |x, y| {
-            image::Rgb([(x * 16) as u8, (y * 16) as u8, ((x + y) * 8) as u8])
-        });
-        let mut jpeg = Vec::new();
-        image::DynamicImage::ImageRgb8(img.clone())
-            .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
-            .unwrap();
-        let turbo = decode_jpeg_turbo(&jpeg).expect("turbo path decodes JPEG");
-        assert_eq!((turbo.1, turbo.2), (16, 16));
-        let (via_raster, w, h, _) = decode_raster(&jpeg).unwrap();
-        assert_eq!((w, h), (16, 16));
-        // decode_raster must return exactly the turbo pixels (not zune-jpeg's,
-        // which differ by a few LSBs on gradient content).
-        assert_eq!(via_raster, turbo.0);
-
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        assert!(decode_jpeg_turbo(&png).is_none());
     }
 
     /// Q-94: the sizing-policy resize convolves PREMULTIPLIED pixels exactly

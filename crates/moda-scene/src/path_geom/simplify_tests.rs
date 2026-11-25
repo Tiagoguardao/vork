@@ -378,30 +378,6 @@ fn parity_cases() -> Vec<(&'static str, Vec<BlendPathPoint>, bool, usize, f64)> 
     ]
 }
 
-#[test]
-#[ignore = "probe: prints anchors / deviation per tolerance (cargo test -p moda-scene parity_probe -- --ignored --nocapture)"]
-fn parity_probe() {
-    for (name, pts, closed, ai_n, ai_dev) in parity_cases() {
-        let mut row = format!(
-            "{name:12} in {:3}; Illustrator {ai_n} ({ai_dev})",
-            pts.len()
-        );
-        for tol in [3.0, 1.0, 0.5, 0.3, 0.2, 0.15, 0.1, 0.05] {
-            let out = simplify_path(
-                &pts,
-                closed,
-                &SimplifyOptions {
-                    tolerance: tol,
-                    ..Default::default()
-                },
-            );
-            let dev = deviation(&pts, &out.points, closed);
-            row += &format!(" | {tol}: {} ({dev:.2})", out.anchors_after);
-        }
-        println!("{row}");
-    }
-}
-
 /// Anchors in `points` (a closed fit repeats its first point at the end).
 fn anchors(points: &[BlendPathPoint], closed: bool) -> usize {
     let n = points.len();

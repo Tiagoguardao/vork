@@ -119,7 +119,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 // Main shader code
 
         // Frame-level uniforms
-        @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>; // viewProjection
+// #include "rect-clip.wgsl"
         // Mask sampling (optional). Group(2)=sampler+texture+uniforms
         struct MaskUniforms {
           maskActive: u32,
@@ -155,7 +155,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
           @location(0) @interpolate(flat) instanceId: u32,
           @location(1) color: vec4<f32>,
           @location(2) @interpolate(flat) isStroke: f32,
-          @location(3) worldPos: vec2<f32>, // Add world position for clipping
+          @location(3) worldPos: vec2<f32>, // World position for mask sampling
           @location(4) @interpolate(flat) clip: vec4<f32>,
         }
         
@@ -164,35 +164,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
           vertex: VertexInput,
           @builtin(instance_index) instanceIndex: u32
         ) -> VertexOutput {
-          var output: VertexOutput;
-          let owner = select(vertex.owner, instanceIndex, vertex.owner == 0xffffffffu);
-          let path = paths[owner];
-          
-          // Use the vertex position from the buffer
-          let localPos = vertex.position;
-          
-          // Transform to world space
-          let worldPos = path.model * vec4<f32>(localPos.x, localPos.y, 0.0, 1.0);
-          output.worldPos = worldPos.xy; // Pass world position to fragment shader
-          output.position = frameUniforms * worldPos;
-          
-          // Use pre-calculated depth value
-          // For stroke vertices, add a small offset to render on top of fill
-          let depthOffset = select(0.0, STROKE_DEPTH_OFFSET, vertex.vertexType > 0.5);
-          output.position.z = path.pathInfo.w + depthOffset;
-          
-          output.instanceId = owner;
-          output.isStroke = vertex.vertexType;
-          
-          // Select color based on vertex type
-          if (vertex.vertexType > 0.5) {
-            output.color = path.strokeColor;
-          } else {
-            output.color = path.fillColor;
-          }
-          // Pass page clip bounds to fragment via flat varying
-          output.clip = path.pageClipBounds;
-          
+// #include "path-solid-vertex.wgsl"
           return output;
         }
         
@@ -203,14 +175,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
             discard;
           }
           
-          // Use passed clip bounds
-          let bounds = input.clip;
-          
-          // Check if fragment is within page bounds
-          if (input.worldPos.x < bounds.x || 
-              input.worldPos.x > bounds.x + bounds.z ||
-              input.worldPos.y < bounds.y || 
-              input.worldPos.y > bounds.y + bounds.w) {
+          if (outsideRectClip(input.position.xy, input.clip)) {
             discard;
           }
           

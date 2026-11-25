@@ -93,19 +93,13 @@ pub(crate) fn escapes_container_clip(node: &RawNode) -> bool {
         })
 }
 
-/// Whether `a` holds no point.
 pub fn is_empty(a: &Aabb) -> bool {
     !(a[0] <= a[2] && a[1] <= a[3])
 }
 
 /// Whether `a` and `b` overlap (touching counts as overlapping).
-pub fn intersects(a: &Aabb, b: &Aabb) -> bool {
+pub(crate) fn intersects(a: &Aabb, b: &Aabb) -> bool {
     !is_empty(a) && a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
-}
-
-/// Whether `outer` contains `inner`.
-pub fn contains(outer: &Aabb, inner: &Aabb) -> bool {
-    outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]
 }
 
 fn num(v: Option<&Value>) -> f64 {
@@ -122,11 +116,7 @@ fn stroke_reach(o: &moda_scene::value::Map, node: &RawNode) -> Option<f64> {
         return Some(0.0);
     }
     let w = num(o.get("width"));
-    if o.get("brush").is_some_and(|b| !b.is_null()) {
-        // Brush artwork (art / scatter / pattern) reaches by the artwork's own
-        // proportions and scatter settings; not bounded here.
-        return None;
-    }
+
     // Miter joins reach `miterLimit * w / 2` past the centre line, an outside-aligned
     // stroke a full `w`; `w * max(miterLimit, 4)` covers both, square caps and the
     // width profile's widest marker (the engine's own outline estimate uses 4w).
@@ -137,12 +127,7 @@ fn stroke_reach(o: &moda_scene::value::Map, node: &RawNode) -> Option<f64> {
         .unwrap_or(10.0)
         .max(4.0);
     let mut reach = w * miter;
-    if let Some(wave) = o.get("wave").and_then(Value::as_object) {
-        reach += num(wave.get("amount")) * w.max(1.0);
-    }
-    if let Some(dynamic) = o.get("dynamic").and_then(Value::as_object) {
-        reach += num(dynamic.get("wiggle")) * w.max(1.0);
-    }
+
     let has_arrow = |k: &str| {
         o.get(k)
             .and_then(Value::as_str)
@@ -256,7 +241,7 @@ fn group_appearance_reach(scene: &Scene, node: &RawNode) -> Option<f64> {
 
 /// How far paint can reach past the node's geometry box: in node-local units, plus in canvas units (a drop
 /// shadow's offset, which is added after the node's transform), or `None` when it cannot be bounded.
-fn local_reach(node: &RawNode, box_w: f64, box_h: f64, brush_learned: bool) -> Option<(f64, f64)> {
+fn local_reach(node: &RawNode, box_w: f64, box_h: f64, ) -> Option<(f64, f64)> {
     let extent = box_w.abs().max(box_h.abs());
     let has_text = node.node_type() == "richtext"
         || matches!(node.json_field("textContent"), Some(Value::String(s)) if !s.is_empty());
@@ -267,9 +252,7 @@ fn local_reach(node: &RawNode, box_w: f64, box_h: f64, brush_learned: bool) -> O
     if let Some(strokes) = node.array("strokes") {
         for s in strokes {
             if let Some(o) = s.as_object() {
-                if brush_learned && o.get("brush").is_some_and(|b| !b.is_null()) {
-                    continue;
-                }
+
                 stroke = stroke.max(stroke_reach(o, node)?);
             }
         }
@@ -337,12 +320,12 @@ fn affine_reach_scale(a: &Affine) -> f64 {
 /// World-space visual bounds of one primary display-list item (its own paint only,
 /// not its subtree), `EMPTY` for items that paint nothing themselves (groups), or
 /// `INFINITE` when they cannot be bounded.
-pub fn item_visual_bounds(scene: &Scene, item: &PaintItem) -> Aabb {
-    visual_bounds(scene, item, false)
+pub(crate) fn item_visual_bounds(scene: &Scene, item: &PaintItem) -> Aabb {
+    visual_bounds(scene, item)
 }
 
 /// [`item_visual_bounds`]; `brush_learned` leaves the placed brush stroke out (its box is learned).
-fn visual_bounds(scene: &Scene, item: &PaintItem, brush_learned: bool) -> Aabb {
+fn visual_bounds(scene: &Scene, item: &PaintItem, ) -> Aabb {
     if item.kind == PaintKind::GroupBoundary {
         return EMPTY;
     }
@@ -371,7 +354,7 @@ fn visual_bounds(scene: &Scene, item: &PaintItem, brush_learned: bool) -> Aabb {
         node.f64("width").unwrap_or(r.width),
         node.f64("height").unwrap_or(r.height),
     );
-    let Some((reach, offset)) = local_reach(node, box_w, box_h, brush_learned) else {
+    let Some((reach, offset)) = local_reach(node, box_w, box_h) else {
         return INFINITE;
     };
     let pad = reach * affine_reach_scale(a).max(1e-9) + offset;
@@ -449,13 +432,11 @@ pub struct CullPlan {
     pub culled_roots: Vec<String>,
     /// Number of primary items inside skipped ranges.
     pub culled_items: usize,
-    /// The placed brush strokes the decision reached (drawn, or skipped by their learned box): their cached
-    /// placements and geometry stay warm (`PlanCaches::brush_kept`).
-    pub brush_seen: Vec<String>,
+
 }
 
 impl CullPlan {
-    pub fn skip_at(&self, index: usize) -> Option<(usize, u64)> {
+    pub(crate) fn skip_at(&self, index: usize) -> Option<(usize, u64)> {
         self.skip.get(index).copied().flatten()
     }
 }
@@ -463,8 +444,6 @@ impl CullPlan {
 /// Per display-list index, the subtree facts the skip decision needs: visual bounds
 /// (the item's own paint unioned with its descendants'), the render-z the subtree
 /// consumes, where its contiguous range ends, and how many primary items it holds.
-/// Independent of the window, so the camera lane keeps one per display list and
-/// scene generation (`PlanCaches::cull_index`) and only re-decides on a pan.
 #[derive(Debug, Default)]
 pub struct CullIndex {
     bounds: Vec<Aabb>,
@@ -475,35 +454,17 @@ pub struct CullIndex {
     /// capture blurs every descendant into its neighbours, so one outside the
     /// window can still paint inside it.
     whole: Vec<bool>,
-    /// A placed brush stroke (a leaf): its learned-bounds key and the bounds of the rest of its paint (fills,
-    /// shadows, other strokes).
-    brush: Vec<Option<(u64, Aabb)>>,
-}
 
-/// The learned canvas box of a placed brush stroke (`PlanCaches::brush_bounds`) and the zoom band it was drawn
-/// at, by its key.
-pub type LearnedBrushBounds<'a> = &'a dyn Fn(&str, u64) -> Option<(Aabb, i32)>;
-
-/// Decide which display-list ranges miss `window`. `z_cost(item)` is the render-z the
-/// plan builder would consume for `item` alone (0 for filtered items and groups, 1 for
-/// every drawn kind; never called for a blend, which is never culled).
-pub fn plan_cull(
-    scene: &Scene,
-    dl: &DisplayList,
-    window: &Aabb,
-    z_cost: impl Fn(&PaintItem) -> u64,
-) -> CullPlan {
-    CullIndex::build(scene, dl, z_cost, |_| None).decide(dl, window, &|_, _| None)
 }
 
 impl CullIndex {
     /// `brush_key(item)`: the learned-bounds key of a placed brush stroke (`None` for anything else, or a stroke
     /// that can't be learned).
-    pub fn build(
+    pub(crate) fn build(
         scene: &Scene,
         dl: &DisplayList,
         z_cost: impl Fn(&PaintItem) -> u64,
-        brush_key: impl Fn(&PaintItem) -> Option<u64>,
+
     ) -> CullIndex {
         let n = dl.items.len();
         let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(n);
@@ -517,7 +478,7 @@ impl CullIndex {
         let mut end = vec![0usize; n];
         let mut primaries = vec![0usize; n];
         let mut whole = vec![false; n];
-        let mut brush = vec![None; n];
+
         // Whether the subtree at i holds paint that escapes an ancestor container's clip.
         let mut escapes = vec![false; n];
         // The nearest ancestor that has its own display-list item (a table / generated
@@ -550,9 +511,7 @@ impl CullIndex {
             next_primary = i;
             let own = item_visual_bounds(scene, item);
             bounds[i] = union(bounds[i], own);
-            if own == INFINITE {
-                brush[i] = brush_key(item).map(|k| (k, visual_bounds(scene, item, true)));
-            }
+
             // A group's (or frame's) layer blur and a group's (or unfilled
             // frame's) shadows paint around its whole subtree (`layer_blur::shadow`): grow the folded
             // descendants' bounds by their reach.
@@ -610,23 +569,14 @@ impl CullIndex {
             end,
             primaries,
             whole,
-            brush,
+
         }
-    }
-
-    /// The display-list length this index was built for.
-    pub fn len(&self) -> usize {
-        self.bounds.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bounds.is_empty()
     }
 
     /// Skip every range whose subtree bounds miss `window`, outermost first. A placed brush stroke with a learned
     /// box (`learned`) is skipped when that box, grown by the flattening tolerances, and the rest of its paint miss
     /// the window.
-    pub fn decide(&self, dl: &DisplayList, window: &Aabb, learned: LearnedBrushBounds) -> CullPlan {
+    pub fn decide(&self, dl: &DisplayList, window: &Aabb) -> CullPlan {
         let n = dl.items.len().min(self.bounds.len());
         let mut plan = CullPlan {
             skip: vec![None; n],
@@ -635,23 +585,8 @@ impl CullIndex {
         let mut i = 0;
         while i < n {
             let item = &dl.items[i];
-            let brush_misses = || {
-                let Some((key, rest)) = self.brush.get(i).copied().flatten() else {
-                    return false;
-                };
-                if self.primaries[i] != 1 {
-                    return false;
-                }
-                let Some((b, band)) = learned(&item.node_id, key) else {
-                    return false;
-                };
-                let own = union(grown_for_bands(b, band), rest);
-                !intersects(&own, window)
-            };
-            if item.is_primary_node_item && self.brush.get(i).is_some_and(Option::is_some) {
-                plan.brush_seen.push(item.node_id.clone());
-            }
-            if item.is_primary_node_item && (!intersects(&self.bounds[i], window) || brush_misses()) {
+
+            if item.is_primary_node_item && !intersects(&self.bounds[i], window) {
                 let e = self.end[i].max(i + 1);
                 plan.skip[i] = Some((e, self.z[i]));
                 plan.culled_roots.push(item.node_id.clone());
@@ -666,45 +601,6 @@ impl CullIndex {
         plan
     }
 
-    /// The canvas box holding everything the subtrees `drawn` keeps paint: each kept primary item's whole subtree
-    /// bounds (the items under it may draw less, never more), the subtrees under a dropped item looked at one by
-    /// one. `None` when some kept subtree can't be bounded; an empty box when nothing is kept.
-    pub fn drawn_bounds(
-        &self,
-        dl: &DisplayList,
-        drawn: impl Fn(&PaintItem) -> bool,
-    ) -> Option<Aabb> {
-        let n = dl.items.len().min(self.bounds.len());
-        let mut b = EMPTY;
-        let mut i = 0;
-        while i < n {
-            let item = &dl.items[i];
-            if !item.is_primary_node_item || !drawn(item) {
-                i += 1;
-                continue;
-            }
-            let sub = self.bounds[i];
-            if is_empty(&sub) {
-                i = self.end[i].max(i + 1);
-                continue;
-            }
-            if !sub.iter().all(|v| v.is_finite()) {
-                return None;
-            }
-            b = union(b, sub);
-            i = self.end[i].max(i + 1);
-        }
-        Some(b)
-    }
-}
-
-/// A learned brush box drawn at `band`, grown to hold the same shapes flattened at any band: a flattening lies
-/// within its tolerance of the curve, and a band's tolerance is at most the coarsest band's. Plus a hundredth of
-/// its size and a canvas unit, for the joins of an outline and rounding.
-fn grown_for_bands(b: Aabb, band: i32) -> Aabb {
-    let tol = crate::tess::outline::tolerance_for_band(band) + crate::tess::outline::tolerance_for_band(i32::MIN);
-    let pad = 2.0 * tol + 0.01 * (b[2] - b[0]).max(b[3] - b[1]) + 1.0;
-    [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad]
 }
 
 #[cfg(test)]
@@ -859,111 +755,4 @@ mod tests {
         assert!(b[2] - b[0] >= 200.0 + 2.0 * 2.0 * 10.0 - 1e-9, "{b:?}");
     }
 
-    #[test]
-    fn brushed_strokes_are_never_culled() {
-        let s = load(
-            json!([rect(
-                "b",
-                100.0,
-                json!({ "strokes": [{"id": "s", "paint": {"type": "solid", "color": "#000000"},
-                "width": 4, "brush": {"brushId": "x"}}] })
-            )]),
-            &["b"],
-        );
-        assert_eq!(bounds_of(&s, "b"), INFINITE);
-    }
-
-    fn one_per_drawn(it: &PaintItem) -> u64 {
-        (it.kind != PaintKind::GroupBoundary) as u64
-    }
-
-    #[test]
-    fn a_group_outside_the_window_is_skipped_as_one_range_with_its_z() {
-        let s = load(
-            json!([
-                rect("a", 100.0, json!({})),
-                { "id": "g", "type": "group", "children": ["g1", "g2"] },
-                rect("g1", 1500.0, json!({ "parentId": "g" })),
-                rect("g2", 1700.0, json!({ "parentId": "g" })),
-                rect("c", 300.0, json!({})),
-            ]),
-            &["a", "g", "c"],
-        );
-        let dl = moda_scene::build_display_list(&s, "p1");
-        let gi = dl.items.iter().position(|i| i.node_id == "g").unwrap();
-        let ci = dl.items.iter().position(|i| i.node_id == "c").unwrap();
-        let plan = plan_cull(&s, &dl, &[0.0, 0.0, 1000.0, 1000.0], one_per_drawn);
-        assert_eq!(plan.culled_roots, vec!["g".to_string()]);
-        assert_eq!(plan.culled_items, 3);
-        assert_eq!(plan.skip_at(gi), Some((ci, 2)), "skips g1 and g2, two z");
-        // A window reaching one child keeps the group; the other child is culled alone.
-        let plan = plan_cull(&s, &dl, &[1400.0, 0.0, 1650.0, 1000.0], one_per_drawn);
-        assert!(plan.skip_at(gi).is_none());
-        assert!(plan.culled_roots.contains(&"g2".to_string()));
-        assert!(!plan.culled_roots.contains(&"g1".to_string()));
-    }
-
-    #[test]
-    fn a_groups_shadow_entering_the_window_keeps_the_group() {
-        // The group's children end at x = 200; its drop shadow reaches 150 + 3·20 past.
-        let s = load(
-            json!([
-                { "id": "g", "type": "group", "children": ["g1"],
-                  "effects": [{ "id": "d", "type": "drop-shadow", "color": "#000000", "blur": 20,
-                                "offset": {"x": 150, "y": 0} }] },
-                rect("g1", 100.0, json!({ "parentId": "g" })),
-            ]),
-            &["g"],
-        );
-        let dl = moda_scene::build_display_list(&s, "p1");
-        let plan = plan_cull(&s, &dl, &[300.0, 0.0, 1000.0, 1000.0], one_per_drawn);
-        // The group stays (its shadow is planned from the whole subtree, culled
-        // children included); the child outside the window is culled alone.
-        assert_eq!(
-            plan.culled_roots,
-            vec!["g1".to_string()],
-            "the group's shadow is in the window"
-        );
-        let plan = plan_cull(&s, &dl, &[600.0, 0.0, 1000.0, 1000.0], one_per_drawn);
-        assert_eq!(plan.culled_roots, vec!["g".to_string()]);
-    }
-
-    #[test]
-    fn a_layer_blurred_group_is_kept_or_culled_whole() {
-        // g1 is far outside the window, but the group's capture blurs it with g2,
-        // which is inside: g1 must stay in the plan.
-        let s = load(
-            json!([
-                { "id": "g", "type": "group", "children": ["g1", "g2"],
-                  "effects": [{ "id": "b", "type": "layer-blur", "radius": 4 }] },
-                rect("g1", 1500.0, json!({ "parentId": "g" })),
-                rect("g2", 100.0, json!({ "parentId": "g" })),
-            ]),
-            &["g"],
-        );
-        let dl = moda_scene::build_display_list(&s, "p1");
-        let plan = plan_cull(&s, &dl, &[0.0, 0.0, 500.0, 500.0], one_per_drawn);
-        assert!(plan.culled_roots.is_empty(), "{:?}", plan.culled_roots);
-        let plan = plan_cull(&s, &dl, &[0.0, 1000.0, 500.0, 1500.0], one_per_drawn);
-        assert_eq!(plan.culled_roots, vec!["g".to_string()]);
-    }
-
-    #[test]
-    fn a_shadow_entering_the_window_keeps_the_node() {
-        // The rect's geometry ends at x = 200; its shadow reaches x = 200 + 150 + 3·20.
-        let s = load(
-            json!([rect(
-                "r",
-                100.0,
-                json!({ "effects": [{ "id": "d", "type": "drop-shadow", "color": "#000000", "blur": 20,
-                "offset": {"x": 150, "y": 0} }] })
-            )]),
-            &["r"],
-        );
-        let dl = moda_scene::build_display_list(&s, "p1");
-        let plan = plan_cull(&s, &dl, &[300.0, 0.0, 1000.0, 1000.0], |_| 1);
-        assert!(plan.culled_roots.is_empty(), "the shadow is in the window");
-        let plan = plan_cull(&s, &dl, &[600.0, 0.0, 1000.0, 1000.0], |_| 1);
-        assert_eq!(plan.culled_roots, vec!["r".to_string()]);
-    }
 }

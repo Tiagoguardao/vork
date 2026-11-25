@@ -10,6 +10,7 @@
 mod constants;
 mod ffmpeg;
 mod rate;
+mod yuv;
 pub use rate::validate_video_rate;
 pub use ffmpeg::{probe_video_clock_capabilities, validate_video_clock, validate_video_clock_capabilities};
 pub mod gpu_memory;
@@ -32,12 +33,16 @@ impl std::fmt::Display for DeviceLimit {
 }
 impl std::error::Error for DeviceLimit {}
 
+fn is_prores(path: &Path) -> bool {
+    path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"))
+}
+
 /// Check external video dependencies before device startup or scene installation.
 /// Native macOS video does not need FFmpeg. PNG/EXR callers need no check.
 /// Returns the dependency report for the persistent timing-capability identity.
 pub fn validate_video_output(path: &Path) -> Result<Vec<u8>> {
     if cfg!(target_os = "macos") { return Ok(Vec::new()); }
-    let mov = path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"));
+    let mov = is_prores(&path);
     if mov { return require_ffmpeg_encoder("prores_ks"); }
     // Linux native NVENC still requires FFmpeg as a muxer. Windows needs a
     // usable software fallback even if its FFmpeg advertises NVENC.
@@ -126,6 +131,7 @@ pub struct Encoder {
 pub struct Surface {
     pub texture: Option<wgpu::Texture>,
     readback: Option<wgpu::Buffer>,
+    conversion: Option<std::sync::Arc<yuv::Conversion>>,
     pixels: Vec<u8>,
     returned: std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
     completed: std::sync::Mutex<std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>>,
@@ -141,9 +147,13 @@ impl Surface {
         self.pipe_wait_ms
     }
 
-    /// Record the portable sink's copy in the frame's command buffer.
+    /// Record the portable sink's conversion and copy in the frame's command buffer.
     pub fn record_copy(&self, encoder: &mut wgpu::CommandEncoder, source: &wgpu::Texture) {
         if let Some(buffer) = &self.readback {
+            if let Some(conversion) = &self.conversion {
+                conversion.record(encoder, source, buffer);
+                return;
+            }
             let stride = (source.width() * 4).div_ceil(COPY_ROW_ALIGNMENT as u32)
                 * COPY_ROW_ALIGNMENT as u32;
             encoder.copy_texture_to_buffer(
@@ -165,6 +175,7 @@ enum Sink {
     #[cfg(target_os = "linux")]
     Nvidia(nvidia::Session),
     Pipe {
+        conversion: Option<std::sync::Arc<yuv::Conversion>>,
         child: Child,
         input: Option<pipe::Writer>,
         stderr: Option<pipe::Diagnostics>,
@@ -172,8 +183,8 @@ enum Sink {
     #[cfg(target_os = "macos")]
     Metal(native::Session),
 }
-/// Device-independent output preparation. Native codec/driver initialization
-/// overlaps adapter discovery and GPU device creation.
+/// Device-independent output preparation can overlap GPU device creation.
+/// Linux native initialization waits for the rendering device.
 /// Dropping an unfinished preparation cancels and reclaims its native session.
 pub struct PreparedEncoder {
     backend: Backend,
@@ -187,9 +198,27 @@ pub struct PreparedEncoder {
     #[cfg(target_os = "macos")]
     metal: Option<native::Session>,
     #[cfg(target_os = "linux")]
-    nvidia: Option<nvidia::Prepared>,
+    nvidia: std::sync::OnceLock<Option<nvidia::Prepared>>,
 }
 impl PreparedEncoder {
+    #[cfg(target_os = "linux")]
+    fn prepare_nvidia(&self, device: &wgpu::Device) -> bool {
+        matches!(self.backend, Backend::Auto)
+            && !is_prores(&self.path)
+            && nvidia::is_adapter(device)
+            && self.nvidia.get_or_init(|| {
+                // NVIDIA's Vulkan ICD can enter CUDA during vkCreateDevice.
+                // Wait for the rendering device before calling cuInit ourselves.
+                match nvidia::Prepared::new() {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        eprintln!("GPU NVENC unavailable; using readback: {error:#}");
+                        None
+                    }
+                }
+            }).is_some()
+    }
+
     /// Validate the selected FFmpeg codec and clock before replacing existing output.
     /// Native sessions do not need a readback codec unless attachment fails.
     /// Supply the rendering device for Linux hardware selection; software-only
@@ -199,7 +228,7 @@ impl PreparedEncoder {
         #[cfg(target_os = "macos")]
         if self.metal.is_some() { return Ok(()); }
         #[cfg(target_os = "linux")]
-        if self.nvidia.is_some() && device.is_none_or(nvidia::is_adapter) { return ffmpeg::validate_mux_rate(self.fps); }
+        if device.is_some_and(|device| self.prepare_nvidia(device)) { return ffmpeg::validate_mux_rate(self.fps); }
         if self.fallback_codec.get().is_none() {
             let codec = readback_codec(self.backend, self.width, self.height, &self.path, device)?;
             let _ = self.fallback_codec.set(codec);
@@ -215,6 +244,18 @@ impl PreparedEncoder {
         frames: u64,
         ring_depth: usize,
     ) -> Result<Encoder> {
+        ensure!(
+            ring_depth > 0 && ring_depth <= u32::MAX as usize,
+            "invalid ring depth"
+        );
+        validate_device(&device, self.width, self.height)?;
+        let prores = is_prores(&self.path);
+        ensure!(
+            !(prores && matches!(self.backend, Backend::HardwareReadback)),
+            "HardwareReadback is not supported for MOV; use Auto for native Mac ProRes or Readback for software ProRes"
+        );
+        #[cfg(target_os = "linux")]
+        let use_nvidia = self.prepare_nvidia(&device);
         let Self {
             backend,
             width,
@@ -234,20 +275,8 @@ impl PreparedEncoder {
             queue,
             backend,
         };
-        ensure!(
-            ring_depth > 0 && ring_depth <= u32::MAX as usize,
-            "invalid ring depth"
-        );
-        validate_device(&gpu.device, width, height)?;
-        let prores = path
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("mov"));
-        ensure!(
-            !(prores && matches!(gpu.backend, Backend::HardwareReadback)),
-            "HardwareReadback is not supported for MOV; use Auto for native Mac ProRes or Readback for software ProRes"
-        );
         #[cfg(target_os = "linux")]
-        if let Some(prepared) = nvidia.filter(|_| nvidia::is_adapter(&gpu.device)) {
+        if let Some(prepared) = nvidia.into_inner().flatten().filter(|_| use_nvidia) {
             match nvidia::Session::open(
                 &gpu,
                 prepared,
@@ -305,7 +334,13 @@ impl PreparedEncoder {
             Some(codec) => codec,
             None => readback_codec(gpu.backend, width, height, &path, Some(&gpu.device))?,
         };
-        eprintln!("Video encoder: FFmpeg {codec} (readback)");
+        let conversion = if codec == "libx264" {
+            yuv::Conversion::new(&gpu.device, width, height).map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        let format = if conversion.is_some() { ffmpeg::Input::Yuv420p } else { ffmpeg::Input::Rgba };
+        eprintln!("Video encoder: FFmpeg {codec} ({} readback)", format.pixel_format());
         let mut staging = tempfile::Builder::new();
         staging.prefix(".vork-video-").suffix(if prores { ".mov" } else { ".mp4" });
         #[cfg(unix)]
@@ -317,7 +352,7 @@ impl PreparedEncoder {
         let staged_output = staging
             .tempfile_in(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
             .with_context(|| format!("prepare video output {}", path.display()))?.into_temp_path();
-        let mut child = ffmpeg::readback_command(width, height, fps, frames, settings, codec, gop_frames, &staged_output)?
+        let mut child = ffmpeg::readback_command(width, height, fps, frames, settings, codec, format, gop_frames, &staged_output)?
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -347,6 +382,7 @@ impl PreparedEncoder {
             path,
             next: 0,
             sink: Sink::Pipe {
+                conversion,
                 child,
                 input,
                 stderr,
@@ -361,11 +397,10 @@ impl PreparedEncoder {
 /// Test FFmpeg's NVENC against the installed driver, using the same initialization
 /// probe for setup and output selection. Native Linux NVENC has a separate ABI.
 pub fn probe_ffmpeg_nvenc(width: u32, height: u32) -> Result<()> {
-    // Modern NVENC rejects tiny frames; preserve small output dimensions so Auto
-    // can select software for those outputs rather than accepting a larger probe.
+    // Driver limits depend on the requested dimensions, including at 8K.
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i",
-            &format!("color=size={}x{}", width.min(NVENC_PROBE_EXTENT), height.min(NVENC_PROBE_EXTENT)),
+            &format!("color=size={width}x{height}"),
             "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"])
         .stdin(Stdio::null()).output().context("start FFmpeg NVENC probe")?;
     ensure!(output.status.success(), "FFmpeg h264_nvenc initialization failed ({}): {}",
@@ -378,7 +413,7 @@ fn readback_codec(backend: Backend, width: u32, height: u32, path: &Path, device
     let _ = device;
     #[cfg(target_os = "macos")]
     let _ = (width, height);
-    let prores = path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"));
+    let prores = is_prores(&path);
     #[allow(unused_mut)]
     let mut codec = if prores { "prores_ks" } else { "libx264" };
     #[cfg(target_os = "macos")]
@@ -550,20 +585,6 @@ impl Encoder {
                 .context("Linux video output needs ffmpeg on PATH, including MP4 with native NVENC (ffmpeg muxes H.264). Install it with: sudo apt install ffmpeg")?;
             ensure!(output.status.success(), "ffmpeg on PATH is unusable; install ffmpeg (sudo apt install ffmpeg). Linux MP4 needs ffmpeg even with NVENC");
         }
-        #[cfg(target_os = "linux")]
-        let nvidia = if matches!(backend, Backend::Auto)
-            && !path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"))
-        {
-            match nvidia::Prepared::new() {
-                Ok(prepared) => Some(prepared),
-                Err(error) => {
-                    eprintln!("GPU NVENC unavailable; using readback: {error:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         #[cfg(target_os = "macos")]
         let metal = if matches!(backend, Backend::Auto) {
             match native::Session::prepare(
@@ -572,8 +593,7 @@ impl Encoder {
                 fps,
                 settings.hardware_bitrate,
                 gop_frames,
-                path.extension()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("mov")),
+                is_prores(&path),
                 settings.primaries,
             ) {
                 Ok(session) => Some(session),
@@ -597,7 +617,7 @@ impl Encoder {
             #[cfg(target_os = "macos")]
             metal,
             #[cfg(target_os = "linux")]
-            nvidia,
+            nvidia: std::sync::OnceLock::new(),
         })
     }
     /// Consume the next ring entry in frame order. The caller owns sink staging;
@@ -654,6 +674,16 @@ impl Encoder {
             #[cfg(target_os = "macos")]
             Sink::Metal(_) => false,
         }
+    }
+    /// Push can arm a GPU completion callback without waiting for the submission.
+    /// Callers may hand off before reading frame results, but must still validate
+    /// every frame before finishing the output and release each surface before reuse.
+    pub fn uses_completion_handoff(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Sink::Metal(_) = &self.sink {
+            return true;
+        }
+        false
     }
     /// Acquire a native encoder surface for rendering, if this backend supports it.
     fn acquire_output(&mut self) -> Result<Option<wgpu::Texture>> {
@@ -725,12 +755,23 @@ impl Encoder {
     /// Allocate the sink's part of a graph ring entry before rendering begins.
     pub fn create_surface(&mut self) -> Result<Surface> {
         let (returned, completed) = std::sync::mpsc::channel();
+        let conversion = match &self.sink {
+            Sink::Pipe { conversion, .. } => conversion.clone(),
+            #[cfg(target_os = "linux")]
+            Sink::Nvidia(_) => None,
+            #[cfg(target_os = "macos")]
+            Sink::Metal(_) => None,
+        };
         let readback = self.uses_pixel_readback().then(|| {
+            let size = if conversion.is_some() {
+                yuv::Conversion::size(self.width, self.height)
+            } else {
+                (u64::from(self.width) * 4).div_ceil(COPY_ROW_ALIGNMENT)
+                    * COPY_ROW_ALIGNMENT * u64::from(self.height)
+            };
             self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ring encoder staging"),
-                size: (u64::from(self.width) * 4).div_ceil(COPY_ROW_ALIGNMENT)
-                    * COPY_ROW_ALIGNMENT
-                    * u64::from(self.height),
+                size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -743,12 +784,9 @@ impl Encoder {
         };
         Ok(Surface {
             texture: self.acquire_output()?,
-            pixels: if readback.is_some() {
-                Vec::with_capacity(self.width as usize * self.height as usize * 4)
-            } else {
-                Vec::new()
-            },
+            pixels: Vec::with_capacity(readback.as_ref().map_or(0, |buffer| buffer.size() as usize)),
             readback,
+            conversion,
             returned,
             completed: std::sync::Mutex::new(completed),
             in_flight: false,
@@ -778,9 +816,8 @@ impl Encoder {
         #[cfg(target_os = "macos")]
         if let Sink::Metal(session) = &mut self.sink {
             let texture = surface.texture.as_ref().context("missing ring surface")?;
-            let raw = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }
-                .context("expected Metal surface")?;
-            session.wait(raw.raw_handle() as *const _ as *mut std::ffi::c_void)?;
+            let raw = native::texture(texture)?;
+            session.wait(objc2::rc::Retained::as_ptr(&raw) as *mut std::ffi::c_void)?;
         }
         surface.submitted = None;
         Ok(())
@@ -809,21 +846,20 @@ impl Encoder {
             // Flush deferred queue.write_texture/write_buffer uploads before native access.
             self.gpu.queue.submit([]);
             // Both render and conversion use this queue: conversion precedes render-slot reuse.
-            // SAFETY: guards keep the native objects alive while native submission retains them.
+            // Retain each native texture separately: overlapping as_hal guards can
+            // deadlock behind a canvas worker waiting to destroy another resource.
+            // SAFETY: the queue guard keeps this device's native queue alive through submission.
             let queue = unsafe { self.gpu.queue.as_hal::<wgpu::hal::api::Metal>() }
                 .context("Auto requires a Metal queue")?;
-            let raw = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }.context(
-                "Auto requires Metal device on macOS; select Readback for other backends",
-            )?;
+            let raw = native::texture(texture)?;
             let surface = surface
                 .texture
                 .as_ref()
                 .context("VideoToolbox requires an installed ring surface")?;
-            let destination = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() }
-                .context("encoder surface must be Metal")?;
+            let destination = native::texture(surface)?;
             return session.push(
-                raw.raw_handle() as *const _ as *mut std::ffi::c_void,
-                destination.raw_handle() as *const _ as *mut std::ffi::c_void,
+                objc2::rc::Retained::as_ptr(&raw) as *mut std::ffi::c_void,
+                objc2::rc::Retained::as_ptr(&destination) as *mut std::ffi::c_void,
                 queue.as_raw() as *const _ as *mut std::ffi::c_void,
                 self.next,
             );
@@ -865,16 +901,28 @@ impl Encoder {
             };
             let input = input.as_mut().context("closed encoder")?;
             let mut packed = std::mem::take(&mut surface.pixels);
-            packed.clear();
-            if stride == self.width * 4 && texture.format() == wgpu::TextureFormat::Rgba8Unorm {
-                packed.extend_from_slice(&view);
-            } else {
-                for bytes in view.chunks_exact(stride as usize) {
-                    packed.extend_from_slice(&bytes[..self.width as usize * 4]);
+            let row_bytes = self.width as usize * 4;
+            if surface.conversion.is_some() {
+                yuv::Conversion::pack(&view, self.width, self.height, &mut packed);
+            } else if texture.format() == wgpu::TextureFormat::Bgra8Unorm {
+                // Pack and swizzle together so the pipe payload is written once.
+                packed.resize(row_bytes * self.height as usize, 0);
+                for (source, destination) in view.chunks_exact(stride as usize)
+                    .zip(packed.chunks_exact_mut(row_bytes))
+                {
+                    let (source, _) = source[..row_bytes].as_chunks::<4>();
+                    let (destination, _) = destination.as_chunks_mut::<4>();
+                    for (&[blue, green, red, alpha], pixel) in source.iter().zip(destination) {
+                        *pixel = [red, green, blue, alpha];
+                    }
                 }
-                if texture.format() == wgpu::TextureFormat::Bgra8Unorm {
-                    for pixel in packed.chunks_exact_mut(4) {
-                        pixel.swap(0, 2);
+            } else {
+                packed.clear();
+                if stride as usize == row_bytes {
+                    packed.extend_from_slice(&view);
+                } else {
+                    for row in view.chunks_exact(stride as usize) {
+                        packed.extend_from_slice(&row[..row_bytes]);
                     }
                 }
             }
@@ -888,6 +936,7 @@ impl Encoder {
                 child,
                 input,
                 stderr,
+                ..
             } = &mut self.sink
             {
                 pipe::finish(child, input, stderr)?;
@@ -910,6 +959,7 @@ impl Encoder {
                 child,
                 input,
                 stderr,
+                ..
             } => pipe::finish(child, input, stderr)?,
             #[cfg(target_os = "macos")]
             Sink::Metal(session) => session.finish()?,
@@ -928,6 +978,7 @@ impl Drop for Encoder {
             child,
             input,
             stderr,
+            ..
         } = &mut self.sink
         {
             let _ = child.kill();
@@ -938,10 +989,23 @@ impl Drop for Encoder {
 #[cfg(target_os = "macos")]
 mod native {
     use super::*;
+    use objc2::Message;
     use std::{
         ffi::{CString, c_void},
         os::unix::ffi::OsStrExt,
     };
+
+    /// Keep native ownership without holding wgpu's device-wide destruction lock
+    /// across another texture lookup or a VideoToolbox wait.
+    pub(super) fn texture(texture: &wgpu::Texture) -> Result<objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLTexture>,
+    >> {
+        // SAFETY: the HAL guard protects the handle until retain takes ownership;
+        // the caller keeps the wgpu texture live through native submission.
+        let raw = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }
+            .context("native encoding requires a live Metal texture")?;
+        Ok(raw.raw_handle().retain())
+    }
     unsafe extern "C" {
         fn enc_prepare(
             w: u32,
@@ -1042,5 +1106,43 @@ mod device_limit_tests {
             }
         }
         validate_device_limits(&limits, 8, 1).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_interop_tests {
+    use super::*;
+    use objc2_metal::MTLTexture;
+
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn native_texture_ownership_releases_the_device_destruction_lock() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native interop ownership"),
+            size: wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        });
+        let other = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("concurrent canvas destruction"), size: 16,
+            usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false,
+        });
+        let retained = native::texture(&texture).unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            other.destroy();
+            done.send(()).unwrap();
+        });
+        completed.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("native texture ownership must not pin wgpu's destruction read lock");
+        worker.join().unwrap();
+        let destination = native::texture(&texture).unwrap();
+        texture.destroy();
+        assert_eq!(retained.width(), 8);
+        assert_eq!(destination.height(), 8);
     }
 }

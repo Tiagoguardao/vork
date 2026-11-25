@@ -243,7 +243,7 @@ impl Draw {
         snatch_guard: &SnatchGuard,
         resources: &mut DrawResources,
         temp_resources: &mut Vec<TempResource>,
-        encoder: &mut dyn hal::DynCommandEncoder,
+        encoder: &mut crate::command::InnerCommandEncoder,
         batcher: DrawBatcher,
     ) -> Result<(), RenderPassErrorInner> {
         let mut batches = batcher.batches;
@@ -251,6 +251,8 @@ impl Draw {
         if batches.is_empty() {
             return Ok(());
         }
+
+        let encoder = encoder.open_pre_pass()?;
 
         let max_staging_buffer_size = 1 << 26; // ~67MiB
 

@@ -60,3 +60,12 @@ Local native geometry extension: axis-aligned bounding-box BLAS descriptions and
 build inputs use the existing Vulkan/Metal HAL AABB implementation. Core checks
 geometry counts, compatible flags, stride/alignment, buffer range, usage and device
 ownership, and tracks initialization and build-input transitions.
+
+Native texture binding size queries use the same validated descriptor as creation. Shader, pipeline-layout, bind-group-layout and pipeline creation report allocation and internal errors through the caller’s error scopes. Explicit driver device loss still invalidates the device.
+
+Local patch: render and compute pass replay open the native pre-pass buffer
+on the first discard clear, query reset, explicit barrier, or indirect draw
+validation batch. The pass still merges its usage into the command-buffer
+tracker and drains pending transitions, including on Metal. A populated
+pre-pass retains its position immediately before the pass body. Remove when
+upstream elides empty pre-pass buffers.

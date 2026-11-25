@@ -55,7 +55,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 
 // Main shader code
 
-      @group(0) @binding(0) var<uniform> frameUniforms: mat4x4<f32>;
+// #include "rect-clip.wgsl"
 
       struct GradientShapeData {
         model: mat4x4<f32>,
@@ -77,7 +77,6 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 
       struct VSOut {
         @builtin(position) position: vec4<f32>,
-        @location(0) worldPos: vec2<f32>,
         @location(1) localPos: vec2<f32>,
         @location(2) @interpolate(flat) clip: vec4<f32>,
         @location(3) @interpolate(flat) size: vec2<f32>,
@@ -596,11 +595,10 @@ fn applyInnerShadow(
 
         let local = vec4<f32>(anchored, 0.0, 1.0);
         let world = s.model * local;
-        var clip = frameUniforms * world;
+        var clip = frameUniforms.viewProjection * world;
         clip.z = s.dimensions.z;
         out.position = clip;
-        out.worldPos = world.xy;
-        out.clip = s.pageClipBounds;
+        out.clip = projectRectClip(s.pageClipBounds);
         out.localPos = localPos;
         out.size = halfSize;
         out.radii = s.cornerRadii;
@@ -613,11 +611,7 @@ fn applyInnerShadow(
       fn sampleGradientColor(inp: VSOut) -> vec4<f32> {
         let s = shapes[inp.instanceId];
 
-        let bounds = inp.clip;
-        if (inp.worldPos.x < bounds.x ||
-            inp.worldPos.x > bounds.x + bounds.z ||
-            inp.worldPos.y < bounds.y ||
-            inp.worldPos.y > bounds.y + bounds.w) {
+        if (outsideRectClip(inp.position.xy, inp.clip)) {
           discard;
         }
 

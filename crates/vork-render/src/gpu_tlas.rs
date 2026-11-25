@@ -16,6 +16,13 @@ pub(crate) struct Placement {
     software_masked: Option<SoftwareMasked>,
 }
 
+/// The size-free pipelines one installation's frame slots share.
+#[derive(Default)]
+pub(crate) struct Pipelines {
+    placement: std::sync::OnceLock<wgpu::ComputePipeline>,
+    software_masked: std::sync::OnceLock<wgpu::ComputePipeline>,
+}
+
 /// Mesa 25.2 lavapipe encodes only the active leaf count, but its BVH retains
 /// sparse input leaf offsets. A zero-mask slot before a live slot leaves that
 /// later leaf uninitialized. Keep every software TLAS slot active using a finite
@@ -26,7 +33,7 @@ struct SoftwareMasked {
     group: wgpu::BindGroup,
 }
 impl SoftwareMasked {
-    fn new(r: &Renderer, buffer: &wgpu::Buffer, bytes: &[u8], references: &mut Vec<wgpu::Blas>, layout: wgpu::hal::TlasInstanceLayout, count: u32, width: u32) -> Result<Self> {
+    fn new(r: &Renderer, buffer: &wgpu::Buffer, bytes: &[u8], references: &mut Vec<wgpu::Blas>, layout: wgpu::hal::TlasInstanceLayout, retained: &std::sync::OnceLock<wgpu::ComputePipeline>) -> Result<Self> {
         let d = &r.device;
         let vertices = init(d, "masked software triangle", bytemuck::cast_slice(&[[0f32; 3]; 3]), wgpu::BufferUsages::BLAS_INPUT);
         let size = wgpu::BlasTriangleGeometrySizeDescriptor { vertex_format: wgpu::VertexFormat::Float32x3, vertex_count: 3, index_format: None, index_count: None, flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE };
@@ -41,18 +48,25 @@ impl SoftwareMasked {
         templates.extend(sentinel);
         let templates = init(d, "software TLAS templates", &templates, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         let words = layout.stride / 4;
-        let code = format!(r#"
+        // Like `source`, the text holds no scene size: the slot count is the descriptor
+        // buffer's length, the sentinel is the last template and the row width follows
+        // from the count and the device's workgroup limit, so every frame slot of an
+        // installation shares one pipeline.
+        let pipeline = retained.get_or_init(|| {
+            let code = format!(r#"
 @group(0) @binding(0) var<storage,read> templates:array<u32>;
 @group(0) @binding(1) var<storage,read_write> descriptors:array<u32>;
 @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid:vec3<u32>) {{
-    let i=gid.x+gid.y*{width}u;if(i>={count}u) {{return;}}
+    let count=arrayLength(&descriptors)/{words}u;
+    let i=gid.x+gid.y*min((count+63u)/64u,{row_groups}u)*64u;if(i>=count) {{return;}}
     let base=i*{words}u;
     if(((descriptors[base+{mask}u]>>{shift}u)&255u)==0u) {{
-        for(var word=0u;word<{words}u;word++) {{descriptors[base+word]=templates[{count}u*{words}u+word];}}
+        for(var word=0u;word<{words}u;word++) {{descriptors[base+word]=templates[count*{words}u+word];}}
     }}
 }}
-"#, mask=layout.mask, shift=layout.mask_shift);
-        let pipeline = crate::compute::pipeline_layout(r, &code, "software masked TLAS slots", &[Some(true), Some(false)], "main");
+"#, mask=layout.mask, shift=layout.mask_shift, row_groups=r.device.limits().max_compute_workgroups_per_dimension);
+            crate::compute::pipeline_layout(r, &code, "software masked TLAS slots", &[Some(true), Some(false)], "main")
+        }).clone();
         let group = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("software masked TLAS slots"), layout: &pipeline.get_bind_group_layout(0), entries: &[entry(0, templates.as_entire_binding()), entry(1, buffer.as_entire_binding())] });
         Ok(Self { templates, pipeline, group })
     }
@@ -118,11 +132,12 @@ fn source(
 }
 
 impl Placement {
+    #[cfg(test)]
     pub(crate) fn new(
         r: &Renderer,
         objects: &wgpu::Buffer,
         instances: &[(u32, bool, bool, bool, wgpu::Blas)],
-        retained: &std::sync::OnceLock<wgpu::ComputePipeline>,
+        retained: &Pipelines,
     ) -> Result<Self> {
         Self::with_points(r,objects,instances,retained,&vec![None;instances.len()],&vec![(false,false);instances.len()])
     }
@@ -130,7 +145,7 @@ impl Placement {
         r: &Renderer,
         objects: &wgpu::Buffer,
         instances: &[(u32,bool,bool,bool,wgpu::Blas)],
-        retained: &std::sync::OnceLock<wgpu::ComputePipeline>,
+        retained: &Pipelines,
         point_poses: &[Option<(wgpu::Buffer,u32)>],
         triangle_sides: &[(bool,bool)],
     ) -> Result<Self> {
@@ -189,7 +204,7 @@ impl Placement {
         let width = (instances.len() as u32)
             .div_ceil(64)
             .min(r.device.limits().max_compute_workgroups_per_dimension);
-        let pipeline = retained.get_or_init(|| crate::compute::pipeline_layout(
+        let pipeline = retained.placement.get_or_init(|| crate::compute::pipeline_layout(
             r,
             &source(
                 layout.stride,
@@ -251,7 +266,7 @@ impl Placement {
             points.push((pipeline,group,count,width));
         }
         let software_masked = if r.adapter_info.device_type == wgpu::DeviceType::Cpu {
-            Some(SoftwareMasked::new(r, &buffer, &bytes, &mut references, layout, instances.len() as u32, width * 64)?)
+            Some(SoftwareMasked::new(r, &buffer, &bytes, &mut references, layout, &retained.software_masked)?)
         } else { None };
         Ok(Self {
             software_masked,
