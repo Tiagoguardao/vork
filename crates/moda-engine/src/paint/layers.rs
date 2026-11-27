@@ -119,7 +119,7 @@ fn paints_nothing(fill: &Fill) -> bool {
 /// arrowhead (each of those draws pieces that may overlap one another).
 fn plain_stroke_body(s: &Stroke) -> bool {
     let arrow = |a: &Option<String>| a.as_deref().is_some_and(|v| v != "none");
-    s.dash.as_ref().is_none_or(|d| d.iter().all(|v| *v <= 0.0))
+    s.sampled_dash.is_none() && s.dash.as_ref().is_none_or(|d| d.iter().all(|v| *v <= 0.0))
         && !arrow(&s.start_arrow)
         && !arrow(&s.end_arrow)
 }
@@ -220,7 +220,7 @@ fn appearance_is_grouped(node: &RawNode, opacity: f64) -> bool {
 /// with the backdrop. A single body fades or blends the fill and the stroke separately, so the fill shows through
 /// (`stack-fill-stroke-object-50`: 46/255 on the stroke's inner half), or the stroke blends with the fill.
 pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
-    if !LAYERED_TYPES.contains(&node.node_type()) || node.plain_solid_fill() {
+    if !LAYERED_TYPES.contains(&node.node_type()) || node.plain_path_fill() {
         return LayerPlan::Single(None);
     }
     // Illustrator's Appearance (E8.2): an interleaved order or an entry effect draws every visible layer as
@@ -272,6 +272,9 @@ pub fn plan_at(node: &RawNode, opacity: f64) -> LayerPlan {
 
     let single = fills.len() <= 1
         && strokes.len() <= 1
+        // A path stays one logical mask source. Its visible body binds one fragment stage per band.
+        && !(fills.first().zip(strokes.first()).is_some_and(|(f, s)|
+            matches!(f.paint, Paint::Program(_)) || matches!(s.paint, Paint::Program(_))))
         && fills.iter().all(plain_fill)
         && strokes.iter().all(plain_stroke)
         && !(appearance_is_grouped(node, opacity)
@@ -593,6 +596,19 @@ mod tests {
         assert_eq!(layer_owner_id("plain"), "plain");
         assert_eq!(layer_owner_id("n::paint::"), "n::paint::");
         assert_eq!(layer_owner_id("n::paint::x1"), "n::paint::x1");
+    }
+
+    #[test]
+    fn a_mixed_program_path_draws_one_layer_per_band() {
+        let color = json!({"type":"solid", "color":"#884422"});
+        let material = json!({"type":"program", "unit":0, "inputs":1, "site":0, "clock":0, "stroke_uv":false});
+        for (fill, stroke) in [(&color, &material), (&material, &color), (&material, &material)] {
+            let path = raw(json!({"id":"path", "type":"path",
+                "fills":[{"id":"fill", "paint":fill}], "strokes":[{"id":"stroke", "width":3, "paint":stroke}]}));
+            let layers = plan_at(&path, 1.);
+            let [fill, stroke] = stack(&layers) else { panic!("expected fill and stroke"); };
+            assert!(!fill.is_stroke && stroke.is_stroke);
+        }
     }
 
     #[test]

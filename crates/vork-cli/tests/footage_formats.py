@@ -26,8 +26,9 @@ def plate(case, folder, height):
         else:
             source += ",drawbox=x=32:w=32:h=32:color=white:t=fill,format=yuv444p10le"
         path = folder / "plate.mkv"
-        ffmpeg("-f", "lavfi", "-i", source, "-frames:v", "1", "-c:v", "ffv1",
-               "-color_primaries", "bt2020", "-color_trc", transfer, "-colorspace", "bt2020nc", path)
+        # FFmpeg 9 takes the tags of filtered frames over the encoder's options.
+        source += f",setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc"
+        ffmpeg("-f", "lavfi", "-i", source, "-frames:v", "1", "-c:v", "ffv1", path)
         reference = ["zscale=transfer=linear:npl=100", "format=gbrpf32le", "zscale=primaries=709",
                      "tonemap=tonemap=clip", "zscale=transfer=iec61966-2-1:matrix=gbr:range=full"]
     elif case in ("hevc10", "prores422", "prores4444"):

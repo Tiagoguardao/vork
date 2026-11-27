@@ -14,6 +14,8 @@ pub(super) struct PublishedFiles {
 impl PublishedFiles {
     pub(super) fn capture(files: &[(PathBuf, FileVersion)], previous: &Self, media: &crate::footage::Opened) -> Result<Self> {
         let mut published = BTreeMap::new();
+        let mut media = media.pins();
+        media.files.publish();
         for (path, version) in files {
             // Held movies and sound files retain their authored spelling. The
             // rollback render receives this same map, including after a rename.
@@ -22,37 +24,41 @@ impl PublishedFiles {
             let saved = if let Some((_, copy)) = previous.assets.get(&absolute).filter(|(old, _)| old == version) {
                 copy.clone()
             } else {
-                let suffix = absolute.extension().map_or(String::new(), |s| format!(".{}", s.to_string_lossy()));
-                let copy = Builder::new().prefix("vork-revision-").suffix(&suffix).tempfile()?.into_temp_path();
-                std::fs::copy(&version.target, &copy)?;
-                anyhow::ensure!(crate::asset_revision::content(&copy)? == version.content && path.canonicalize()? == version.target,
-                    "asset {} changed during installation; retry the command", path.display());
-                Arc::new(copy)
+                crate::asset_revision::save(path, version)?
             };
+            media.files.bind(path, Ok(saved.clone()))?;
             published.insert(absolute, (version.clone(), saved));
         }
-        Ok(Self { media: media.pins(), assets: Arc::new(published), containers: Default::default() })
+        Ok(Self { media, assets: Arc::new(published), ..Default::default() })
     }
 
-    pub(super) fn name_decode_source(&self, mut error: anyhow::Error) -> anyhow::Error {
-        if let Some(location) = crate::failure::cause_mut::<crate::texture_source::DecodeLocation>(&mut error) {
-            self.name_source(&mut location.path);
-        } else if let Some(font) = crate::failure::cause_mut::<vork_std::moda::InvalidFont>(&mut error) {
-            self.name_source(&mut font.path);
-        }
-        error
+    pub(super) fn saved(&self, path: &Path) -> Result<Option<&Path>> {
+        let path = std::path::absolute(path)?;
+        Ok(self.assets.get(&path).map(|(_, copy)| copy.as_ref().as_ref()))
     }
 
-    fn name_source(&self, path: &mut PathBuf) {
-        if let Some((original, _)) = self.assets.iter().find(|(_, (_, copy))| copy.as_os_str() == path.as_os_str()) {
-            path.clone_from(original);
-        }
+    pub(super) fn scene(&self, scene: &Scene, base: &Path) -> Result<Scene> {
+        self.relocated(scene, base, None)
+    }
+
+    pub(super) fn install_scene(&self, scene: &Scene, base: &Path, files: Option<&[(PathBuf, FileVersion)]>) -> Result<Scene> {
+        // Canvas identity hashes the resolved scene. Relocate only its draw
+        // inputs when admission proves that list complete.
+        self.relocated(scene, base, files.filter(|_| scene.is_canvas()))
+    }
+
+    pub(super) fn retain_install_containers(&mut self, previous: &Self) {
+        self.containers.clone_from(&previous.containers);
     }
 
     /// Source modules use the compiler's original virtual paths. Other resources
     /// use private files. Rewrite glTF sidecar URIs before handing them to gltf.
-    pub(super) fn relocate(&self, scene: &mut Scene, base: &Path) -> Result<()> {
-        if self.assets.is_empty() { return Ok(()); }
+    fn relocated(&self, scene: &Scene, base: &Path, install_files: Option<&[(PathBuf, FileVersion)]>) -> Result<Scene> {
+        let mut scene = scene.clone();
+        if self.assets.is_empty() { return Ok(scene); }
+        let included = |path: &Path| {
+            install_files.is_none_or(|files| files.binary_search_by(|(file, _)| file.as_path().cmp(path)).is_ok())
+        };
         let mut containers = self.containers.lock().unwrap();
         {
             let executable = std::env::current_exe()?.canonicalize()?;
@@ -61,7 +67,7 @@ impl PublishedFiles {
                 for data in library.images {
                     if let vork_scene::libraries::ProgramImage::File(relative) = data.image {
                         let path = directory.join(relative);
-                        if let Some((_, copy)) = self.assets.get(&path) {
+                        if included(&path) && let Some((_, copy)) = self.assets.get(&path) {
                             scene.library_files.insert(path, copy.to_path_buf());
                         }
                     }
@@ -81,24 +87,32 @@ impl PublishedFiles {
         let mut files: Vec<_> = scene.animation.iter_mut().filter_map(|l| l.clip.as_mut()?.file.as_mut()).collect();
         node_files(&mut scene.nodes, &mut files);
         for file in files {
-            let original = std::path::absolute(base.join(&*file))?;
+            let path = base.join(&*file);
+            if !included(&path) { continue; }
+            let original = std::path::absolute(&path)?;
             let Some((_, copy)) = self.assets.get(&original) else { continue };
             if !containers.contains_key(&original) {
                 containers.insert(original.clone(), self.container(&original, copy.as_ref())?);
             }
             if let Some(container) = &containers[&original] {
+                self.media.files.alias(container, &path);
                 *file = container.to_str().context("revision resource path is not UTF-8")?.to_owned();
             }
         }
-        let programs = scene.programs.clone();
+        // Image readers receive the binding with their Opened input. The scene
+        // carries the author's spelling through checks, warnings and refusals.
+        let images = std::mem::take(&mut scene.images);
+        let programs = std::mem::take(&mut scene.programs);
         scene.map_resource_paths(|file| {
-            let original = std::path::absolute(base.join(&*file))?;
-            let Some((_, copy)) = self.assets.get(&original) else { return Ok(()); };
-            *file = copy.to_str().context("revision resource path is not UTF-8")?.to_owned();
+            let path = base.join(&*file);
+            if included(&path) && let Some(copy) = self.saved(&path)? {
+                *file = copy.to_str().context("revision resource path is not UTF-8")?.to_owned();
+            }
             Ok(())
         })?;
+        scene.images = images;
         scene.programs = programs;
-        Ok(())
+        Ok(scene)
     }
 
     fn container(&self, original: &Path, saved: &Path) -> Result<Option<TempPath>> {

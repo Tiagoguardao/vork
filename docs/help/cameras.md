@@ -1,16 +1,19 @@
 CAMERAS
-camera.material selects a ray program; omitted selects std/camera. Its numeric Inputs use material tracks. For bundled optics, set program:"std/camera" explicitly; a material with no program selects std/openpbr. Custom camera programs are also supported (vork help light-paths).
-std/camera follows Blender physical cameras. Input fields below use material.inputs; lens and sensor sizes are mm, clip/focus/ortho_scale metres, aperture_rotation radians. Exact lookup: vork help field std/camera.lens.
-focus_object supplies sampled camera-axis depth; target and transforms retain node semantics.
-For depth of field with std/camera, use perspective projection, use_dof:true and a positive aperture_fstop.
-Set focus_distance in metres beyond the focal length (lens in mm divided by 1000), or put focus_object beyond that distance.
-For example, a 50 mm lens can focus at 2 m with aperture_fstop:2.8. Set use_dof:false for a pinhole look.
-For orthographic projection, ortho_scale is a full extent, not a half extent.
-With aspect = width/height, Horizontal fit (fit:"horizontal") sets full width = ortho_scale
-and full height = ortho_scale/aspect. Vertical fit (fit:"vertical") sets full height = ortho_scale
-and full width = ortho_scale*aspect. Auto fit (fit:"auto") uses Horizontal when aspect > 1,
-otherwise Vertical. Auto chooses from image aspect, not scene bounds.
+Omit camera.material for std/camera. To set optics, bind a material with
+program:"std/camera" and set material.inputs (a material without program selects
+std/openpbr). Use numeric material tracks. Custom rays: vork help light-paths.
+std/camera follows Blender optics: lens/sensor in mm, clip/focus/ortho_scale in
+metres, aperture_rotation in radians. focus_object supplies sampled camera-axis depth.
+Exact fields: vork help field std/camera.lens, etc.
+For DOF use perspective, use_dof:true and positive aperture_fstop. Both focus_distance
+and sampled focus_object depth must exceed lens/1000 metres when used. A 50 mm lens can
+focus at 2 m at f/2.8. For pinhole use use_dof:false.
+In orthographic projection, Horizontal fit (horizontal) sets full width to
+ortho_scale; Vertical (vertical) sets full height. The other axis follows image
+aspect. Auto (auto) uses Horizontal at width/height > 1, otherwise Vertical.
+Fit uses image aspect, independent of scene bounds.
 <!-- all -->
-CAMERA PROGRAM REFERENCE
-Physical apertures can select sampled path transport where supported, retaining the selected profile's sample budget.
-CameraRay t_min/t_max bound geometry visibility in metres along its normalized direction. Optional camera_calibration declares projective acceleration; omission declares none. See light-paths and camera-json.
+Physical apertures can select path transport with the existing sample budget.
+Optional camera_calibration declares projective acceleration; omission declares none.
+See vork help light-paths --all for CameraRay clipping and
+vork help camera-json for sidecar fields.

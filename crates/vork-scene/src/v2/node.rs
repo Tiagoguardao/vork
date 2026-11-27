@@ -313,10 +313,10 @@ pub enum NodeKind {
         #[schemars(extend("x-source" = "END-STATE-API §7 (width to wrap)", "x-help-path" = "node.width (text)", "x-help" = "number|null; px; lines wrap and align in it; null = no wrapping"))]
         width: Option<f32>,
         #[serde(default = "canvas::black")]
-        #[schemars(extend("default" = "#000", "x-source" = "SVG 2 fill; CSS Color 4", "x-help-path" = "node.fill (text)", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}"))]
+        #[schemars(with = "canvas::TextPaint", extend("default" = "#000", "x-source" = "SVG 2 fill; CSS Color 4", "x-help-path" = "node.fill (text)", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}"))]
         fill: Paint,
         #[serde(default = "canvas::no_paint")]
-        #[schemars(extend("default" = "none", "x-source" = "SVG 2 stroke; CSS Color 4", "x-help-path" = "node.stroke (text)", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; the glyph outlines"))]
+        #[schemars(with = "canvas::TextPaint", extend("default" = "none", "x-source" = "SVG 2 stroke; CSS Color 4", "x-help-path" = "node.stroke (text)", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; the glyph outlines"))]
         stroke: Paint,
         #[serde(rename = "stroke-width", default = "text::one")]
         #[schemars(extend("default" = 1.0, "x-source" = "SVG 2 stroke-width", "x-help-path" = "node.stroke-width (text)", "x-help" = "number; px"))]
@@ -330,7 +330,7 @@ pub enum NodeKind {
         #[schemars(extend("default" = "none", "x-source" = "SVG 2 path d", "x-help-path" = "node.d (path)", "x-help" = "string; SVG path data, px; \"none\" or empty paints nothing"))]
         d: String,
         #[serde(default = "canvas::black")]
-        #[schemars(extend("default" = "#000", "x-source" = "SVG 2 fill; CSS colour and gradient", "x-help-path" = "node.fill (path)", "x-help" = "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}"))]
+        #[schemars(extend("default" = "#000", "x-source" = "SVG 2 fill; CSS colour and gradient", "x-help-path" = "node.fill (path)", "x-help" = "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}"))]
         fill: Paint,
         #[serde(rename = "fill-rule", default)]
         #[schemars(extend("x-source" = "SVG 2 fill-rule", "x-help-path" = "node.fill-rule (path)", "x-help" = "nonzero|evenodd"))]
@@ -339,7 +339,7 @@ pub enum NodeKind {
         #[schemars(extend("default" = 1.0, "x-source" = "SVG 2 fill-opacity", "x-help-path" = "node.fill-opacity (path)", "x-help" = "number; 0..1"))]
         fill_opacity: f32,
         #[serde(default = "canvas::no_paint")]
-        #[schemars(extend("default" = "none", "x-source" = "SVG 2 stroke; CSS colour and gradient", "x-help-path" = "node.stroke (path)", "x-help" = "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}"))]
+        #[schemars(extend("default" = "none", "x-source" = "SVG 2 stroke; CSS colour and gradient", "x-help-path" = "node.stroke (path)", "x-help" = "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}"))]
         stroke: Paint,
         #[serde(rename = "stroke-width", default = "constants::stroke_width")]
         #[schemars(extend("default" = 1.0, "x-source" = "SVG 2 stroke-width", "x-help-path" = "node.stroke-width (path)", "x-help" = "number; px; 0 paints nothing"))]
@@ -468,6 +468,52 @@ impl NodeKind {
         matches!(self, Self::Light { shadowed_by, .. } if !shadowed_by.as_ref().is_some_and(Vec::is_empty))
     }
 }
+macro_rules! kind_style_fields {
+    ($field:ident, $access:ident; $($name:literal => $slot:ident),* $(,)?) => {
+        match $field {
+            $($name => $access!(*$slot, kind),)*
+            _ => Err(<serde_json::Error as serde::de::Error>::custom(format!("unknown field `{}`", $field))),
+        }
+    };
+}
+
+// The renderer reads and writes the same typed slots. Authoring documents can omit defaults.
+macro_rules! style_fields {
+    ($node:ident, $field:ident, $access:ident; $($borrow:tt)*) => {
+        match $field {
+            // The node's own fields are read from the document as they stand.
+            "filter" => $access!($node.filter, node),
+            "clip-path" => $access!($node.clip_path, node),
+            "isolation" => $access!($node.isolation, node),
+            "mix-blend-mode" => $access!($node.mix_blend_mode, node),
+            "mask-type" => $access!($node.mask_type, node),
+            "mask" => $access!($node.mask, node),
+            _ => match &$($borrow)* $node.kind {
+                NodeKind::Text { content, font, font_size, font_weight, font_style, font_variation_settings, font_feature_settings,
+                    letter_spacing, word_spacing, line_height, text_align, direction, white_space, word_break, line_break, width,
+                    fill, stroke, stroke_width } => kind_style_fields!($field, $access;
+                    "content" => content, "font" => font, "font-size" => font_size, "font-weight" => font_weight,
+                    "font-style" => font_style, "font-variation-settings" => font_variation_settings,
+                    "font-feature-settings" => font_feature_settings, "letter-spacing" => letter_spacing,
+                    "word-spacing" => word_spacing, "line-height" => line_height, "text-align" => text_align,
+                    "direction" => direction, "white-space" => white_space, "word-break" => word_break,
+                    "line-break" => line_break, "width" => width, "fill" => fill, "stroke" => stroke,
+                    "stroke-width" => stroke_width,
+                ),
+                NodeKind::Path { d, fill, fill_rule, fill_opacity, stroke, stroke_width, stroke_linecap, stroke_linejoin,
+                    stroke_miterlimit, stroke_dasharray, stroke_dashoffset, stroke_opacity, path_length, paint_order } => kind_style_fields!($field, $access;
+                    "d" => d, "fill" => fill, "fill-rule" => fill_rule, "fill-opacity" => fill_opacity, "stroke" => stroke,
+                    "stroke-width" => stroke_width, "stroke-linecap" => stroke_linecap, "stroke-linejoin" => stroke_linejoin,
+                    "stroke-miterlimit" => stroke_miterlimit, "stroke-dasharray" => stroke_dasharray,
+                    "stroke-dashoffset" => stroke_dashoffset, "stroke-opacity" => stroke_opacity, "pathLength" => path_length,
+                    "paint-order" => paint_order,
+                ),
+                _ => Err(<serde_json::Error as serde::de::Error>::custom(format!("unknown field `{}`", $field))),
+            },
+        }
+    };
+}
+
 impl Node {
     /// Write an authored value into one field of this node: a style field a track keys (`fill`, `font-size`,
     /// `d`, `filter`, ...). The value is read as that field reads it from a scene document, numbers included,
@@ -493,47 +539,27 @@ impl Node {
             let Tagged::Field { value } = serde_json::from_value::<Tagged<T>>(serde_json::Value::Object(record))?;
             Ok(value)
         }
-        macro_rules! fields {
-            ($($name:literal => $slot:ident),* $(,)?) => {
-                match field {
-                    $($name => *$slot = read(value)?,)*
-                    _ => return Err(<serde_json::Error as serde::de::Error>::custom(format!("unknown field `{field}`"))),
-                }
-            };
+        macro_rules! write {
+            ($slot:expr, node) => {{
+                $slot = serde_json::from_value(value.clone())?;
+                Ok(())
+            }};
+            ($slot:expr, kind) => {{
+                $slot = read(value)?;
+                Ok(())
+            }};
         }
-        match field {
-            // The node's own fields are read from the document as they stand.
-            "filter" => self.filter = serde_json::from_value(value.clone())?,
-            "clip-path" => self.clip_path = serde_json::from_value(value.clone())?,
-            "isolation" => self.isolation = serde_json::from_value(value.clone())?,
-            "mix-blend-mode" => self.mix_blend_mode = serde_json::from_value(value.clone())?,
-            "mask-type" => self.mask_type = serde_json::from_value(value.clone())?,
-            "mask" => self.mask = serde_json::from_value(value.clone())?,
-            _ => match &mut self.kind {
-                NodeKind::Text { content, font, font_size, font_weight, font_style, font_variation_settings, font_feature_settings,
-                    letter_spacing, word_spacing, line_height, text_align, direction, white_space, word_break, line_break, width,
-                    fill, stroke, stroke_width } => fields! {
-                    "content" => content, "font" => font, "font-size" => font_size, "font-weight" => font_weight,
-                    "font-style" => font_style, "font-variation-settings" => font_variation_settings,
-                    "font-feature-settings" => font_feature_settings, "letter-spacing" => letter_spacing,
-                    "word-spacing" => word_spacing, "line-height" => line_height, "text-align" => text_align,
-                    "direction" => direction, "white-space" => white_space, "word-break" => word_break,
-                    "line-break" => line_break, "width" => width, "fill" => fill, "stroke" => stroke,
-                    "stroke-width" => stroke_width,
-                },
-                NodeKind::Path { d, fill, fill_rule, fill_opacity, stroke, stroke_width, stroke_linecap, stroke_linejoin,
-                    stroke_miterlimit, stroke_dasharray, stroke_dashoffset, stroke_opacity, path_length, paint_order } => fields! {
-                    "d" => d, "fill" => fill, "fill-rule" => fill_rule, "fill-opacity" => fill_opacity, "stroke" => stroke,
-                    "stroke-width" => stroke_width, "stroke-linecap" => stroke_linecap, "stroke-linejoin" => stroke_linejoin,
-                    "stroke-miterlimit" => stroke_miterlimit, "stroke-dasharray" => stroke_dasharray,
-                    "stroke-dashoffset" => stroke_dashoffset, "stroke-opacity" => stroke_opacity, "pathLength" => path_length,
-                    "paint-order" => paint_order,
-                },
-                _ => return Err(<serde_json::Error as serde::de::Error>::custom(format!("unknown field `{field}`"))),
-            },
-        }
-        Ok(())
+        style_fields!(self, field, write; mut)
     }
+
+    /// Read one canvas style value, including typed defaults omitted on disk.
+    pub fn field_value(&self, field: &str) -> Result<serde_json::Value, serde_json::Error> {
+        macro_rules! read {
+            ($slot:expr, $owner:ident) => { serde_json::to_value(&$slot) };
+        }
+        style_fields!(self, field, read;)
+    }
+
     /// This node without its subtree (the renderer flattens the tree once).
     pub fn without_children(&self) -> Self {
         Self {

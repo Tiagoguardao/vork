@@ -31,6 +31,14 @@ pub struct ShaderSource {
 
 include!(concat!(env!("OUT_DIR"), "/modules_gen.rs"));
 
+/// Common frame/clip code for the path material pipeline.
+pub const PATH_CLIP: &str = concat!(include_str!("../wgsl/include/path-frame.wgsl"), "\n",
+    include_str!("../wgsl/include/rect-clip.wgsl"), "
+",
+    include_str!("../wgsl/include/vector-text-bounds.wgsl"), "
+",
+    include_str!("../wgsl/include/path-placement.wgsl"));
+
 /// The raw extraction manifest (see `Manifest` for the typed view).
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
 

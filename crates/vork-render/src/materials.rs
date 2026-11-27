@@ -1024,7 +1024,9 @@ impl<'a> TextureInstaller<'a> {
             return Ok(view.clone());
         }
         let ies = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies"));
-        let source = match std::fs::read(&path) {
+        let file = self.opened.files.source(&path);
+        let path = file.name.clone();
+        let source = match file.read() {
             Ok(source) => source,
             Err(error) if !ies && error.kind() == std::io::ErrorKind::NotFound => {
                 let data = decoded_data(crate::texture_source::missing_image(&path))?;
@@ -2048,7 +2050,7 @@ pub(crate) fn load_cached(
     decoders.finish()?;
     let gltf::Gltf { document, blob } = import::open(path)?;
     for warning in gltf_extension_warnings(&document) {
-        crate::warnings::dropped("gltf_extension", serde_json::json!({"file":path,"extension":warning.split(':').next(),"materials":document.materials().filter_map(|m| m.extensions().map(|e|serde_json::json!({"index":m.index(),"name":m.name(),"extensions":e}))).collect::<Vec<_>>(),"primitive_variants":document.meshes().flat_map(|m|m.primitives()).filter_map(|p|p.extension_value("KHR_materials_variants").cloned()).collect::<Vec<_>>()}), warning);
+        crate::warnings::dropped("gltf_extension", serde_json::json!({"file":crate::warnings::source_name(path),"extension":warning.split(':').next(),"materials":document.materials().filter_map(|m| m.extensions().map(|e|serde_json::json!({"index":m.index(),"name":m.name(),"extensions":e}))).collect::<Vec<_>>(),"primitive_variants":document.meshes().flat_map(|m|m.primitives()).filter_map(|p|p.extension_value("KHR_materials_variants").cloned()).collect::<Vec<_>>()}), warning);
     }
     let base = path.parent().unwrap_or(Path::new("./"));
     let buffers = std::sync::Arc::new(import::buffers(&document, Some(base), blob)?);
@@ -2082,18 +2084,25 @@ pub(crate) fn load_cached(
                 .step_by(workers)
                 .map(|image| {
                     let index = image.index();
-                    prepare_cached(image, &source, &cache)
-                        .map(|prepared| (index, prepared))
-                        .with_context(|| format!("load {} image {index}; restore a valid image or re-export the asset", path.display()))
+                    let (result, notices) = crate::warnings::Notices::defer(|| {
+                        prepare_cached(image, &source, &cache)
+                            .map(|prepared| (index, prepared))
+                            .with_context(|| format!("load {} image {index}; restore a valid image or re-export the asset", path.display()))
+                    });
+                    (index, result, notices)
                 })
                 .collect::<Vec<_>>();
             let mut errors = Vec::new();
-            let prepared = prepared.into_iter().filter_map(|result|match result {
-                Ok(prepared) => Some(prepared),
-                Err(error) => {errors.push(error); None}
+            let mut notices = Vec::new();
+            let prepared = prepared.into_iter().filter_map(|(index, result, image_notices)| {
+                if !image_notices.is_empty() { notices.push((index, image_notices)); }
+                match result {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {errors.push(error); None}
+                }
             }).collect::<Vec<_>>();
             if let Err(error) = vork_scene::v2::diagnostics::joined(errors) {
-                let _ = ready.send(Err(error));
+                let _ = ready.send((Err(error), notices));
                 return Ok(());
             }
             let mut metadata = Vec::with_capacity(prepared.len());
@@ -2105,7 +2114,7 @@ pub(crate) fn load_cached(
                 });
                 metadata.push((index, image, key, pixels));
             }
-            let _ = ready.send(Ok(metadata));
+            let _ = ready.send((Ok(metadata), notices));
             drop(ready);
             let mut failures = Vec::new();
             for task in tasks {
@@ -2131,20 +2140,27 @@ pub(crate) fn load_cached(
     drop(ready);
     let mut images = Vec::with_capacity(count);
     let mut errors = Vec::new();
+    let mut notices = Vec::new();
     for _ in 0..workers {
-        let batch = match batches.recv() {
-            Ok(Ok(batch)) => batch,
-            Ok(Err(error)) => {errors.push(error); continue;}
+        let (batch, image_notices) = match batches.recv() {
+            Ok(batch) => batch,
             Err(_) => {
                 decoders.finish()?;
                 bail!("image decoder returned no metadata");
             }
+        };
+        notices.extend(image_notices);
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => { errors.push(error); continue; }
         };
         for (index, mut image, key, pixels) in batch {
             image.pending = pixels;
             images.push((index, (image, key)));
         }
     }
+    notices.sort_unstable_by_key(|(index, _)| *index);
+    for (_, notices) in notices { notices.replay(); }
     if !errors.is_empty() {
         if let Err(error) = decoders.finish() {errors.push(error);}
         vork_scene::v2::diagnostics::joined(errors)?;

@@ -156,9 +156,9 @@ export type LightShape = "sun" | "point" | "spot" | "rectangle" | "ellipse" | "e
  */
 export type Content = string | Run[];
 /**
- * `fill` and `stroke` (§7): `"none"`, a CSS colour, a CSS gradient function, or an image.
+ * Paints admitted in shaped text positions.
  */
-export type Paint = NoPaint | string | ImagePaint;
+export type TextPaint = NoPaint | string | ImagePaint;
 /**
  * The string `"none"` (SVG `fill="none"`): nothing is painted.
  */
@@ -205,6 +205,10 @@ export type WhiteSpace = "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" |
  * CSS `word-break`.
  */
 export type WordBreak = "normal" | "break-all" | "keep-all" | "break-word";
+/**
+ * Path fill or stroke. Material paints shade the path's existing coverage.
+ */
+export type Paint = NoPaint | string | ImagePaint | MaterialPaint;
 /**
  * SVG `fill-rule`.
  */
@@ -1152,7 +1156,7 @@ export interface TextNode {
   composition?: Composition | null;
   content: Content;
   direction?: Direction;
-  fill?: Paint;
+  fill?: TextPaint;
   /**
    * 2D canvas only: CSS filter functions over the node's picture, in order.
    * The blur length is the Gaussian standard deviation before transforms.
@@ -1199,7 +1203,7 @@ export interface TextNode {
    * @maxItems 3
    */
   scale?: [number, number, number];
-  stroke?: Paint;
+  stroke?: TextPaint;
   "stroke-width"?: number;
   target?: AimTarget | null;
   "text-align"?: TextAlign;
@@ -1230,7 +1234,7 @@ export interface TextNode {
  */
 export interface Run {
   content: string;
-  fill?: Paint | null;
+  fill?: TextPaint | null;
   font?: FontFiles | null;
   "font-feature-settings"?: string | null;
   "font-size"?: number | null;
@@ -1238,7 +1242,7 @@ export interface Run {
   "font-variation-settings"?: string | null;
   "font-weight"?: FontWeight | null;
   "letter-spacing"?: number | null;
-  stroke?: Paint | null;
+  stroke?: TextPaint | null;
 }
 /**
  * An image as a paint: bound as every image is (`{image: name}`), drawn in the shape's bounding box
@@ -1344,6 +1348,12 @@ export interface PathNode {
   visible_glossy?: boolean;
   visible_shadow?: boolean;
   visible_transmission?: boolean;
+}
+/**
+ * A path fragment program, evaluated inside the fill or stroke coverage.
+ */
+export interface MaterialPaint {
+  material: NameOr;
 }
 export interface Propagation {
   /**

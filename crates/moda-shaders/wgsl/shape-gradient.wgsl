@@ -55,6 +55,7 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 
 // Main shader code
 
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
 
       struct GradientShapeData {

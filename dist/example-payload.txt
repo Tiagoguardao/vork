@@ -218,3 +218,6 @@ examples/fog-constant.slang
 examples/product-orbit.profile.json
 examples/programs.profile.json
 examples/compositor-bloom.profile.json
+examples/motion-graphics/path-paint/scene.json
+examples/motion-graphics/path-paint/cloth.slang
+examples/motion-graphics/path-paint/ink.slang

@@ -303,6 +303,7 @@ impl std::ops::IndexMut<usize> for TextDrawRows {
 pub(crate) struct Document {
     prepared: Arc<Prepared>,
     styles: RefCell<Vec<Option<StyledItem>>>,
+    warned_evaluation: RefCell<Option<crate::warnings::Checkpoint>>,
     fonts: Fonts,
     /// The tracks' samples, reused from frame to frame.
     samples: RefCell<crate::animation::Samples>,
@@ -448,6 +449,7 @@ pub(crate) struct Prepared {
     /// The image files the canvas's image graph may read, by name, each with its fixed time when it has one
     /// (`images.X.time`): every frame carries their instants (`Frame::images`).
     graph_images: Vec<(String, Option<vork_time::Clock>)>,
+    paints: Arc<crate::canvas_program::Paints>,
     images: v2::Table<v2::Image>,
     base: PathBuf,
     font_lists: Vec<Vec<PathBuf>>,
@@ -509,6 +511,7 @@ impl StyleField {
 
 struct ReferenceFields {
     path_data: StyleField,
+    dash_array: StyleField,
     filter: StyleField,
     clip_path: StyleField,
     mask: StyleField,
@@ -516,7 +519,7 @@ struct ReferenceFields {
 
 static REFERENCE_FIELDS: std::sync::LazyLock<ReferenceFields> = std::sync::LazyLock::new(|| {
     let property = |name| StyleField::Property(v2::StyleProperty::parse(name).expect("registered canvas field"));
-    ReferenceFields { path_data: property("d"), filter: property("filter"), clip_path: property("clip-path"), mask: property("mask") }
+    ReferenceFields { path_data: property("d"), dash_array: property("stroke-dasharray"), filter: property("filter"), clip_path: property("clip-path"), mask: property("mask") }
 });
 
 #[derive(Default, PartialEq)]
@@ -580,6 +583,7 @@ struct Layouts {
 /// One instant of a canvas, as asked for. Its values are the document's evaluated table (`Evaluated`), which
 /// stands at this instant until the next frame is evaluated.
 struct Frame {
+    paint_words: Arc<[u32]>,
     /// The instant asked for, exactly: an authored view's `ctx.time`, and what its animated inputs are sampled
     /// at, so a view's keys fall on the same side of a boundary as the canvas's own.
     request: vork_time::Request,
@@ -613,6 +617,7 @@ impl FrameState {
 /// frame. There is one, it is never copied, and it has no revision: the document's samples stand at the same
 /// frame, so the tracks the next sampling reports changed are what differs from it.
 struct Evaluated {
+    /// Presence per compiled clock domain. A domain change affects every bound node.
     present: Vec<bool>,
     state: FrameState,
 }
@@ -1059,7 +1064,7 @@ fn font_lists(scene: &Scene, base: &Path, tracks: &[(&v2::Track, TrackTarget)],
 /// images its paints name, authored or keyed. A self-contained movie has one pinned file. A session declines a frame sequence or
 /// rendered image, or tracks that do not resolve, so it reads those inputs again
 /// for every render. An image no paint names is not read and is not a source.
-pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>, for_export: bool, opened: &crate::footage::Opened) -> bool {
+pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>, optional_stills: &mut BTreeSet<PathBuf>, for_export: bool, opened: &crate::footage::Opened) -> bool {
     let mut complete = true;
     // Nodes inside nested worlds' canvases are read too: more files than this document's own, never fewer.
     match canvas_tracks(scene).and_then(|tracks| font_lists(scene, base, &tracks, &|_| true)) {
@@ -1121,8 +1126,10 @@ pub(crate) fn sources(scene: &Scene, base: &Path, files: &mut BTreeSet<PathBuf>,
                 Err(_) => complete = false,
             }
         } else {
-            if crate::footage::is_media(&path) && opened.revision(&path).is_err() {
-                complete = false;
+            if crate::footage::is_media(&path) {
+                if opened.revision(&path).is_err() { complete = false; }
+            } else {
+                optional_stills.insert(path.clone());
             }
             files.insert(path);
         }
@@ -1160,10 +1167,15 @@ impl Document {
         let scene: &Scene = &outer;
         let tracks = canvas_tracks(scene)?;
         let lists = font_lists(scene, base, &tracks, &includes)?;
-        let fonts = if let Some((old, _)) = previous.filter(|(old, _)| old.font_lists == lists) {
+        let fonts = if let Some((old, _)) = previous.filter(|(old, _)| old.font_lists == lists && old.fonts.host.uses_current_font_inputs()) {
             old.fonts.clone()
         } else {
-            let host = Arc::new(vork_std::moda::host(&vork_std::moda::read(&lists)?)?);
+            let faces = vork_std::moda::read(&lists, |path| {
+                let source = opened.files.source(path);
+                let bytes = source.read();
+                (source.name, bytes)
+            })?;
+            let host = Arc::new(vork_std::moda::host(&faces)?);
             Fonts { store: std::rc::Rc::new(host.vector_font_store_lenient()), host, layouts: Default::default() }
         };
         // Which pieces' fields each text node's tracks key, and CSS colour keys read once.
@@ -1180,7 +1192,7 @@ impl Document {
 
         }
         let previous_media = previous.map(|(doc, files)| (doc.media.borrow(), files));
-        let media = crate::canvas_draw::Media::with_readers(scene, base, wanted, opened,
+        let mut media = crate::canvas_draw::Media::with_readers(scene, base, wanted, opened,
             previous_media.as_ref().map(|(readers, files)| (&**readers, *files)))?;
         // The scene's nodes in paint order, each where the scene holds it, with its parent's item: a walk with
         // its own stack, so the tree's depth costs no call stack.
@@ -1196,6 +1208,24 @@ impl Document {
                 None => { open.pop(); }
             }
         }
+        let mut plan = crate::animation::Plan::compile_in(scene, base, None, opened)?;
+        plan.mark_canvas_nodes(&mut flat)?;
+        let mut materials = BTreeSet::new();
+        for SceneNode { node, .. } in &flat {
+            if includes(&node.name) && let NodeKind::Path { fill, stroke, .. } = &node.kind {
+                for p in [fill, stroke] {
+                    if let v2::Paint::Material(p) = p { materials.insert(p.material.clone()); }
+                }
+            }
+        }
+        for (track, target) in &tracks {
+            if let TrackTarget::Node { node, property: v2::NodeProperty::Fill | v2::NodeProperty::Stroke } = target
+                && includes(node) && let v2::Values::Inline(values) = &track.values {
+                materials.extend(values.iter().filter_map(|v| v.get("material")?.as_str().map(str::to_owned)));
+            }
+        }
+        let paints = Arc::new(crate::canvas_program::Paints::install(scene, base, materials, &mut plan)?);
+        media.paints = paints.clone();
         let mut items = Vec::with_capacity(flat.len());
         // The fields each node's tracks restyle.
         let mut restyled: HashMap<&str, Vec<StyleField>> = HashMap::new();
@@ -1218,14 +1248,9 @@ impl Document {
             authored.push(if !selected || fields.is_empty() { None } else {
                 let mut source_node=node.without_children();
                 source_node.animation.clear();
-                // The fields' authored values, as the node writes them: read from the written node, which is not kept.
-                let mut source=serde_json::to_value(&source_node)?;
-                // These computed defaults are omitted by the authoring serializer.
-                if let NodeKind::Text {font_variation_settings,font_feature_settings,..}=&source_node.kind {
-                    source["font-variation-settings"]=serde_json::json!(font_variation_settings);
-                    source["font-feature-settings"]=serde_json::json!(font_feature_settings);
-                }
-                let fields = fields.into_iter().filter_map(|field| Some((field, source.get(field.name())?.clone()))).collect();
+                let fields = fields.into_iter().map(|field| {
+                    source_node.field_value(field.name()).map(|value| (field, value))
+                }).collect::<Result<_, _>>()?;
                 Some(Box::new(Authored { node: source_node, fields }))
             });
             let world = node.composition.as_ref().is_some_and(|c| c.space == v2::Space::World);
@@ -1238,7 +1263,11 @@ impl Document {
                     worlds.push(WorldPart { item: items.len(), scene: whole.world_part(&node.name, px)? });
                     crate::canvas_draw::Kind::World { bounds: [x, y, x + vw, y + vh] }
                 }
-                (NodeKind::Path { .. }, _) if selected => crate::canvas_draw::Kind::Path(Arc::new(crate::canvas_draw::path_item(&scene.images, base, node, &media)?)),
+                (NodeKind::Path { .. }, _) if selected => {
+                    let mut path = crate::canvas_draw::path_item(&scene.images, base, node, &media)?;
+                    path.paint_clock = paints.clock_slot(&plan, items.len())?;
+                    crate::canvas_draw::Kind::Path(Arc::new(path))
+                }
                 _ => crate::canvas_draw::Kind::Group,
             };
             let filter = match &node.filter {
@@ -1283,8 +1312,6 @@ impl Document {
             let count = text.units[&TextUnit::Lines].len();
             ensure!(*index < count, "track {}: node {node:?} has {count} lines; index {index} is past the end", v2::display_path(&track.path));
         }
-        let mut plan = crate::animation::Plan::compile_in(scene, base, None, opened)?;
-        plan.mark_canvas_nodes(&mut flat)?;
         let samples = RefCell::new(plan.samples_naming_changes());
         let mut kinds: Vec<Option<ChangeKind>> = {
             // Paths own their paints; text paints are part of glyph batches.
@@ -1361,13 +1388,13 @@ impl Document {
         let prepared = Arc::new(Prepared {
             opened: opened.clone(),
             view: (float || working != v2::WorkingColorSpace::Srgb).then(|| whole.clone()),
-            float, working, graph_images, images: scene.images.clone(), base: base.into(),
+            float, working, graph_images, paints, images: scene.images.clone(), base: base.into(),
             font_lists: lists, authored, items, rest,
             children, by_name, plan, page, worlds, kinds, track_items, track_parts,
             item_tracks_first, item_tracks, page_tracks,
         });
         Ok(Self { prepared, fonts, samples, styles, media: RefCell::new(media),
-            retained: Default::default(), text_specs, evaluated: Default::default(),
+            retained: Default::default(), text_specs, evaluated: Default::default(), warned_evaluation: Default::default(),
             stale: std::cell::Cell::new(true), text: Default::default(), changes: Default::default(), item_marks,
             #[cfg(test)]
             id: Self::next_id(),
@@ -1389,7 +1416,7 @@ impl Document {
         let nodes: Vec<&crate::canvas_draw::Node> = self.items.iter().map(|item| &item.node).collect();
         let paints: Vec<_> = self.items.iter().filter_map(|item| item.text.as_ref())
             .flat_map(|text| text.fill.iter().chain(&text.stroke)).collect();
-        crate::canvas_draw::install_images(&nodes, &paints)
+        crate::canvas_draw::install_images(&self.media.borrow().files, &nodes, &paints)
     }
     /// Whether the canvas keeps a float picture (RGBA16F) instead of the 8-bit one a browser's canvas keeps:
     /// only when something in it needs the precision. It holds a world, whose viewed picture arrives floating
@@ -1415,6 +1442,7 @@ impl Document {
         errors: Option<&wgpu::Buffer>) -> Result<wgpu::Texture> {
         let frame = self.frame(request)?;
         let (drawn, _) = worlds.draw(renderer, self, &frame, None, engine, errors, None, || {})?;
+        if let Some(e) = &worlds.paint_errors { e.check(e.word.read(renderer)?)?; }
         if let (Some(graph), None) = (&worlds.graph, errors) { graph.check(renderer)?; }
         let Some(view) = &worlds.view else { return Ok(drawn) };
         // Each draw's viewed picture is a texture of its own: its readers are recorded in commands submitted
@@ -1449,8 +1477,8 @@ impl Document {
     ) -> Result<vork_time::exact::Germ> {
         let mut samples = self.plan.samples();
         self.plan.sample_request_into(request.numeric()?, request, &mut samples)?;
-        let scene_time = request.exact()?;
-        self.plan.footage_time(&samples, &scene_time, name, image.time.as_ref())?
+        let scene_time = self.plan.sampled_scene(&samples, request)?;
+        self.plan.footage_time(&samples, scene_time, name, image.time.as_ref())?
             .with_context(|| format!("ask: image {name:?} is absent at this time"))
     }
 
@@ -1666,6 +1694,26 @@ impl Document {
 
     /// Evaluate into the table. Returns the frame and what of the table it changed.
     fn evaluate(&self, request: &vork_time::Request) -> Result<(Frame, Changed)> {
+        let checkpoint = crate::warnings::Checkpoint::current();
+        let mut warned = self.warned_evaluation.borrow_mut();
+        if warned.as_ref().is_some_and(|old| checkpoint.as_ref().is_none_or(|now| !old.same_request(now))) {
+            // A warning from evaluating a keyed paint belongs to that sample.
+            // Evaluate again for a new request if the cached state could hide it.
+            warned.take();
+            self.evaluated.borrow_mut().take();
+            self.styles.borrow_mut().fill_with(|| None);
+            self.text_specs.borrow_mut().fill_with(|| None);
+            self.text.borrow_mut().take();
+            self.stale.set(true);
+        }
+        let result = self.evaluate_sample(request);
+        if let Some(checkpoint) = checkpoint.filter(|checkpoint| checkpoint.emitted()) {
+            *warned = Some(checkpoint);
+        }
+        result
+    }
+
+    fn evaluate_sample(&self, request: &vork_time::Request) -> Result<(Frame, Changed)> {
         let _frame_profile = moda_engine::prof::span("canvas.evaluate");
         let time = request.numeric()?;
         let mut samples = self.samples.borrow_mut();
@@ -1694,23 +1742,24 @@ impl Document {
         let mut counts = self.changes.get();
         counts[change.map_or(0, |kind| kind as usize + 1)] += 1;
         self.changes.set(counts);
-        let scene_instant = request.exact()?;
+        let scene_instant = self.plan.sampled_scene(samples, request)?;
+        let paint_words = self.paints.sample(&self.plan, samples, scene_instant)?;
         // The image graph's images follow scene time (a movie shown under a node's clock is not also one of
         // them: `validate_media_clocks`), as a world's compositor images do.
         let images = self.graph_images.iter().map(|(name, time)| {
             let base = time.as_ref().map(|time| vork_time::exact::Germ::point(time.exact())).unwrap_or_else(|| scene_instant.clone());
-            Ok((name.clone(), self.plan.image_time_exact(samples, &scene_instant, name, base)?))
+            Ok((name.clone(), self.plan.image_time_exact(samples, scene_instant, name, base)?))
         }).collect::<Result<Vec<_>>>()?;
         // World clocks advance even when the canvas around them stands.
         let worlds = |shown: &[bool]| -> Vec<Option<vork_time::Request>> {
             self.worlds.iter().map(|world| shown[world.item]
-                .then(|| self.plan.local_instant(samples, world.item, &scene_instant)).flatten().map(vork_time::Request::Exact)).collect()
+                .then(|| self.plan.local_instant(samples, world.item, scene_instant)).flatten().map(vork_time::Request::Exact)).collect()
         };
         if same {
             // The table stands, and the scene is owed nothing new.
             let evaluated = self.evaluated.borrow();
             let state = &evaluated.as_ref().expect("the state that stands").state;
-            return Ok((Frame { request: request.clone(), worlds: worlds(&state.shown), images }, Changed::Nothing));
+            return Ok((Frame { paint_words, request: request.clone(), worlds: worlds(&state.shown), images }, Changed::Nothing));
         }
         // Do not publish a partially evaluated state after an error.
         let previous = self.evaluated.borrow_mut().take();
@@ -1728,7 +1777,7 @@ impl Document {
                     let worlds = worlds(&old.state.shown);
                     if !same_draws { self.text.borrow_mut().take(); }
                     *self.evaluated.borrow_mut() = Some(old);
-                    return Ok((Frame { request: request.clone(), worlds, images }, Changed::Items(items, bound)));
+                    return Ok((Frame { paint_words, request: request.clone(), worlds, images }, Changed::Items(items, bound)));
                 }
                 // A scale reached or left zero: which nodes draw changed after all, and every item is evaluated.
                 crate::canvas_host_memory::require_serial_growth()?;
@@ -1762,7 +1811,7 @@ impl Document {
         // Every item was evaluated: the text builder is owed its batches.
         self.text.borrow_mut().take();
         *self.evaluated.borrow_mut() = Some(Evaluated { present, state });
-        Ok((Frame { request: request.clone(), worlds, images }, Changed::Every))
+        Ok((Frame { paint_words, request: request.clone(), worlds, images }, Changed::Every))
     }
 
     /// The values an item's slot holds before its first evaluation writes them.
@@ -1989,12 +2038,9 @@ impl Document {
                         fields.get_or_insert_with(StyleFields::default).set(key, value.clone());
                         continue;
                     }
-                    let field = key.name();
                     let kind=target.style_interpolation().unwrap();
                     let rest=fields.as_ref().and_then(|f|f.get(key)).cloned().map(Ok).unwrap_or_else(|| {
-                        let mut value=self.authored(i)?.field(key).clone();
-                        if field=="filter" && value.is_null() {value=serde_json::json!("none");}
-                        crate::animation::style::StyleValue::parse(kind,&value).map(Arc::new)
+                        crate::animation::style::StyleValue::parse(kind, self.authored(i)?.field(key)).map(Arc::new)
                     })?;
                     fields.get_or_insert_with(StyleFields::default).set(key,Arc::new(rest.mix(value,weight,kind)));
                 }
@@ -2098,7 +2144,11 @@ impl Document {
                 let node=if content_changed {
                     // The node as authored, with each field a track wrote in it: written into the typed node, field by field.
                     let mut node=self.authored(i)?.node.clone();
-                    for (field,value) in &fields.0 {if *field != REFERENCE_FIELDS.path_data {node.set_field(field.name(),&value.json())?;}}
+                    for (field, value) in &fields.0 {
+                        if *field != REFERENCE_FIELDS.path_data && *field != REFERENCE_FIELDS.dash_array {
+                            node.set_field(field.name(), &value.json())?;
+                        }
+                    }
                     Some(node)
                 } else {None};
                 // The kept text when only its paints differ: the fields other than fill and stroke are the ones it
@@ -2120,7 +2170,12 @@ impl Document {
                 }
                 if let Some(node)=node.as_ref().filter(|node|matches!(node.kind,NodeKind::Path{..})) {
                     let mut path=crate::canvas_draw::sampled_path_item(&self.images,&self.base,node,fields.get(REFERENCE_FIELDS.path_data).map(|v|v.as_ref()),&self.media.borrow())?;
+                    path.paint_clock = self.paints.clock_slot(&self.plan, i)?;
                     for (field,value) in &fields.0 {if let crate::animation::style::StyleValue::Paint(p)=value.as_ref(){path.set_paint(&self.images,&self.base,field.name(),p,&self.media.borrow())?;}}
+                    if let Some(crate::animation::style::StyleValue::Dash(dash)) = fields.get(REFERENCE_FIELDS.dash_array).map(Arc::as_ref)
+                    {
+                        path.set_dash(dash);
+                    }
                     draw.kind=crate::canvas_draw::Kind::Path(Arc::new(path));
                 }
                 let reference=|field:StyleField,rest:Option<usize>| fields.get(field).map_or(rest,|value|value.json().as_str().and_then(|name|self.by_name.get(name).copied()));
@@ -2131,7 +2186,7 @@ impl Document {
                 let revision=styled[i].as_ref().map_or(1,|c|c.revision+1);
                 if content_changed && self.media.borrow().publish_assets {
                     let text_paints: Vec<_> = text.iter().flat_map(|t| t.fill.iter().chain(&t.stroke)).collect();
-                    crate::canvas_draw::install_images(&[&draw], &text_paints)?;
+                    crate::canvas_draw::install_images(&self.media.borrow().files, &[&draw], &text_paints)?;
                 }
                 let text_revision=styled[i].as_ref().map_or(0,|old|old.text_revision)+u64::from(content_changed && text.is_some());
                 styled[i]=Some(StyledItem{fields,draw:Arc::new(draw),text,revision,text_revision});
@@ -2337,7 +2392,7 @@ impl Document {
             if n > 0 { base.unit_groups = (vec![0; n]).into(); }
         }
         if text.stroke_width <= 0. { strokes.iter_mut().for_each(|s| *s = PaintSource::None); }
-        if self.media.borrow().publish_assets { crate::canvas_draw::install_images(&[],&fills.iter().chain(&strokes).collect::<Vec<_>>())?; }
+        if self.media.borrow().publish_assets { crate::canvas_draw::install_images(&self.media.borrow().files, &[],&fills.iter().chain(&strokes).collect::<Vec<_>>())?; }
         if fills.iter().chain(&strokes).any(|p| matches!(p, PaintSource::Moda(_))) {
             return Ok(self.painted_batches(text, units, base, fills, strokes));
         }
@@ -2475,15 +2530,15 @@ impl Document {
     /// batches keep their geometry until their content or AA/raster scale changes; Moda places them anew.
     /// `worlds` are the pictures of the canvas's worlds at the frame the table stands at.
     fn plan(&self, worlds: &[Option<(String, [u32; 2])>]) -> Result<crate::canvas_draw::Plan> {
-        let mut plan = self.plan_for_draw(worlds)?;
+        let mut plan = self.plan_for_draw(worlds, crate::canvas_draw::PlanUse::Snapshot)?;
         plan.materialize(self.retained.borrow_mut().as_mut().context("canvas scene")?)?;
         Ok(plan)
     }
 
-    fn plan_for_draw(&self, worlds: &[Option<(String, [u32; 2])>]) -> Result<crate::canvas_draw::Plan> {
+    fn plan_for_draw(&self, worlds: &[Option<(String, [u32; 2])>], usage: crate::canvas_draw::PlanUse) -> Result<crate::canvas_draw::Plan> {
         let mut evaluated = self.evaluated.borrow_mut();
         let evaluated = evaluated.as_mut().context("internal: a canvas planned before a frame was evaluated")?;
-        self.bring(&mut evaluated.state, worlds)
+        self.bring(&mut evaluated.state, worlds, usage)
     }
 
     /// Publish the evaluated frame to GPU workers. Release the producer's old
@@ -2492,12 +2547,12 @@ impl Document {
         let scene = self.retained.borrow().as_ref().expect("parallel frames follow a serial draw").picture_scene();
         if !self.stale.get() && let Some(plan) = engine.published(scene) { return Ok(plan); }
         engine.forget_published();
-        let plan = self.plan_for_draw(&[])?;
-        engine.publish(&plan).ok_or_else(|| wgpu::optional_allocations::Refused.into())
+        let plan = self.plan(&[])?;
+        engine.publish(&plan).context("materialized canvas snapshot could not be shared")
     }
 
     /// Give the scene its worlds' pictures, bring it whole to `state` if it is owed that, and plan it.
-    fn bring(&self, state: &mut FrameState, worlds: &[Option<(String, [u32; 2])>]) -> Result<crate::canvas_draw::Plan> {
+    fn bring(&self, state: &mut FrameState, worlds: &[Option<(String, [u32; 2])>], usage: crate::canvas_draw::PlanUse) -> Result<crate::canvas_draw::Plan> {
         let _profile = moda_engine::prof::span("canvas.plan");
         let update_profile = moda_engine::prof::span("canvas.plan.update");
         let mut page=self.page.clone();page.background=state.background;
@@ -2549,7 +2604,7 @@ impl Document {
                 text as crate::canvas_draw::CanvasTextBuilder
             }
         };
-        let result = crate::canvas_draw::plan_for_draw(retained.as_mut().unwrap(), &page, text.clone())?;
+        let result = crate::canvas_draw::plan_for_draw(retained.as_mut().unwrap(), &page, text.clone(), usage)?;
         *self.text.borrow_mut() = Some(text);
         self.stale.set(false);
         Ok(result)
@@ -2572,7 +2627,7 @@ impl Document {
         let mut state = snapshot.state.clone();
         self.stale.set(true);
         self.text.borrow_mut().take();
-        let plan = self.bring(&mut state, worlds);
+        let plan = self.bring(&mut state, worlds, crate::canvas_draw::PlanUse::Snapshot);
         self.stale.set(true);
         self.text.borrow_mut().take();
         plan
@@ -2748,7 +2803,7 @@ struct Target {
     float: bool,
     /// The stage that writes the canvas's picture as a reader takes it (`Pictures::reader_stage`), built when a
     /// render first writes that picture to EXR (`set_raw`).
-    picture: RefCell<Option<crate::display_program::PictureStage>>,
+    picture: RefCell<Option<InstalledStage>>,
 }
 /// A root canvas's view stages, each built when a render first encodes for its display and kept with the
 /// canvas: a float canvas has one for any display, an 8-bit canvas for a display other than the one its
@@ -2757,15 +2812,20 @@ struct Target {
 /// builds each once.
 #[derive(Default)]
 struct Stages {
-    built: Vec<(crate::output_device::Target, crate::display_program::PictureStage)>,
+    built: Vec<(crate::output_device::Target, InstalledStage)>,
     /// The stage for the display in use; `None` when the picture needs none.
     current: Option<usize>,
 }
 impl Stages {
     fn stage(&self) -> Option<&crate::display_program::PictureStage> {
-        self.current.map(|index| &self.built[index].1)
+        self.current.map(|index| &self.built[index].1.stage)
     }
 }
+struct InstalledStage {
+    stage: crate::display_program::PictureStage,
+    warnings: crate::warnings::Notices,
+}
+
 /// How `Target::finish` writes a destination.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Finish {
@@ -2776,7 +2836,32 @@ enum Finish {
 }
 /// Installed world pictures shared by standalone canvases and material pictures, and the canvas's image graph
 /// and view stage.
+struct PaintErrors {
+    word: crate::display_program::ErrorWord,
+    document: Arc<Prepared>,
+}
+
+impl PaintErrors {
+    fn new(r: &Renderer, document: &Arc<Prepared>) -> Option<Self> {
+        (!document.paints.sources.is_empty()).then(|| Self {
+            word: crate::display_program::ErrorWord::new(r, "canvas path paint errors"),
+            document: document.clone(),
+        })
+    }
+
+    fn check(&self, code: u32) -> Result<()> {
+        if code != 0 {
+            let site = (code - 1) / 2;
+            let field = if code % 2 == 1 { "fill" } else { "stroke" };
+            let name = &self.document.items[site as usize].name;
+            bail!("path {name:?} (item {site}).{field}: paint returned a non-finite colour");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Pictures {
+    paint_errors: Option<PaintErrors>,
     /// The canvas's image graph (`composition.compositor`), run over each drawn picture before any view.
     graph: Option<crate::compositor::CanvasGraph>,
     /// The view stage of a canvas a world reads (`floating`, `reader_stage`): it writes that world's float
@@ -2795,14 +2880,14 @@ impl Pictures {
             .with_context(|| format!("node {:?}", document.items[world.item].name))).collect::<Result<Vec<_>>>()?;
         let view = if floating { Self::reader_stage(renderer, document, base)? } else { None };
         let graph = document.view.as_ref().map(|scene| crate::compositor::CanvasGraph::new(renderer, scene, base, &document.opened)).transpose()?.flatten();
-        Ok(Self { graph, view, worlds: RefCell::new(worlds), pool: moda_engine::pixel::pool::TexturePool::new(&renderer.device, moda_engine::pixel::pool::TexturePool::budget_from_env()),
+        Ok(Self { paint_errors: PaintErrors::new(renderer, &document.prepared), graph, view, worlds: RefCell::new(worlds), pool: moda_engine::pixel::pool::TexturePool::new(&renderer.device, moda_engine::pixel::pool::TexturePool::budget_from_env()),
             convert: crate::canvas_world::Convert::into_canvas(document.working) })
     }
-    fn worker(renderer: &Renderer, document: &Prepared,
+    fn worker(renderer: &Renderer, document: &Arc<Prepared>,
         programs: Option<Arc<crate::compositor::CanvasGraphPrograms>>) -> Result<Self> {
         let graph = programs.map(|programs| crate::compositor::CanvasGraph::from_programs(renderer,
             document.view.as_ref().expect("a graph has an installed scene"), programs)).transpose()?;
-        Ok(Self { graph, view: None, worlds: Default::default(),
+        Ok(Self { paint_errors: PaintErrors::new(renderer, document), graph, view: None, worlds: Default::default(),
             pool: moda_engine::pixel::pool::TexturePool::new(&renderer.device, moda_engine::pixel::pool::TexturePool::budget_from_env()),
             convert: crate::canvas_world::Convert::into_canvas(document.working) })
     }
@@ -2855,13 +2940,18 @@ impl Pictures {
         drop(worlds_profile);
         // Evaluation has already written changed rows. A world capture is a further
         // scene input installed by plan(), so it must go through that step first.
+        engine.path_programs(&document.paints.sources, &frame.paint_words, self.paint_errors.as_ref().map(|e| e.word.buffer()))?;
         let held = if pictures.is_empty() && !document.stale.get() {
             document.retained.borrow().as_ref().zip(document.text.borrow().as_ref())
                 .and_then(|(scene, text)| engine.picture(scene.picture_scene(), &std::rc::Rc::downgrade(text)))
         } else { None };
         let drawn = if let Some(texture) = held { planned(); texture } else {
             engine.forget_published();
-            let mut plan = document.plan_for_draw(&pictures).map_err(scene_error)?;
+            let mut plan = if engine.publishing() {
+                document.plan(&pictures)
+            } else {
+                document.plan_for_draw(&pictures, crate::canvas_draw::PlanUse::Packet)
+            }.map_err(scene_error)?;
             planned();
             let _profile = moda_engine::prof::span("canvas.draw");
             engine.render_resident(&mut plan, document.retained.borrow_mut().as_mut().expect("planned scene")).map_err(device)?
@@ -2917,15 +3007,38 @@ struct NativeCanvasFrame {
     frame: Option<usize>,
 }
 type CanvasJob = (u32, f32, Frame, crate::canvas_draw::SharedPlan, Slot);
-type CanvasCompletion = Result<(usize, Slot, Option<wgpu::SubmissionIndex>)>;
+type CanvasCompletion = Result<(usize, Slot, std::result::Result<wgpu::SubmissionIndex, RetryCanvas>)>;
+
+#[derive(Clone, Copy)]
+enum RetryCanvas { Memory, SerialCapture }
+
+impl RetryCanvas {
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        if crate::failure::cause::<wgpu::optional_allocations::Refused>(error).is_some() { return Some(Self::Memory); }
+        crate::failure::cause::<moda_engine::frame::MissingSharedCapture>(error).map(|_| Self::SerialCapture)
+    }
+
+    fn error(self) -> anyhow::Error {
+        match self {
+            Self::Memory => wgpu::optional_allocations::Refused.into(),
+            Self::SerialCapture => moda_engine::frame::MissingSharedCapture.into(),
+        }
+    }
+}
 type CanvasWorkers = Vec<(std::sync::mpsc::SyncSender<CanvasJob>, std::sync::mpsc::Receiver<CanvasCompletion>)>;
 
-fn stop_canvas_workers(pool: CanvasWorkers, joins: Vec<std::thread::ScopedJoinHandle<'_, ()>>,
-    slots: &mut [Option<Slot>], renderer: &Renderer) -> Result<()> {
+fn stop_canvas_workers(pool: CanvasWorkers, joins: Vec<std::thread::ScopedJoinHandle<'_, Option<RetryCanvas>>>,
+    slots: &mut [Option<Slot>], renderer: &Renderer, memory_refused: &mut bool) -> Result<()> {
     if pool.is_empty() { return Ok(()); }
     let (senders, receivers): (Vec<_>, Vec<_>) = pool.into_iter().unzip();
     drop(senders);
-    for join in joins { join.join().map_err(|panic| panicked("canvas frame worker", panic))?; }
+    // A worker stops drawing on its first refusal and returns that reason for
+    // every outstanding slot. Join also observes an initialization refusal on
+    // a worker which never received a frame.
+    for join in joins {
+        let reason = join.join().map_err(|panic| panicked("canvas frame worker", panic))?;
+        *memory_refused |= matches!(reason, Some(RetryCanvas::Memory));
+    }
     for receiver in receivers {
         for result in receiver.try_iter() {
             let (frame, slot, _) = result?;
@@ -2957,7 +3070,12 @@ impl Target {
     /// none (the default view of an sRGB canvas) has its drawn picture read as it is, 8-bit or float.
     fn set_raw(&self, renderer: &Renderer, document: &Prepared, base: &Path) -> Result<()> {
         let mut picture = self.picture.borrow_mut();
-        if picture.is_none() { *picture = Pictures::reader_stage(renderer, document, base)?; }
+        if let Some(picture) = picture.as_ref() {
+            picture.warnings.replay();
+        } else {
+            let (stage, warnings) = crate::warnings::Notices::capture(|| Pictures::reader_stage(renderer, document, base))?;
+            *picture = stage.map(|stage| InstalledStage { stage, warnings });
+        }
         Ok(())
     }
 
@@ -2972,10 +3090,12 @@ impl Target {
         let current = if !document.float && crate::display_program::Prepared::identity(scene, display) {
             None
         } else if let Some(index) = stages.built.iter().position(|(built, _)| *built == display) {
+            stages.built[index].1.warnings.replay();
             Some(index)
         } else {
-            let stage = crate::display_program::PictureStage::new(renderer, scene, base, display, false, &document.opened)?;
-            stages.built.push((display, stage));
+            let (stage, warnings) = crate::warnings::Notices::capture(||
+                crate::display_program::PictureStage::new(renderer, scene, base, display, false, &document.opened))?;
+            stages.built.push((display, InstalledStage { stage, warnings }));
             Some(stages.built.len() - 1)
         };
         stages.current = current;
@@ -3018,9 +3138,9 @@ impl Target {
             stats: crate::display_stats::Stats::new(&renderer.device),
             ring,
             readback,
-            picture_errors: (self.pictures.graph.is_some() || self.display.borrow().stage().is_some() || raw.as_ref().is_some_and(|raw| raw.picture.is_some()))
+            picture_errors: (self.pictures.paint_errors.is_some() || self.pictures.graph.is_some() || self.display.borrow().stage().is_some() || raw.as_ref().is_some_and(|raw| raw.picture.is_some()))
                 .then(|| crate::gpu_memory::buffer(&renderer.device, &wgpu::BufferDescriptor {
-                    label: Some("canvas picture errors"), size: 12,
+                    label: Some("canvas picture errors"), size: 16,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
                 })),
             raw,
@@ -3045,6 +3165,7 @@ impl Target {
         // Each step's error word travels with this frame, before the next frame's graph and view clear them.
         let display = self.display.borrow();
         if let Some(errors) = &slot.picture_errors {
+            if let Some(paint) = &self.pictures.paint_errors { encoder.copy_buffer_to_buffer(paint.word.buffer(), 0, errors, 12, 4); }
             if let Some(graph) = &self.pictures.graph { encoder.copy_buffer_to_buffer(graph.errors(), 0, errors, 0, 4); }
             if let Some(view) = display.stage() { encoder.copy_buffer_to_buffer(view.errors(), 0, errors, 4, 4); }
         }
@@ -3056,6 +3177,7 @@ impl Target {
             let stage = self.picture.borrow();
             let picture = match (stage.as_ref(), &raw.picture) {
                 (Some(stage), Some(picture)) => {
+                    let stage = &stage.stage;
                     stage.encode(renderer, &mut encoder, drawn, picture, &frame.request, None)?;
                     if let Some(errors) = &slot.picture_errors { encoder.copy_buffer_to_buffer(stage.errors(), 0, errors, 8, 4); }
                     picture
@@ -3148,7 +3270,7 @@ impl Target {
         for _ in &mapped { receiver.recv().context("canvas readback").map_err(device)?.context("canvas readback").map_err(device)?; }
         slot.diagnostic_time = slot.diagnostic_gpu.as_ref().map(|gpu| gpu.time());
         let picture_errors = slot.picture_errors.as_ref().map(|errors| {
-            let codes = { let mapped = errors.get_mapped_range(..); [0, 4, 8].map(|at| u32::from_le_bytes(mapped[at..at + 4].try_into().expect("four bytes"))) };
+            let codes = { let mapped = errors.get_mapped_range(..); [0, 4, 8, 12].map(|at| u32::from_le_bytes(mapped[at..at + 4].try_into().expect("four bytes"))) };
             errors.unmap();
             codes
         });
@@ -3159,10 +3281,11 @@ impl Target {
         // Every step's word is read before the frame's error is chosen. A view written for another display
         // is wrong at every frame, so it outranks a non-finite result, which is this frame's refusal, as a
         // world's is: a sequence of per-frame files skips that.
-        let codes = picture_errors.into_iter().flatten().filter(|&code| code != 0).collect::<Vec<_>>();
+        let paint_code = picture_errors.map_or(0, |codes| codes[3]);
+        let codes = picture_errors.into_iter().flat_map(|[graph, display, raw, _]| [graph, display, raw]).filter(|&code| code != 0).collect::<Vec<_>>();
         let wrong_display = codes.contains(&vork_slang::registry::VIEW_DESTINATION);
         let code = if wrong_display { vork_slang::registry::VIEW_DESTINATION } else { codes.first().copied().unwrap_or(0) };
-        if let Err(error) = crate::display_program::refuse(code) {
+        if let Err(error) = crate::display_program::refuse(code).and_then(|_| match &self.pictures.paint_errors { Some(p) => p.check(paint_code), None => Ok(()) }) {
             // The frame delivers nothing: let go of its pixels, so its slot can take another frame.
             if slot.readback { slot.ring.readback.unmap(); }
             if let Some(raw) = &slot.raw { raw.readback.unmap(); }
@@ -3283,15 +3406,41 @@ fn frame_event(event: &'static str, frame: usize) {
     });
 }
 
+/// Preserve the order of call and delivery overrides. A call resolution is
+/// validated before the delivery resolution is applied.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct LookOverrides {
+    resolution: Option<[u32; 2]>,
+    fps: Option<vork_scene::Time>,
+    delivery_resolution: Option<[u32; 2]>,
+}
+impl LookOverrides {
+    pub(crate) fn new(call: &vork_scene::CallOverrides, delivery_resolution: Option<[u32; 2]>) -> Self {
+        Self { resolution: call.resolution, fps: call.fps, delivery_resolution }
+    }
+}
+
 /// What a session keeps of a canvas between renders: the document (its text laid out, its fonts loaded, its tracks
 /// compiled) and the GPU side (Moda's engine with its pipelines and caches, the installed worlds). It belongs to the
-/// renderer that made it and to one resolved scene, which `identity` names; the session proves the scene's files.
+/// renderer that made it and its resolved scene. The session proves the scene's files.
 pub(crate) struct Kept {
-    identity: blake3::Hash,
+    scene: Arc<Scene>,
+    base: PathBuf,
+    call: LookOverrides,
     document: Document,
     target: Target,
+    pub(crate) admission_warnings: crate::warnings::Notices,
+    document_warnings: crate::warnings::Notices,
+    target_warnings: crate::warnings::Notices,
+    image_warnings: crate::warnings::Notices,
 }
 impl Kept {
+    pub(crate) fn admitted(&self, base: &Path, settings: &vork_scene::Settings, call: LookOverrides) -> Option<(Arc<Scene>, crate::warnings::Notices)> {
+        (self.base == base && self.scene.render.settings == *settings && self.call == call).then(|| {
+            self.admission_warnings.replay();
+            (self.scene.clone(), self.admission_warnings.clone())
+        })
+    }
     pub(crate) fn opened(&self) -> &crate::footage::Opened { &self.document.opened }
     /// The resolved scene and the directory its files resolve against: everything the document and the target are
     /// built from. Outputs, frame ranges and destinations are each render's own. The scene's content is hashed
@@ -3306,18 +3455,48 @@ impl Kept {
 
     /// Stage the new CPU inputs while the published document still owns its installation. The
     /// first evaluated sample supplies the same row writes as a seek during an export.
-    pub(crate) fn revise(&mut self, renderer: &Renderer, scene: &Scene, base: &Path,
-        opened: &crate::footage::Opened, unchanged: &BTreeSet<&Path>) -> Result<bool> {
+    pub(crate) fn revise(&mut self, renderer: &Renderer, scene: Arc<Scene>, base: &Path, call: LookOverrides,
+        opened: &crate::footage::Opened, unchanged: &BTreeSet<&Path>, changes: &[serde_json::Value]) -> Result<bool> {
         let old = &self.document;
-        if old.view.is_some() || has_worlds(&scene.nodes) { return Ok(false); }
-        let next = Document::prepare_document(scene, base, None, opened, Some((old, unchanged)))?;
-        if next.view.is_some() || next.page != old.page || next.items.len() != old.items.len()
+        let paint_inputs_only = !changes.is_empty()
+            && scene.compositor().is_empty() && scene.composition.as_ref().is_none_or(|c| c.view.is_none())
+            && old.images.values().all(|image| image.render.is_none() && image.compositor().is_empty()) && changes.iter().all(|path| {
+            matches!(path.as_array().map(Vec::as_slice), Some([table, name, inputs, ..])
+                if table == "materials" && inputs == "inputs" && name.as_str().is_some_and(|n| old.paints.bindings.contains_key(n)))
+        });
+        // A row update keeps the target and can keep media readers and decoded
+        // images. A warned producer must run for the changed document.
+        // A non-native display can already have compiled a view.
+        if (!paint_inputs_only && (old.view.is_some() || !self.target.display.borrow().built.is_empty()))
+            || self.target.picture.borrow().is_some() || has_worlds(&scene.nodes)
+            || !self.document_warnings.is_empty() || !self.target_warnings.is_empty() || !self.image_warnings.is_empty()
+        {
+            return Ok(false);
+        }
+        let (next, document_warnings) = crate::warnings::Notices::capture(||
+            Document::prepare_document(&scene, base, None, opened, Some((old, unchanged))))?;
+        if (!paint_inputs_only && next.view.is_some()) || next.page != old.page || next.items.len() != old.items.len()
             || !Arc::ptr_eq(&next.fonts.host, &old.fonts.host) || old.stale.get() {
             return Ok(false);
         }
-        let identity = Self::identity(scene, base)?;
+        // The replacement has proved and packed the edited inputs. Keep the evaluated rows at the
+        // displayed instant, including any group translation still represented by the resident packet.
+        // The proof of unchanged source files and authored paths comes from the session's open diff.
+        if paint_inputs_only && old.paints.bindings == next.paints.bindings
+            && old.paints.sources == next.paints.sources
+        {
+            if let Some(errors) = &mut self.target.pictures.paint_errors {
+                errors.document = next.prepared.clone();
+            }
+            self.document.prepared = next.prepared;
+            self.document_warnings = document_warnings;
+            self.scene = scene;
+            self.call = call;
+            return Ok(true);
+        }
+        if next.view.is_some() || !self.target.display.borrow().built.is_empty() { return Ok(false); }
         next.media.borrow_mut().prepare_gpu(renderer)?;
-        next.install_images()?;
+        let ((), image_warnings) = crate::warnings::Notices::capture(|| next.install_images())?;
         // Text stamps are local to a bound row. Compare the new specs against that row's
         // previous specs, even when neither document has an animated text style.
         next.text_specs.borrow_mut().clone_from(&old.text_specs.borrow());
@@ -3360,27 +3539,38 @@ impl Kept {
             old.stale.set(true);
             return Err(error);
         }
+        if let Some(e) = &mut self.target.pictures.paint_errors && !next.paints.sources.is_empty() {
+            e.document = next.prepared.clone();
+        } else {
+            self.target.pictures.paint_errors = PaintErrors::new(renderer, &next.prepared);
+        }
         self.document = next;
-        self.identity = identity;
+        self.document_warnings = document_warnings;
+        self.image_warnings = image_warnings;
+        self.scene = scene;
+        self.base = base.to_owned();
+        self.call = call;
         Ok(true)
     }
     /// Build what a render of `scene` builds before its first frame, with a render's errors, then evaluate and
     /// plan the first frame as `check` does: a session proves a candidate document this way before it publishes
     /// it. A canvas with worlds is planned by its first render instead, when the worlds' pictures exist; their
     /// scenes are installed here, in the target.
-    pub(crate) fn prepare(renderer: &Renderer, scene: &Scene, base: &Path, display: crate::output_device::Target, opened: &crate::footage::Opened) -> Result<Self> {
-        let identity = Self::identity(scene, base)?;
-        let document = Document::new_with_paints(scene, base, None, opened).map_err(scene_error)?;
-        let target = Target::new(renderer, scene.render.resolution, &document, base).map_err(scene_error)?;
+    pub(crate) fn prepare(renderer: &Renderer, scene: Arc<Scene>, base: &Path, call: LookOverrides, display: crate::output_device::Target, opened: &crate::footage::Opened) -> Result<Self> {
+        let (document, document_warnings) = crate::warnings::Notices::capture(||
+            Document::new_with_paints(&scene, base, None, opened)).map_err(scene_error)?;
+        let (target, target_warnings) = crate::warnings::Notices::capture(||
+            Target::new(renderer, scene.render.resolution, &document, base)).map_err(scene_error)?;
         // The view stage for the display the session's renders encode for: an authored view's program, inputs
         // and images are proved here, and the render finds the stage built.
-        target.set_display(renderer, &document, scene, base, display).map_err(scene_error)?;
-        document.install_images().map_err(scene_error)?;
+        target.set_display(renderer, &document, &scene, base, display).map_err(scene_error)?;
+        let ((), image_warnings) = crate::warnings::Notices::capture(|| document.install_images()).map_err(scene_error)?;
         document.frame(&vork_time::Request::Numeric(0.)).map_err(scene_error)?;
         if document.worlds.is_empty() {
             document.plan(&[]).map_err(scene_error)?;
         }
-        Ok(Self { identity, document, target })
+        Ok(Self { scene, base: base.to_owned(), call, document, target, document_warnings, target_warnings,
+            image_warnings, admission_warnings: Default::default() })
     }
 }
 
@@ -3388,7 +3578,8 @@ impl Kept {
 pub(crate) struct Request {
     pub sound: Option<crate::audio::MovieSound>,
     pub opened: crate::footage::Opened,
-    pub scene: Scene,
+    pub scene: Arc<Scene>,
+    pub call: LookOverrides,
     pub base: PathBuf,
     pub out: Vec<PathBuf>,
     pub outputs: Vec<Output>,
@@ -3412,11 +3603,12 @@ pub(crate) struct Request {
     /// A session's document and GPU side from an earlier render on the same renderer, reused when this render
     /// resolves to the same scene.
     pub kept: Option<Kept>,
+    pub admission_warnings: crate::warnings::Notices,
 }
 
 /// Render a canvas to the destinations a 3D shot writes: a PNG still, a directory of frames, EXR frames, MP4 or MOV.
 pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHandle<'_, Result<Renderer>>, warnings: &crate::warnings::Collector, wall: Instant) -> Result<RenderedShot> {
-    let Request { scene, base, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused, sound, kept, opened } = request;
+    let Request { scene, call, base, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused, sound, kept, opened, admission_warnings } = request;
     let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
     let parse_start = Instant::now();
     let [w, h] = scene.render.resolution;
@@ -3444,6 +3636,11 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let at = still.as_ref().map(|still| still.time);
     ensure_usage!(at.is_none() || !video, "--at selects one still; a video renders every frame");
     let frames = if at.is_some() { 1 } else { last_frame + 1 - first_frame };
+    let forced_workers = std::env::var("VORK_CANVAS_WORKERS").ok().and_then(|v| v.parse::<usize>().ok());
+    let limit = forced_workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from).min(crate::constants::CANVAS_DEFAULT_MAX_WORKERS))
+        .clamp(1, crate::constants::CANVAS_MAX_WORKERS).min(frames);
+    let may_replicate = limit > 1 && (forced_workers.is_some() || frames >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES);
+    let mut host_memory = may_replicate.then(|| crate::canvas_host_memory::Guard::new(diagnostics)).flatten();
     let still_index = still.as_ref().map(|still| still.index);
     let output_index = |frame: usize| still_index.unwrap_or((first_frame + frame) as u32);
     if video {
@@ -3462,42 +3659,41 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             std::fs::create_dir_all(path)?;
         }
     }
-    // A kept document and GPU side serve the same resolved scene; any other is dropped here and built again.
-    // The scene's identity is what decides that. With nothing kept there is nothing to decide: the scene is
-    // hashed by the worker that prepares the encoders, beside its document's construction, not before it.
-    let known = match &kept {
-        Some(_) => Some(Kept::identity(&scene, &base)?),
-        None => None,
+    // The worker can hand us the very scene this device installed. A public
+    // retained shot with independently supplied input still proves equivalence.
+    let kept = match kept {
+        Some(kept) if kept.base == base && (Arc::ptr_eq(&kept.scene, &scene)
+            || (kept.scene.render.settings == scene.render.settings
+                && Kept::identity(&kept.scene, &base)? == Kept::identity(&scene, &base)?)) => Some(kept),
+        _ => None,
     };
-    let kept = kept.filter(|kept| Some(kept.identity) == known);
     let install_reused = kept.is_some();
-    let (kept_document, kept_target) = kept.map_or((None, None), |kept| (Some(kept.document), Some(kept.target)));
+    let (kept_document, kept_target, kept_images) = kept.map_or((None, None, None), |kept| (
+        Some((kept.document, kept.document_warnings)), Some((kept.target, kept.target_warnings)), Some(kept.image_warnings),
+    ));
     // Prepare the encoders while the text is laid out.
     let (document, prepared) = std::thread::scope(|scope| {
-        // The worker walks the scene to hash it, so it has the stack a scene nested to its limit needs.
         let prepared = vork_scene::scene_thread().spawn_scoped(scope, || {
             let start = diagnostics.then(Instant::now);
             let prepared = video_paths.iter().map(|path| {
                 Encoder::prepare(Backend::Auto, w, h, fps, EncodeSettings { diagnostics, primaries: display.video_primaries(), ..EncodeSettings::default() }, path).map_err(device)
             }).collect::<Result<Vec<_>>>();
             let encoder_prepare_ms = start.map_or(0., |s| s.elapsed().as_secs_f64() * 1000.);
-            let identity = match known {
-                Some(identity) => Ok(identity),
-                None => Kept::identity(&scene, &base),
-            };
-            (prepared, identity, encoder_prepare_ms)
+            (prepared, encoder_prepare_ms)
         }).expect("start the encoder preparation worker");
         let document = match kept_document {
-            Some(document) => Ok(document),
-            None => Document::new_with_paints(&scene, &base, None, &opened).map_err(scene_error),
+            Some((document, notices)) => {
+                notices.replay();
+                Ok((document, notices))
+            }
+            None => crate::warnings::Notices::capture(|| Document::new_with_paints(&scene, &base, None, &opened)).map_err(scene_error),
         };
         (document, prepared.join().map_err(|panic| panicked("encoder preparation worker", panic)))
     });
-    let document = document?;
+    let (document, document_warnings) = document?;
     let scene_parse_ms = parse_start.elapsed().as_secs_f64() * 1000.;
-    let (prepared, identity, encoder_prepare_ms) = prepared?;
+    let (prepared, encoder_prepare_ms) = prepared?;
     let prepared = prepared?;
-    let identity = identity?;
     let renderer = device_worker.join().map_err(|panic| panicked("device creation worker", panic))??;
     // Receipts describe this request: timings from earlier renders on a retained device are excluded.
     let pipeline_timings_before: std::collections::BTreeMap<String, f64> =
@@ -3508,37 +3704,44 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         let available = moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue);
         eprintln!("canvas GPU timestamps available: {available}; query resolution serializes frames");
     }
-    // Old outputs are removed only after every encoder can be written.
     for prepared in &prepared { prepared.validate_fallback(frames as u64, Some(&renderer.device)).map_err(device)?; }
-    let output_run = if no_write || gpu_only { None } else {
-        Some(crate::output_run::OutputRun::begin(&out, selected)?)
-    };
     let install_start = Instant::now();
-    let target = match kept_target {
-        Some(target) => target,
-        None => Target::new(&renderer, [w, h], &document, &base).map_err(scene_error)?,
+    let (target, target_warnings) = match kept_target {
+        Some((target, notices)) => {
+            notices.replay();
+            (target, notices)
+        }
+        None => crate::warnings::Notices::capture(||
+            Target::new(&renderer, [w, h], &document, &base)).map_err(scene_error)?,
     };
     target.set_display(&renderer, &document, &scene, &base, display).map_err(scene_error)?;
     // An 8-bit canvas shows its authored display colours as they are, or (sRGB code values on a wider display)
     // re-expressed with nothing lost. Display P3 code values shown as sRGB are not: the view clips the colours
     // sRGB cannot show.
     let as_authored = !document.float() && (document.working() == v2::WorkingColorSpace::Srgb || document.working().display() == Some(display.display));
-    // Images already in Moda's store are not read again.
-    document.install_images().map_err(scene_error)?;
+    // Images already in Moda's store are not read again. They can be
+    // republished if another render has replaced the store.
+    let image_warnings = if let Some(notices) = kept_images {
+        notices.replay();
+        document.install_images().map_err(scene_error)?;
+        notices
+    } else {
+        crate::warnings::Notices::capture(|| document.install_images()).map_err(scene_error)?.1
+    };
     // Sharing belongs only to optional replicas. Serial and nested-world
     // histories retain their ordinary image-cache eviction/destruction path.
     let shared_images = std::sync::Arc::new(moda_engine::paint::draw::SharedImages::default());
+    // PNG files read the 8-bit frame back; EXR files read the picture after its view.
+    let pngs = !no_write && !gpu_only && directory_paths.iter().any(|path| !is_exr(path));
+    let raws = !no_write && !gpu_only && directory_paths.iter().any(|path| is_exr(path));
+    if raws { target.set_raw(&renderer, &document, &base)?; }
     let target_install_ms = install_start.elapsed().as_secs_f64() * 1000.;
     // Frames in flight: the CPU builds the next frames while the GPU draws and the encoders take the earlier ones.
-    let forced_workers = std::env::var("VORK_CANVAS_WORKERS").ok().and_then(|v| v.parse::<usize>().ok());
     let independent = document.worlds.is_empty() && document.media.borrow().is_empty();
-    let limit = forced_workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from).min(crate::constants::CANVAS_DEFAULT_MAX_WORKERS))
-        .clamp(1, crate::constants::CANVAS_MAX_WORKERS).min(frames);
     let frame_bytes = (u64::from(w) * 4).div_ceil(256) * 256 * u64::from(h);
     // Native device/local/unified headroom decides whether replication is
     // optional. The encoder validates its fixed serial buffer independently.
-    let can_replicate = independent && limit > 1
-        && (forced_workers.is_some() || frames >= crate::constants::CANVAS_PARALLEL_MIN_FRAMES);
+    let can_replicate = independent && may_replicate;
     let free = can_replicate.then(|| crate::canvas_parallel::headroom(&renderer.device)).flatten().map(|(_, free)| free);
     let serial_capacity = crate::constants::FRAMES_IN_FLIGHT.min(frames);
     // Each destination may retain conversion textures and a native shared ring;
@@ -3553,16 +3756,18 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     // Native encoders keep the serial ring. Optional output slots and histories
     // are reserved only when main's existing policy admits parallel rendering.
     let mut in_flight = serial_capacity;
+    // Replace the previous export only once the new picture and encoder settings are admitted.
+    let output_run = if no_write || gpu_only { None } else {
+        Some(crate::output_run::OutputRun::begin(&out, selected)?)
+    };
+    let before_encoder = host_memory.as_ref().filter(|_| video).and_then(|host| host.sample(None));
     let encoder_open_start = diagnostics.then(Instant::now);
     let mut encoders = prepared.into_iter().map(|prepared| prepared.open(renderer.device.clone(), renderer.queue.clone(), frames as u64, serial_capacity).map_err(device)).collect::<Result<Vec<_>>>()?;
+    if let (Some(host), Some(before)) = (&mut host_memory, before_encoder) { host.output_opened(before); }
     let completion_handoff = !encoders.is_empty() && encoders.iter().all(Encoder::uses_completion_handoff);
     // Each slot's ring entry on every encoder, installed in frame order so entry indices match the slots.
     let surfaces = (0..in_flight).map(|_| encoders.iter_mut().map(|encoder| encoder.create_surface().map_err(setup)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     let encoder_start_ms = if video { encoder_prepare_ms + encoder_open_start.map_or(0., |s| s.elapsed().as_secs_f64() * 1000.) } else { 0. };
-    // PNG files read the 8-bit frame back; EXR files read the picture after its view.
-    let pngs = !no_write && !gpu_only && directory_paths.iter().any(|path| !is_exr(path));
-    let raws = !no_write && !gpu_only && directory_paths.iter().any(|path| is_exr(path));
-    if raws { target.set_raw(&renderer, &document, &base)?; }
     let slot_start = Instant::now();
     let native_frames = RefCell::new(surfaces.into_iter().map(|surfaces| NativeCanvasFrame { surfaces, frame: None, diagnostic_gpu: None }).collect::<Vec<_>>());
     let mut slots: Vec<Option<Slot>> = (0..in_flight).map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect();
@@ -3586,7 +3791,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     let mut interrupted = false;
     let mp4 = video_paths.iter().any(|path| shot::mp4_destination(path));
     let mut refused = shot::Refusals::default();
-    let host_memory = (worker_limit > 1).then(|| crate::canvas_host_memory::Guard::new(diagnostics)).flatten().map(Arc::new);
+    let host_memory = host_memory.filter(|_| worker_limit > 1).map(Arc::new);
     let optional_budget = host_memory.as_ref().and_then(|host| crate::canvas_parallel::budget(&renderer.device,
         cfg!(not(target_os = "macos")) && renderer.adapter_info.device_type == wgpu::DeviceType::DiscreteGpu, host.clone()));
     if diagnostics && worker_limit > 1 && optional_budget.is_none() {
@@ -3610,7 +3815,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             // A stage shares every installed resource except its mutable error word.
             let (display_stage, raw_stage) = budget.run(|| (
                 target.display.borrow().stage().map(|stage| stage.replica(renderer)),
-                target.picture.borrow().as_ref().map(|stage| stage.replica(renderer)),
+                target.picture.borrow().as_ref().map(|stage| stage.stage.replica(renderer)),
             ))?;
             let finish = target.finish.borrow().clone();
             let draw = target.engine.draw_resources();
@@ -3626,9 +3831,9 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                         crate::canvas_draw::Engine::with_engine(renderer, engine));
                     target.engine.share_images(shared_images);
                     *target.finish.get_mut() = finish;
-                    *target.picture.get_mut() = raw_stage;
+                    *target.picture.get_mut() = raw_stage.map(|stage| InstalledStage { stage, warnings: Default::default() });
                     if let Some(stage) = display_stage {
-                        *target.display.get_mut() = Stages { built: vec![(display, stage)], current: Some(0) };
+                        *target.display.get_mut() = Stages { built: vec![(display, InstalledStage { stage, warnings: Default::default() })], current: Some(0) };
                     }
                     if gpu_profile { moda_engine::gpu_profile::enable(&renderer.device, &renderer.queue); }
                     let _capture = diagnostics.then(|| moda_engine::prof::capture(crate::canvas_timing::category));
@@ -3646,6 +3851,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                         let frame_profile = moda_engine::prof::span("canvas.frame");
                         if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
                         let recording = target.engine.record_for_output();
+                        target.engine.path_programs(&prepared.paints.sources, &instant.paint_words, target.pictures.paint_errors.as_ref().map(|e| e.word.buffer())).map_err(device)?;
                         let drawn = target.engine.draw_shared(&plan, &shared_masks).map_err(device)?;
                         drop(plan);
                         let (drawn, prefix) = target.pictures.composite(renderer, drawn, &instant, Some(output_index(_frame as usize)), None, recording.finish())?;
@@ -3674,26 +3880,28 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                         if gpu_profile { moda_engine::gpu_profile::resolve_into_prof(&renderer.device, &renderer.queue); }
                         drop(job);
                         let (frame, slot) = current.take().unwrap();
-                        if done.send(Ok((frame, slot, Some(submission)))).is_err() { break; }
+                        if done.send(Ok((frame, slot, Ok(submission)))).is_err() { break; }
                     }
                     Ok(())
                 };
                 let result = match budget.run(run) { Ok(result) => result, Err(refused) => Err(refused.into()) };
                 if let Err(error) = result {
-                    if crate::failure::cause::<wgpu::optional_allocations::Refused>(&error).is_some() {
+                    if let Some(retry) = RetryCanvas::from_error(&error) {
                         moda_engine::scratch::discard_pending();
                         if let Some((frame, slot)) = current.take() {
-                            let _ = done.send(Ok((frame, slot, None)));
+                            let _ = done.send(Ok((frame, slot, Err(retry))));
                         }
                         // Return every queued lease, then exit after the
                         // export thread disconnects and joins this worker.
                         while let Ok((frame, _, _, _, slot)) = receive.recv() {
-                            if done.send(Ok((frame as usize, slot, None))).is_err() { break; }
+                            if done.send(Ok((frame as usize, slot, Err(retry)))).is_err() { break; }
                         }
+                        return Some(retry);
                     } else { let _ = done.send(Err(error)); }
                 }
+                None
             }).map_err(|error| match error.kind() {
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory => anyhow::Error::new(wgpu::optional_allocations::Refused),
+                std::io::ErrorKind::OutOfMemory => anyhow::Error::new(wgpu::optional_allocations::Refused),
                 _ => anyhow::Error::new(error).context("start canvas frame worker"),
             })?;
             Ok::<_, anyhow::Error>(((send, completed), join))
@@ -3704,6 +3912,9 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
         let mut retry_from = 0;
         let accepted = std::cell::Cell::new(0usize);
         let mut memory_refused = false;
+        // After a structural cut, observe the new serial workload before paying
+        // for another pool. A stream of fresh plans gets one serial traversal.
+        let mut stable_after_refresh: Option<(usize, u64)> = None;
         let mut schedule = Schedule::default();
         let mut admission_limit = worker_limit;
         let mut awaiting_publication = false;
@@ -3786,7 +3997,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     let (completed, slot, submission) = pool[frame % workers - 1].1.recv().context("canvas frame worker stopped")??;
                     ensure!(completed == frame, "canvas worker completion order");
                     slots[frame % in_flight] = Some(slot);
-                    submission.ok_or(wgpu::optional_allocations::Refused)?
+                    submission.map_err(RetryCanvas::error)?
                 }
             };
             let delivery_start = automatic.then(Instant::now);
@@ -3885,11 +4096,30 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             }
             Ok(())
         };
+        // Producer barriers leave every earlier dispatch in this FIFO. Finish
+        // its valid prefix before retrying. A failed collection exits at once.
+        let mut producer_result = Ok(());
         for frame in retry_from..frames {
             if stop.as_ref().is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)) && frame > 0 { interrupted = true; break; }
             let mut wanted = workers;
             let host = host_memory.as_deref();
-            if !memory_refused && frame > 0 && workers == 1 && (awaiting_publication || forced_workers.is_some() && admission_limit > 1 && frames > 2) {
+            if let Some((stable, captures)) = &mut stable_after_refresh {
+                // A changing deferred mask can need the serial executor without
+                // invalidating the producer's CPU coverage plan.
+                let current = target.engine.serial_mask_captures();
+                if crate::canvas_host_memory::take_serial_growth() || current != *captures {
+                    *stable = 0;
+                    *captures = current;
+                } else if frame > retry_from {
+                    *stable += 1;
+                }
+                if *stable >= crate::constants::CANVAS_PARALLEL_PROBE_FRAMES {
+                    stable_after_refresh = None;
+                    if forced_workers.is_some() { target.engine.publish_masks(true); }
+                }
+            }
+            let may_admit = !memory_refused && stable_after_refresh.is_none();
+            if may_admit && frame > 0 && workers == 1 && (awaiting_publication || forced_workers.is_some() && admission_limit > 1 && frames > 2) {
                 if document.retained.borrow().as_ref().is_some_and(|scene| target.engine.published(scene.picture_scene()).is_some()) {
                     wanted = if automatic { 2 } else { admission_limit };
                 } else if awaiting_publication {
@@ -3897,7 +4127,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     schedule.cancel_trial(2);
                 }
                 awaiting_publication = false;
-            } else if automatic && !memory_refused {
+            } else if automatic && may_admit {
                 match schedule.decide(workers, admission_limit, frames - frame, install_ms, diagnostics) {
                     Resize::Grow if workers == 1 => {
                         // Capture just the next serial draw. A direct placement replay
@@ -3928,7 +4158,8 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                             for (encoder, surface) in encoders.iter_mut().zip(&mut native.surfaces) { encoder.release(index as u64, surface).map_err(device)?; }
                         }
                     }
-                    stop_canvas_workers(pool.split_off(wanted - 1), joins.split_off(wanted - 1), &mut slots, &renderer)?;
+                    stop_canvas_workers(pool.split_off(wanted - 1), joins.split_off(wanted - 1), &mut slots, &renderer, &mut memory_refused)?;
+                    if memory_refused { return Err(wgpu::optional_allocations::Refused.into()); }
                     workers = wanted;
                     let retained_slots = serial_capacity + crate::canvas_parallel::extra_slots(serial_capacity, capacity, workers);
                     // PNG/EXR writers own independent pixel copies until the
@@ -3942,7 +4173,7 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                     wanted = wanted.min((free / used.max(frame_bytes).max(1)) as usize);
                     let sample = host.sample(None).ok_or(wgpu::optional_allocations::Refused)?;
                     let reserve = sample.reserve();
-                    let bytes = sample.resident_peak().saturating_add(vork_scene::LOAD_STACK_BYTES as u64);
+                    let bytes = host.replica_residency().saturating_add(vork_scene::LOAD_STACK_BYTES as u64);
                     let admitted = (workers + 1..=wanted).rev().find(|&count| {
                         let extra = crate::canvas_parallel::extra_slots(in_flight, capacity, count);
                         host.claim_workers(sample, reserve, bytes.saturating_mul((count - workers) as u64),
@@ -3960,11 +4191,27 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
                         slots.extend(optional_budget.as_ref().unwrap().run(|| (0..extra)
                             .map(|_| Some(target.slot(&renderer, pngs, raws, Vec::new()))).collect::<Vec<_>>())?);
                         for _ in workers..count {
-                            let (worker, join) = spawn_worker()?;
+                            let (worker, join) = match spawn_worker() {
+                                Ok(started) => started,
+                                Err(error) if error.downcast_ref::<std::io::Error>()
+                                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {
+                                    // The OS thread limit can be lower than the memory budget.
+                                    // No frames are pending during resize. Keep the lanes that
+                                    // started and return only the unused reservations and slots.
+                                    admission_limit = workers;
+                                    schedule.cancel_trial(workers + 1);
+                                    host.release_workers(lane_claims.drain(workers - 1..).sum());
+                                    slots.truncate(in_flight + crate::canvas_parallel::extra_slots(in_flight, capacity, workers));
+                                    if workers == 1 { target.engine.publish_masks(false); }
+                                    if diagnostics { eprintln!("canvas concurrency: thread unavailable at frame {frame}; keep {workers} workers"); }
+                                    break;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             pool.push(worker);
                             joins.push(join);
+                            workers += 1;
                         }
-                        workers = count;
                     } else {
                         admission_limit = workers;
                         schedule.cancel_trial(workers + 1);
@@ -3991,11 +4238,19 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             let time = request.numeric().map_err(scene_error)?;
             let prepared_frame = if !pool.is_empty() {
                 host_memory.as_ref().unwrap().check(frame)?;
-                Some(crate::canvas_host_memory::with_workers(|| -> Result<_> {
+                let prepared = crate::canvas_host_memory::with_workers(|| -> Result<_> {
                     let instant = document.frame(&request).map_err(scene_error)?;
                     let plan = document.shared_plan(&target.engine)?;
                     Ok((instant, plan))
-                })?)
+                });
+                match prepared {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) if crate::failure::cause::<crate::canvas_host_memory::SerialGrowth>(&error).is_some() => {
+                        producer_result = Err(error);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else { None };
             let mut draw_start = (automatic && prepared_frame.is_some()).then(Instant::now);
             if frame % workers != 0 {
@@ -4031,7 +4286,15 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             if diagnostics { moda_engine::gpu_profile::begin_frame(&renderer.device, &renderer.queue, slot.diagnostic_gpu.take()); }
             let mut command = if let Some(plan) = plan {
                 let recording = target.engine.record_for_output();
-                let drawn = target.engine.draw_shared(&plan, &shared_masks).map_err(device)?;
+                target.engine.path_programs(&document.paints.sources, &instant.paint_words, target.pictures.paint_errors.as_ref().map(|e| e.word.buffer())).map_err(device)?;
+                let drawn = match target.engine.draw_shared(&plan, &shared_masks) {
+                    Ok(drawn) => drawn,
+                    Err(error) if crate::failure::cause::<moda_engine::frame::MissingSharedCapture>(&error).is_some() => {
+                        producer_result = Err(error);
+                        break;
+                    }
+                    Err(error) => return Err(device(error)),
+                };
                 let (drawn, prefix) = target.pictures.composite(&renderer, drawn, &instant, Some(output_index(frame)), None, recording.finish())?;
                 target.encode_drawn(&renderer, drawn, &instant, slot, prefix)?
             } else { target.encode(&renderer, &document, &instant, output_index(frame), slot, || {
@@ -4091,22 +4354,36 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
             pending.push_back((frame, time, frame_start, Some(submission)));
         }
         while let Some(frame) = pending.pop_front() { collect(frame, &mut slots, &mut encoders, &pool, workers, in_flight, &mut schedule)?; }
-        Ok(())
+        producer_result
         })();
-        if result.as_ref().err().is_some_and(|error| crate::failure::cause::<wgpu::optional_allocations::Refused>(error).is_some()) {
-            stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer)?;
+        let serial_work = result.as_ref().err().and_then(|error| {
+            if crate::failure::cause::<crate::canvas_host_memory::SerialGrowth>(error).is_some() { Some("plan construction") }
+            else { crate::failure::cause::<moda_engine::frame::MissingSharedCapture>(error).map(|_| "unpublished mask") }
+        });
+        if serial_work.is_some() || result.as_ref().is_err_and(|error| crate::failure::cause::<wgpu::optional_allocations::Refused>(error).is_some()) {
+            stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer, &mut memory_refused)?;
             retry_from = accepted.get();
             target.engine.publish_masks(false);
             workers = 1;
+            for slot in slots[serial_capacity..].iter().flatten() { slot.ring.credit.wait(); }
             slots.truncate(serial_capacity);
             in_flight = slots.len();
             crate::gpu_memory::wait(&renderer.device, &renderer.queue, &renderer.errors, None)?;
             if let Some(host) = &host_memory { host.release_workers(lane_claims.drain(..).sum()); }
-            memory_refused = true;
-            if diagnostics { eprintln!("canvas concurrency: memory reservation refused; retry serial at frame {retry_from}"); }
+            if let Some(reason) = serial_work.filter(|_| !memory_refused) {
+                // Reconsider automatic throughput on the new workload. A forced
+                // pool can consume the fresh publication after this serial draw.
+                schedule.plan_refreshed(in_flight);
+                stable_after_refresh = Some((0, target.engine.serial_mask_captures()));
+                crate::canvas_host_memory::take_serial_growth();
+                if diagnostics { eprintln!("canvas concurrency: plan refresh at frame {retry_from}; {reason}; resume serial publication"); }
+            } else {
+                memory_refused = true;
+                if diagnostics { eprintln!("canvas concurrency: memory reservation refused; retry serial at frame {retry_from}"); }
+            }
             continue;
         }
-        stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer)?;
+        stop_canvas_workers(std::mem::take(&mut pool), std::mem::take(&mut joins), &mut slots, &renderer, &mut memory_refused)?;
         return result;
         }
     });
@@ -4233,7 +4510,8 @@ pub(crate) fn render(request: Request, device_worker: std::thread::ScopedJoinHan
     if let Some(run) = &output_run { run.complete(&pending_metadata)?; }
     #[cfg(feature = "frame-profile")]
     crate::frame_profile::report(&report);
-    Ok(RenderedShot::canvas(report, encoders, renderer, Kept { identity, document, target }))
+    Ok(RenderedShot::canvas(report, encoders, renderer, Kept { scene, base, call, document, target,
+        admission_warnings, document_warnings, target_warnings, image_warnings }))
 }
 
 #[cfg(test)]
@@ -4353,6 +4631,53 @@ mod canvas_regressions {
                 assert_eq!(pixel.0, [if covered { 255 } else { 0 }; 3], "view {view:?} at ({px},{py})");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires real GPU and pinned Slang"]
+    fn still_paint_and_compositor_honor_the_same_colour_declaration() -> Result<()> {
+        use image::ImageEncoder;
+        let dir = tempfile::tempdir()?;
+        let tagged = std::fs::File::create(dir.path().join("tagged.png"))?;
+        let mut encoder = image::codecs::png::PngEncoder::new(tagged);
+        encoder.set_icc_profile(moxcms::ColorProfile::new_display_p3().encode()?)?;
+        let stored = [110, 170, 65, 255];
+        let mut pixels = stored.repeat(16 * 16);
+        for row in pixels.chunks_exact_mut(16 * 4) {
+            row[..4].copy_from_slice(&[210, 20, 190, 0]);
+        }
+        encoder.write_image(&pixels, 16, 16, image::ExtendedColorType::Rgba8)?;
+        let document = json!({
+            "version":2,"composition":{"space":"2d","compositor":["read"]},
+            "render":{"resolution":[128,32],"background":"black"},
+            "images":{"declared":{"file":"tagged.png","color_space":"sRGB"},"embedded":{"file":"tagged.png"}},
+            "nodes":[
+                {"type":"path","d":"M0 0H32V32H0Z","fill":{"image":"declared","fit":"fill"}},
+                {"type":"path","d":"M32 0H64V32H32Z","fill":{"image":"embedded","fit":"fill"}}
+            ],
+            "materials":{"read":{"program":"read","inputs":{"a":{"image":"declared"},"b":{"image":"embedded"}}}},
+            "programs":{"read":{"source":"
+                import vork;
+                public struct Inputs { Image a; Image b; };
+                public float4 composite(CompositeContext ctx, Inputs inputs) {
+                    if (ctx.uv.x < 0.5) return compositor_sample(ctx.uv);
+                    if (ctx.uv.x < 0.75) return compositor_sample(inputs.a, float2(0.5, 0.5));
+                    return compositor_sample(inputs.b, float2(0.5, 0.5));
+                }"}}
+        });
+        let scene = dir.path().join("scene.json");
+        let out = dir.path().join("frame.png");
+        std::fs::write(&scene, serde_json::to_vec(&document)?)?;
+        crate::shot::Shot { scene, out: vec![out.clone().into()], ..Default::default() }.render()?;
+        let frame = image::open(out)?.to_rgba8();
+        // LittleCMS independently gives these sRGB codes for the profile and input.
+        let converted = [89, 172, 42, 255];
+        for (x, expected) in [(16, stored), (48, converted), (80, stored), (112, converted)] {
+            let actual = frame.get_pixel(x, 16).0;
+            assert!(actual.into_iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2), "{x}: {actual:?}");
+        }
+        assert!(frame.get_pixel(0, 16).0[..3].iter().all(|v| *v < 4));
         Ok(())
     }
 

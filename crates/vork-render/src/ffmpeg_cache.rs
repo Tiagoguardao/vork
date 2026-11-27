@@ -1,36 +1,12 @@
 //! FFmpeg timing receipts share the renderer's content-addressed store.
 use crate::disk_cache;
 use anyhow::{Context, Result, ensure};
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 pub(crate) fn clock_help(dependency: &[u8]) -> Result<String> {
-    let name = if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    };
-    let executable = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|directory| directory.join(name))
-        .find(|path| {
-            let Ok(metadata) = path.metadata() else {
-                return false;
-            };
-            if !metadata.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o111 == 0 {
-                    return false;
-                }
-            }
-            true
-        })
-        .context("cannot locate ffmpeg executable on PATH for timing capability identity")?;
-    let binary = fs::read(&executable).context("read ffmpeg timing capability identity")?;
+    let identity = vork_inputs::tool_identity("ffmpeg").context("read ffmpeg timing capability identity")?;
     let mut key = blake3::Hasher::new();
-    key.update(blake3::hash(&binary).as_bytes());
+    key.update(identity.digest().as_bytes());
     // This report includes runtime libav* versions: a shared-library upgrade
     // can change capabilities without replacing the ffmpeg executable.
     key.update(dependency);
@@ -39,8 +15,12 @@ pub(crate) fn clock_help(dependency: &[u8]) -> Result<String> {
         return Ok(help);
     }
     let help = vork_encode::probe_video_clock_capabilities()?;
+    // A new on-disk receipt can outlive this worker. Publish only if the executable
+    // used to measure it still matches the selection captured by the worker.
+    let selected = vork_inputs::tool_command("ffmpeg");
     ensure!(
-        fs::read(&executable).context("recheck ffmpeg timing capability identity")? == binary,
+        vork_inputs::Executable::open(selected.get_program().as_ref())
+            .context("recheck ffmpeg timing capability identity")? == identity,
         "ffmpeg changed while checking timing capabilities; retry the render"
     );
     let _ = disk_cache::write(&path, help.as_bytes());

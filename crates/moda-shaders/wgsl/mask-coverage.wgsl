@@ -33,6 +33,8 @@
           _pad: u32,
           gradBounds: vec4<f32>,
           stops: array<vec4<f32>, 8>,
+          pictureFromAtlas: vec4f, // scale and offset from coverage texels to output pixels
+          program: vec4<u32>, // material input offset, local clock, diagnostic site, stroke flag
         }
         @group(0) @binding(0) var<uniform> globals: Globals;
         @group(1) @binding(0) var textSampler: sampler;
@@ -45,7 +47,8 @@
           @location(0) worldPos: vec2<f32>,
           @location(1) localPos: vec2<f32>,
         };
-        @vertex fn vs_main(input: VSIn) -> VSOut {
+        @vertex fn vs_main(input: VSIn) -> VSOut { return maskVertex(input); }
+        fn maskVertex(input: VSIn) -> VSOut {
           var out: VSOut;
           let world = globals.model * vec4<f32>(input.pos, 0.0, 1.0);
           out.worldPos = world.xy;
@@ -153,23 +156,32 @@
             paint = paint * gradientColor(gradientT(input.localPos));
           }
 
+          return maskCoverage(paint, maskAncestor(input.worldPos));
+        }
+
+        fn maskAncestor(world: vec2<f32>) -> f32 {
+          // If we have an ancestor mask, sample and multiply by its coverage
+          // This ensures nested containers properly compose their clip regions
+          if (globals.hasAncestorMask == 1u) {
+            let uvAncestor = (world - globals.ancestorOrigin) * globals.ancestorInvSize;
+            // If outside ancestor bounds, discard (fully clipped)
+            if (uvAncestor.x < 0.0 || uvAncestor.x > 1.0 || uvAncestor.y < 0.0 || uvAncestor.y > 1.0) {
+              discard;
+            }
+            return textureSample(ancestorMaskTexture, ancestorSampler, uvAncestor).r;
+          }
+
+          return 1.0;
+        }
+
+        fn maskCoverage(paint: vec4<f32>, ancestor: f32) -> vec4<f32> {
           var coverage = paint.a;
           if (globals.luminance == 1u) {
             // CSS Masking's luminance coefficients, on the sRGB-encoded colour, times alpha.
             coverage = dot(clamp(paint.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.2125, 0.7154, 0.0721)) * paint.a;
           }
 
-          // If we have an ancestor mask, sample and multiply by its coverage
-          // This ensures nested containers properly compose their clip regions
-          if (globals.hasAncestorMask == 1u) {
-            let uvAncestor = (input.worldPos - globals.ancestorOrigin) * globals.ancestorInvSize;
-            // If outside ancestor bounds, discard (fully clipped)
-            if (uvAncestor.x < 0.0 || uvAncestor.x > 1.0 || uvAncestor.y < 0.0 || uvAncestor.y > 1.0) {
-              discard;
-            }
-            let ancestorCoverage = textureSample(ancestorMaskTexture, ancestorSampler, uvAncestor).r;
-            coverage = coverage * ancestorCoverage;
-          }
+          coverage = coverage * ancestor;
 
           // Nothing to composite.
           if (paint.a < 0.001) { discard; }

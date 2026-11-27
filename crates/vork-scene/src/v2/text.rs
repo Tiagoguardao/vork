@@ -55,10 +55,10 @@ pub struct Run {
     #[schemars(extend("x-source" = "CSS letter-spacing", "x-help-path" = "run.letter-spacing", "x-help" = "number; px; default the node's"))]
     pub letter_spacing: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-source" = "SVG 2 fill; CSS Color 4", "x-help-path" = "run.fill", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's"))]
+    #[schemars(with = "Option<canvas::TextPaint>", extend("x-source" = "SVG 2 fill; CSS Color 4", "x-help-path" = "run.fill", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's"))]
     pub fill: Option<Paint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-source" = "SVG 2 stroke; CSS Color 4", "x-help-path" = "run.stroke", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's"))]
+    #[schemars(with = "Option<canvas::TextPaint>", extend("x-source" = "SVG 2 stroke; CSS Color 4", "x-help-path" = "run.stroke", "x-help" = "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's"))]
     pub stroke: Option<Paint>,
 }
 
@@ -428,6 +428,7 @@ impl Scene {
         }
         ensure!(stroke_width.is_finite() && *stroke_width >= 0., "node {name:?}: stroke-width must be a nonnegative number of px");
         for value in [fill, stroke].into_iter().chain(content.runs().iter().flat_map(|run| run.fill.iter().chain(&run.stroke))) {
+            ensure!(!matches!(value, Paint::Material(_)), "node {name:?}: program paint is supported on paths only");
             if let Paint::Image(image) = value {
                 ensure!(images.contains_key(&image.image), "node {name:?}: paint names image {:?}, which is not in images", image.image);
             }

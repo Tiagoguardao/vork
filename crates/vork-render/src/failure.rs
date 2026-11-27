@@ -26,11 +26,6 @@ pub fn scene(error: anyhow::Error) -> anyhow::Error {
 pub(crate) fn cause<T: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static>(error: &anyhow::Error) -> Option<&T> {
     error.downcast_ref::<T>().or_else(|| error.downcast_ref::<Authored>().and_then(|authored| authored.0.downcast_ref::<T>()))
 }
-/// Mutable counterpart for diagnostics that replace a private resource path with its authored path.
-pub(crate) fn cause_mut<T: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static>(error: &mut anyhow::Error) -> Option<&mut T> {
-    if error.is::<T>() { return error.downcast_mut::<T>(); }
-    error.downcast_mut::<Authored>()?.0.downcast_mut::<T>()
-}
 /// Wrap operations that also evaluate scene inputs, retaining their precise category.
 /// Leaf GPU failures can attach Device directly.
 pub(crate) fn device(error: anyhow::Error) -> anyhow::Error {

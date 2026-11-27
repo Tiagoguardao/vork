@@ -10,6 +10,7 @@ pub(crate) enum Paint {
     Color([f32; 4]),
     Gradient(Arc<str>),
     Image(Value),
+    Material(String),
     Mix(Arc<Paint>, Arc<Paint>, f32),
 }
 impl Paint {
@@ -30,6 +31,10 @@ impl Paint {
             }
             return Ok(v2::text::paint(s)?.map_or(Self::None, Self::Color));
         }
+        if v.get("material").is_some() {
+            let paint: v2::MaterialPaint = serde_json::from_value(v.clone())?;
+            return Ok(Self::Material(paint.material));
+        }
         let _: v2::ImagePaint = serde_json::from_value(v.clone())?;
         Ok(Self::Image(v.clone()))
     }
@@ -38,6 +43,7 @@ impl Paint {
             Self::None => json!("none"),
             Self::Color(c) => json!(color_css(*c)),
             Self::Gradient(s) => json!(s.as_ref()),
+            Self::Material(name) => json!({"material": name}),
             Self::Image(v) => v.clone(),
             Self::Mix(a, b, t) => {
                 if *t < 0.5 {
@@ -108,6 +114,7 @@ pub(crate) enum StyleValue {
     Filter(crate::canvas_draw::Filter),
     Paint(Paint),
     Variations(Vec<(String, f64)>),
+    Dash(moda_scene::dash::DashList),
 }
 impl StyleValue {
     pub fn parse(kind: I, value: &Value) -> Result<Self> {
@@ -122,7 +129,13 @@ impl StyleValue {
                 Some("bold") => json!(700.),
                 _ => value.clone(),
             }),
+            I::Repeatable => Self::Dash(moda_scene::dash::DashList::Lengths(
+                value.as_array().into_iter().flatten()
+                    .map(|v| v.as_f64().context("stroke-dasharray length must be a number"))
+                    .collect::<Result<Vec<_>>>()?.into(),
+            )),
             I::Paint => Self::Paint(Paint::parse(value)?),
+            I::Filter if value.is_null() => Self::Filter(Default::default()),
             I::Filter => Self::Filter(crate::canvas_draw::parse_filter(
                 value.as_str().context("filter keys are CSS strings")?,
             )?),
@@ -276,6 +289,7 @@ impl StyleValue {
     }
     pub fn json(&self) -> Value {
         match self {
+            Self::Dash(_) => unreachable!("stroke dashes are sampled by the stroke"),
             Self::Origin(_) => unreachable!("origins are consumed as length-percentage pairs"),
             Self::Json(v) => v.clone(),
             Self::Paint(p) => p.json(),
@@ -344,9 +358,7 @@ impl StyleValue {
             (Self::Json(a), Self::Json(b)) if matches!(kind, I::Number | I::FontWeight) => {
                 !(a.is_number() && b.is_number())
             }
-            (Self::Json(Value::Array(a)), Self::Json(Value::Array(b))) if kind == I::Repeatable => {
-                a.is_empty() || b.is_empty()
-            }
+            (Self::Dash(a), Self::Dash(b)) => a.is_empty() || b.is_empty(),
             _ => true,
         }
     }
@@ -415,23 +427,8 @@ impl StyleValue {
                     discrete()
                 }
             }
-            (Self::Json(Value::Array(a)), Self::Json(Value::Array(b)))
-                if kind == I::Repeatable && !a.is_empty() && !b.is_empty() =>
-            {
-                fn gcd(a: usize, b: usize) -> usize {
-                    if b == 0 { a } else { gcd(b, a % b) }
-                }
-                let n = a.len() / gcd(a.len(), b.len()) * b.len();
-                Self::Json(
-                    (0..n)
-                        .map(|i| {
-                            json!(mix(
-                                a[i % a.len()].as_f64().unwrap(),
-                                b[i % b.len()].as_f64().unwrap()
-                            ))
-                        })
-                        .collect(),
-                )
+            (Self::Dash(a), Self::Dash(b)) if !a.is_empty() && !b.is_empty() => {
+                Self::Dash(a.mix(b, t))
             }
             _ => discrete(),
         }
@@ -498,7 +495,7 @@ mod tests {
         };
         crate::canvas_host_memory::with_workers(|| {
             assert!(Arc::ptr_eq(&track.sample(0., Some(0), None).unwrap(), &track.values[0]));
-            assert!(track.sample(1., None, None).unwrap_err().is::<wgpu::optional_allocations::Refused>());
+            assert!(track.sample(1., None, None).unwrap_err().is::<crate::canvas_host_memory::SerialGrowth>());
         });
         assert!(track.sample(1., None, None).is_ok());
     }
@@ -576,10 +573,14 @@ mod tests {
     }
     #[test]
     fn dash_lists_repeat_and_variation_axes_match_by_tag() {
-        assert_eq!(
-            sample(I::Repeatable, json!([2, 4]), json!([4, 8, 12]), 0.5),
-            json!([3., 6., 7., 4., 5., 8.])
-        );
+        let left = StyleValue::parse(I::Repeatable, &json!([2, 4])).unwrap();
+        let right = StyleValue::parse(I::Repeatable, &json!([4, 8, 12])).unwrap();
+        let StyleValue::Dash(dash) = left.mix(&right, 0.5, I::Repeatable) else { panic!("dash") };
+        assert_eq!(dash.period(), Some(6));
+        let moda_scene::dash::DashList::Mix(left, right, weight) = dash else { panic!("mix") };
+        assert_eq!(*left, moda_scene::dash::DashList::Lengths([2., 4.].into()));
+        assert_eq!(*right, moda_scene::dash::DashList::Lengths([4., 8., 12.].into()));
+        assert_eq!(weight, 0.5);
         assert_eq!(
             sample(
                 I::Variations,

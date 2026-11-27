@@ -739,7 +739,7 @@ impl Compute {
                 identity.update(&serde_json::to_vec(artifact)?);
             }
             if !artifact.warnings.trim().is_empty() {
-                eprintln!("{}", artifact.warnings.trim());
+                crate::warnings::diagnostic(artifact.warnings.trim());
             }
             let mut types = vec![(0, None), (1, None)];
             types.extend(used.iter().enumerate().map(|(index, _)| (index as u32 + 2, Some(false))));

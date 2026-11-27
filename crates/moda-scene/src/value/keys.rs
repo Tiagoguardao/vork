@@ -362,4 +362,8 @@ known_keys! {
     XTime = "xTime",
     Y = "y",
     YRange = "yRange",
+    Clock = "clock",
+    Inputs = "inputs",
+    Site = "site",
+    StrokeUv = "stroke_uv",
 }

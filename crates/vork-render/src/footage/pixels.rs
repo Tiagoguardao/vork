@@ -11,12 +11,13 @@ use vork_media::{PictureIndex, PictureStamp};
 
 // FFmpeg 5/6 expose POS on decoded frames. Starting with FFmpeg 7
 // (libavcodec 61), setts can carry the demuxed packet position into the decoder.
+#[derive(Clone, Copy)]
 enum SeekStamp {
     FramePosition,
     InputFilter,
 }
-static SEEK_STAMP: LazyLock<Option<SeekStamp>> = LazyLock::new(|| {
-    let list = Command::new("ffmpeg").arg("-bsfs").output().ok()?;
+fn probe_seek_stamp() -> Option<SeekStamp> {
+    let list = vork_inputs::tool_output("ffmpeg", &["-bsfs"]).ok()?;
     if !list.status.success() {
         return None;
     }
@@ -38,14 +39,19 @@ static SEEK_STAMP: LazyLock<Option<SeekStamp>> = LazyLock::new(|| {
         .lines()
         .any(|line| line.trim() == "setts")
         .then_some(SeekStamp::InputFilter)
-});
+}
+
+fn seek_stamp() -> Option<SeekStamp> {
+    static STAMP: LazyLock<Option<SeekStamp>> = LazyLock::new(probe_seek_stamp);
+    *STAMP
+}
 
 pub(super) fn can_stamp_seek() -> bool {
-    SEEK_STAMP.is_some()
+    seek_stamp().is_some()
 }
 
 pub(super) fn seek_input(command: &mut Command) {
-    if matches!(*SEEK_STAMP, Some(SeekStamp::InputFilter)) {
+    if matches!(seek_stamp(), Some(SeekStamp::InputFilter)) {
         // FFmpeg's encoder stats preserve the decoder's input PTS. Carry
         // the byte position there so duplicate raw PTS cannot alias a landing.
         command.args(["-bsf:v:0", "setts=pts=POS:dts=DTS"]);
@@ -59,7 +65,7 @@ pub(super) fn configure(
     sought: bool,
     records: &str,
 ) {
-    let mut chain = if sought && matches!(*SEEK_STAMP, Some(SeekStamp::InputFilter)) {
+    let mut chain = if sought && matches!(seek_stamp(), Some(SeekStamp::InputFilter)) {
         command.args([
             "-stats_enc_pre",
             records,

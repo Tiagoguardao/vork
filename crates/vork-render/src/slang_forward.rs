@@ -115,6 +115,7 @@ impl SlangScene {
         consume:impl FnOnce(&[(&str,&str)],&[&str],&std::collections::BTreeMap<String,Vec<u8>>,&[vork_slang::InputIdentity],EntryTransforms)->T,
     )->T {
         let _revision = self.revision_files.enter();
+        let _host = self.installed_inputs.as_ref().and_then(|inputs| inputs.lock().unwrap().host.enter_worker());
         use crate::pipelines::{ProgramKernel, ShadeStage};
         let (_, target, flags) = if metal {
             METAL_TARGET

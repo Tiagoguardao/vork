@@ -119,6 +119,9 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
 // Main shader code
 
         // Frame-level uniforms
+// #include "path-frame.wgsl"
+// #include "vector-text-bounds.wgsl"
+// #include "path-placement.wgsl"
 // #include "rect-clip.wgsl"
         // Mask sampling (optional). Group(2)=sampler+texture+uniforms
         struct MaskUniforms {
@@ -132,14 +135,17 @@ fn blendNormal(base: vec4<f32>, blend: vec4<f32>) -> vec4<f32> {
         
         // Storage buffer for path instances
         struct PathData {
-          model: mat4x4<f32>,      // 16 floats
           fillColor: vec4<f32>,    // 4 floats
           strokeColor: vec4<f32>,  // 4 floats
-          pathInfo: vec4<f32>,     // triangleOffset, triangleCount, strokeWidth, depth - 4 floats
+          slot: u32,
+          reserved0: u32,
+          reserved1: u32,
+          depth: f32,
           pageClipBounds: vec4<f32>, // x, y, width, height - 4 floats
         }
         
         @group(1) @binding(0) var<storage, read> paths: array<PathData>;
+        @group(1) @binding(1) var<storage, read> models: array<mat4x4<f32>>;
         
         // Stroke depth offset constant
         const STROKE_DEPTH_OFFSET: f32 = -0.000001490116119384765625;

@@ -389,6 +389,51 @@ fn end_of_input_closes_the_worker_without_a_device() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"), "{output:?}");
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn eof_from_write_only_pipe_or_idle_noncanonical_terminal_closes_the_worker() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    fn expect_eof(stdin: Stdio, source: &str) {
+        let mut child = Command::new(binary()).arg("session")
+            .stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("{source}: worker did not exit at EOF: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success() && output.stdout.is_empty(), "{source}: {output:?}");
+    }
+
+    let (_reader, writer) = std::io::pipe().unwrap();
+    expect_eof(Stdio::from(writer), "write-only pipe");
+
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes to both descriptors on success; optional arguments are null.
+    assert_eq!(unsafe {
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+    }, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: both descriptors are newly opened and each is owned once.
+    let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let fd = slave.as_raw_fd();
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr initializes termios on success.
+    assert_eq!(unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) }, 0);
+    let mut termios = unsafe { termios.assume_init() };
+    termios.c_lflag &= !libc::ICANON;
+    termios.c_cc[libc::VMIN] = 0;
+    termios.c_cc[libc::VTIME] = 1;
+    // SAFETY: termios contains the slave's settings with the read mode adjusted.
+    assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) }, 0);
+    expect_eof(Stdio::from(slave), "idle noncanonical terminal");
+}
+
 /// Expansion consumes sources before file admission; compare its current output
 /// with the actual installation, including after a render-time source edit.
 #[test]
@@ -522,7 +567,7 @@ fn footage_still_reaps_the_compositor_decoder() {
 /// between requests. These fixtures use only builtins so authored programs cannot
 /// accidentally disable the dependency path under test.
 #[test]
-fn sampled_sources_match_ordinary_renders_and_never_cache_missing_images() {
+fn sampled_sources_match_ordinary_renders_and_invalidate_missing_images() {
     if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") {
         eprintln!("SKIP GPU session test: set VORK_GPU_TESTS=1 on a supported GPU");
         return;
@@ -602,11 +647,15 @@ fn sampled_sources_match_ordinary_renders_and_never_cache_missing_images() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("magenta"));
     assert_eq!(std::fs::read(root.join("cold-missing.png")).unwrap(), magenta);
     assert_eq!(session.open(106, &missing, &root)["ok"], true);
+    let mut first = None;
     for attempt in 0..2 {
         let path = root.join(format!("missing-{attempt}.png"));
         let reply = session.render(107, &path);
-        assert_eq!(reply["install_reused"], false, "{reply}");
-        assert!(reply["result"]["warnings"].to_string().contains("missing_image"), "{reply}");
+        assert_eq!(reply["install_reused"], true, "{reply}");
+        let warnings = &reply["result"]["warnings"];
+        assert_eq!(warnings[0]["code"], "missing_image", "{reply}");
+        if let Some(installs) = first { assert_eq!(reply["installs"], installs, "{reply}"); }
+        else { first = reply["installs"].as_u64(); }
         assert_eq!(std::fs::read(path).unwrap(), magenta);
     }
     // Repair, edit and remove the file without reopening the document.
@@ -632,6 +681,89 @@ fn sampled_sources_match_ordinary_renders_and_never_cache_missing_images() {
     assert_eq!(reply["install_reused"], true, "{reply}");
     assert_eq!(std::fs::read(root.join("unused-session.png")).unwrap(), expected);
     assert_eq!(session.send(serde_json::json!({"id":111,"op":"close"}))["ok"], true);
+    assert!(session.child.wait().unwrap().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn canvas_repeats_install_warnings_and_resamples_keyed_paint_warnings() {
+    use serde_json::{Value, json};
+
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") {
+        eprintln!("SKIP GPU session test: set VORK_GPU_TESTS=1 on a supported GPU");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("vork-session-warnings-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let root = root.as_path();
+    let document = json!({
+        "version": 2, "composition": {"space": "2d"},
+        "render": {"resolution": [32, 24], "duration": 2, "fps": 2},
+        "images": {"static": {"file": "static.png"}, "keyed": {"file": "keyed.png"}},
+        "nodes": [
+            {"type": "path", "name": "static", "d": "M0 0H16V24H0Z", "fill": {"image": "static", "fit": "fill"}},
+            {"type": "path", "name": "keyed", "d": "M16 0H32V24H16Z", "fill": "lime"}
+        ],
+        "animation": [{"tracks": [{"path": ["nodes", "keyed", "fill"], "interpolation": "STEP",
+            "keys": [[0, "lime"], [1, {"image": "keyed", "fit": "fill"}]]}]}]
+    });
+    let read_warnings = |name: &str| -> Value {
+        let bytes = std::fs::read(root.join(format!("{name}.png.meta.json"))).unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["warnings"].clone()
+    };
+    let fresh = [cold_with(root, &document, "early", &["--at", "0"]),
+                 cold_with(root, &document, "late", &["--at", "1"])];
+    let fresh_warnings = [read_warnings("early"), read_warnings("late")];
+    assert_eq!(fresh_warnings[0].as_array().unwrap().len(), 1);
+    assert_eq!(fresh_warnings[1].as_array().unwrap().len(), 2);
+    assert_eq!(fresh_warnings[0][0], fresh_warnings[1][0]);
+    assert_eq!(fresh_warnings[1][1]["requested"]["file"], root.join("keyed.png").to_str().unwrap());
+    assert_ne!(fresh[0], fresh[1]);
+
+    let mut session = Session::start();
+    assert_eq!(session.open(0, &document, root)["ok"], true);
+    for (id, sample) in [1, 1, 0, 0, 1].into_iter().enumerate() {
+        let name = format!("look-{id}");
+        let out = root.join(format!("{name}.png"));
+        let reply = session.send(json!({"id": id + 1, "op": "render", "out": out,
+            "at": sample, "profile": "std/draft", "set": {"samples": 1, "denoise": false}}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["install_reused"], id != 0, "{reply}");
+        assert_eq!(reply["installs"], 1, "{reply}");
+        assert_eq!(reply["result"]["warnings"], fresh_warnings[sample], "{reply}");
+        assert_eq!(read_warnings(&name), fresh_warnings[sample]);
+        assert_eq!(std::fs::read(out).unwrap(), fresh[sample]);
+    }
+    // The next look adopts the restored still at the same published revision.
+    std::fs::copy(root.join("early.png"), root.join("static.png")).unwrap();
+    let repaired = cold_with(root, &document, "repaired", &["--at", "0"]);
+    let out = root.join("look-repaired.png");
+    let reply = session.render(10, &out);
+    assert_eq!(reply["installs"], 2, "{reply}");
+    assert_eq!(reply["result"]["warnings"], json!([]), "{reply}");
+    assert_eq!(std::fs::read(out).unwrap(), repaired);
+
+    // A changed open prepares at zero. Its keyed warning belongs to frame zero,
+    // while the first requested look at time one still receives the install warning.
+    let mut changed = document;
+    changed["images"]["static"]["file"] = "other.png".into();
+    changed["animation"][0]["tracks"][0]["keys"] =
+        json!([[0, {"image": "keyed", "fit": "fill"}], [1, "lime"]]);
+    let fresh = cold_with(root, &changed, "changed", &["--at", "1"]);
+    let fresh_warnings = read_warnings("changed");
+    assert_eq!(fresh_warnings.as_array().unwrap().len(), 1);
+    assert_eq!(fresh_warnings[0]["requested"]["file"], root.join("other.png").to_str().unwrap());
+    let opened = session.open(11, &changed, root);
+    assert_eq!(opened["reuse"], "reinstalled", "{opened}");
+    let out = root.join("look-changed.png");
+    let reply = session.send(json!({"id": 12, "op": "render", "out": out,
+        "at": 1, "profile": "std/draft", "set": {"samples": 1, "denoise": false}}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["install_reused"], true, "{reply}");
+    assert_eq!(reply["installs"], 3, "{reply}");
+    assert_eq!(reply["result"]["warnings"], fresh_warnings, "{reply}");
+    assert_eq!(std::fs::read(out).unwrap(), fresh);
+    assert_eq!(session.send(json!({"id": 13, "op": "close"}))["ok"], true);
     assert!(session.child.wait().unwrap().success());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -1160,6 +1292,9 @@ fn rejected_open_replays_keyed_fonts() {
         let mut session = Session::start();
         let opened = session.open(1,&doc,&root);
         assert_eq!(opened["ok"],true,"{opened}");
+        let questions = serde_json::json!([{"text":"inputs","read":"size"}]);
+        let published = session.send(serde_json::json!({"id":10,"op":"ask","questions":questions}));
+        assert_eq!(published["ok"], true, "{published}");
         session.render(2,&root.join("large.png"));
         std::fs::write(root.join("keyed.ttf"),regular).unwrap();
         assert_ne!(small,cold_with(&root,&doc,"replacement-small",&["--set","resolution=64x32"]));
@@ -1168,6 +1303,17 @@ fn rejected_open_replays_keyed_fonts() {
             "profile":"std/draft","set":{"samples":1,"denoise":false,"resolution":"64x32"}}));
         assert_eq!(result["ok"],true,"{result}");
         assert_eq!(small,std::fs::read(root.join("small.png")).unwrap());
+        let held = session.send(serde_json::json!({"id":11,"op":"ask","questions":questions}));
+        assert_eq!(held["ok"], true, "{held}");
+        assert_eq!(held["revision"], published["revision"]);
+        assert_eq!(held["answers"], published["answers"]);
+
+        let reopened = session.open(12, &doc, &root);
+        assert_eq!(reopened["ok"], true, "{reopened}");
+        let replacement = session.send(serde_json::json!({"id":13,"op":"ask","questions":questions}));
+        assert_eq!(replacement["ok"], true, "{replacement}");
+        assert_eq!(replacement["revision"], reopened["revision"]);
+        assert_ne!(replacement["answers"], published["answers"]);
         session.send(serde_json::json!({"id":5,"op":"close"}));
         assert!(session.child.wait().unwrap().success());
     }
@@ -1227,4 +1373,384 @@ fn rejected_open_replays_executable_relative_filmic_lut() {
     session.send(serde_json::json!({"id":5,"op":"close"}));
     assert!(session.child.wait().unwrap().success());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ambient_colour_fonts_refresh_the_picture_and_the_query_together() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+    let directory = std::env::temp_dir().join(format!("vork-ambient-fonts-{}", std::process::id()));
+    let root = directory.as_path();
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(root.join("declared.ttf"), include_bytes!("../../vork-std/tests/fonts/LiberationSans-Regular.ttf")).unwrap();
+    let doc = json!({"version":2,"composition":{"space":"2d"},"render":{"resolution":[128,128]},
+        "nodes":[{"type":"text","name":"tick","content":"✅","font":"declared.ttf","font-size":64}]});
+    let fallback = root.join("fallback");
+    let system = root.join("system");
+    for dir in [&fallback, &system] { std::fs::create_dir(dir).unwrap(); }
+    let config = root.join("fonts.conf");
+    std::fs::write(&config, format!("<fontconfig><dir>{}</dir></fontconfig>", system.display())).unwrap();
+    let start = || {
+        let mut command = Command::new(binary());
+        command.env("FONTCONFIG_FILE", &config).env("MODA_DEGRADED_FONTS_DIR", &fallback);
+        let mut worker = Session::command(command);
+        let reply = worker.open(1, &doc, root);
+        assert_eq!(reply["ok"], true, "{reply}");
+        worker
+    };
+    let ask = |worker: &mut Session| {
+        let reply = worker.send(json!({"id":2,"op":"ask","questions":[{"text":"tick","read":"size"}]}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        reply["answers"].clone()
+    };
+    let close = |mut worker: Session| {
+        worker.send(json!({"id":9,"op":"close"}));
+        assert!(worker.child.wait().unwrap().success());
+    };
+    for dir in [&fallback, &system] {
+        let path = dir.join("ambient.ttf");
+        std::fs::write(&path, include_bytes!("../../moda-text/tests/fonts/colour/Narrow.ttf")).unwrap();
+        let mut kept = start();
+        kept.render(3, &root.join("before.png"));
+        let before = ask(&mut kept);
+        std::fs::write(&path, include_bytes!("../../moda-text/tests/fonts/colour/Wide.ttf")).unwrap();
+        assert_eq!(ask(&mut kept), before);
+        kept.render(4, &root.join("kept.png"));
+        let mut fresh = start();
+        fresh.render(5, &root.join("fresh.png"));
+        let after = ask(&mut fresh);
+        assert_ne!(before, after);
+        assert_eq!(ask(&mut kept), after);
+        let after = std::fs::read(root.join("fresh.png")).unwrap();
+        assert_ne!(std::fs::read(root.join("before.png")).unwrap(), after);
+        assert_eq!(std::fs::read(root.join("kept.png")).unwrap(), after);
+        close(kept);
+        close(fresh);
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn query_only_asset_keeps_the_actual_read_error_until_the_next_look() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+    let directory = std::env::temp_dir().join(format!("vork-query-failure-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let root = directory.as_path();
+    let file = root.join("plate.png");
+    let scene = json!({"version":2,"composition":{"space":"2d"},"render":{"resolution":[32,32]},
+        "images":{"plate":{"file":"plate.png"}},"nodes":[{"type":"path","d":"M0 0H32V32Z","fill":"red"}]});
+    let mut kept = Session::start();
+    assert_eq!(kept.open(1, &scene, root)["ok"], true);
+    let info = |worker: &mut Session| {
+        let answer = worker.send(json!({"op":"ask","questions":[{"image":"plate","read":"info"}]}));
+        assert_eq!(answer["ok"], false);
+        answer["error"].as_str().unwrap().to_owned()
+    };
+    let missing = info(&mut kept);
+    assert!(missing.contains(file.to_str().unwrap()));
+    std::fs::create_dir(&file).unwrap();
+    assert_eq!(info(&mut kept), missing);
+    kept.render(2, &root.join("refresh.png"));
+    let mut fresh = Session::start();
+    assert_eq!(fresh.open(3, &scene, root)["ok"], true);
+    let directory = info(&mut fresh);
+    assert_ne!(directory, missing);
+    assert!(directory.contains(file.to_str().unwrap()));
+    assert_eq!(info(&mut kept), directory);
+    for mut worker in [kept, fresh] {
+        drop(worker.child.stdin.take());
+        assert!(worker.child.wait().unwrap().success());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn canvas_asks_follow_successful_refreshes_and_replay_rejected_inputs() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+
+    const LANDSCAPE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x10\x00\x00\x00\x08\x08\x02\x00\x00\x00\x7f\x14\xe8\xc0\x00\x00\x00\x14\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\x40\x12\x22\x4d\xf5\xa8\x06\x22\x11\x00\x24\xc6\x7f\x81\xde\x4a\x7d\xa2\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    const PORTRAIT: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x08\x00\x00\x00\x10\x08\x02\x00\x00\x00\xa4\xe8\xa9\x2a\x00\x00\x00\x12\x49\x44\x41\x54\x78\x9c\x63\x60\x60\xf8\x8f\x03\x8d\x4a\x0c\x80\x04\x00\x23\xdd\x7f\x81\x27\xb2\xf1\xd3\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    const SQUARE: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x0c\x00\x00\x00\x0c\x08\x02\x00\x00\x00\xd9\x17\xcb\xb0\x00\x00\x00\x12\x49\x44\x41\x54\x78\x9c\x63\x60\xf8\xcf\x40\x18\x8d\x2a\x1a\x8c\x8a\x00\x6c\x20\x8f\x71\xf6\x00\xce\x6f\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    for with_program in [false, true] {
+        let directory = std::env::temp_dir().join(format!("vork-session-fresh-{}-{with_program}", std::process::id()));
+        let root = directory.as_path();
+        std::fs::create_dir_all(root).unwrap();
+        let write = |png| {
+            std::fs::write(root.join("plate.png"), png).unwrap();
+            std::fs::write(root.join("spare.png"), png).unwrap();
+        };
+        let mut doc = json!({
+            "version":2, "composition":{"space":"2d"}, "render":{"resolution":[32,32]},
+            "images":{"paint":{"file":"plate.png"}, "unused":{"file":"spare.png"}},
+            "nodes":[{"type":"path","d":"M0 0H32V32H0Z","fill":{"image":"paint","fit":"contain"}}],
+        });
+        if with_program { doc["programs"] = json!({"authored":{"source":"import vork;"}}); }
+        let mut worker = Session::start();
+        let ask = |worker: &mut Session, id, revision, width, height| {
+            let reply = worker.send(json!({"id":id,"op":"ask","questions":[
+                {"image":"paint","read":"info"}, {"image":"unused","read":"info"}
+            ]}));
+            assert_eq!(reply["revision"], revision, "{reply}");
+            assert_eq!(reply["answers"], json!([
+                {"width":width,"height":height}, {"width":width,"height":height}
+            ]), "{reply}");
+        };
+
+        write(LANDSCAPE);
+        assert_eq!(worker.open(1, &doc, root)["ok"], true);
+        ask(&mut worker, 2, 1, 16, 8);
+        let red = root.join("red.png");
+        assert_eq!(worker.render(3, &red)["revision"], 1);
+
+        write(PORTRAIT);
+        ask(&mut worker, 4, 1, 16, 8);
+        let blue = root.join("blue.png");
+        assert_eq!(worker.render(5, &blue)["revision"], 1);
+        ask(&mut worker, 6, 1, 8, 16);
+        assert_ne!(std::fs::read(red).unwrap(), std::fs::read(&blue).unwrap());
+
+        write(SQUARE);
+        assert_eq!(worker.open(7, &json!({"version":0}), root)["ok"], false);
+        ask(&mut worker, 8, 1, 8, 16);
+        let replay = root.join("replay.png");
+        assert_eq!(worker.render(9, &replay)["revision"], 1);
+        assert_eq!(std::fs::read(replay).unwrap(), std::fs::read(blue).unwrap());
+
+        assert_eq!(worker.open(10, &doc, root)["ok"], true);
+        ask(&mut worker, 11, 2, 12, 12);
+        if !with_program {
+            let before = root.join("before-unused-change.png");
+            worker.render(12, &before);
+            std::fs::write(root.join("spare.png"), PORTRAIT).unwrap();
+            let after = root.join("after-unused-change.png");
+            let refreshed = worker.render(13, &after);
+            assert_eq!(refreshed["revision"], 2);
+            assert_eq!(refreshed["install_reused"], true, "{refreshed}");
+            assert_eq!(std::fs::read(before).unwrap(), std::fs::read(after).unwrap());
+            let reply = worker.send(json!({"id":14,"op":"ask","questions":[
+                {"image":"paint","read":"info"}, {"image":"unused","read":"info"}
+            ]}));
+            assert_eq!(reply["revision"], 2);
+            assert_eq!(reply["answers"], json!([
+                {"width":12,"height":12}, {"width":8,"height":16}
+            ]));
+        }
+
+        assert_eq!(worker.send(json!({"id":15,"op":"close"}))["ok"], true);
+        assert!(worker.child.wait().unwrap().success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Run from the crate directory with the checked-in Water assets staged.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+#[ignore = "requires an isolated 32 GiB Linux/glibc L4 host and a cold driver cache"]
+fn water_finishes_all_four_profiles_in_one_session() {
+    fn idle_anon_kib(session: &Session, step: &str) -> u64 {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let mut stable_since = started;
+        let mut low = u64::MAX;
+        let mut high = 0;
+        let rollup_path = format!("/proc/{}/smaps_rollup", session.child.id());
+        loop {
+            let rollup = std::fs::read_to_string(&rollup_path).unwrap();
+            let kib: u64 = rollup.lines().find_map(|line| line.strip_prefix("Anonymous:"))
+                .unwrap().split_whitespace().next().unwrap().parse().unwrap();
+            let now = Instant::now();
+            low = low.min(kib);
+            high = high.max(kib);
+            if high - low > 16 * 1024 {
+                stable_since = now;
+                low = kib;
+                high = kib;
+            }
+            // Give deferred compilation time to retire, then require a stable RSS band.
+            if now - started >= Duration::from_secs(10) && now - stable_since >= Duration::from_secs(3) {
+                eprintln!("{step}: settled anonymous RSS {kib} KiB");
+                return kib;
+            }
+            assert!(now - started < Duration::from_secs(60),
+                "{step}: anonymous RSS did not settle within 60 s (last sample {kib} KiB)");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let scene = Path::new("../../examples/water/scene.json").canonicalize().unwrap();
+    let output = std::env::temp_dir().join(format!("vork-session-water-{}", std::process::id()));
+    std::fs::create_dir(&output).unwrap();
+    let mut command = Command::new(binary());
+    for variable in ["VORK_CACHE_DIR", "XDG_CACHE_HOME", "CUDA_CACHE_PATH", "__GL_SHADER_DISK_CACHE_PATH"] {
+        let cache = output.join(variable);
+        std::fs::create_dir(&cache).unwrap();
+        command.env(variable, cache);
+    }
+    let mut session = Session::command(command);
+    let opened = session.send(serde_json::json!({"id": "open", "op": "open", "scene": scene}));
+    assert_eq!(opened["ok"], true, "{opened}");
+    let opened_kib = idle_anon_kib(&session, "open");
+    // Cold L4 open retained 0.44 GiB with trimming and nearly 5 GiB without.
+    assert!(opened_kib <= 2 * 1024 * 1024, "open: anonymous RSS {opened_kib} KiB after reply");
+    for profile in ["path", "previs", "draft", "final"] {
+        let picture = output.join(format!("{profile}.png"));
+        let reply = session.send(serde_json::json!({
+            "id": profile, "op": "render", "profile": format!("std/{profile}"),
+            "at": 0, "out": picture, "set": {
+                "resolution": "160x90", "samples": 2, "seed": 17, "denoise": false
+            }
+        }));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["device_reused"], true, "{reply}");
+        assert_eq!(reply["result"]["frames"], 1, "{reply}");
+        assert!(picture.metadata().unwrap().len() > 0);
+        // Cold Water grew by 20 GiB across installs on a base that survived
+        // the switch. Allow 4 GiB above this device's own open measurement.
+        let idle_kib = idle_anon_kib(&session, profile);
+        assert!(idle_kib <= opened_kib + 4 * 1024 * 1024,
+            "std/{profile}: anonymous RSS {idle_kib} KiB after reply, opened at {opened_kib} KiB");
+    }
+    session.send(serde_json::json!({"id":"close","op":"close"}));
+    assert!(session.child.wait().unwrap().success());
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+/// An earlier missing lookup can become the import a canvas graph uses.
+#[test]
+fn canvas_program_repeat_observes_shadowed_imports_and_replays_refused_edits() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+    let directory = std::env::temp_dir().join(format!("vork-session-canvas-import-{}", std::process::id()));
+    let root = directory.as_path();
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/wrapper.slang"), "import helper; public float wrapped(){return value();}").unwrap();
+    let module = |value| format!("public float value(){{return {value};}}");
+    let helper = root.join("helper.slang");
+    let shadow = root.join("sub/helper.slang");
+    std::fs::write(&helper, module("0.25")).unwrap();
+    let doc = json!({"version":2,"composition":{"space":"2d","compositor":["paint"]},
+        "render":{"resolution":[32,32]},"nodes":[],
+        "materials":{"paint":{"program":{"source":"import sub.wrapper; struct Inputs {}; float4 composite(CompositeContext c, Inputs i){return float4(wrapped(),0.,0.,1.);}"}}}});
+    let path = root.join("kept.png");
+    let mut session = Session::start();
+    assert_eq!(session.open(1, &doc, root)["ok"], true);
+    let check = |session: &mut Session, id, reused: bool, fresh: &[u8]| {
+        let reply = session.render(id, &path);
+        assert_eq!(reply["install_reused"], reused, "{reply}");
+        assert_eq!(std::fs::read(&path).unwrap(), fresh);
+    };
+    let original = cold(root, &doc, "original");
+    session.render(2, &path);
+    check(&mut session, 3, true, &original);
+    std::fs::write(&shadow, module("0.75")).unwrap();
+    let after = cold(root, &doc, "shadow");
+    assert_ne!(original, after);
+    check(&mut session, 4, false, &after);
+    check(&mut session, 5, true, &after);
+    std::fs::write(&shadow, "INVALID MODULE").unwrap();
+    assert_eq!(session.open(6, &doc, root)["ok"], false);
+    check(&mut session, 7, true, &after);
+    std::fs::remove_file(shadow).unwrap();
+    check(&mut session, 8, false, &original);
+    assert_eq!(session.send(json!({"id":9,"op":"close"}))["ok"], true);
+    assert!(session.child.wait().unwrap().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn canvas_view_compiler_diagnostics_repeat_on_each_look() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+    let root = std::env::temp_dir().join(format!("vork-session-view-warning-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "#warning retained_view_diagnostic\nimport std.view; struct Inputs {}; ViewResult view(ViewContext c, Inputs i){return finish_view(c.color,c,1.);}";
+    let doc = json!({"version":2, "composition":{"space":"2d","view":{"program":{"source":source}}},
+        "render":{"resolution":[32,32]}, "nodes":[]});
+    let path = root.join("scene.json");
+    let png = root.join("fresh.png");
+    let log = root.join("worker.log");
+    std::fs::write(&path, doc.to_string()).unwrap();
+    let fresh = Command::new(binary()).arg("render").arg(&path).arg("--out").arg(&png)
+        .args(["--profile","std/draft","--set","samples=1","--set","denoise=false"]).output().unwrap();
+    assert!(fresh.status.success(), "{}", String::from_utf8_lossy(&fresh.stderr));
+    let count = |s: &str| s.lines().filter(|line| line.contains("retained_view_diagnostic")).count();
+    let expected = count(&String::from_utf8_lossy(&fresh.stderr));
+    assert!(expected > 0);
+    let mut command = Command::new(binary());
+    command.stderr(std::fs::File::create(&log).unwrap());
+    let mut session = Session::command(command);
+    assert_eq!(session.open(1, &doc, &root)["ok"], true);
+    let mut previous = count(&std::fs::read_to_string(&log).unwrap());
+    for id in [2, 3] {
+        let out = root.join(format!("look-{id}.png"));
+        session.render(id, &out);
+        let total = count(&std::fs::read_to_string(&log).unwrap());
+        assert_eq!(total - previous, expected);
+        assert_eq!(std::fs::read(out).unwrap(), std::fs::read(&png).unwrap());
+        previous = total;
+    }
+    assert_eq!(session.send(json!({"id":4,"op":"close"}))["ok"], true);
+    assert!(session.child.wait().unwrap().success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bundled_view_lookups_follow_the_installed_display_through_edit_and_replay() {
+    if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") { return; }
+    use serde_json::json;
+    for rollback in [false, true] {
+        let root = std::env::temp_dir().join(format!("vork-bundled-view-{}-{rollback}", std::process::id()));
+        std::fs::create_dir_all(root.join("std/std")).unwrap();
+        let mut doc = json!({"version":2, "composition":{"space":"2d"}, "render":{"resolution":[32,32]},
+            "nodes":[{"name":"box","type":"path","fill":"red","d":"M2 2H29V29H2Z"}]});
+        if rollback { doc["images"] = json!({"unused":{"file":"query.png"}}); }
+        let start = || {
+            let mut command = Command::new(binary());
+            command.current_dir(&root);
+            Session::command(command)
+        };
+        let look = |session: &mut Session, id: u32, file: &str| {
+            let reply = session.send(json!({"op":"render","id":id,"out":[{"file":root.join(file),"display":"Display P3"}]}));
+            assert_eq!(reply["ok"], true, "{reply}");
+            reply
+        };
+        let mut worker = start();
+        assert_eq!(worker.open(1, &doc, &root)["ok"], true);
+        let srgb = root.join("srgb.png");
+        worker.render(2, &srgb);
+        if rollback {
+            std::fs::copy(&srgb, root.join("query.png")).unwrap();
+            assert_eq!(worker.open(3, &json!({"version":0}), &root)["ok"], false);
+        }
+        look(&mut worker, 4, "first-p3.png");
+        if rollback {
+            std::fs::remove_file(root.join("query.png")).unwrap();
+        } else {
+            // A row edit can keep the GPU target, including its previously compiled display.
+            doc["nodes"][0]["fill"] = "blue".into();
+            assert_eq!(worker.open(5, &doc, &root)["ok"], true);
+        }
+        // The bundled view probes this path before using its supplied std.view.
+        // A directory changes the lookup result while leaving that module usable.
+        std::fs::create_dir(root.join("std/std/view.slang-module")).unwrap();
+        assert_eq!(look(&mut worker, 6, "changed.png")["install_reused"], false);
+        assert_eq!(look(&mut worker, 7, "repeat.png")["install_reused"], true);
+        let mut fresh = start();
+        assert_eq!(fresh.open(1, &doc, &root)["ok"], true);
+        look(&mut fresh, 2, "fresh.png");
+        for file in ["changed.png", "repeat.png"] {
+            assert_eq!(std::fs::read(root.join(file)).unwrap(), std::fs::read(root.join("fresh.png")).unwrap());
+        }
+        for worker in [&mut worker, &mut fresh] {
+            assert_eq!(worker.send(json!({"id":8,"op":"close"}))["ok"], true);
+            assert!(worker.child.wait().unwrap().success());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

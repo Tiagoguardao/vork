@@ -9,6 +9,7 @@ pub mod boolean_node;
 pub mod corner_smoothing;
 pub mod rect_corners;
 pub mod defaults;
+pub mod dash;
 pub mod display_list;
 pub mod effect;
 // Shared distort homography math (TS projectiveTransform.ts mirror) — used by

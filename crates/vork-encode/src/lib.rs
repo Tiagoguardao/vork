@@ -47,7 +47,7 @@ pub fn validate_video_output(path: &Path) -> Result<Vec<u8>> {
     // Linux native NVENC still requires FFmpeg as a muxer. Windows needs a
     // usable software fallback even if its FFmpeg advertises NVENC.
     if cfg!(target_os = "windows") { return require_ffmpeg_encoder("libx264"); }
-    let output = Command::new("ffmpeg").arg("-version").stdin(Stdio::null()).output()
+    let output = vork_inputs::tool_output("ffmpeg", &["-version"])
         .with_context(|| format!("video output needs ffmpeg on PATH: {FFMPEG_REQUIREMENT}"))?;
     ensure!(output.status.success(), "ffmpeg on PATH is unusable: {FFMPEG_REQUIREMENT}");
     let mut identity = output.stdout;
@@ -398,7 +398,7 @@ impl PreparedEncoder {
 /// probe for setup and output selection. Native Linux NVENC has a separate ABI.
 pub fn probe_ffmpeg_nvenc(width: u32, height: u32) -> Result<()> {
     // Driver limits depend on the requested dimensions, including at 8K.
-    let output = Command::new("ffmpeg")
+    let output = vork_inputs::tool_command("ffmpeg")
         .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i",
             &format!("color=size={width}x{height}"),
             "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"])
@@ -456,10 +456,7 @@ fn readback_codec(backend: Backend, width: u32, height: u32, path: &Path, device
 
 // Check before opening the rawvideo pipe so codec errors retain their cause.
 fn require_ffmpeg_encoder(codec: &str) -> Result<Vec<u8>> {
-    let output = Command::new("ffmpeg")
-        .arg("-encoders")
-        .stdin(Stdio::null())
-        .output()
+    let output = vork_inputs::tool_output("ffmpeg", &["-encoders"])
         .with_context(|| format!("query ffmpeg encoders: {FFMPEG_REQUIREMENT}"))?;
     validate_ffmpeg_encoder(output.status.success(), &output.stdout, codec)?;
     // The banner includes the runtime library versions as well as the build.
@@ -581,7 +578,7 @@ impl Encoder {
         let path = path.as_ref().to_owned();
         #[cfg(target_os = "linux")]
         {
-            let output = Command::new("ffmpeg").arg("-version").output()
+            let output = vork_inputs::tool_output("ffmpeg", &["-version"])
                 .context("Linux video output needs ffmpeg on PATH, including MP4 with native NVENC (ffmpeg muxes H.264). Install it with: sudo apt install ffmpeg")?;
             ensure!(output.status.success(), "ffmpeg on PATH is unusable; install ffmpeg (sudo apt install ffmpeg). Linux MP4 needs ffmpeg even with NVENC");
         }

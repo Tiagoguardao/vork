@@ -1,6 +1,6 @@
 NODES
-A field path names one object, not its table: `vork help field node.font-size`, never nodes.font-size
-(the table is scene.nodes). A node type's fields are flat siblings of `type`, addressed as node.NAME.
+Look up a node field with `vork help field node.font-size`. Type-specific fields
+are flat siblings of `type`; type: node has only common fields.
 `vork help text`, `vork help path`, `vork help mesh`, `vork help camera`, `vork help light` and
 `vork help asset` list one type's fields; `vork help composition` lists the canvas's.
 Canvas fields (`vork help field PATH`): composition.space, composition.viewBox, node.d, node.fill, node.stroke,
@@ -10,8 +10,8 @@ Visibility per ray type is ANDed with ancestors. pass_index is inherited; otherw
 are assigned stably in meta.json (0 = background).
 Assets load .glb/.gltf. Imported names: asset/node-name or asset/#index.
 Imported joints are not target, focus or attachment addresses.
-glTF hierarchies must be acyclic, including nodes outside the selected scene.
-A cycle fails import with its node index; repair child references or re-export.
+Keep even unselected glTF nodes acyclic; repair child references at the reported node index
+or re-export.
 
 <!-- all -->
 Painted backdrops: disable visible_shadow; disable other ray visibility when the card should appear only to the camera.
@@ -23,10 +23,7 @@ FROM BLENDER
   CUBICSPLINE with [t,v] keys.
   std/openpbr: glass tint is transmission_color and SSS colour is subsurface_color (base_color tints
   neither); specular_weight 1 = Blender Specular IOR Level 0.5; thin_film_thickness is micrometres.
-  An RGB render.background is camera-only; light the scene with an environment light.
-  Path glass transmission sees the environment, including straight-through thin glass;
-  opacity passthrough keeps the camera background (RGB or transparent).
-  The std/sky shader supplies atmospheric radiance. vork std sky returns that atmosphere plus
-  an ordinary declared sun light, which lights the scene and casts shadows.
+  Path glass, including straight-through thin panes, sees the environment; opacity
+  passthrough keeps the camera background. For Blender sky/sun see vork help lights.
   view_normal is camera space (Blender Normal: world space); motion
   is current-minus-previous with +Y down (Blender Vector: previous-minus-current).

@@ -172,7 +172,7 @@ pub(crate) fn prepare(
     )
     .with_context(|| format!("composition.view: program {name}"))?;
     if !program.warnings.trim().is_empty() {
-        eprintln!("{}", program.warnings.trim());
+        crate::warnings::diagnostic(program.warnings.trim());
     }
     let mut values = display
         .inputs
@@ -217,7 +217,9 @@ pub(crate) fn prepare(
                 v2::diagnostics::unknown("image", &binding.image, scene.images.keys().map(String::as_str))))?;
             let file = image.file.as_ref().with_context(|| format!("input {input}: image {} is a render image; display programs read file images", binding.image))?;
             let path = base.join(file);
-            let bytes = std::fs::read(&path).with_context(|| format!("read image {}", path.display()))?;
+            let file = opened.files.source(&path);
+            let bytes = file.read().with_context(|| format!("read image {}", file.name.display()))?;
+            let path = file.name;
             ImageSource::File { image: Some(binding.image.clone()), path, bytes, srgb: image.is_srgb(), color_space: image.color_space }
         };
         sources.push(source);
@@ -903,6 +905,9 @@ impl ErrorWord {
     pub(crate) fn buffer(&self) -> &wgpu::Buffer { &self.errors }
     /// Wait for the step's last run and refuse an unusable result: for a picture with no collection point of its own.
     pub(crate) fn check(&self, r: &Renderer) -> Result<()> {
+        refuse(self.read(r)?)
+    }
+    pub(crate) fn read(&self, r: &Renderer) -> Result<u32> {
         let mut encoder = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("canvas picture check") });
         encoder.copy_buffer_to_buffer(&self.errors, 0, &self.readback, 0, 4);
         let submission = r.queue.submit([encoder.finish()]);
@@ -912,7 +917,7 @@ impl ErrorWord {
         receiver.recv().context("canvas picture error readback")??;
         let code = { let mapped = self.readback.get_mapped_range(..); u32::from_le_bytes(mapped[..4].try_into().expect("four bytes")) };
         self.readback.unmap();
-        refuse(code)
+        Ok(code)
     }
 }
 

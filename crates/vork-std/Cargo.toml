@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vork-inputs = { path = "../vork-inputs" }
 vork-scene = { path = "../vork-scene" }
 # Text layout and glyph outlines: Moda's text engine (crates/moda-text), shared with the 2D canvas.
 moda-text = { path = "../moda-text" }

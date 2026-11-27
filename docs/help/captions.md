@@ -1,25 +1,17 @@
 CAPTIONS
-Convert transcript timing in authoring code; text uses the same tracks as other
-canvas content. Use STEP keys for node.content. At each cue's start, key its text;
-at its end, key an empty string. At an adjacent boundary, write the incoming
-text once at that time. Keys must increase; do not emit two keys at a shared
-boundary. Include an empty key at zero when the first cue starts later.
+Use STEP keys on node.content. Key cue text at its start and "" at its end.
+At a shared boundary key only the incoming text. If the first cue starts after
+zero, key "" at zero.
 
-SRT timestamps are integer milliseconds: serialize ms as "ms/1000" seconds.
-This preserves the cue's instant independently of render FPS. A cue between
-frames appears on the first sampled frame at or after its start and disappears
-on the first at or after its end. Set white-space to pre-line to keep explicit
-line breaks; width controls wrapping. Fonts are explicit .ttf/.otf files.
-For repeatable emoji artwork, include a colour face in the font list, for example
-["CaptionSans.ttf", "NotoColorEmoji.ttf"]. Canvas tries the base character's font list in order for
-the complete sequence, then looks for a fallback colour face. The selected
-artwork supplies the advance and the visible bounds used for glyph animation.
+Write SRT milliseconds as "ms/1000" seconds. Cue times are independent of FPS; for local clocks see vork help sequences. A cue appears/disappears on the first
+frame at or after its start/end. Use white-space: pre-line to keep explicit breaks;
+width wraps the text. Fonts are explicit .ttf/.otf files. For repeatable emoji,
+include a colour face in the font list, e.g. ["CaptionSans.ttf","NotoColorEmoji.ttf"]. Canvas tries the base character's font
+list in order for the complete sequence, then a fallback colour face. The chosen
+artwork supplies advance and visible glyph animation bounds.
 
-Example: examples/animation-recipes/captions.py reads plain UTF-8 SRT, preserves
-multiline cues, clears gaps, and emits one text node and a STEP content track.
-It accepts BOM and CRLF; malformed timing, nonpositive durations, unordered or
-overlapping cues refuse. SRT markup stays literal. For overlapping speakers,
-use separate text nodes/tracks and give each a separate position. This example
-does not transcribe audio, infer word timing or paginate cues.
-Generation and render commands: examples/animation-recipes/README.md.
-Text controls: vork help text. Windows and local clocks: vork help sequences.
+examples/animation-recipes/captions.py converts UTF-8 SRT (BOM/CRLF accepted) into
+one text node and STEP track. It does not transcribe, infer word times or paginate. It keeps multiline cues and markup literal, clears
+gaps and rejects malformed, nonpositive, unordered or overlapping cues. For
+overlapping speakers, use separate positioned nodes/tracks. Commands are in
+examples/animation-recipes/README.md. Fields: vork help text.

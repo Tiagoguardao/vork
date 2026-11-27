@@ -7,41 +7,38 @@ std/draft   quick       lighting previews           approximate GI, 4 samples
 std/final   moderate    delivery (default)          approximate GI, 8 samples
 std/path    slowest     interiors, glass, caustics  finite depth/budget, 64 samples
 
-Preview means std/previs; use the names above with --profile.
-Resolution does not change the per-pixel sample budget.
+Resolution leaves the per-pixel budget unchanged.
 
-std/previs: fast iteration on framing, materials and direct lighting. It omits general
-indirect bounce lighting; raster surfaces use central-emitter hard shadows. Broad-light
-highlights can narrow or change brightness; ray-camera effects can remain grainy.
-Judge the finished lighting with final or path.
+Previs omits general indirect bounces and uses central-emitter hard shadows.
+Broad-light highlights can narrow/change brightness and ray-camera effects can
+be grainy. Judge lighting with final or path.
 In std/previs, scalar std/openpbr geometry_opacity and alpha_cutoff use each
 material's raster coverage, retaining direct lighting and visible emission. Sampled coverage can make colour and outline-driving depth, normals and AOVs noisy at low sample counts. Bindings
 or animation of either input, and opacity combined with transmission, retain
 whole-view path transport until qualified. Other effects can also require path
 transport. The sample budget and denoise setting stay unchanged.
-Raster previs uses analytic lights and environment approximations. When emissive
-materials can light other surfaces, it enables low-sample raster ray lighting and
-warns that indirect light, reflections and transmission may be noisy or incomplete.
-When available, fast GPU denoising cleans up emissive previews; --set denoise=false
-retains the raw estimate. Use std/final for delivery or std/path for more complete light transport.
+Raster previs uses analytic lights and approximate environment lighting. Emissive lighting
+uses low-sample raster rays and warns of noisy or incomplete indirect light,
+reflections and transmission. Proven unlit displays and null thin transmission
+need no warning. Emissive previs uses fast GPU denoising when available; --set denoise=false
+keeps the raw estimate.
 Hair uses complete-camera path transport automatically, including render-image
 captures. Promoted views keep the sample budget and default to denoising;
 --set denoise=false turns it off. Glass and water retain final’s raster transport.
-std/draft: 4 samples with scene-ray indirect lighting and OIDN denoising.
-std/final: 8 samples, the default; scene-ray lighting and OIDN denoising.
+Draft and final use scene-ray indirect lighting.
 Final's approximate GI can omit bounced paths such as camera → diffuse → glossy → light.
 A custom surface material selects the older one-hit GI for the whole scene.
 More samples cannot recover omitted paths; choose --profile std/path for full bounce lighting.
-std/path: 64 samples, independent of denoise; full path transport.
+Path budget is independent of denoise.
 Previs, draft and final use a cheaper implicit-field boundary test; exact zero
 faces, edges and tangencies can differ. Use path to judge those shapes.
 Views promoted to path transport retain the exact boundary test.
 Draft, final and path denoise with bundled OIDN by default. --set denoise=false uses the profile
 reconstruction (raw path samples for path); --set seed=42 makes sampling repeatable with
 unchanged evaluated scene inputs, frame identity, render settings and backend.
-Reauthoring a pose can change its floating-point transform and resulting image.
-The same machine, build and inputs produce identical pictures; different GPU models or driver versions can produce slight numerical differences that are not visible, so compare against references made on the same hardware; the operating system does not matter.
---set samples=N overrides the profile budget (1..4096); more samples means cleaner and slower.
+Compare on the same machine and build. Reauthoring a pose can change its float
+transform; other GPUs/drivers can change numeric results.
+--set samples=N overrides the budget (1..4096); more samples reduce noise at a time cost.
 Small text, thin geometry and subpixel bevel highlights can need extra camera samples;
 see vork help geometry for the spatial sampling limits.
 Without a fast GPU denoiser, draft and final announce it and use 16 and 32 undenoised samples;

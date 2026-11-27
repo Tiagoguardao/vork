@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     io::{BufReader, Read},
     path::Path,
-    process::{ChildStdout, Command, Stdio},
+    process::{ChildStdout, Stdio},
     sync::{Arc, Mutex},
 };
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -218,15 +218,14 @@ impl Source {
         }
         // The user's decoder is a separate executable, never linked or bundled.
         let probe = revision
-            .input(Command::new("ffprobe").args([
+            .probe(&[
                 "-v",
                 "error",
                 "-show_entries",
                 "stream=codec_type,channels,time_base,duration:stream_disposition=attached_pic:format=format_name",
                 "-of",
                 "json",
-            ]))?
-            .output()
+            ])
             .context("audio: install ffmpeg and ffprobe to decode this file")?;
         ensure!(
             probe.status.success(),
@@ -307,7 +306,7 @@ impl Source {
             );
             return Ok(Stream::Wav(reader));
         }
-        let mut decoder = Command::new("ffmpeg");
+        let mut decoder = vork_media::tool_command("ffmpeg");
         decoder.args(["-v", "error", "-nostdin"]);
         if self.picture.is_some() {
             decoder.arg("-copyts");
@@ -667,7 +666,7 @@ mod tests {
     #[ignore = "requires user-installed ffmpeg and ffprobe"]
     fn short_packet_gap_is_silent_on_the_picture_timeline() -> Result<()> {
         let path = std::env::temp_dir().join(format!("vork-audio-gap-{}.mkv", std::process::id()));
-        let status = Command::new("ffmpeg").args([
+        let status = std::process::Command::new("ffmpeg").args([
             "-v", "error", "-y", "-f", "lavfi", "-i", "color=s=16x16:r=24:d=1",
             "-f", "lavfi", "-i", "aevalsrc=0.25:s=48000:d=1",
             "-af", "asetnsamples=n=1024,aselect='not(eq(n,10))'",

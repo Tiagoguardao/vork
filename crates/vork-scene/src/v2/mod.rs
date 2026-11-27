@@ -22,7 +22,7 @@ pub mod text;
 pub mod time;
 mod validate;
 pub use animation::*;
-pub use canvas::{AspectRatio, Composition, DashArray, FillRule, Fit, ImagePaint, LineCap, LineJoin, NoDash, NoPaint, Paint, PaintLayer, PaintOrder, Space};
+pub use canvas::{AspectRatio, Composition, DashArray, FillRule, Fit, ImagePaint, MaterialPaint, LineCap, LineJoin, NoDash, NoPaint, Paint, PaintLayer, PaintOrder, Space};
 pub use text::{Content, Direction, FontFiles, FontStyle, FontWeight, FontWeightKeyword, LineBreak, LineHeight, LineHeightNormal, Run, TextAlign, TextUnit, UnitProperty, WhiteSpace, WordBreak, laid_out_runs, laid_out_text, transform_origin, unit_ranges};
 use anyhow::{Context, Result, bail, ensure};
 pub use constants::{OPENPBR, OPENPBR_TABLE};
@@ -74,9 +74,9 @@ pub struct Scene {
     /// Authored locations for diagnostics; never scene content or resource identity.
     #[serde(skip)]
     pub origins: std::collections::BTreeMap<String, Vec<String>>,
-    /// Files consumed while expanding native geometry, before typed admission.
+    /// Paths and byte digests consumed by native geometry expansion.
     #[serde(skip)]
-    pub expansion_files: std::collections::BTreeSet<std::path::PathBuf>,
+    pub expansion_files: std::collections::BTreeMap<std::path::PathBuf, [u8; 32]>,
     /// Private copies of executable-relative display data for an installed revision.
     #[serde(skip)]
     pub library_files: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
@@ -621,7 +621,7 @@ mod tests {
             (serde_json::json!({"version":2,"nodes":[camera,{"composition":{"space":"3d"}}]}), "scene.nodes[1].composition: a world inside a 3D world is not built yet; its nodes are already in the world"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"group"}]}), "scene.nodes[0]: type \"group\": use type \"node\" for a canvas group, or omit type"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[camera]}), "scene.nodes[0]: type \"camera\": a 2D canvas accepts node (group), text and path types; camera in a canvas is not built yet; put it in a world (composition {space: \"3d\"})"),
-            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":[{"content":"a","fill":{"program":"p"}}],"font":"a.ttf"}]}), "scene.nodes[0].content[0].fill: a program paint is not built yet; write a CSS colour or gradient, or {\"image\": name}"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":[{"content":"a","fill":{"program":"p"}}],"font":"a.ttf"}]}), "scene.nodes[0].content[0].fill: program paint is supported on paths only; for text write a CSS colour or gradient, or {\"image\": name}"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"background":[0,0,0]},"nodes":[text]}), "render.background: a 2D canvas's background is \"transparent\" or a CSS colour"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"camera":"c"},"nodes":[text]}), "render.camera: not built for a 2D canvas yet; a canvas takes render.resolution, fps, duration and background"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":"a","font":"a.ttf","white-space":"pre"}]}), "node \"\": white-space \"pre\" is not built yet; normal, nowrap and pre-line are"),

@@ -1,0 +1,139 @@
+{
+  "version": 2,
+  "composition": {
+    "space": "2d",
+    "viewBox": [
+      0,
+      0,
+      240,
+      160
+    ]
+  },
+  "render": {
+    "resolution": [
+      720,
+      480
+    ],
+    "background": "#e2d4bc",
+    "fps": 24,
+    "duration": 2
+  },
+  "programs": {
+    "bands": {
+      "file": "cloth.slang"
+    },
+    "taper": {
+      "file": "ink.slang"
+    }
+  },
+  "materials": {
+    "cloth": {
+      "program": "bands",
+      "inputs": {
+        "cut": 0.68
+      }
+    }
+  },
+  "nodes": [
+    {
+      "name": "portrait",
+      "type": "node",
+      "children": [
+        {
+          "name": "disc",
+          "type": "path",
+          "d": "M165 69A54 54 0 1 1 57 69A54 54 0 1 1 165 69Z",
+          "fill": "#d5a57b"
+        },
+        {
+          "name": "jacket",
+          "type": "path",
+          "d": "M51 163Q57 127 84 119L102 108L131 110L150 120Q167 124 186 163Z",
+          "fill": {
+            "material": "cloth"
+          }
+        },
+        {
+          "name": "neck",
+          "type": "path",
+          "d": "M103 88L127 84L129 114L114 131L99 116Z",
+          "fill": "#b56d55"
+        },
+        {
+          "name": "face",
+          "type": "path",
+          "d": "M85 55Q86 29 118 31Q146 33 145 59L143 71L151 84L144 87Q141 106 126 107Q100 102 91 82Z",
+          "fill": "#e6ab81"
+        },
+        {
+          "name": "hair",
+          "type": "path",
+          "d": "M84 85Q74 76 78 61Q70 45 86 36Q92 23 110 27Q124 17 138 31Q155 35 149 52Q143 58 125 54Q111 53 102 65L98 77L92 75L92 89Z",
+          "fill": "#352a31"
+        },
+        {
+          "name": "eye",
+          "type": "path",
+          "d": "M128 68Q134 63 141 68Q135 67 130 70Z",
+          "fill": "#352a31"
+        },
+        {
+          "name": "cheek",
+          "type": "path",
+          "d": "M97 80Q99 93 113 101Q125 110 136 102",
+          "fill": "none",
+          "stroke": {
+            "material": {
+              "program": "taper"
+            }
+          },
+          "stroke-width": 4,
+          "stroke-linecap": "round"
+        },
+        {
+          "name": "lapel",
+          "type": "path",
+          "d": "M98 116L114 131L106 143L87 120Z",
+          "fill": "#633e43"
+        },
+        {
+          "name": "lapel-right",
+          "type": "path",
+          "d": "M129 114L114 131L125 136L141 119Z",
+          "fill": "#f1b287"
+        }
+      ]
+    }
+  ],
+  "animation": [
+    {
+      "tracks": [
+        {
+          "path": [
+            "nodes",
+            "portrait",
+            "translation"
+          ],
+          "keys": [
+            [
+              0,
+              [
+                -12,
+                0,
+                0
+              ]
+            ],
+            [
+              2,
+              [
+                12,
+                0,
+                0
+              ]
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

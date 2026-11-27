@@ -617,3 +617,43 @@
         let static_doc=doc(json!({"name":"n","type":"path","d":"M0 0H100V100H0Z","fill":"linear-gradient(rgb(127.5 0 127.5), rgb(127.5 0 127.5))"}),json!([]));
         assert_eq!(drawing(&animated,0.5),drawing(&static_doc,0.5));
     }
+
+    #[test]
+    fn fading_discrete_styles_use_the_typed_rest_values() {
+        for explicit in [false, true] {
+            let styles = [
+                ("mask-type", "luminance", "alpha"),
+                ("mix-blend-mode", "normal", "multiply"),
+                ("isolation", "auto", "isolate"),
+            ];
+            let mut node = json!({"name":"n","type":"path","d":"M0 0H20V20H0Z","fill":"red"});
+            let mut keyed = node.clone();
+            let mut tracks = Vec::new();
+            for (property, rest, sampled) in styles {
+                if explicit { node[property] = json!(rest); }
+                keyed[property] = json!(sampled);
+                tracks.push(json!({
+                    "path":["nodes","n",property],"interpolation":"STEP","keys":[[0,sampled]]
+                }));
+            }
+            let scene = Scene::from_json(&serde_json::to_vec(&json!({
+                "version":2,"composition":{"space":"2d"},"nodes":[node],
+                "animation":[
+                    {"tracks":[{"path":["animation","effect","weight"],"keys":[[0,1],[1,0]]}]},
+                    {"name":"effect","tracks":tracks}
+                ]
+            })).unwrap()).unwrap();
+            let animated = Document::new(&scene, Path::new(".")).unwrap();
+            let at_rest = doc(node, json!([]));
+            let at_key = doc(keyed, json!([]));
+            for (time, expected) in [(0., &at_key), (0.25, &at_key), (0.75, &at_rest),
+                (1., &at_rest), (0.75, &at_rest), (0.25, &at_key)] {
+                assert_eq!(drawing(&animated, time), drawing(expected, time), "explicit={explicit}, time={time}");
+                let snapshot = animated.snapshot(&vork_time::Request::Numeric(time)).unwrap();
+                let actual = snapshot.nodes[0].as_deref().unwrap_or(&animated.items[0].node);
+                let expected = &expected.items[0].node;
+                assert_eq!((actual.mask_type, actual.blend, actual.isolation),
+                    (expected.mask_type, expected.blend, expected.isolation));
+            }
+        }
+    }

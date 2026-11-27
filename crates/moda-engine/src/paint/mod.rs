@@ -36,11 +36,29 @@
 //!    (fillType 0 keeps the fill solid),
 //! 5. otherwise → solid pipeline.
 
+/// Link one Slang-generated paint function with the path draw's stage interface.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PathProgramSource {
+    pub wgsl: String,
+    pub entry: String,
+}
+
+impl PathProgramSource {
+    pub fn body_module(&self) -> String {
+        format!("{}\n{}\n{}", moda_shaders::PATH_CLIP, self.library(), include_str!("program.wgsl"))
+    }
+
+    pub(crate) fn library(&self) -> String {
+        format!("{}\n{}", self.wgsl, include_str!("program-inputs.wgsl").replace("PAINT_ENTRY", &self.entry))
+    }
+}
+
 pub mod draw;
 pub mod gradient;
 pub mod homography;
 pub mod image_source;
 pub mod layers;
+mod mask_footprint;
 pub mod pattern;
 pub mod shape_sdf;
 
@@ -109,6 +127,7 @@ impl PartialEq for PatternInstance {
 /// How a body's FILL routes (step 1 is reported separately since M3f owns it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRoute {
+    Program(moda_scene::paint::PathProgram),
 
     /// Gradient pipeline owns the whole body (fill gradient, or solid fill +
     /// gradient stroke).
@@ -150,9 +169,13 @@ pub fn classify_fill(node: &RawNode) -> FillRoute {
             // placeholder.
             Paint::Image(_) | Paint::Video(_) => return FillRoute::Pattern,
 
+            Paint::Program(program) => return FillRoute::Program(program),
             Paint::Solid(_) => break,
         }
     }
+    if let Some(program) = moda_scene::paint::with_top_stroke(node, |stroke| match stroke?.paint {
+        Paint::Program(program) => Some(program), _ => None,
+    }) { return FillRoute::Program(program); }
     if has_visible_gradient_stroke(node) {
         return FillRoute::Gradient;
     }

@@ -247,9 +247,8 @@ fn has_nonzero_corner_radius(node: &RawNode) -> bool {
 /// non-array `dash` (the WEB-NEXTJS-13T string regression) is treated as no
 /// dash, matching the tessellator's `Array.isArray` guard.
 fn stroke_has_dash(node: &RawNode) -> bool {
-    scene_paint::node_stroke_style(node)
-        .dash
-        .is_some_and(|a| !a.is_empty())
+    let style = scene_paint::node_stroke_style(node);
+    style.sampled_dash.is_some() || style.dash.is_some_and(|a| !a.is_empty())
 }
 
 /// Trim paths reshape the stroke into arc-length windows, which the SDF ring

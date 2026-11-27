@@ -18,6 +18,7 @@ pub const HELP_TOPICS: &[&str] = &[
     "cameras",
     "camera-json",
     "materials",
+    "paint",
     "fog",
     "geometry",
     "buffers",
@@ -33,4 +34,5 @@ pub const HELP_TOPICS: &[&str] = &[
     "diagnostics",
     "errors",
     "render",
+    "parallel-mp4",
 ];

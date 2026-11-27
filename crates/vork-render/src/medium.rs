@@ -145,7 +145,7 @@ pub(crate) fn compile(
     let abi = programs::abi();
     let mut program = compiled(r, &source, &origin)?;
     if !program.warnings.trim().is_empty() {
-        eprintln!("{}", program.warnings.trim());
+        crate::warnings::diagnostic(program.warnings.trim());
     }
     let words = programs::pack_inputs(
         &program.inputs,

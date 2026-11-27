@@ -1804,6 +1804,21 @@
       "type": "object",
       "x-help-extra": "material (glTF import): mapped to OpenPBR; coat_ior 1.5; occlusion affects indirect only"
     },
+    "MaterialPaint": {
+      "additionalProperties": false,
+      "properties": {
+        "material": {
+          "$ref": "#/$defs/NameOr",
+          "x-help": "material-name|inline material; path fill or stroke; float4 paint(PaintContext, Inputs) returns premultiplied canvas working RGBA",
+          "x-help-path": "paint.material",
+          "x-source": "END-STATE-API §7"
+        }
+      },
+      "required": [
+        "material"
+      ],
+      "type": "object"
+    },
     "MaterialRange": {
       "additionalProperties": false,
       "properties": {
@@ -3790,7 +3805,7 @@
               "x-source": "CSS direction"
             },
             "fill": {
-              "$ref": "#/$defs/Paint",
+              "$ref": "#/$defs/TextPaint",
               "default": "#000",
               "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}",
               "x-help-path": "node.fill (text)",
@@ -3986,7 +4001,7 @@
               "x-source": "glTF 2.0"
             },
             "stroke": {
-              "$ref": "#/$defs/Paint",
+              "$ref": "#/$defs/TextPaint",
               "default": "none",
               "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}; the glyph outlines",
               "x-help-path": "node.stroke (text)",
@@ -4216,7 +4231,7 @@
             "fill": {
               "$ref": "#/$defs/Paint",
               "default": "#000",
-              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}",
+              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}",
               "x-help-path": "node.fill (path)",
               "x-source": "SVG 2 fill; CSS colour and gradient"
             },
@@ -4380,7 +4395,7 @@
             "stroke": {
               "$ref": "#/$defs/Paint",
               "default": "none",
-              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}",
+              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}",
               "x-help-path": "node.stroke (path)",
               "x-source": "SVG 2 stroke; CSS colour and gradient"
             },
@@ -4819,9 +4834,13 @@
         },
         {
           "$ref": "#/$defs/ImagePaint"
+        },
+        {
+          "$ref": "#/$defs/MaterialPaint",
+          "description": "A path fragment program, evaluated inside the fill or stroke coverage."
         }
       ],
-      "description": "`fill` and `stroke` (§7): `\"none\"`, a CSS colour, a CSS gradient function, or an image."
+      "description": "Path fill or stroke. Material paints shade the path's existing coverage."
     },
     "PathSegment": {
       "anyOf": [
@@ -5186,7 +5205,7 @@
         "fill": {
           "anyOf": [
             {
-              "$ref": "#/$defs/Paint"
+              "$ref": "#/$defs/TextPaint"
             },
             {
               "type": "null"
@@ -5276,7 +5295,7 @@
         "stroke": {
           "anyOf": [
             {
-              "$ref": "#/$defs/Paint"
+              "$ref": "#/$defs/TextPaint"
             },
             {
               "type": "null"
@@ -5492,6 +5511,20 @@
       ],
       "type": "string"
     },
+    "TextPaint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NoPaint"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/ImagePaint"
+        }
+      ],
+      "description": "Paints admitted in shaped text positions."
+    },
     "TextureBinding": {
       "additionalProperties": false,
       "description": "An image handle. Sampling and transformations belong to the receiving program.",
@@ -5624,7 +5657,7 @@
       "type": "string"
     }
   },
-  "$id": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.2/packages/ts/scene.schema.json",
+  "$id": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.3/packages/ts/scene.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {

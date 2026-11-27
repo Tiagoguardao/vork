@@ -699,7 +699,7 @@ pub struct PlanCaches {
     /// ([`crate::frame::build_camera_box_plan_cached_with_dl`]), with the address of the scene it was built from.
     /// Set and cleared within that one call.
     frame_canvas_dl: Option<(usize, Arc<moda_scene::DisplayList>)>,
-    reverse_deps: Option<(u64, ReverseDeps)>,
+    reverse_deps: Option<(u64, Arc<ReverseDeps>)>,
 }
 
 /// rust-edit-incremental-z4: everything the incremental patcher needs to rebuild a
@@ -719,17 +719,8 @@ struct PlanIndex {
     /// Resident generation the plan reflects. `dirty_since(built_at_generation)`
     /// drives the fast path.
     built_at_generation: u64,
-    /// Editing one of these changes OTHER nodes the host may not have marked dirty,
-    /// so a dirty node in any of them forces a full rebuild:
-    ///   - `blend_related_ids`: blend nodes + their objects and spine
-    ///     (a blend renders its sources' geometry at plan time);
-    ///   - `mask_source_ids`: `clipMaskNodeId` targets (a group mask's coverage is
-    ///     this node's geometry — editing it re-shapes the mask for masked siblings).
-    /// (Connector/line anchors are NOT here: the engine reads pre-baked line points
-    /// node-locally — `LineSpec::from_json` — so a shape move can't silently change a
-    /// connector's plan items.)
-    blend_related_ids: Arc<weights::RetainedSet<String>>,
-    mask_source_ids: Arc<weights::RetainedSet<String>>,
+    /// Scene-wide bindings whose edits can change output outside the edited subtree.
+    deps: Arc<ReverseDeps>,
     /// Viewport culling: roots of the display-list ranges the build skipped. A
     /// culled node has no span, which the patcher would otherwise read as "draws
     /// nothing" — an edit that touches one (or one of their descendants) falls back.
@@ -778,11 +769,38 @@ impl SourceLookup {
     }
 }
 
-/// `(blend_related_ids, mask_source_ids)` of a scene (`scan_reverse_deps`).
-type ReverseDeps = (
-    Arc<weights::RetainedSet<String>>,
-    Arc<weights::RetainedSet<String>>,
-);
+#[derive(Default)]
+struct ReverseDeps {
+    blend_related_ids: weights::RetainedSet<String>,
+    mask_source_ids: weights::RetainedSet<String>,
+    /// Present only if every binding of this source is a group pruned by the ordinary paint
+    /// walk. Its visibility selector runs before mask resolution, so those groups read no mask.
+    hidden_clip_owners: weights::RetainedMap<String, Vec<u32>>,
+}
+
+impl ReverseDeps {
+    fn add_mask_source(&mut self, source: &str, hidden_owner: Option<u32>) {
+        let first = self.mask_source_ids.insert(source.to_owned());
+        match hidden_owner {
+            Some(row) if first => { self.hidden_clip_owners.insert(source.to_owned(), vec![row]); }
+            Some(row) => {
+                if let Some(owners) = self.hidden_clip_owners.get_mut(source) { owners.push(row); }
+            }
+            None => { self.hidden_clip_owners.remove(source); }
+        }
+    }
+
+    fn clip_owners_still_hidden(&self, scene: &Scene, source: &str) -> bool {
+        self.hidden_clip_owners.get(source).is_some_and(|owners| owners.iter().all(|&row|
+            scene.row(row).is_some_and(|owner| scene.hidden_from_paint_order(owner.id()))))
+    }
+
+    fn bytes(&self) -> usize {
+        weights::set(&self.blend_related_ids) + weights::set(&self.mask_source_ids)
+            + self.hidden_clip_owners.allocation_size()
+            + self.hidden_clip_owners.iter().map(|(id, rows)| id.capacity() + weights::capacity(rows)).sum::<usize>()
+    }
+}
 
 /// Whether `id` or one of its ancestors was culled from the indexed plan.
 fn under_culled_root(scene: &Scene, index: &PlanIndex, id: &str) -> bool {
@@ -1970,6 +1988,8 @@ struct PlacedRows {
     /// The canonical row is already the span's source. This bit certifies that the span
     /// contains only that node's ordinary output and can follow it by placement recipe.
     follows: Vec<bool>,
+    solid_groups: Vec<SolidGroup>,
+
     /// Per row: moving the node is planned whole. It owns a unit, sits above one or inside one; or the build
     /// culled it or a node above it, so it has no span and a move may bring it into the window.
     unit: Vec<bool>,
@@ -1978,8 +1998,197 @@ struct PlacedRows {
     culled: Vec<u32>,
 }
 
+/// A contiguous run of ordinary solid occurrences whose GPU matrices at the
+/// anchor recover the exact local origins of their direct children.
+#[derive(Clone, Copy)]
+struct SolidGroup {
+    /// Position in hierarchy order, also the lookup key for placement writes.
+    position: u32,
+    /// Identity wrappers can share a run. Its leaves read this parent's frame.
+    leaf_parent: u32,
+    first: u32,
+    end: u32,
+    /// Parent translation used by the last ordinary writes, including evicted slots.
+    anchor: Option<[f64; 2]>,
+    proof: Option<GroupOrigins>,
+}
+
+#[derive(Clone, Copy)]
+struct GroupOrigins {
+    axes: [OriginAxis; 2],
+    /// A refreshed anchor can round a local origin on the wrong side of a binade.
+    /// Recover it on the leaves' exact binary lattice only when necessary.
+    grid: [f32; 2],
+}
+
+/// A child's anchored origin is an exact binary32 value. All origins on this axis
+/// are multiples of the finest power of two seen during ordinary preparation.
+#[derive(Clone, Copy)]
+struct OriginAxis { power: i32, min: f64, max: f64 }
+
+impl Default for OriginAxis {
+    fn default() -> Self { Self { power: i32::MAX, min: f64::INFINITY, max: f64::NEG_INFINITY } }
+}
+
+impl OriginAxis {
+    fn include(&mut self, value: f32) {
+        self.min = self.min.min(f64::from(value));
+        self.max = self.max.max(f64::from(value));
+        let bits = value.abs().to_bits();
+        if bits == 0 { return; }
+        let exponent = (bits >> 23) as i32;
+        let significand = bits & 0x7fffff | (u32::from(exponent != 0) << 23);
+        self.power = self.power.min(exponent.max(1) - 150 + significand.trailing_zeros() as i32);
+    }
+
+    /// Check the rounding boundaries for every possible result exponent, once per
+    /// group. Origins share a binary lattice. When its spacing is at least an
+    /// output ULP, adding any origin preserves the translation's distance from
+    /// the nearest midpoint. Otherwise every midpoint is on the origin lattice.
+    fn permits(self, translation: f64) -> bool {
+        let p = translation.abs();
+        let farthest = self.min.abs().max(self.max.abs());
+        // Keep all split words, midpoints, and error bounds away from f32
+        // underflow/overflow, including on adapters that flush subnormals.
+        if farthest > 2f64.powi(60) || self.power < -60 || p > 2f64.powi(60)
+            || (p != 0. && p < 2f64.powi(-60)) { return false; }
+        if p == f64::from(p as f32) || farthest == 0. { return true; }
+        let grid = 2f64.powi(self.power);
+        let distance = |step: f64| { let rem = p % step; rem.min(step - rem) };
+        let nearest = distance(grid);
+        if nearest == 0. { return false; }
+        let exponent = |x: f64| ((x.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+        // All sums lie between the translated extrema. A run on one side of
+        // zero cannot cancel. Include neighboring binades for endpoint rounding.
+        let lo = self.min + translation;
+        let hi = self.max + translation;
+        let closest = nearest.max(lo.max(-hi));
+        (exponent(closest) - 1..=exponent(lo.abs().max(hi.abs())) + 1).all(|e| {
+            let bin = 2f64.powi(e);
+            let ulp = bin * f64::from(f32::EPSILON);
+            let margin = if grid >= ulp { ulp * 0.5 - distance(ulp) } else { nearest };
+            // After TwoSum the large addition's residual is exact. Rounding
+            // its correction and splitting p each cost at most two binary32
+            // rounding errors in succession. This bound also covers rounding
+            // the original sum to binary64 before the ordinary binary32 cast.
+            margin > (p + bin) * 2f64.powi(-45)
+        })
+    }
+}
+
+impl SolidGroup {
+    fn read(row: u32, scene: &Scene, worlds: &moda_scene::worlds::Worlds,
+        index: &PlanIndex, rows: &PlacedRows, plan: &CoveragePlan,
+        prepared: &std::collections::BTreeMap<u32, Self>) -> Option<Self> {
+        if rows.unit[row as usize] || !worlds.whole(row) || scene.row(row)?.node_type() != "group" { return None; }
+        if index.by_node.row(row).is_some_and(|si| index.spans.range(si).1 != 0) { return None; }
+        let anchor = worlds.child_translation(row)?;
+        let (from, to) = worlds.range(row)?;
+        let children = worlds.ordered(from + 1, to);
+        // The canvas lowerer can wrap a group's contents in one identity group.
+        // Its already-certified run is also this parent's. Walk the leaves only
+        // once even when several nested wrappers stand above them.
+        let first = *children.first()?;
+        if let Some(run) = prepared.get(&first) {
+            let (local, parent) = worlds.local_placement(first)?;
+            if worlds.range(first)?.1 == to && parent == Some(row)
+                && [local.a, local.b, local.c, local.d, local.e, local.f] == [1., 0., 0., 1., 0., 0.] {
+                return Some(Self { position: from, ..*run });
+            }
+        }
+        if children.len() < 2 { return None; }
+        let mut logical = None;
+        let mut end = 0;
+        let mut axes = [OriginAxis::default(); 2];
+        for &child in children {
+            let (local, parent) = worlds.local_placement(child)?;
+            if parent != Some(row) { return None; }
+            let si = index.by_node.row(child)?;
+            if !rows.follows[si] { return None; }
+            let (range, _) = index.spans.placement(si)?;
+            if range.is_empty() || logical.is_some() && range.start != end { return None; }
+            logical.get_or_insert(range.start);
+            end = range.end;
+            for item in plan.items.get(range)? {
+                // Both path vertex stages consume the logical slot in pathPlacement.
+                let crate::seams::DrawItem::Body { instance, paint: crate::seams::BodyPaint::Solid | crate::seams::BodyPaint::Program(_),
+                    mask: None, blend_mode: crate::seams::BlendMode::Normal, .. } = item else { return None };
+                let m = &instance.model_matrix;
+                for (i, value) in [local.e, local.f].into_iter().enumerate() {
+                    let origin = m[12 + i] - anchor[i] as f32;
+                    if m[12 + i] != (anchor[i] + value) as f32 || !origin.is_finite() || f64::from(origin) != value { return None; }
+                    axes[i].include(origin);
+                }
+            }
+        }
+        Some(Self { position: from, leaf_parent: row, first: u32::try_from(logical?).ok()?,
+            end: u32::try_from(end).ok()?, anchor: Some(anchor), proof: Some(GroupOrigins { axes, grid: [0.; 2] }) })
+    }
+
+    /// Only placement recipes have run since collection. Every slot therefore
+    /// contains the ordinary world matrix at `anchor`. A pure parent move
+    /// leaves all local affines as they were at that write. Recheck their origins
+    /// once on demand, including when the CPU copies of those matrices were trimmed.
+    fn refreshed_origins(&self, worlds: &moda_scene::worlds::Worlds) -> Option<GroupOrigins> {
+        let anchor = self.anchor?;
+        let (from, to) = worlds.range(self.leaf_parent)?;
+        let mut axes = [OriginAxis::default(); 2];
+        let mut error = [0.0_f64; 2];
+        for &child in worlds.ordered(from + 1, to) {
+            let (local, parent) = worlds.local_placement(child)?;
+            if parent != Some(self.leaf_parent) { return None; }
+            for (i, value) in [local.e, local.f].into_iter().enumerate() {
+                let origin = value as f32;
+                if !origin.is_finite() || f64::from(origin) != value { return None; }
+                axes[i].include(origin);
+                let recovered = (anchor[i] + value) as f32 - anchor[i] as f32;
+                if !recovered.is_finite() { return None; }
+                error[i] = error[i].max((f64::from(recovered) - value).abs());
+            }
+        }
+        let mut grid = [0.; 2];
+        for i in 0..2 {
+            if error[i] == 0. { continue; }
+            let power = axes[i].power;
+            if !(-60..=60).contains(&power) { return None; }
+            grid[i] = 2f32.powi(power);
+            // Strictly inside the cell, so tie-breaking cannot change the result.
+            if error[i] >= 0.5 * f64::from(grid[i]) { return None; }
+        }
+        Some(GroupOrigins { axes, grid })
+    }
+}
+
 impl PlacedRows {
-    fn read(scene: &Scene, index: &PlanIndex, units: Option<&Units>, warnings: &PlanWarnings, plan: &CoveragePlan) -> Option<Self> {
+    /// Placement preserves the original slot layout. Only intersecting groups
+    /// need a new anchor. Sparse edits visit their ancestors and the groups
+    /// rooted in the edited subtree, without walking sibling groups or leaves.
+    fn placed(&mut self, worlds: &moda_scene::worlds::Worlds, ranges: &[(u32, u32)]) {
+        if self.solid_groups.is_empty() { return; }
+        let refresh = |group: &mut SolidGroup| {
+            group.anchor = worlds.child_translation(group.leaf_parent);
+            group.proof = None;
+        };
+        let mut covered = 0;
+        for &(from, to) in ranges {
+            if to <= covered { continue; }
+            covered = to;
+            let start = self.solid_groups.partition_point(|g| g.position < from);
+            for group in self.solid_groups[start..].iter_mut().take_while(|g| g.position < to) {
+                refresh(group);
+            }
+            let mut row = worlds.ordered(from, to)[0];
+            while let Some((_, Some(parent))) = worlds.local_placement(row) {
+                let Some((position, _)) = worlds.range(parent) else { break };
+                if let Ok(i) = self.solid_groups.binary_search_by_key(&position, |g| g.position) {
+                    refresh(&mut self.solid_groups[i]);
+                }
+                row = parent;
+            }
+        }
+    }
+
+    fn read(scene: &Scene, index: &PlanIndex, units: Option<&Units>, warnings: &PlanWarnings, plan: &CoveragePlan, has_composites: bool) -> Option<Self> {
         // The scene's rows, when its owner keeps the world columns current (`Scene::refresh_worlds`).
         let worlds = scene.world_rows()?;
         let rows = worlds.len();
@@ -2017,7 +2226,20 @@ impl PlacedRows {
                 *slot |= units.above.contains(id) || units.holds(scene, id) || units.reads_source(id);
             }
         }
-        Some(Self { hierarchy: worlds.hierarchy(), follows: follows_row, unit, culled })
+        let mut rows = Self { hierarchy: worlds.hierarchy(), follows: follows_row, unit, culled,
+            solid_groups: Vec::new() };
+        if !warned && !has_composites && plan.camera == [0., 0.] && plan.camera_frame.is_none()
+            && plan.region_viewport.is_none() && plan.item_order.is_none() {
+            let mut prepared = std::collections::BTreeMap::new();
+            for row in worlds.parents().rev() {
+                if let Some(group) = SolidGroup::read(row, scene, worlds, index, &rows, plan, &prepared) {
+                    prepared.insert(row, group);
+                }
+            }
+            rows.solid_groups = prepared.into_values().collect();
+            rows.solid_groups.sort_unstable_by_key(|g| g.position);
+        }
+        Some(rows)
     }
 }
 
@@ -2466,8 +2688,9 @@ impl Units {
                 let mut cursor = Some(id);
                 let mut remaining = 4096;
                 while let Some(input) = cursor {
-                    if remaining == 0 || index.blend_related_ids.contains(input)
-                        || (index.mask_source_ids.contains(input) && !self.reads_source(input)) { return None; }
+                    if remaining == 0 || index.deps.blend_related_ids.contains(input)
+                        || (index.deps.mask_source_ids.contains(input) && !self.reads_source(input)
+                            && !index.deps.clip_owners_still_hidden(scene, input)) { return None; }
                     remaining -= 1;
                     cursor = scene.parent_map().get(input).or_else(|| scene.transient_parent_of().get(input)).map(String::as_str);
                 }
@@ -2526,7 +2749,7 @@ impl Units {
             if independent && !cold {
                 let start = seg.prefix + seg.units[ui].item_start;
                 if parameter == Some(moda_scene::value::K::Effects) {
-                    let source = self.sources.load(&seg.dl, scene, &seg.units[ui], &index.mask_source_ids)?;
+                    let source = self.sources.load(&seg.dl, scene, &seg.units[ui], &index.deps.mask_source_ids)?;
                     if patch_capture_parameters(scene, plan, seg, ui, self.outputs[ui].as_deref(), source.as_ref(),
                         changed, opts, hashes, written).is_some() {
                         bytes -= self.outputs[ui].take().as_deref().map_or(0, OutputRecords::bytes) as i64;
@@ -2544,7 +2767,7 @@ impl Units {
             // kinds and mask-source roles; values, transforms, clips and effects come from the scene's
             // current rows. Those structural inputs stand under the caller's stamp proof, so no display
             // list is rebuilt for the unit's placement, paint or node-local content writes.
-            let source = self.sources.load(&seg.dl, scene, unit, &index.mask_source_ids)?;
+            let source = self.sources.load(&seg.dl, scene, unit, &index.deps.mask_source_ids)?;
             let dl = source.as_ref();
             let before_bytes = seg.prepared.as_ref().map_or(0, |rows| rows.bytes());
             let mut prepared = seg.prepared.take();
@@ -2768,9 +2991,9 @@ impl FrameIndexEntry {
         let plan = &self.plan;
         let index = self.patchable.as_ref().map_or(0, |p| {
             let index = &p.index;
-            index.by_node.bytes() + weights::set(&index.blend_related_ids) + weights::set(&index.mask_source_ids)
+            index.by_node.bytes() + index.deps.bytes()
                 + weights::set(&index.culled_roots) + p.page_effects.bytes()
-                + p.rows.as_ref().map_or(0, |r| weights::capacity(&r.follows) + weights::capacity(&r.unit) + weights::capacity(&r.culled))
+                + p.rows.as_ref().map_or(0, |r| weights::capacity(&r.follows) + weights::capacity(&r.unit) + weights::capacity(&r.culled) + weights::capacity(&r.solid_groups))
                 + p.units.as_ref().map_or(0, |u| u.source_bytes(&mut allocations)) + self.span_bytes
         });
         self.fixed_bytes = std::mem::size_of::<Self>() + std::mem::size_of::<CoveragePlan>() + plan.page_id.capacity()
@@ -2948,7 +3171,7 @@ impl FramePlanIndex {
             }
             let page_effects = std::mem::take(&mut aux.page_effects);
             let index = build_plan_index(scene, plan.page_index, opts, aux, generation, &mut caches.reverse_deps);
-            let rows = (!index.spans.pages.is_empty()).then(|| PlacedRows::read(scene, &index, units.as_ref(), warnings, plan)).flatten();
+            let rows = (!index.spans.pages.is_empty()).then(|| PlacedRows::read(scene, &index, units.as_ref(), warnings, plan, need_units)).flatten();
             Patchable { page_effects, units, rows, index }
         });
         let inputs = moda_assets::engine_seam::installed().filter(|store| !store.is_empty())
@@ -3080,6 +3303,30 @@ impl FramePlanIndex {
         Some(())
     }
 
+    /// Replay the anchored packet while the only edit since its plan is a translation
+    /// of this group. Its ordinary dirty subscriptions remain pending. A later
+    /// change to a child, the clip, or the layout sees all intervening writes.
+    pub fn translated_group(&mut self, scene: &Scene, opts: &RenderOptions, row: u32)
+        -> Option<(Arc<CoveragePlan>, crate::frame::GroupTranslation)> {
+        let entry = self.entry.as_mut()?;
+        if entry.reads_clock() || entry.publication != moda_assets::engine_seam::store_generation()
+            || scene.stamps().last_composition() > entry.built_at { return None; }
+        let patch = entry.patchable.as_mut()?;
+        let rows = patch.rows.as_mut()?;
+        let worlds = scene.world_rows()?;
+        if patch.index.opts_key != render_options_key(opts) || rows.hierarchy != worlds.hierarchy() { return None; }
+        let position = worlds.range(row)?.0;
+        let i = rows.solid_groups.binary_search_by_key(&position, |g| g.position).ok()?;
+        let group = &mut rows.solid_groups[i];
+        let anchor = group.anchor?;
+        let translation = worlds.child_translation(group.leaf_parent)?;
+        if group.proof.is_none() { group.proof = group.refreshed_origins(worlds); }
+        let proof = group.proof?;
+        if !proof.axes.iter().zip(translation).all(|(axis, t)| axis.permits(t)) { return None; }
+        Some((entry.plan.clone(), crate::frame::GroupTranslation::new(group.first, group.end,
+            anchor.map(|x| x as f32), translation, proof.grid)))
+    }
+
     /// The plan held for the scene state `key` names, when nothing was written since it was made or last
     /// brought there. An offscreen frame has no live clock to thread into a plan, so a plan that reads the
     /// shader clock is the plan of its exact clock only.
@@ -3139,7 +3386,7 @@ impl FramePlanIndex {
         let mut owners = None;
         for (si, span) in index.spans.iter().enumerate().filter(|(_, s)| s.start == parts::ABSENT) {
             let (out, consumed, _) = emit_span(scene, span, opts, index.transparent, index.page_clip,
-                backdrop.as_ref(), layer.as_ref(), caches, hashes, &plan.masks, &index.mask_source_ids,
+                backdrop.as_ref(), layer.as_ref(), caches, hashes, &plan.masks, &index.deps.mask_source_ids,
                 true, seg, &mut owners)?;
             if out.len() != span.len || consumed != span.z_consumed { return None; }
             let at = parts.start(si);
@@ -3303,6 +3550,7 @@ impl FramePlanIndex {
             resident.len().div_ceil(rayon::current_num_threads()).max(2048)
         } else { usize::MAX };
         write_placed_spans(&mut index.spans.pages, 0, &mut plan_mut.items, 0, &resident, &placed, grain);
+        patchable.rows.as_mut().unwrap().placed(worlds, &ranges);
         self.written.evicted = matrices;
         if !written.is_sorted_by_key(|w| w.at) { written.sort_unstable_by_key(|w| w.at); }
         self.written.placed = written;
@@ -3421,6 +3669,9 @@ impl FramePlanIndex {
             patchable.units.as_ref().and_then(|units| units.segment.as_ref()), entry.parts.as_mut()) {
             IncrementalOutcome::Fallback => None,
             IncrementalOutcome::Served { bytes } => {
+                // Re-emission can change coverage, phase and item kinds. Only the
+                // placement writer preserves the proof of the solid run's layout.
+                if let Some(rows) = &mut patchable.rows { rows.solid_groups.clear(); }
                 if let Some(bytes) = bytes { entry.bytes = bytes; }
                 entry.reweigh |= !written.replaced.is_empty() || written.masks_changed || entry.plan.items.len() != resident_before
                     || (written.placed.iter().any(|w| w.is_full()) && [moda_scene::stamps::Group::Content, moda_scene::stamps::Group::Paint]
@@ -3450,7 +3701,7 @@ fn build_plan_index(
     opts: &RenderOptions,
     aux: crate::frame::PlanBuildAux,
     generation: u64,
-    deps_memo: &mut Option<(u64, ReverseDeps)>,
+    deps_memo: &mut Option<(u64, Arc<ReverseDeps>)>,
 ) -> PlanIndex {
     let mut by_node = SourceLookup::default();
     if !aux.spans.is_empty() { by_node.rows.resize(scene.doc().nodes.len(), u32::MAX); }
@@ -3462,11 +3713,10 @@ fn build_plan_index(
     }
     // The scan is O(scene) and depends on the scene alone: once per generation (a
     // culled camera plan re-seeds its index on every pan past its window).
-    let (blend_related_ids, mask_source_ids) = match deps_memo {
+    let deps = match deps_memo {
         Some((gen, deps)) if *gen == generation => deps.clone(),
         _ => {
-            let (b, m) = scan_reverse_deps(scene);
-            let deps = (Arc::new(b), Arc::new(m));
+            let deps = Arc::new(scan_reverse_deps(scene));
             *deps_memo = Some((generation, deps.clone()));
             deps
         }
@@ -3480,8 +3730,7 @@ fn build_plan_index(
         transparent: aux.transparent,
         opts_key: render_options_key(opts),
         built_at_generation: generation,
-        blend_related_ids,
-        mask_source_ids,
+        deps,
     }
 }
 
@@ -3493,36 +3742,42 @@ fn build_plan_index(
 /// that node's geometry), and every clipped layer and its base (clip to the layer below). Connector anchors are deliberately absent — the engine
 /// reads pre-baked line points node-locally, so a shape move never silently
 /// re-routes a connector at plan time.
-fn scan_reverse_deps(
-    scene: &Scene,
-) -> (
-    weights::RetainedSet<String>,
-    weights::RetainedSet<String>,
-) {
-    let mut blend = weights::RetainedSet::default();
-    let mut mask_src = weights::RetainedSet::default();
+fn scan_reverse_deps(scene: &Scene) -> ReverseDeps {
+    let mut deps = ReverseDeps::default();
     scene.visit_effective_nodes(|id, node| {
         if node.node_type() == "blend" {
-            blend.insert(id.to_owned());
+            deps.blend_related_ids.insert(id.to_owned());
             for src in moda_scene::blend::dependency_ids(node) {
-                blend.insert(src.to_string());
+                deps.blend_related_ids.insert(src.to_string());
             }
         }
-        if let Some(m) = node.str("clipMaskNodeId") {
-            if !m.is_empty() {
-                mask_src.insert(m.to_string());
-            }
+        if let Some(source) = node.str("clipMaskNodeId").filter(|m| !m.is_empty()) {
+            let hidden = node.node_type() == "group" && scene.hidden_from_paint_order(id);
+            deps.add_mask_source(source, scene.row_of(id).filter(|_| hidden));
         }
-        // Clip to the layer below: the base's coverage clips the layers above it, and a clipped layer's toggle or
-        // move changes which base the ones above it share, so an edit to any of them is non-local.
         if node.truthy("clipToBelow") {
-            mask_src.insert(id.to_owned());
-            if let Some(base) = scene.clip_below_base(id) {
-                mask_src.insert(base.clone());
-            }
+            // The layer and the base both participate in sibling selection.
+            deps.add_mask_source(id, None);
+            if let Some(base) = scene.clip_below_base(id) { deps.add_mask_source(base, None); }
         }
     });
-    (blend, mask_src)
+    // Generated nodes have no canonical row on which to retain a visibility proof.
+    // Keep their source roles conservative without changing display-list membership.
+    if !deps.hidden_clip_owners.is_empty() {
+        for (id, node) in scene.transient_by_id() {
+            if node.node_type() == "blend" {
+                for source in moda_scene::blend::dependency_ids(node) {
+                    deps.hidden_clip_owners.remove(source);
+                }
+            }
+            if let Some(source) = node.str("clipMaskNodeId") { deps.hidden_clip_owners.remove(source); }
+            if node.truthy("clipToBelow") {
+                deps.hidden_clip_owners.remove(id);
+                if let Some(base) = scene.clip_below_base(id) { deps.hidden_clip_owners.remove(base); }
+            }
+        }
+    }
+    deps
 }
 
 fn render_options_key(opts: &RenderOptions) -> u64 {
@@ -3557,7 +3812,7 @@ fn warnings_mention_node(skipped: &[String], id: &str) -> bool {
 /// never an infinite loop.
 fn has_blend_or_mask_ancestor(scene: &Scene, id: &str, index: &PlanIndex,
     memo: &mut HashMap<String, bool>) -> bool {
-    if index.blend_related_ids.is_empty() && index.mask_source_ids.is_empty() { return false; }
+    if index.deps.blend_related_ids.is_empty() && index.deps.mask_source_ids.is_empty() { return false; }
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut cursor = id;
@@ -3565,7 +3820,7 @@ fn has_blend_or_mask_ancestor(scene: &Scene, id: &str, index: &PlanIndex,
         if let Some(&known) = memo.get(cursor) { break known; }
         if !seen.insert(cursor) { break true; }
         chain.push(cursor);
-        if index.blend_related_ids.contains(cursor) || index.mask_source_ids.contains(cursor) { break true; }
+        if index.deps.blend_related_ids.contains(cursor) || index.deps.mask_source_ids.contains(cursor) { break true; }
         match scene.group_parent_of(cursor).or_else(|| scene.transient_parent_of().get(cursor)) {
             Some(parent) => cursor = parent,
             None => break false,
@@ -3754,7 +4009,7 @@ enum IncrementalOutcome {
 /// The ordinary span writer's source-role proof, shared with source-interval promotion.
 fn plain_source_eligible(scene: &Scene, index: &PlanIndex, id: &str,
     restriction_memo: &mut HashMap<String, bool>) -> bool {
-    !index.blend_related_ids.contains(id) && !index.mask_source_ids.contains(id)
+    !index.deps.blend_related_ids.contains(id) && !index.deps.mask_source_ids.contains(id)
         && !has_blend_or_mask_ancestor(scene, id, index, restriction_memo)
 }
 
@@ -3859,7 +4114,7 @@ impl EmittedRun {
         let grain = dirty.len().div_ceil(rayon::current_num_threads()).max(2048);
         let chunks: Vec<_> = anchors.par_chunks(grain).map(|rows| {
             let sources = rows.iter().map(|&(id, ordinal, _, _)| (ordinal, id));
-            moda_scene::display_list::display_list_items_at(scene, sources, &index.mask_source_ids)
+            moda_scene::display_list::display_list_items_at(scene, sources, &index.deps.mask_source_ids)
         }).collect();
         let dl = moda_scene::DisplayList { page_id: String::new(), page_index: 0, items: chunks.into_iter().flatten().collect() };
         let mut items = Vec::new();
@@ -4099,7 +4354,7 @@ fn apply_incremental_patch(
                 if !content_current { span.primary = usize::MAX; }
                 let Some((new_items, z_consumed, recipe)) = next.or_else(|| emit_span(scene, span, opts, transparent, page_clip,
                     backdrop_ctx.as_ref(), layer_blur_ctx.as_ref(), caches, hashes, &plan_mut.masks,
-                    &index.mask_source_ids, content_current, page_segment, &mut mask_owners)) else {
+                    &index.deps.mask_source_ids, content_current, page_segment, &mut mask_owners)) else {
                     caches.incr_fallbacks += 1;
                     return IncrementalOutcome::Fallback;
                 };
@@ -5378,6 +5633,7 @@ mod unit_placement_tests {
             }
             assert_eq!((full.transparent, full.sample_count), (fresh.transparent, fresh.sample_count), "{id}.{field}");
             let splits = full.items.iter().filter(|i| matches!(i, crate::seams::DrawItem::BackdropSplit(_))).count();
+            assert_eq!(full.masks, fresh.masks, "mask bindings after {id}.{field}");
             assert_eq!(format!("{warnings:?}"), format!("{expected:?}"), "edit {at}: {id}.{field}");
             assert_eq!(format!("{full:?}"), format!("{fresh:?}"), "edit {at}: {id}.{field}");
             let writes = self.index.take_written();
@@ -5829,6 +6085,45 @@ mod unit_placement_tests {
         }
         crate::text_draw::install_text_builder(None);
         assert!(families.iter().all(|&n| n >= 2) && sparse_hits > 0, "{families:?}, {sparse_hits} partial patches");
+    }
+
+    #[test]
+    fn parent_translation_declines_the_unresolved_side_of_a_rounding_midpoint() {
+        let mut axis = OriginAxis::default();
+        axis.include(-5466.09130859375);
+        assert!(!axis.permits(11723.878662109377));
+        assert!(axis.permits(11723.5));
+    }
+
+    #[test]
+    fn translation_checks_only_exponents_reached_by_the_run() {
+        let mut axis = OriginAxis::default();
+        axis.include(36.);
+        axis.include(1035.75);
+        assert!(axis.permits(-3.9999998));
+        axis.include(4.);
+        assert!(!axis.permits(-3.9999998));
+    }
+
+    #[test]
+    fn translating_a_prepared_solid_group_leaves_its_sibling_outside_the_range() {
+        let mut host = Host::new(vec![
+            path("left", 20.25, 14., "#224466"), path("right", 31., 18.75, "#cc8844"),
+            path("fixed", 90., 38., "#112233"),
+            json!({"id":"group","type":"group","children":["left","right"]}),
+            json!({"id":"viewport","type":"group","children":["group","fixed"]}),
+        ], &["viewport"]);
+        let (base, _) = host.step(None);
+        let scene = &mut host.resident.state.as_mut().unwrap().scene;
+        let row = scene.row_of("group").unwrap();
+        scene.write_placement(row, Some(moda_scene::scene::NodePlacement { translation: Some([moda_scene::value::Number::from_f64(0.21333334).unwrap(), 0.into()]), rotation: None, scale: None }), None);
+        scene.refresh_worlds();
+        let (_, movement) = host.index.translated_group(scene, &host.opts, row).expect("prepared run");
+        let names: Vec<_> = base.items[movement.range()].iter().map(drawitem_node_id).collect();
+        assert_eq!(names, [Some("left"), Some("right")]);
+        scene.write_placement(row, Some(moda_scene::scene::NodePlacement { translation: None, rotation: None, scale: Some([(-1).into(), 1.into()]) }), None);
+        scene.refresh_worlds();
+        assert!(host.index.translated_group(scene, &host.opts, row).is_none());
     }
 
     #[test]
@@ -6554,7 +6849,7 @@ mod unit_placement_tests {
             let state = host.resident.state.as_mut().unwrap();
             let entry = host.index.entry.as_mut().unwrap();
             if compact { assert!(entry.fit_cold_units(&state.scene, usize::MAX)); }
-            assert!(entry.patchable.as_ref().unwrap().index.mask_source_ids.contains("mask"));
+            assert!(entry.patchable.as_ref().unwrap().index.deps.mask_source_ids.contains("mask"));
             let row = state.scene.row_of("group").unwrap();
             let before = state.scene.stamps().clock();
             state.scene.write_row(row, |f| f.set("opacity", json!(0.375))).unwrap();
@@ -7206,6 +7501,70 @@ mod unit_placement_tests {
             assert_eq!(format!("{warnings:?}"), format!("{fresh_warnings:?}"));
         }
         assert!(read_sets.len() > 1, "the oracle exercises a changed query read set");
+    }
+
+    #[test]
+    fn nested_clip_tracks_a_generated_source_and_a_base_that_also_draws() {
+        let mut host = Host::new(vec![
+            json!({"id":"card","type":"group","opacity":0.6,"children":["base","outer"]}),
+            path("base", 4., 2., "#909090"),
+            json!({"id":"outer","type":"group","clipToBelow":true,"clipMaskNodeId":"vector","children":["vector","inner"]}),
+            path("vector", 0., 0., "#ffffff"),
+            json!({"id":"inner","type":"group","clipMaskNodeId":"__page_bg_page","children":["ink"]}),
+            path("ink", 5., 3., "#4070ef"),
+        ], &["card"]);
+        let (plan, _) = host.step(None);
+        assert_eq!(plan.masks.len(), 3);
+        for source in ["base", "vector", "__page_bg_page"] {
+            assert!(plan.masks.iter().any(|mask| mask.source_node_id == source));
+        }
+        for (id, field, value) in [("card","x",12.), ("card","scaleY",0.8),
+            ("base","x",8.), ("inner","x",4.), ("card","opacity",0.7)] {
+            host.edit_and_compare(id, field, json!(value));
+        }
+    }
+
+    #[test]
+    fn a_hidden_clip_cannot_certify_a_shared_blend_source() {
+        let mut host = Host::new(vec![
+            json!({"id":"moving","type":"group","opacity":0,"children":["clipped"]}),
+            json!({"id":"clipped","type":"group","clipMaskNodeId":"source","children":["source","ink"]}),
+            path("source", 0., 0., "#ffffff"), path("ink", 3., 5., "#4060ef"),
+            path("end", 20., 3., "#ef6060"),
+            json!({"id":"blend","type":"blend","sourceIds":["source","end"],"spacing":"steps","steps":2}),
+        ], &["moving", "end", "blend"]);
+        host.step(None);
+        assert!(!host.edit_and_compare("moving", "x", json!(12.)).0);
+        host.edit_and_compare("source", "y", json!(3.));
+        host.edit_and_compare("moving", "opacity", json!(0.6));
+        host.edit_and_compare("moving", "scaleX", json!(1.5));
+    }
+
+    #[test]
+    fn moving_a_hidden_clip_tracks_every_referring_group() {
+        let mut host = Host::new(vec![
+            json!({"id":"moving","type":"group","opacity":0,"children":["inner"]}),
+            json!({"id":"inner","type":"group","clipMaskNodeId":"source","children":["source","first"]}),
+            json!({"id":"other","type":"group","opacity":0,"clipMaskNodeId":"source","children":["second"]}),
+            path("source", 0., 0., "#ffffff"), path("first", 0., 0., "#3060ff"),
+            path("second", 4., 2., "#ef5030"),
+        ], &["moving", "other"]);
+        let (seed, _) = host.step(None);
+        assert!(seed.masks.is_empty());
+        for (field, value) in [("x", 12.), ("scaleX", 0.75)] {
+            assert!(host.edit_and_compare("moving", field, json!(value)).0, "{field}");
+        }
+        // A different group can start reading the hidden source. A new mask slot requires
+        // ordinary collection. Subsequent edits to its source must update the visible output.
+        host.edit_and_compare("other", "opacity", json!(0.75));
+        assert_eq!(host.index.entry.as_ref().unwrap().plan.masks.len(), 1);
+        host.edit_and_compare("source", "x", json!(27.));
+        host.edit_and_compare("source", "points", json!([{"type":"move","x":0,"y":0},
+            {"type":"line","x":38,"y":5},{"type":"line","x":20,"y":35}]));
+        host.edit_and_compare("moving", "opacity", json!(0.6));
+        assert_eq!(host.index.entry.as_ref().unwrap().plan.masks.len(), 2);
+        host.edit_and_compare("moving", "y", json!(32.));
+        host.edit_and_compare("moving", "opacity", json!(0.4));
     }
 
     #[test]

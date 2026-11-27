@@ -323,7 +323,7 @@ pub struct PlanMasks<'a> {
     /// (`RenderOptions::working`). A luminance mask is the luminance of the mask's picture as sRGB. The
     /// shortcut for one shape reduces each of its paints to luminance and blends those, which is the picture's
     /// luminance where the picture blends sRGB code values, and in any encoding where the shape is one layer
-    /// of one solid colour (`one_solid_layer`). Otherwise, in a working colour, the mask is its rendered
+    /// of one solid colour (`one_color_layer`). Otherwise, in a working colour, the mask is its rendered
     /// picture (`build_rendered_mask`), which the engine converts back and reduces once.
     working_color: bool,
     shader_time_s: f64,
@@ -589,7 +589,7 @@ impl PlanMasks<'_> {
         let source_type = scene.canonical_or_transient(&mask_node_id)
             .map_or(mask_node.node_type(), |node| node.node_type());
         if mask_type != MaskType::Vector
-            && ((mask_type == MaskType::Luminance && self.working_color && !one_solid_layer(mask_node))
+            && ((mask_type == MaskType::Luminance && self.working_color && !one_color_layer(mask_node))
                 || !matches!(source_type, "rectangle" | "ellipse" | "polygon" | "star" | "path" | "line" | "richtext" | "container" | "boolean")
                 || mask_reads_store_image(mask_node)
                 || crate::layer_blur::plan::needs_layer_capture(mask_node)
@@ -1250,6 +1250,7 @@ fn node_canvas_aabb(scene: &Scene, node: &RawNode) -> Option<(f64, f64, f64, f64
 /// `build_mask` discards — a refused mask covers nothing.
 #[derive(Default)]
 struct MaskGeometry {
+    stroke_uv: Vec<f32>,
     positions: Vec<f32>,
     /// This node kind has no outline implementation and uses its box.
     box_fallback: bool,
@@ -1393,6 +1394,7 @@ fn mask_geometry_positions_inner(node: &RawNode, scene: Option<&Scene>) -> MaskG
         );
         return MaskGeometry {
             positions: geometry.positions.clone(),
+            stroke_uv: geometry.stroke_uv.clone(),
             vertex_types: geometry.vertex_types.clone(),
             path_bounds: tess::path_bounds(&cmds),
             fill_dropped: geometry.fill_dropped.clone(),
@@ -1488,17 +1490,17 @@ fn mask_reads_store_image(node: &RawNode) -> bool {
         || sp::node_strokes(node).iter().any(|s| sp::shown(s.visible, s.opacity) && s.width > 0. && stored(&s.paint))
 }
 
-/// Whether a mask shape's picture is one layer of one solid colour: one visible fill or stroke, a solid paint.
+/// One solid or programmable fill or stroke can compute its colour on the coverage triangles.
 /// Reducing that paint to luminance is then the luminance of the shape's picture in whatever encoding the
 /// engine blends in: the picture is that colour, converted there and back. Several layers blend in the
 /// engine's encoding before they are reduced; a gradient's picture is interpolated in its own space, which the
 /// coverage shader's gradient does not model; and text, an image or a shader is a picture of its own.
-fn one_solid_layer(node: &RawNode) -> bool {
+fn one_color_layer(node: &RawNode) -> bool {
     use moda_scene::paint as sp;
     if node.node_type() == "richtext" {
         return false;
     }
-    let authored = |paint: &sp::Paint| matches!(paint, sp::Paint::Solid(_));
+    let authored = |paint: &sp::Paint| matches!(paint, sp::Paint::Solid(_) | sp::Paint::Program(_));
     let fills: Vec<sp::Fill> = if node.node_type() == "line" {
         Vec::new()
     } else {
@@ -1592,7 +1594,7 @@ fn paint_layer_draws(scene: &Scene, node: &RawNode, node_opacity: f32) -> LayerD
                     MaskPaint::Solid([1.0, 1.0, 1.0, opacity])
                 }
             },
-            paint => layer_paint(paint, opacity, &g, fill_stroke_width, &mut out.notes),
+            paint => layer_paint(paint, opacity, &g, false, fill_stroke_width, &mut out.notes),
         };
         out.push(&g.positions, paint);
     }
@@ -1616,7 +1618,7 @@ fn paint_layer_draws(scene: &Scene, node: &RawNode, node_opacity: f32) -> LayerD
             g.positions.clone()
         };
         let opacity = node_opacity * layer_opacity(stroke.opacity);
-        let paint = layer_paint(&stroke.paint, opacity, &g, stroke.width, &mut out.notes);
+        let paint = layer_paint(&stroke.paint, opacity, &g, true, stroke.width, &mut out.notes);
         out.push(&band, paint);
     }
     out
@@ -1630,11 +1632,22 @@ fn layer_paint(
     paint: &moda_scene::paint::Paint,
     opacity: f32,
     g: &MaskGeometry,
+    stroke: bool,
     stroke_width: f64,
     notes: &mut Vec<String>,
 ) -> MaskPaint {
     use moda_scene::paint::Paint;
     match paint {
+        Paint::Program(binding) => {
+            let bounds = g.path_bounds.map_or([0.; 4], |[x, y, right, bottom]|
+                [x as f32, y as f32, (right-x) as f32, (bottom-y) as f32]);
+            let stroke_uv = if stroke && binding.stroke_uv {
+                g.stroke_uv.chunks_exact(6).zip(g.vertex_types.chunks_exact(3))
+                    .filter(|(_, types)| types.iter().all(|t| *t == 1.))
+                    .flat_map(|(triangle, _)| triangle.iter().copied()).collect()
+            } else { Default::default() };
+            MaskPaint::Program { body: crate::seams::ProgramBody { binding: *binding, bounds }, opacity, stroke, stroke_uv }
+        }
         Paint::Solid(_) => {
             let c = crate::paint::gradient::solid_fill_color(Some(paint));
             MaskPaint::Solid([c.r as f32, c.g as f32, c.b as f32, c.a as f32 * opacity])
@@ -2182,7 +2195,7 @@ fn intersect_rect(a: [f64; 4], b: [f64; 4]) -> Option<[f64; 4]> {
 
 /// WGSL `Globals` byte size (`wgsl/mask-coverage.wgsl`: the mask's placement
 /// and source, then the draw's paint, E7.18) and the per-draw slot stride.
-const MASK_GLOBALS_BYTE_SIZE: u64 = 352;
+const MASK_GLOBALS_BYTE_SIZE: u64 = 384;
 const MASK_GLOBALS_ALIGNMENT: u64 = 512;
 
 /// MSAA sample count of the coverage draw (resolved into the r8 texture).
@@ -2334,31 +2347,33 @@ pub fn coverage_scale(px_scale: f64) -> f64 {
 /// [`MAX_MASK_TEXELS`] overall.
 pub fn coverage_placement(origin: [f64; 2], size: [f64; 2], scale: f64, max_dim: u32) -> CoveragePlacement {
     let max_dim = max_dim.max(1);
+    let end = [origin[0] + size[0], origin[1] + size[1]];
+    let fallback = CoveragePlacement { origin, size, tex: [1, 1], scale: 1.0 };
+    // A snapped axis spanning zero always needs at least two texels.
+    if max_dim == 1 && (0..2).any(|axis| origin[axis] < 0.0 && end[axis] > 0.0) {
+        return fallback;
+    }
     let mut s = scale;
     loop {
         let x0 = (origin[0] * s).floor();
         let y0 = (origin[1] * s).floor();
-        let x1 = ((origin[0] + size[0]) * s).ceil();
-        let y1 = ((origin[1] + size[1]) * s).ceil();
+        let x1 = (end[0] * s).ceil();
+        let y1 = (end[1] * s).ceil();
+        if !(s > 0.0 && s.is_finite() && [x0, y0, x1, y1].iter().all(|v| v.is_finite())) {
+            return fallback;
+        }
         let w = (x1 - x0).max(1.0);
         let h = (y1 - y0).max(1.0);
-        let fits = w <= max_dim as f64 && h <= max_dim as f64 && w * h <= MAX_MASK_TEXELS as f64;
-        if (fits || s <= 1.0 / 1024.0) && x0.is_finite() && y0.is_finite() {
-            let (tw, th) = (w.min(max_dim as f64) as u32, h.min(max_dim as f64) as u32);
+        if w <= max_dim as f64 && h <= max_dim as f64 && w * h <= MAX_MASK_TEXELS as f64 {
+            let bounds = [x0 / s, y0 / s, w / s, h / s];
+            if bounds.iter().any(|v| !v.is_finite()) {
+                return fallback;
+            }
             return CoveragePlacement {
-                origin: [x0 / s, y0 / s],
-                size: [tw as f64 / s, th as f64 / s],
-                tex: [tw, th],
+                origin: [bounds[0], bounds[1]],
+                size: [bounds[2], bounds[3]],
+                tex: [w as u32, h as u32],
                 scale: s,
-            };
-        }
-        if !x0.is_finite() || !y0.is_finite() {
-            // Degenerate input: one texel over the plan box.
-            return CoveragePlacement {
-                origin,
-                size,
-                tex: [1, 1],
-                scale: 1.0,
             };
         }
         s *= 0.5;
@@ -2408,7 +2423,7 @@ pub struct MaskCache {
     tick: u64,
     /// The last atlas built for a plan (by identity) at a coverage scale, when every mask came from the cache: a
     /// frame of the same plan at the same scale (a pan) binds it again without keying every mask.
-    memo: Option<(std::sync::Weak<crate::seams::CoveragePlan>, u64, Vec<(wgpu::BindGroup, wgpu::Texture)>)>,
+    memo: Option<(std::sync::Weak<crate::seams::CoveragePlan>, (u64, [u32; 4]), Vec<(wgpu::BindGroup, wgpu::Texture)>)>,
     /// Counters for benches: masks served from the cache, rendered, and full-rect.
     pub hits: u64,
     pub renders: u64,
@@ -2439,7 +2454,7 @@ pub const MASK_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 impl MaskCache {
     /// `working`: the owning engine's working colour, which a rendered mask's picture is in.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, working: Option<&moda_shaders::WorkingColor>) -> Result<MaskCache> {
-        let pipeline = coverage_pipeline(device, working)?;
+        let pipeline = coverage_pipeline(device, working, None)?;
         // One linear clamp sampler for the coverage source (textSampler), the
         // ancestor coverage (anti-aliased, possibly at another resolution) and
         // consumption (`bindMaskGroup` fallback/clamp sampler).
@@ -2604,13 +2619,16 @@ fn content_key(
     m: &MaskPlan,
     full_rect: bool,
     ancestor_key: Option<Option<u64>>,
-    placement: &CoveragePlacement,
+    placement: &CoveragePlacement, picture_projection: [f32; 4],
 ) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     if m.mode != 0 {
         return None;
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    if m.draws.iter().any(|d| matches!(d.paint, MaskPaint::Program { .. })) {
+        picture_projection.map(f32::to_bits).hash(&mut h);
+    }
     full_rect.hash(&mut h);
     if m.invert || m.feather > 0.0 {
         m.invert.hash(&mut h);
@@ -2666,6 +2684,14 @@ fn hash_paint(p: &MaskPaint, h: &mut impl std::hash::Hasher) {
         }
     };
     match p {
+        MaskPaint::Program { body, opacity, stroke, stroke_uv } => {
+            3u8.hash(h);
+            body.binding.hash(h);
+            floats(h, &body.bounds);
+            floats(h, &[*opacity]);
+            stroke.hash(h);
+            floats(h, stroke_uv);
+        }
         MaskPaint::Solid(c) => {
             0u8.hash(h);
             floats(h, c);
@@ -2695,6 +2721,13 @@ fn hash_paint(p: &MaskPaint, h: &mut impl std::hash::Hasher) {
     }
 }
 
+#[derive(Default)]
+pub struct MaskPrograms {
+    pub(crate) picture_projection: [f32; 4],
+    pub(crate) pipelines: std::sync::Arc<HashMap<(u32, bool), wgpu::RenderPipeline>>,
+    pub(crate) inputs: Option<wgpu::BindGroup>,
+}
+
 impl MaskAtlas {
     pub fn is_empty(&self) -> bool {
         self.bind_groups.is_empty()
@@ -2721,14 +2754,14 @@ impl MaskAtlas {
         mask_bgl: &wgpu::BindGroupLayout,
         masks: &[MaskPlan],
         px_scale: f64,
-        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool, programs: &MaskPrograms,
         working: Option<&moda_shaders::WorkingColor>,
     ) -> Result<MaskAtlas> {
         if masks.is_empty() {
             return Ok(MaskAtlas::empty());
         }
         let mut local = MaskCache::new(device, queue, working)?;
-        Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, &mut local, false, false, surfaces, scratch)
+        Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, &mut local, false, false, surfaces, scratch, programs)
     }
 
     /// [`MaskAtlas::build`] through a retained [`MaskCache`]: masks whose content is
@@ -2746,13 +2779,13 @@ impl MaskAtlas {
         px_scale: f64,
         cache: &mut MaskCache,
         live: bool,
-        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool, programs: &MaskPrograms,
     ) -> Result<MaskAtlas> {
         if masks.is_empty() {
             return Ok(MaskAtlas::empty());
         }
         cache.tick += 1;
-        let atlas = Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, cache, true, live, surfaces, scratch)?;
+        let atlas = Self::build_inner(device, queue, encoder, mask_bgl, masks, px_scale, cache, true, live, surfaces, scratch, programs)?;
         cache.trim();
         Ok(atlas)
     }
@@ -2770,14 +2803,16 @@ impl MaskAtlas {
         px_scale: f64,
         cache: &mut MaskCache,
         live: bool,
-        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool, programs: &MaskPrograms,
     ) -> Result<MaskAtlas> {
         let masks = &identity.masks;
         if masks.is_empty() {
             return Ok(MaskAtlas::empty());
         }
+        let projection = if programs.inputs.is_some() { programs.picture_projection } else { [0.; 4] };
+        let memo_projection = (px_scale.to_bits(), projection.map(f32::to_bits));
         if let Some((plan, scale, bind_groups)) = &cache.memo {
-            if plan.as_ptr() == std::sync::Arc::as_ptr(identity) && *scale == px_scale.to_bits() && live {
+            if plan.as_ptr() == std::sync::Arc::as_ptr(identity) && *scale == memo_projection && live {
                 return Ok(MaskAtlas {
                     bind_groups: bind_groups.clone(),
                     _textures: Vec::new(),
@@ -2785,9 +2820,9 @@ impl MaskAtlas {
                 });
             }
         }
-        let atlas = Self::build_cached(device, queue, encoder, mask_bgl, masks, px_scale, cache, live, surfaces, scratch)?;
+        let atlas = Self::build_cached(device, queue, encoder, mask_bgl, masks, px_scale, cache, live, surfaces, scratch, programs)?;
         cache.memo = (live && atlas._textures.is_empty() && atlas._buffers.is_empty()).then(|| {
-            (std::sync::Arc::downgrade(identity), px_scale.to_bits(), atlas.bind_groups.clone())
+            (std::sync::Arc::downgrade(identity), memo_projection, atlas.bind_groups.clone())
         });
         Ok(atlas)
     }
@@ -2817,7 +2852,7 @@ impl MaskAtlas {
         cache: &mut MaskCache,
         retain: bool,
         live: bool,
-        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool,
+        surfaces: &SurfaceViews, scratch: &crate::scratch::ScratchPool, programs: &MaskPrograms,
     ) -> Result<MaskAtlas> {
         let n = masks.len();
         let atlas_on = live && mask_atlas_enabled();
@@ -2864,7 +2899,7 @@ impl MaskAtlas {
                         h.finish()
                     })
                 });
-                keys[i] = content_key(m, full_rect[i], anc, &placement);
+                keys[i] = content_key(m, full_rect[i], anc, &placement, programs.picture_projection);
             }
         }
 
@@ -3129,6 +3164,17 @@ impl MaskAtlas {
                 for (d, draw) in m.draws.iter().enumerate() {
                     let mut buf = buf;
                     write_draw_paint(&mut buf, &draw.paint, m.mode);
+                    if matches!(draw.paint, MaskPaint::Program { .. }) {
+                        let spot = packing.spot[slot].unwrap_or([0, 0]);
+                        for axis in 0..2 {
+                            let scale = f64::from(programs.picture_projection[axis]);
+                            let gain = scale / pl.scale;
+                            let offset = f64::from(programs.picture_projection[2 + axis])
+                                + pl.origin[axis] * scale - f64::from(spot[axis]) * gain;
+                            f(&mut buf, 352 + axis * 4, gain as f32);
+                            f(&mut buf, 360 + axis * 4, offset as f32);
+                        }
+                    }
                     crate::gpu_profile::count_buffer_write(buf.len());
                     crate::scratch::write_buffer(device, queue, &globals, MASK_GLOBALS_ALIGNMENT * (draw_slots[slot] + d) as u64, &buf);
                 }
@@ -3155,6 +3201,27 @@ impl MaskAtlas {
                 crate::scratch::write_buffer(device, queue, &vbuf, 0, bytemuck::cast_slice(&all_positions));
             }
             drop(all_positions);
+
+            let mut stroke_stream = Vec::new();
+            let mut uv_ranges = HashMap::new();
+            for (slot, &i) in to_render.iter().enumerate() {
+                for draw in masks[i].draws.iter() {
+                    if let MaskPaint::Program { body, stroke: true, stroke_uv, .. } = &draw.paint {
+                        if !body.binding.stroke_uv || draw.count == 0 { continue; }
+                        anyhow::ensure!(stroke_uv.len() == 2 * draw.count as usize, "missing stroke coordinates for programmed matte");
+                        let start = stroke_stream.len() as u64 * 4;
+                        stroke_stream.extend_from_slice(stroke_uv);
+                        uv_ranges.insert((slot, draw.first), start..stroke_stream.len() as u64 * 4);
+                    }
+                }
+            }
+            let stroke_buffer = (!stroke_stream.is_empty()).then(|| {
+                use wgpu::util::DeviceExt;
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Mask stroke coordinates"), contents: bytemuck::cast_slice(&stroke_stream),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+            });
 
             // Coverage passes, ancestors-first (plan guarantees ancestor index <
             // descendant index; a cached or full-rect ancestor's view is ready).
@@ -3255,9 +3322,7 @@ impl MaskAtlas {
                              slot: usize,
                              (bg0, bg1, bg2): &(Vec<wgpu::BindGroup>, wgpu::BindGroup, wgpu::BindGroup)| {
                 let m = &masks[to_render[slot]];
-                pass.set_pipeline(&cache.pipeline);
-                pass.set_bind_group(1, bg1, &[]);
-                pass.set_bind_group(2, bg2, &[]);
+
                 let (vstart, vlen) = vranges[slot];
                 if vlen > 0 {
                     pass.set_vertex_buffer(0, vbuf.slice(vstart..vstart + vlen));
@@ -3268,8 +3333,23 @@ impl MaskAtlas {
                     if draw.first >= end {
                         continue;
                     }
+                    let uv = uv_ranges.get(&(slot, draw.first));
+                    if let MaskPaint::Program { body, .. } = &draw.paint {
+                        pass.set_pipeline(&programs.pipelines[&(body.binding.unit, uv.is_some())]);
+                        pass.set_bind_group(3, programs.inputs.as_ref().expect("installed path inputs"), &[]);
+                    } else {
+                        pass.set_pipeline(&cache.pipeline);
+                    }
                     pass.set_bind_group(0, bg0, &[]);
-                    pass.draw(draw.first..end, 0..1);
+                    pass.set_bind_group(1, bg1, &[]);
+                    pass.set_bind_group(2, bg2, &[]);
+                    if let Some(range) = uv {
+                        let start = vstart + u64::from(draw.first) * 8;
+                        pass.set_vertex_buffer(0, vbuf.slice(start..vstart + vlen));
+                        pass.set_vertex_buffer(1, stroke_buffer.as_ref().unwrap().slice(range.clone()));
+                        pass.draw(0..end - draw.first, 0..1);
+                        pass.set_vertex_buffer(0, vbuf.slice(vstart..vstart + vlen));
+                    } else { pass.draw(draw.first..end, 0..1); }
                 }
             };
             let clear = wgpu::Operations {
@@ -3581,6 +3661,14 @@ fn write_draw_paint(buf: &mut [u8], paint: &MaskPaint, mode: u32) {
         }
     };
     match paint {
+        MaskPaint::Program { body, opacity, stroke, .. } => {
+            color(buf, [1., 1., 1., *opacity]);
+            for (i, v) in body.bounds.into_iter().enumerate() { f(buf, 208 + i * 4, v); }
+            let binding = body.binding;
+            for (i, v) in [binding.inputs, binding.clock, binding.site, u32::from(*stroke)].into_iter().enumerate() {
+                u(buf, 368 + i * 4, v);
+            }
+        }
         MaskPaint::Solid(c) => {
             u(buf, 80, 0);
             color(buf, *c);
@@ -3631,7 +3719,10 @@ fn inv_or_zero(v: f64) -> f32 {
 /// The unified coverage pipeline from the EXTRACTED `mask-coverage` module
 /// (manifest descriptor: r8unorm target, no blend/depth, float32x2 stride-8
 /// vertex stream, entry points vs_main/fs_main).
-fn coverage_pipeline(device: &wgpu::Device, working: Option<&moda_shaders::WorkingColor>) -> Result<wgpu::RenderPipeline> {
+pub(crate) fn coverage_pipeline(
+    device: &wgpu::Device, working: Option<&moda_shaders::WorkingColor>,
+    program: Option<(&crate::paint::PathProgramSource, bool, &wgpu::BindGroupLayout)>,
+) -> Result<wgpu::RenderPipeline> {
     let src = moda_shaders::module_source("mask-coverage")
         .ok_or_else(|| anyhow!("no extracted WGSL module 'mask-coverage'"))?;
     let manifest = moda_shaders::manifest();
@@ -3653,9 +3744,13 @@ fn coverage_pipeline(device: &wgpu::Device, working: Option<&moda_shaders::Worki
         .as_ref()
         .ok_or_else(|| anyhow!("mask-coverage lacks fragment state"))?;
 
+    let source = match program {
+        Some((code, _, _)) => format!("{}\n{}\n{}", src.source, code.mask_library()?, include_str!("../paint/mask-program.wgsl")).into(),
+        None => src.source.into(),
+    };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mask-coverage"),
-        source: wgpu::ShaderSource::Wgsl(moda_shaders::working_color::specialize(working, src.source.into())),
+        source: wgpu::ShaderSource::Wgsl(moda_shaders::working_color::specialize(working, source)),
     });
 
     let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3696,9 +3791,27 @@ fn coverage_pipeline(device: &wgpu::Device, working: Option<&moda_shaders::Worki
     };
     let bgl1 = tex_bgl("mask coverage-source bgl");
     let bgl2 = tex_bgl("mask ancestor bgl");
+    let mut groups = vec![Some(&bgl0), Some(&bgl1), Some(&bgl2)];
+    let mut streams = vec![wgpu::VertexBufferLayout {
+        array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+    }];
+    let mut vs_entry = vs_entry;
+    let mut fs_entry = fragment.entry_point.as_str();
+    if let Some((_, stroke_uv, inputs)) = program {
+        groups.push(Some(inputs));
+        vs_entry = if stroke_uv { "vs_stroke_paint" } else { "vs_paint" };
+        fs_entry = "fs_paint";
+        if stroke_uv {
+            streams.push(wgpu::VertexBufferLayout {
+                array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![1 => Float32x2],
+            });
+        }
+    }
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("mask coverage layout"),
-        bind_group_layouts: &[Some(&bgl0), Some(&bgl1), Some(&bgl2)],
+        bind_group_layouts: &groups,
         ..Default::default()
     });
 
@@ -3723,19 +3836,11 @@ fn coverage_pipeline(device: &wgpu::Device, working: Option<&moda_shaders::Worki
                 module: &module,
                 entry_point: Some(vs_entry),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
-                }],
+                buffers: &streams,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &module,
-                entry_point: Some(&fragment.entry_point),
+                entry_point: Some(fs_entry),
                 compilation_options: Default::default(),
                 // E7.18: a mask's paint layers composite source-over: the
                 // shader writes (coverage, 0, 0, layer alpha), so
@@ -4098,7 +4203,7 @@ mod tests {
         let mut m = masks.masks[r.mask_id as usize].clone();
         let key = |m: &MaskPlan| {
             let p = coverage_placement(m.origin, m.size, 1., 8192);
-            content_key(m, false, None, &p).unwrap()
+            content_key(m, false, None, &p, [1., 1., 0., 0.]).unwrap()
         };
         assert!(local_coverage(&m, &coverage_placement(m.origin, m.size, 1., 8192)));
         let initial = key(&m);
@@ -4323,6 +4428,35 @@ mod tests {
         let p = coverage_placement([0.0, 0.0], [4096.0, 4096.0], 2.0, 16384);
         assert_eq!((p.scale, p.tex), (1.0, [4096, 4096]));
         assert!(u64::from(p.tex[0]) * u64::from(p.tex[1]) <= MAX_MASK_TEXELS);
+    }
+
+    #[test]
+    fn huge_masks_keep_the_far_corner_inside_both_texture_limits() {
+        let half = 8_388_608.0;
+        let origin = [-half; 2];
+        let size = [2.0 * half; 2];
+        let p = coverage_placement(origin, size, 1.0, 8192);
+        assert_eq!(p.tex, [4096; 2]);
+        assert_eq!(p.scale, 1.0 / 4096.0);
+        assert_eq!(p.origin, origin);
+        assert_eq!(p.size, size);
+
+        let p = coverage_placement(origin, size, 1.0, 2048);
+        assert_eq!(p.tex, [2048; 2]);
+        assert_eq!(p.origin, origin);
+        assert_eq!(p.size, size);
+    }
+
+    #[test]
+    fn mask_placement_terminates_for_an_impossible_grid_or_scale() {
+        let origin = [-1.0; 2];
+        let size = [2.0; 2];
+        for (scale, limit) in [(1.0, 1), (0.0, 8192), (-1.0, 8192), (f64::NAN, 8192), (f64::INFINITY, 8192)] {
+            let p = coverage_placement(origin, size, scale, limit);
+            assert_eq!(p.tex, [1; 2]);
+            assert_eq!(p.origin, origin);
+            assert_eq!(p.size, size);
+        }
     }
 
     #[test]

@@ -2,6 +2,12 @@ UPGRADE
 Breaking changes, newest first. Rewrite scenes and scripts for the current API.
 Use matching SDK and executable versions; regenerate SDK-written scenes after upgrading.
 
+0.6.3 (from 0.6.2)
+- Numeric key, cut, activation and footage times now mean the simplest fraction that rounds to the same
+  binary64 value, so full-precision decimals such as 0.06666666666666667 land on their frame. Frames where a
+  key fell one frame late in 0.6.2 change. Fraction strings and buffer clocks are unchanged.
+- A canvas whose scene or still images are refused leaves old outputs untouched.
+
 0.6.2 (from 0.6.1)
 - Movies in supported node bindings now play sound. Remove a redundant audio.file to avoid doubling.
   Use a decodable mono or stereo first audio stream, or strip the audio.

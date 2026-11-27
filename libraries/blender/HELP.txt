@@ -5,12 +5,11 @@ Diffuse_BSDF uses EEVEE (Lambert); Roughness is Cycles-only in Blender.
 blender/filmic look: none|very_high_contrast|high_contrast|medium_high_contrast|medium_contrast|
   medium_low_contrast|low_contrast|very_low_contrast.
 Filmic reads libraries/blender/filmic.exr beside vork.
-Shared colour, procedural, bump and white-balance maths lives in std.
-Existing blender imports re-export the same functions and types.
+Blender imports re-export shared std colour, procedural, bump and white-balance functions/types.
 Modules: blender.nodes
 (Diffuse_BSDF, Glass_BSDF, Transparent_BSDF, Fresnel, Layer_Weight_Fresnel, Math, Normal_Map);
 blender.texture_coordinate (Generated, Normal, UV, Object, Camera, Window, Reflection);
-blender.color (mix with BlendMode, float_curve); blender.procedurals (wave, brick, magic, noise, noise_color, voronoi, white_noise, gabor).
+blender.color (mix with BlendMode, float_curve); blender.procedurals (wave, brick, magic and below).
 
 blender.procedurals: noise, noise_color, voronoi, white_noise, gabor.
 Slang signatures below: p is float3; scalar inputs float except dimensions:int and normalize:bool.

@@ -34,13 +34,14 @@ pub fn family(index: usize) -> String {
 }
 
 /// Each list's font files, read.
-pub fn read(lists: &[Vec<PathBuf>]) -> Result<Vec<Vec<Face>>> {
+pub fn read(lists: &[Vec<PathBuf>], source: impl Fn(&Path) -> (PathBuf, std::io::Result<Vec<u8>>)) -> Result<Vec<Vec<Face>>> {
     lists
         .iter()
         .map(|list| {
             list.iter()
                 .map(|path| {
-                    let bytes = std::fs::read(path).with_context(|| {
+                    let (path, bytes) = source(path);
+                    let bytes = bytes.with_context(|| {
                         format!("font {}: restore a readable .ttf or .otf file or correct its path", path.display())
                     })?;
                     Ok(Face { label: path.display().to_string(), bytes })

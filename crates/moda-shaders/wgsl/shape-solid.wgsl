@@ -12,6 +12,7 @@ const MIN_GRADIENT_STOP_DIFF: f32 = 0.0001;
 
 // Main shader code
 
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
 
       struct RectData {

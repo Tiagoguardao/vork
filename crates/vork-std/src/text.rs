@@ -298,7 +298,7 @@ fn validate_options(o: &Options) -> Result<()> {
     ensure!(ALIGN_Y.contains(&o.align_y.as_str()), "invalid align_y");
     Ok(())
 }
-pub(crate) fn evaluate(argument: &str) -> Result<String> {
+pub(crate) fn evaluate(argument: &str, observed: &dyn Fn(&std::path::Path, &[u8]) -> Result<()>) -> Result<String> {
     let options: Options = serde_json::from_str(argument)?;
     let metadata = std::fs::metadata(&options.font)
         .with_context(|| format!("read font {}; restore the font file or correct its path", options.font))?;
@@ -307,7 +307,8 @@ pub(crate) fn evaluate(argument: &str) -> Result<String> {
             format!("font {} is not a regular file; restore a readable font file or correct its path", options.font)).into());
     }
     let bytes =
-        std::fs::read(&options.font).with_context(|| format!("read font {}", options.font))?;
+        vork_inputs::bytes(&options.font).with_context(|| format!("read font {}", options.font))?;
+    observed(std::path::Path::new(&options.font), &bytes)?;
     let label = options.font.clone();
     Ok(serde_json::to_string(&geometry(options, &label, &bytes)?)?)
 }
@@ -332,7 +333,7 @@ fn hosted(label: &str, bytes: &[u8]) -> Result<std::rc::Rc<Hosted>> {
     let key = *blake3::hash(bytes).as_bytes();
     if let Some(hosted) = HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
-        let index = hosts.iter().position(|(k, _)| *k == key)?;
+        let index = hosts.iter().position(|(k, h)| *k == key && h.host.uses_current_font_inputs())?;
         let entry = hosts.remove(index)?;
         let host = entry.1.clone();
         hosts.push_back(entry);

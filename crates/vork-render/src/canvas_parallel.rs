@@ -182,6 +182,14 @@ impl Schedule {
         Resize::Keep
     }
 
+    /// A new serial plan changes the measured workload. Preserve the observed
+    /// cold cost and start the next comparison with a fresh serial baseline.
+    pub(crate) fn plan_refreshed(&mut self, slots: usize) {
+        self.trial = None;
+        self.rejected = None;
+        self.resized(slots);
+    }
+
     pub(crate) fn cancel_trial(&mut self, requested: usize) {
         if let Some((_, gain)) = self.trial.take() { self.rejected = Some((requested, gain)); }
         self.growing = 0;

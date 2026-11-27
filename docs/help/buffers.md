@@ -1,13 +1,10 @@
 BUFFERS
-Use inline data for small geometry; binary files for large arrays.
-Inline data has one typed element per outer-array entry; vector/matrix entries
-contain the full component count (2/3/4/16), not a flat stream of scalar entries.
-Binary data is tightly packed, little-endian. Exact fields: buffers --all.
+Use inline data for small arrays or tightly packed little-endian binary for large
+ones. Inline entries are typed elements; vectors/matrices nest all components
+(2/3/4/16) in each entry. Fields: vork help buffers --all.
 <!-- all -->
-COMPUTED PLACEMENT REFERENCE
-Use computed placement for opaque, unskinned geometry and opaque instances.
+Computed placement requires opaque, unskinned geometry and opaque instances.
 TRANSLATION/ROTATION/SCALE are node-relative; ROTATION is a unit XYZW quaternion.
 instances.count selects a live prefix from zero to installed capacity.
-Computed instance material attributes follow GPU updates, including shutter samples
-and seeks. Displacement cannot read computed instance attributes. Transparent
-placements must be authored, not compute-bound.
+Computed instance material attributes follow GPU updates, shutter samples and
+seeks. Displacement cannot read them. Author transparent placements.

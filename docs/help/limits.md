@@ -1,12 +1,9 @@
 LIMITS
-Supported GPUs: Apple Silicon Metal, recent NVIDIA Vulkan and AMD Vulkan with
-hardware ray tracing and storage buffer arrays (tested on Mesa RADV, RDNA3).
-Intel GPUs are unsupported.
-CPU rendering requires the explicit opt-in below. Run vork setup to check the
-adapter. Windows x64 ships install.ps1;
-macOS and Linux provide install.sh as a separate release asset.
-Use Apple Silicon with macOS 15 or newer.
-See README.md (Install) for binary setup.
+Run vork setup to check the adapter. Supported: Apple Silicon Metal (macOS 15+),
+recent NVIDIA Vulkan (Windows/Linux) and Linux AMD Vulkan with ray queries and storage buffer arrays
+(tested: Mesa RADV, RDNA3). Intel GPUs are unsupported. CPU mode is opt-in below.
+Install scripts: Windows x64 install.ps1, macOS/Linux install.sh (release assets).
+See README.md (Install).
 
 Device-limit errors name the failing resource, limit and remedy.
 
@@ -14,22 +11,14 @@ Canvas nodes support transform, bounds and screen. Canvas text and paths support
 A canvas inside a canvas cannot set viewBox or preserveAspectRatio.
 Canvas frames with more than 335,544 ordered items use additional depth passes.
 
-Fog, smoke and fire use closed triangle carriers or grid volumes, or constant/height
-world media, through complete-camera path transport. Varying world density without
-a finite domain and custom surface callbacks remain unsupported. See vork help fog.
+Volume carriers, world media and fog transport limits: vork help fog.
+Use one environment light; combine contributions in one program or precomposite maps.
 
-Additional environment lights also fail;
-combine their contributions in one environment program or precomposite their maps.
-
-std/final approximates indirect lighting and can omit bounced paths such as
-camera → diffuse → glossy → light, with built-in or custom surfaces. A custom
-surface material selects the older one-hit GI for the whole scene. More samples
-do not restore omitted paths. Choose --profile std/path for full bounce lighting,
-interiors, glass and caustics. Shipped path transport still has finite bounce budgets,
-indirect clamping, adaptive sampling and denoising; it is not an unclamped oracle.
-The indirect clamp limits each contribution's mean absolute RGB to 10, matching
-Cycles' brightness measure. It scales all channels uniformly to preserve hue;
-direct contributions are unclamped. Bright indirect lighting can still lose energy.
+For indirect-light omissions and profile budgets see vork help profiles.
+std/path still has finite depth, adaptive sampling and denoising. It clamps each
+indirect contribution to mean absolute RGB 10 by uniform RGB scaling; direct
+contributions are unclamped. The clamp matches Cycles’ brightness measure and preserves
+hue, but bright indirect light can lose energy.
 Path transport refuses `render.root` and reachable `image.render.root` subtree
 renders on every device, including CPU Vulkan. Use `--profile std/final` with depth of
 field and path-only effects disabled for subtree rendering, or render the
@@ -39,14 +28,11 @@ Non-finite camera/light samples mark affected pixels magenta; output metadata li
 Final's rough glass shadows follow straight connections: roughness does not spread
 transmitted shadows, light off-axis receivers, or test scattered-direction blockers.
 
-On Apple Silicon, solid glass and heavy interiors can still abort with exit code 4
-and "Impacting Interactivity". A retry can succeed; lower resolution is not a reliable
-fix. For thin panes use geometry_thin_walled: true. Try std/path or a supported
-NVIDIA or AMD GPU for repeated failures; path is slower and is not a universal
-workaround.
-Dense imported transmitting geometry has not been qualified on Metal. Large scenes
-with dense transparency can lose the device in final even at small resolutions;
-try path and test the full shot before committing to a batch.
+On Apple Silicon, solid glass and heavy interiors can abort with code 4
+("Impacting Interactivity"). Retry, use geometry_thin_walled:true for thin panes,
+or try std/path or a supported NVIDIA/AMD GPU. Path is slower and can also fail; lower resolution is not a reliable fix.
+Dense imported transmission is unqualified on Metal; test the full shot before
+batching. Dense std/final transparency can lose the device even at low resolution.
 
 A scene that draws meshes or imported models can bind a limited number of distinct
 attribute names across all its materials. Apple Silicon Metal fits 17. On Vulkan the
@@ -60,22 +46,18 @@ limit even when total free VRAM is sufficient. Follow the error's resolution/pro
 advice or simplify scene buffers. Scene import support does not guarantee rendering
 at any size.
 
-vork setup builds the prebuilt path engine (the same few pipelines for every scene) and
-warms the vork init starter at the default std/final profile. Without setup, nothing breaks.
-On an NVIDIA L4, a first path render takes about 8 s with shipped shaders and about 40 s
-when compilation is needed; repeats take 1 to 3 s. It does not build the shared engine afterward.
-With a warm engine, supported scenes draw with it while any needed scene kernel compiles
-in a detached background process; delivery and exit do not wait for it. Scenes the engine
-cannot draw (authored programs, a participating medium, AOVs, splats, points or hair, or
-cameras other than one std/camera, say) use their own scene kernel. A path-traced world
-inside a canvas starts no background process. Only shader warming may stop early and still
-succeed, at its ten-minute limit or when interrupted; required GPU/tool checks fail on
-errors or their own stage timeouts.
-Use setup --skip-warmup for the GPU/tools report only, or setup --all for the
-bundled program/profile catalog and built-in descriptors without the shader time limit. You can interrupt setup
-safely and rerun it: completed device-local cache entries are retained.
-Other scene kinds, authored programs and uncovered layouts compile once on first use. Cold compilation
-can take minutes; setup does not guarantee instant first renders.
+vork setup builds the shared path engine (the same few pipelines across scenes) and warms the std/final starter. Without
+setup, renders use scene kernels when needed without building the shared engine.
+Without setup on an NVIDIA L4: first path render ~8 s with shipped shaders, ~40 s
+when compiling; repeats 1–3 s.
+With a warm engine, supported scenes render while scene kernels compile in a
+detached background process; delivery and exit do not wait. A path-traced world inside a canvas starts no background compile. Authored programs,
+media, AOVs, splats, points, hair and cameras other than one std/camera can need
+their own scene kernels. Uncovered layouts compile on first use (can take minutes).
+Required GPU/tool checks fail on error or timeout. Default GPU shader warming can defer at
+10 minutes or on interruption (e.g. a driver crash) without failing setup. Reruns keep completed cache
+entries. --skip-warmup checks only; --all warms bundled programs/profiles and
+built-in descriptors with no shader time limit.
 
 Hair displacement and lit stages are ignored with a warning. Curved propagation
 selects path transport automatically; motion channels are zero with a warning,
@@ -83,23 +65,20 @@ while sampled shutter blur remains available.
 
 Unsupported geometry effects refuse with the node and an authoring alternative.
 Approximate effects can warn and render.
-Legacy spatial environments evaluate at the origin. Unsupported light masks
-are ignored with warnings. Environment programs sampling
-render images fall back to the light colour. Inspect warnings and the image. Each dropped effect prints WARNING: REQUESTED EFFECT DROPPED,
-with its code, authored request and omitted/substituted behaviour. Every render
-meta.json sidecar and SDK render result returns the same structured warnings array;
-warning-and-render success does not mean every requested effect was applied.
+Spatial legacy environments evaluate at the origin. Unsupported light masks warn
+and are ignored. Environments sampling render images use the light colour. Check
+WARNING: REQUESTED EFFECT DROPPED and the structured warnings in meta.json and
+SDK results; see vork help outputs.
 
 ## Opt-in CPU rendering
 
 On Linux, install recent Mesa Vulkan drivers (`mesa-vulkan-drivers` on
 Debian/Ubuntu; `mesa-vulkan-drivers` or `vulkan-swrast` elsewhere), then run
 `vork setup --gpu cpu` (or `VORK_GPU=cpu vork setup`) and `VORK_GPU=cpu vork render scene.json --out frame.png`.
-The driver must expose ray queries and storage buffer arrays. CPU rendering is
-slow and never selected automatically. Setup warms the default starter. CPU shader
-warm-up has no time limit. First-run shader compilation can take several minutes. vork's driver
-pipeline cache is disabled because it can trigger a lavapipe compiler crash.
-Portable shader artifacts and Mesa's own shader disk cache can still speed later runs.
+CPU Vulkan needs ray queries and storage buffer arrays. It is slow and opt-in.
+Setup warms the default starter without a shader time limit. First compile can
+take minutes. The driver pipeline cache is disabled to avoid a lavapipe compiler crash; portable shaders and Mesa
+disk caching can help later runs.
 
 macOS requires Apple Silicon; CPU mode is unavailable through Metal. Windows
 requires a Vulkan loader and a recent Mesa lavapipe driver with its ICD manifest;

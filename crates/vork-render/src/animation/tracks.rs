@@ -26,7 +26,7 @@ where T: Clone + std::ops::Add<Output=T> + std::ops::Sub<Output=T> + std::ops::M
         three*u2.clone()-two*u3.clone(), u3-u2]
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Interpolation {
     Step,
     Linear,
@@ -411,11 +411,11 @@ pub(crate) struct PropertyTrack {
     material_targets: Option<Vec<usize>>,
 }
 /// How one track is read at one sample.
-struct TrackRead {
+struct TrackRead<'a> {
     /// The key interval, when the track's keys are read exactly.
     upper: Option<usize>,
     /// The layer's exact local instant, for a channel that reads it.
-    exact_local: Option<Germ>,
+    exact_local: Option<&'a Germ>,
 }
 impl CompiledLayer {
     /// A looping layer's numeric local time, wrapped into its tracks' key span.
@@ -436,6 +436,9 @@ pub(crate) struct CompiledLayer {
     owner: Option<Vec<usize>>,
     /// The owner's installed node index, bound by `mark_nodes`; sampled at its local time.
     pub owner_node: Option<usize>,
+    /// Indices of the exact remap and the numeric reading used by ordinary channels.
+    exact_domain: usize,
+    numeric_domain: usize,
 }
 /// One immutable ordered layer plan. glTF import appends channels to these layers.
 #[derive(Clone)]
@@ -456,8 +459,10 @@ pub(crate) struct Samples {
     layer_weights: Vec<f32>,
     pub render: Option<v2::Render>,
     material_values: Vec<Sample>,
-    /// Each node's local instant at this sample; `None` is an absent node (A7 rule 1).
+    /// Each distinct node domain's local instant at this sample; `None` is an absent node (A7 rule 1).
     pub clocks: Vec<Option<Germ>>,
+    scene_time: std::sync::OnceLock<Germ>,
+    exact_times: exact::ExactTimes,
     /// Per track, how long the value it was last sampled to stands ([`Held`]). It is read from the track's keys
     /// each time the track is sampled, and from nothing else.
     held: Vec<Held>,
@@ -530,6 +535,9 @@ pub(crate) struct Plan {
     discrete_tracks: bool,
     /// Node clocks (A7), one per installed node, bound by `mark_nodes`.
     clocks: Vec<ClockSpec>,
+    domains: clocks::NodeDomains,
+    exact_domains: usize,
+    numeric_domains: usize,
     clock_names: Vec<String>,
     /// Flat index of each layer's first track, for clock-consumed tracks.
     layer_starts: Vec<usize>,
@@ -759,6 +767,8 @@ impl Plan {
                 time_span: time_slice.then(||std::sync::Arc::new(exact::TimeSpan::new(clock_endpoints))),
                 owner,
                 owner_node: None,
+                exact_domain: 0,
+                numeric_domain: 0,
             })
         }
     }
@@ -782,7 +792,7 @@ impl Plan {
         }
         let mut layers = layers;
         Self::gather_keys(&mut layers);
-        Ok(Self {
+        let mut plan = Self {
             layers,
             camera_tracks,
             discrete_tracks,
@@ -793,6 +803,9 @@ impl Plan {
             material_offsets: vec![],
             cameras: Default::default(),
             clocks: vec![],
+            domains: Default::default(),
+            exact_domains: 0,
+            numeric_domains: 0,
             clock_names: vec![],
             layer_starts: vec![],
             has_clocks: false,
@@ -801,7 +814,9 @@ impl Plan {
             image_samplers,
             images_with_time,
             source_lengths,
-        })
+        };
+        plan.bind_layer_domains();
+        Ok(plan)
     }
     /// Move every numeric track's keys into one store, in flat track order (layer by layer, track by track: the
     /// order `sampled` yields and a frame samples in): each curve's times, then its values. The keys are the
@@ -1016,6 +1031,7 @@ impl Plan {
             }
         }
         self.refresh_layer_starts();
+        self.bind_layer_domains();
         Ok(())
     }
     /// Content identity includes decoded buffer-backed keys, not their file names.
@@ -1182,7 +1198,9 @@ impl Plan {
                 .iter()
                 .map(|b| b.default.clone())
                 .collect(),
-            clocks: vec![None; self.clocks.len()],
+            scene_time: Default::default(),
+            exact_times: exact::ExactTimes::new(self),
+            clocks: vec![None; self.domains.sample_count(self.has_clocks)],
             held: vec![Held::No; self.layers.iter().map(|l| l.tracks.len()).sum()],
             changed: None,
             scratch: Vec::new(),
@@ -1193,6 +1211,10 @@ impl Plan {
     /// consumer; naming costs a comparison of each sampled value with the one it replaces.
     pub(crate) fn samples_naming_changes(&self) -> Samples {
         Samples { changed: Some(Vec::new()), ..self.samples() }
+    }
+    /// The caller just sampled this request. Reuse its exact root for footage and nested worlds.
+    pub(crate) fn sampled_scene<'a>(&self, samples: &'a Samples, request: &vork_time::Request) -> Result<&'a Germ> {
+        exact::get_or_try(&samples.scene_time, || request.exact())
     }
     pub fn has_discrete_tracks(&self)->bool {self.discrete_tracks}
     /// Every authored track's sampled value after `sample_into`, in layer then track order: its target,
@@ -1262,42 +1284,44 @@ impl Plan {
             value.clone_from(&binding.default);
         }
         self.start_sample(samples, 0..self.layers.len());
-        if self.has_clocks {
-            let scene = match request { Some(request) => request.exact()?, None => Germ::point(vork_time::exact::ieee(time)?) };
-            samples.clocks = self.clocks(&scene)?;
-        }
-        let mut index = 0;
-        let mut exact_request = None;
+        let scene = std::sync::OnceLock::new();
+        let clocks = if self.has_clocks {
+            let instant = exact::get_or_try(&scene, || match request {
+                Some(request) => request.exact(),
+                None => Ok(Germ::point(vork_time::exact::ieee(time)?)),
+            })?;
+            self.clocks(instant)?
+        } else { Vec::new() };
+        let times = exact::LayerTimes::new(self);
+        let mut first = 0;
         for (layer_index, layer) in self.layers.iter().enumerate() {
-            // A node-owned layer runs on its owner's clock, retimed by its own offset, speed and loop.
-            let mut exact_local = match layer.owner_node.and_then(|owner| samples.clocks.get(owner).cloned().flatten()) {
-                Some(instant) => Some(layer.exact_local(&instant)?),
-                None => None,
-            };
-            let owner_local = exact_local.as_ref().map(|local| local.numeric()).transpose()?;
-            let count = layer.tracks.len();
-            self.sample_layer(layer_index, index, time, owner_local, (index..index + count).map(|flat| (flat, ())), |samples, flat, track, ()| {
-                // Rule 1: a track on an absent node, or inside an absent subtree, is not evaluated.
-                let absent = self.subjects.get(flat).copied().flatten().is_some_and(|node| self.absent(samples, node));
+            let owner = layer.owner_node.and_then(|n| clocks[self.domains.by_node[n]].as_ref());
+            let local = times.numeric(layer, time, owner)?;
+            let end = first + layer.tracks.len();
+            self.sample_layer(layer_index, first, local, (first..end).map(|flat| (flat, ())), |_, flat, track, ()| {
+                let absent = self.subjects.get(flat).copied().flatten()
+                    .is_some_and(|n| self.has_clocks && clocks[self.domains.by_node[n]].is_none());
                 if absent || !(track.weight_target.is_some() || wanted(track)) { return Ok(None); }
-                let upper = match track.discrete_keys.as_ref() {
-                    Some(keys) => {
-                        if exact_local.is_none() {
-                            if let Some(request) = request {
-                                if exact_request.is_none() {exact_request=Some(request.exact()?);}
-                                exact_local=Some(layer.exact_local(exact_request.as_ref().unwrap())?);
-                            }
-                        }
-                        exact_local.as_ref().map(|local| keys.upper(local))
+                let exact_local = match (&track.discrete_keys, owner, request) {
+                    (Some(_), Some(owner), _) => Some(times.remaps.read(layer, owner)?),
+                    (Some(_), None, Some(request)) => {
+                        let instant = exact::get_or_try(&scene, || request.exact())?;
+                        Some(times.remaps.read(layer, instant)?)
                     }
-                    None => None,
+                    _ => None,
                 };
-                // Only a style channel reads the exact instant itself.
-                let exact_local = if matches!(track.channel, Channel::Style(_)) { exact_local.clone() } else { None };
+                let upper = track.discrete_keys.as_ref().zip(exact_local).map(|(keys, t)| keys.upper(t));
                 Ok(Some(TrackRead { upper, exact_local }))
             }, samples)?;
-            index += count;
+            first = end;
         }
+        if moda_engine::prof::on() {
+            moda_engine::prof::add_work("animation.node_domains", 0, clocks.len() as u64);
+            times.record_counts();
+        }
+        samples.clocks = clocks;
+        samples.scene_time = scene;
+        samples.exact_times = times.remaps;
         Ok(())
     }
     /// The start of one sample, for pictures and for sound: layer weights start at their authored values (weight
@@ -1309,27 +1333,21 @@ impl Plan {
     /// One layer at one sample: what a layer does with its clock, its weight and its tracks,
     /// for pictures and for sound. `first` is the flat index of the layer's first track and
     /// `tracks` the flat indices to evaluate, in order, each with whatever `read` needs.
-    /// A scene layer reads the sample's `time`; a node-owned layer reads `owner_local`, its
-    /// owner's instant as the layer's numeric local time, and with an absent owner (`None`)
-    /// evaluates nothing. `read` says how a track is read, or `None` when it is not evaluated
+    /// `local` is the layer's numeric reading after its affine map and loop. An absent owner
+    /// gives it no reading. `read` says how a track is read, or `None` when it is not evaluated
     /// (its node is absent, or the caller does not consume it).
     #[allow(clippy::too_many_arguments)]
-    fn sample_layer<T>(
+    fn sample_layer<'a, T>(
         &self,
         layer_index: usize,
         first: usize,
-        time: f32,
-        owner_local: Option<f32>,
+        local: Option<f32>,
         tracks: impl IntoIterator<Item = (usize, T)>,
-        mut read: impl FnMut(&Samples, usize, &PropertyTrack, T) -> Result<Option<TrackRead>>,
+        mut read: impl FnMut(&Samples, usize, &PropertyTrack, T) -> Result<Option<TrackRead<'a>>>,
         samples: &mut Samples,
     ) -> Result<()> {
         let layer = &self.layers[layer_index];
         let weight = samples.layer_weights[layer_index];
-        let local = match layer.owner_node {
-            Some(_) => owner_local,
-            None => Some(layer.source.offset + time * layer.source.speed),
-        }.map(|local| layer.looped(local));
         let additive = matches!(layer.source.blend, v2::Blend::Add);
         for (index, given) in tracks {
             let track = &layer.tracks[index - first];
@@ -1338,7 +1356,7 @@ impl Plan {
                 _ => None,
             };
             match (local, read) {
-                (Some(local), Some(read)) => self.sample_track(index, track, local, read.upper, read.exact_local.as_ref(), weight, additive, samples)?,
+                (Some(local), Some(read)) => self.sample_track(index, track, local, read.upper, read.exact_local, weight, additive, samples)?,
                 _ => {
                     // A track that is no longer consumed changed: its weight went to zero.
                     if samples.weights[index].to_bits() != 0f32.to_bits() {
@@ -1539,7 +1557,7 @@ impl Plan {
         }
         // Rule 1: an absent node has no picture and lights nothing, its subtree included.
         for (node, spec) in self.clocks.iter().enumerate() {
-            if spec.gated && wanted(node) && samples.clocks.get(node).is_some_and(Option::is_none) {
+            if spec.gated && wanted(node) && self.absent(samples, node) {
                 if let Some(value) = values[node].as_mut() { value.node.visibility.visible = false; }
             }
         }
@@ -1821,6 +1839,8 @@ impl Plan {
             }
         }
         self.refresh_layer_starts();
+        self.domains = self.node_domains();
+        self.bind_layer_domains();
         self.subjects = self.layers.iter().flat_map(|layer| layer.tracks.iter().map(move |track| (layer, track)))
             .map(|(layer, track)| match &track.target {
                 Some(v2::TrackTarget::Node { node, .. } | v2::TrackTarget::Imported { asset: node, .. }) => by_name.get(node).copied(),
@@ -1857,6 +1877,8 @@ impl Plan {
             if nodes[i].parent().is_some_and(|p| self.clocks[p].gated) { self.clocks[i].gated = true; }
         }
         self.refresh_layer_starts();
+        self.domains = self.node_domains();
+        self.bind_layer_domains();
         self.subjects = self.layers.iter().flat_map(|layer| layer.tracks.iter())
             .map(|track| match &track.target {
                 Some(v2::TrackTarget::Node { node, .. } | v2::TrackTarget::Text { node, .. }) => by_name.get(node.as_str()).copied(),
@@ -2409,7 +2431,7 @@ mod asset_index_tests {
     #[test]
     fn asset_index_work_is_independent_of_unrelated_population() -> Result<()> {
         let mut plan = Plan::default();
-        plan.layers.push(CompiledLayer { owner: None, owner_node: None, source: serde_json::from_value(json!({"tracks":[]}))?, tracks: vec![], span: None, time_span: None });
+        plan.layers.push(CompiledLayer { owner: None, owner_node: None, exact_domain: 0, numeric_domain: 0, source: serde_json::from_value(json!({"tracks":[]}))?, tracks: vec![], span: None, time_span: None });
         let curve = std::sync::Arc::new(Curve { times: vec![0.,1.].into(), values: vec![0.,0.,0.,1.,2.,3.].into(), width: 3,
             interpolation: Interpolation::Linear, rotation: false, euler: false });
         for asset in 0..1024 {

@@ -138,8 +138,11 @@ pub(crate) struct PaintMemo(
     std::sync::OnceLock<std::sync::Arc<[crate::paint::Stroke]>>,
     std::sync::OnceLock<std::sync::Arc<[crate::paint::Fill]>>,
     std::sync::OnceLock<std::sync::Arc<[crate::effect::Effect]>>,
-    std::sync::OnceLock<bool>,
+    std::sync::OnceLock<Option<PlainFill>>,
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainFill { Solid, Program }
 
 impl std::fmt::Debug for PaintMemo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -464,19 +467,26 @@ impl RawNode {
         self.2 .2.get_or_init(|| parse().into()).clone()
     }
 
-    /// A single unmodified solid drawn as stored, at any inherited opacity. The
-    /// planner and body emitter read the same paint-stack classification.
-    pub fn plain_solid_fill(&self) -> bool {
+    /// One solid or path program can draw its stored geometry from any planning worker.
+    pub fn plain_path_fill(&self) -> bool { self.plain_fill().is_some() }
+
+    pub fn plain_solid_fill(&self) -> bool { self.plain_fill() == Some(PlainFill::Solid) }
+
+    fn plain_fill(&self) -> Option<PlainFill> {
         use crate::paint::{self, Paint};
         *self.2.3.get_or_init(|| {
             if self.node_type() == "line" || self.has(crate::appearance::APPEARANCE_ORDER_KEY)
-                || !paint::node_strokes_shared(self).is_empty() { return false; }
+                || !paint::node_strokes_shared(self).is_empty() { return None; }
             let fills = paint::node_fills_shared(self);
-            let [fill] = &*fills else { return false; };
-            let Paint::Solid(_) = &fill.paint else { return false; };
-            fill.visible != Some(false) && fill.opacity.unwrap_or(1.) == 1.
+            let [fill] = &*fills else { return None; };
+            let kind = match fill.paint {
+                Paint::Solid(_) => PlainFill::Solid,
+                Paint::Program(_) => PlainFill::Program,
+                _ => return None,
+            };
+            (fill.visible != Some(false) && fill.opacity.unwrap_or(1.) == 1.
                 && fill.blend_mode.as_deref().is_none_or(|b| b == "normal")
-                && fill.effects.as_ref().is_none_or(Vec::is_empty)
+                && fill.effects.as_ref().is_none_or(Vec::is_empty)).then_some(kind)
         })
     }
 

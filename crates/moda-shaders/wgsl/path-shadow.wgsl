@@ -176,6 +176,7 @@ fn sdEllipse(p: vec2<f32>, radii: vec2<f32>) -> f32 {
 // Main shader code
 
         // Frame-level uniforms (constant for all shapes in a frame)
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
         
         // Storage buffer for rectangle shadow instances

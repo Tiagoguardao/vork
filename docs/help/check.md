@@ -1,20 +1,17 @@
 CHECK
 vork check SCENE|- [--profile P] [--shaders]
-Validate without opening a GPU driver or rendering frames. The default profile is
-std/final; select the same profile as the intended render. File-relative assets
-resolve beside SCENE; stdin assets resolve from the current directory.
+CPU-only validation. Match the render profile (default std/final). Assets resolve
+beside SCENE or from cwd for stdin.
 
-Check collects independent errors at each stage; untyped scenes stop after expansion.
-Missing sampled images retain their magenta substitution. File-backed resources
-must be readable regular files; decoding can fail on later sequence frames.
+Check collects independent errors per stage; untyped scenes stop after expansion.
+Missing sampled images substitute magenta. File resources must be readable regular
+files; later sequence frames can still fail to decode.
 
-Runs the render loader and installation: JSON decoding and schema constraints,
-std expansion, program resolution and input validation, feature and fog admission,
-asset loading, animation binding and timeline/shutter sanity. Program reflection and effect proofs need the same Slang toolchain as rendering.
-Compilation caches are shared. Default checks omit native backend shader generation.
---shaders also compiles portable shaders; it stays CPU-only but can take minutes.
+Check runs the render loader and install validation, including JSON/schema, expansion, resolution, bindings,
+feature/fog admission, assets, shutter sanity, animation/timeline
+checks, program reflection and effect proofs. Use the render Slang toolchain;
+caches and error messages/categories are shared. --shaders also compiles portable shaders for the target
+without opening a GPU driver; this can take minutes.
 
-Success prints `Scene checked successfully` and exits 0. Errors use render's
-messages and exit categories (see errors). A successful check does not guarantee
-that a particular GPU has enough memory or supports the required device features,
-or validate encoder setup or effects that depend on executing a frame.
+Success prints `Scene checked successfully` and exits 0; see vork help errors.
+Validate GPU features/memory, encoder setup and frame-execution effects by rendering.

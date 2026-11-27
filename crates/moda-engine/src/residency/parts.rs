@@ -613,7 +613,7 @@ impl PlanParts {
         for cold in self.units.ranges.iter().filter(|u| u.len != 0) {
             let at = cold.logical as usize;
             if !matches!(dest.get(at)?, DrawItem::Vacant) { continue; }
-            let out = Self::emit_unit(cold, patch.units.as_ref()?, &patch.index.mask_source_ids, plan, scene, opts, caches, hashes, &mut owners)?;
+            let out = Self::emit_unit(cold, patch.units.as_ref()?, &patch.index.deps.mask_source_ids, plan, scene, opts, caches, hashes, &mut owners)?;
             for (slot, item) in dest.get_mut(at..at + out.len())?.iter_mut().zip(out) { *slot = item; }
         }
         Some(())
@@ -635,7 +635,7 @@ impl PlanParts {
             let cold: Vec<_> = self.units.ranges.iter().copied().filter(|u| u.len != 0 && includes(u.logical as usize, u.len as usize)).collect();
             for cold in cold {
                 let ui = cold.index as usize;
-                let items = Self::emit_unit(&cold, units, &index.mask_source_ids, plan, scene, opts, caches, hashes, &mut owners)?;
+                let items = Self::emit_unit(&cold, units, &index.deps.mask_source_ids, plan, scene, opts, caches, hashes, &mut owners)?;
                 let (at, size) = self.restore_unit(ui, index, plan, items, written)?;
                 let seg = units.segment.as_mut()?;
                 if let Some(unit) = seg.units.get_mut(ui) { unit.item_start = at.checked_sub(seg.prefix)?; }
@@ -650,7 +650,7 @@ impl PlanParts {
             if !includes(range.logical as usize, range.len as usize) || index.spans[si].start != ABSENT { continue; }
             let span = &mut index.spans[si];
             let (out, consumed, recipe) = emit_span(scene, span, opts, index.transparent, index.page_clip, backdrop.as_ref(), layer.as_ref(),
-                caches, hashes, &plan.masks, &index.mask_source_ids, true, seg, &mut owners)?;
+                caches, hashes, &plan.masks, &index.deps.mask_source_ids, true, seg, &mut owners)?;
             if consumed != span.z_consumed { return None; }
             delta += (items_bytes(&out) + 4 * out.len()) as i64;
             self.restore(si, span, plan, out, written, false)?;

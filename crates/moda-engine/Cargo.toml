@@ -23,6 +23,7 @@ rustc-hash = "2"
 hashbrown = { version = "0.16", default-features = false }
 rayon = "1.12"
 half = "2"
+num-bigint = "0.4"
 # Path FILL tessellation: sweep-line fill with nonzero/evenodd on self-intersecting outlines.
 lyon_tessellation = "1"
 # Aligned (inside / outside) dashed or trimmed strokes: the centred stroke clipped

@@ -217,6 +217,7 @@ pub struct TextHost {
     vector_files: HashMap<String, String>,
     manifest: Value,
     emoji_dir: PathBuf,
+    ambient: Option<crate::degraded::FontInputs>,
     canvas_engine: OnceLock<Arc<crate::degraded::DegradedEngine>>,
     /// decoded emoji cache: cluster → premultiplied RgbaImage (the browser
     /// uploads premultiplied — `copyExternalImageSafe(premultipliedAlpha:
@@ -263,6 +264,9 @@ impl TextHost {
     pub fn load_with_files(fonts_root: &Path, files: HashMap<String, Vec<u8>>) -> Result<TextHost, String> {
         let lease = Arc::new(VfsLease::install(files));
         let mut host = Self::load(fonts_root)?;
+        if host.manifest.get("systemFonts").and_then(Value::as_bool) == Some(false) {
+            host.ambient = crate::degraded::FontInputs::current();
+        }
         host.vfs_lease = Some(lease);
         Ok(host)
     }
@@ -291,6 +295,7 @@ impl TextHost {
             root: fonts_root.to_path_buf(),
             vector_files: crate::vector::manifest_files(&manifest),
             manifest,
+            ambient: None,
             canvas_engine: OnceLock::new(),
             emoji_dir: fonts_root.join("emoji"),
             emoji_cache: Mutex::new(ByteLruCache::new(
@@ -320,12 +325,27 @@ impl TextHost {
     /// Build the degraded text tier from this host's retained manifest, so a
     /// concurrent directory writer cannot change the set between text systems.
     pub fn degraded_engine(&self) -> crate::degraded::DegradedEngine {
-        crate::degraded::build_catalog_engine_from_snapshot(&self.root, &self.manifest)
+        self.build_engine(false)
+    }
+
+    pub fn uses_current_font_inputs(&self) -> bool {
+        match (&self.ambient, crate::degraded::FontInputs::current()) {
+            (Some(a), Some(b)) => a.same(&b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn build_engine(&self, canvas: bool) -> crate::degraded::DegradedEngine {
+        match &self.ambient {
+            Some(inputs) => inputs.engine(&self.root, &self.manifest, canvas),
+            None => crate::degraded::build_host_engine(&self.root, &self.manifest, canvas),
+        }
     }
 
     /// The scene catalog plus a system colour face when the scene supplies none.
     pub fn canvas_engine(&self) -> &Arc<crate::degraded::DegradedEngine> {
-        self.canvas_engine.get_or_init(|| Arc::new(crate::degraded::build_host_engine(&self.root, &self.manifest, true)))
+        self.canvas_engine.get_or_init(|| Arc::new(self.build_engine(true)))
     }
 
     /// Compare against the manifest snapshot already loaded by this host, without

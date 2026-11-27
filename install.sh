@@ -5,7 +5,7 @@
 set -eu
 repo=${VORK_REPO:-voyager-so/vork}
 # Default version is generated from Cargo.toml by scripts/sync-version.
-version=${VERSION:-0.6.2}
+version=${VERSION:-0.6.3}
 default_prefix=$HOME/.local
 prefix=${PREFIX:-"$default_prefix"}
 # POSIX shell literals for copy/paste, including embedded quotes and $/backticks.

@@ -15,6 +15,7 @@ fn same_paint(a: &crate::seams::BodyPaint, b: &crate::seams::BodyPaint) -> bool 
     use crate::seams::BodyPaint;
     match (a, b) {
         (BodyPaint::Solid, BodyPaint::Solid) => true,
+        (BodyPaint::Program(a), BodyPaint::Program(b)) => a == b,
         (BodyPaint::Gradient(a), BodyPaint::Gradient(b)) => {
             a == b
         }

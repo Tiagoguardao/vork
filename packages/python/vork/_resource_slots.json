@@ -296,6 +296,13 @@
         }
       }
     },
+    "MaterialPaint": {
+      "properties": {
+        "material": {
+          "ref": "NameOr"
+        }
+      }
+    },
     "Morph": {
       "properties": {
         "NORMAL": {
@@ -613,6 +620,12 @@
                   "ref": "Composition"
                 }
               ]
+            },
+            "fill": {
+              "ref": "Paint"
+            },
+            "stroke": {
+              "ref": "Paint"
             }
           }
         }
@@ -648,6 +661,13 @@
           "file": true
         }
       }
+    },
+    "Paint": {
+      "branches": [
+        {
+          "ref": "MaterialPaint"
+        }
+      ]
     },
     "Program": {
       "branches": [

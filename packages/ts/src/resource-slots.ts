@@ -297,6 +297,13 @@ export const resourceSlots = {
         }
       }
     },
+    "MaterialPaint": {
+      "properties": {
+        "material": {
+          "ref": "NameOr"
+        }
+      }
+    },
     "Morph": {
       "properties": {
         "NORMAL": {
@@ -614,6 +621,12 @@ export const resourceSlots = {
                   "ref": "Composition"
                 }
               ]
+            },
+            "fill": {
+              "ref": "Paint"
+            },
+            "stroke": {
+              "ref": "Paint"
             }
           }
         }
@@ -649,6 +662,13 @@ export const resourceSlots = {
           "file": true
         }
       }
+    },
+    "Paint": {
+      "branches": [
+        {
+          "ref": "MaterialPaint"
+        }
+      ]
     },
     "Program": {
       "branches": [

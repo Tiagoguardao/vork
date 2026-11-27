@@ -22,7 +22,7 @@ pub(crate) fn is_sequence(path:&Path)->bool {
 }
 
 pub enum Source {
-    Sequence { files:Vec<PathBuf>, fps:Option<vork_time::Time> },
+    Sequence { files:Vec<PathBuf>, fps:Option<vork_time::Time>, inputs: crate::asset_revision::SourceFiles },
     Video(Video),
 }
 
@@ -35,26 +35,62 @@ type PathMap<T> = Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, T>>>;
 /// about a source is remembered for the next one.
 #[derive(Clone, Default)]
 pub struct Opened {
+    pub(crate) files: crate::asset_revision::SourceFiles,
+    previous: Option<(PathMap<Arc<vork_media::MediaRevision>>, PathMap<Arc<MovieHeader>>)>,
     sources: PathMap<Source>,
     headers: PathMap<Arc<MovieHeader>>,
     sequence_names: PathMap<PathBuf>,
+    sequence_pins: PathMap<Result<Source, String>>,
     soundtracks: PathMap<Option<Arc<vork_audio::Source>>>,
     revisions: PathMap<Arc<vork_media::MediaRevision>>,
 }
 impl Opened {
-    /// Keep the name bindings for a published revision without retaining
-    /// picture decoder processes or frame pages from its validation.
     pub(crate) fn pins(&self) -> Self {
-        Self { revisions: self.revisions.clone(), soundtracks: self.soundtracks.clone(), ..Default::default() }
+        Self { files: self.files.clone(), revisions: self.revisions.clone(), headers: self.headers.clone(), soundtracks: self.soundtracks.clone(), sequence_pins: self.sequence_pins.clone(), ..Default::default() }
     }
+    pub(crate) fn handles_current(&self) -> bool {
+        self.revisions.lock().unwrap().iter().all(|(path, pin)| pin.signal().is_some_and(|s| s.current(path)))
+    }
+
+    /// A new admission adopts only the unchanged generations it actually opens.
+    pub(crate) fn next(&self) -> Self {
+        Self { previous: Some((self.revisions.clone(), self.headers.clone())), ..Default::default() }
+    }
+
+    pub(crate) fn pin_sequence(&self, path: &Path, source: Result<Source, String>) -> Result<()> {
+        self.sequence_pins.lock().unwrap().insert(self.files.key(path)?, source);
+        Ok(())
+    }
+
+    pub(crate) fn sequence_files(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        if let Some(source) = self.sequence_pins.lock().unwrap().get(&self.files.key(path)?) {
+            return match source {
+                Ok(source) => Ok(source.files().to_vec()),
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+        }
+        sequence(path)
+    }
+
     pub(crate) fn revision(&self, path: &Path) -> Result<Arc<vork_media::MediaRevision>> {
-        let key = std::path::absolute(path)?;
+        let key = self.files.key(path)?;
         let mut revisions = self.revisions.lock().unwrap();
         if let Some(known) = revisions.get(&key) { return Ok(known.clone()); }
-        let target = path.canonicalize().with_context(|| format!("open media {}", path.display()))?;
+        let file = self.files.source(path);
+        let target = file.media_name(key.clone()).with_context(|| format!("open media {}", file.name.display()))?;
         let revision = match revisions.get(&target) {
             Some(known) => known.clone(),
-            None => vork_media::MediaRevision::open(&target)?,
+            None => {
+                let previous = self.previous.as_ref().and_then(|(revisions, headers)| {
+                    let revision = revisions.lock().unwrap().get(&target)?.clone();
+                    if !revision.signal().is_some_and(|signal| signal.current(&target)) { return None; }
+                    if let Some(header) = headers.lock().unwrap().get(&target) {
+                        self.headers.lock().unwrap().insert(target.clone(), header.clone());
+                    }
+                    Some(revision)
+                });
+                match previous { Some(pin) => pin, None => file.open_media(&target)? }
+            }
         };
         revisions.insert(target, revision.clone());
         revisions.insert(key, revision.clone());
@@ -73,7 +109,7 @@ impl Opened {
         self.optional_audio(path)?.context("audio: file has no audio stream")
     }
     pub(crate) fn held(&self, path: &Path) -> Result<Option<Arc<vork_media::MediaRevision>>> {
-        Ok(self.revisions.lock().unwrap().get(&std::path::absolute(path)?).cloned())
+        Ok(self.revisions.lock().unwrap().get(&self.files.key(path)?).cloned())
     }
     pub(crate) fn file_version(&self, path: &Path) -> Result<crate::asset_revision::FileVersion> {
         let Some(revision) = self.held(path)? else {
@@ -81,7 +117,7 @@ impl Opened {
         };
         let mut hash = blake3::Hasher::new();
         hash.update_reader(revision.reader()?)?;
-        Ok(crate::asset_revision::FileVersion { target: revision.original().to_owned(), content: hash.finalize() })
+        Ok(crate::asset_revision::FileVersion { target: revision.original().to_owned(), content: hash.finalize(), binding: Some(revision.binding()) })
     }
     fn movie_header(&self, revision: &vork_media::MediaRevision) -> Result<Arc<MovieHeader>> {
         let mut headers = self.headers.lock().unwrap();
@@ -90,16 +126,24 @@ impl Opened {
         if !header.unresolved_aperture() { headers.insert(revision.original().into(), header.clone()); }
         Ok(header)
     }
-    pub(super) fn movie_info(&self, path: &Path) -> Result<serde_json::Value> {
+    pub(crate) fn movie_info(&self, path: &Path) -> Result<serde_json::Value> {
         let revision = self.revision(path)?;
         self.movie_header(&revision)?.info()
     }
     pub(super) fn read<T>(&self, path: &Path, with: impl FnOnce(&Source) -> Result<T>) -> Result<T> {
-        let revision = if is_sequence(path) { None } else { Some(self.revision(path)?) };
+        let revision = if is_sequence(path) {
+            if let Some(sequence) = self.sequence_pins.lock().unwrap().get(&self.files.key(path)?) {
+                return match sequence {
+                    Ok(sequence) => with(sequence),
+                    Err(error) => Err(anyhow::anyhow!("{error}")),
+                };
+            }
+            None
+        } else { Some(self.revision(path)?) };
         let key = match &revision {
             Some(pin) => pin.original().to_owned(),
             None => {
-                let spelling = std::path::absolute(path)?;
+                let spelling = self.files.key(path)?;
                 let mut names = self.sequence_names.lock().unwrap();
                 if let Some(key) = names.get(&spelling) { key.clone() } else {
                     let parent = spelling.parent().context("sequence needs a directory")?.canonicalize()?;
@@ -147,7 +191,7 @@ impl Source {
     /// What was read from disk, without this value's decoding state.
     pub(super) fn fresh(&self) -> Self {
         match self {
-            Self::Sequence {files,fps} => Self::Sequence {files:files.clone(),fps:*fps},
+            Self::Sequence {files,fps,inputs} => Self::Sequence {files:files.clone(),fps:*fps,inputs:inputs.clone()},
             Self::Video(video) => Self::Video(video.fresh()),
         }
     }
@@ -175,7 +219,7 @@ impl Source {
                     .map(|(n,d)|vork_time::Time::new(n.into(),d.into())).transpose().context("EXR sequence framesPerSecond must be positive")?
             } else {None};
             ensure!(fps.is_none_or(|fps|fps > vork_time::Time::ZERO),"EXR sequence framesPerSecond must be positive");
-            return Ok(Self::Sequence {files,fps});
+            return Ok(Self::Sequence {files,fps,inputs:Default::default()});
         }
         Ok(Self::Video(Video::open(path).with_context(||format!("movie {}; restore a playable movie and install ffmpeg/ffprobe on PATH",path.display()))?))
     }
@@ -183,9 +227,9 @@ impl Source {
     pub(crate) fn dimensions(&self) -> Result<[u32; 2]> {
         match self {
             Self::Video(video) => Ok(video.size),
-            Self::Sequence { files, .. } => {
+            Self::Sequence { files, inputs, .. } => {
                 let path = &files[0];
-                let (width, height, _) = crate::texture_source::header(image::ImageFormat::from_path(path)?, &std::fs::read(path)?, u32::MAX)?;
+                let (width, height, _) = crate::texture_source::header(image::ImageFormat::from_path(path)?, &inputs.source(path).read()?, u32::MAX)?;
                 Ok([width, height])
             }
         }
@@ -213,7 +257,7 @@ impl Source {
     /// movie the stream's declared duration, else the displayed span plus one mean frame.
     pub(crate) fn length(&self,fps:vork_time::Time)->Result<Rational> {
         match self {
-            Self::Sequence {files,fps:source_fps} => {
+            Self::Sequence {files,fps:source_fps,..} => {
                 let rate = source_fps.unwrap_or(fps).exact();
                 Ok(Rational::from_integer(files.len().into())/rate)
             }
@@ -230,7 +274,7 @@ impl Source {
     /// boundaries. The decoder receives the selected integer, never a rounded time.
     pub(crate) fn frame_index_exact(&self, time:&Germ, fps:vork_time::Time)->Result<usize> {
         match self {
-            Self::Sequence {files,fps:source_fps} => {
+            Self::Sequence {files,fps:source_fps,..} => {
                 let rate = source_fps.unwrap_or(fps).exact();
                 Ok(time.scale(&rate).floor_clamped(0,i64::try_from(files.len()-1)?)? as usize)
             }
@@ -243,7 +287,7 @@ impl Source {
     }
     fn map_timeline<T>(&self, fps:vork_time::Time, convert: impl Fn(Rational) -> Result<T>)->Result<Vec<T>> {
         Ok(match self {
-            Self::Sequence {files,fps:source_fps} => {
+            Self::Sequence {files,fps:source_fps,..} => {
                 let rate = source_fps.unwrap_or(fps).exact();
                 (0..files.len()).map(|n|convert(Rational::from_integer(n.into())/&rate)).collect::<Result<_>>()?
             }
@@ -269,9 +313,9 @@ impl Source {
     }
     pub(crate) fn frame_at_index(&mut self, index:usize, max_side:u32)->Result<image::DynamicImage> {
         match self {
-            Self::Sequence {files,..} => {
+            Self::Sequence {files,inputs,..} => {
                 let path=&files[index];
-                crate::texture_source::decode(path,&std::fs::read(path)?,max_side)
+                crate::texture_source::decode(path,&inputs.source(path).read()?,max_side)
                     .with_context(||format!("decode sequence frame {}; restore a valid frame or re-export the sequence",path.display()))
             }
             Self::Video(video) => video.frame_at(index,max_side),
@@ -286,10 +330,10 @@ impl Source {
         let _decode = moda_engine::prof::span("canvas.input_decode");
         let index=self.frame_index_exact(time,fps)?;
         match self {
-            Self::Sequence {files,..} => {
+            Self::Sequence {files,inputs,..} => {
                 let path=&files[index];
                 let decode=if light {crate::texture_source::decode_light} else {crate::texture_source::decode_color};
-                decode(path,&std::fs::read(path)?,max_side,explicit,upload)
+                decode(path,&inputs.source(path).read()?,max_side,explicit,upload)
                     .with_context(||format!("decode sequence frame {}",path.display()))
             }
             Self::Video(video) => {
@@ -323,8 +367,8 @@ impl Source {
     pub(crate) fn identity(&self)->Result<blake3::Hash> {
         let mut hash=blake3::Hasher::new();
         match self {
-            Self::Sequence {files,..} => for file in files {
-                hash.update(crate::asset_revision::content(file)?.as_bytes());
+            Self::Sequence {files,inputs,..} => for file in files {
+                hash.update(inputs.source(file).digest()?.as_bytes());
             },
             Self::Video(video) => {
                 let mut part = blake3::Hasher::new();
@@ -459,9 +503,8 @@ struct MovieHeader {
 impl MovieHeader {
     fn read(revision: &vork_media::MediaRevision) -> Result<Self> {
         let path = revision.original();
-        let probe = revision.input(Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_streams","-show_entries",
-            "stream=codec_name,pix_fmt,width,height,time_base,duration,avg_frame_rate,color_transfer,color_primaries,color_space:stream_tags=alpha_mode:stream_side_data=side_data_type,rotation:format=format_name,duration","-of","json"])
-            )?.output().context("video inputs require ffprobe and ffmpeg on PATH")?;
+        let probe = revision.probe(&["-v","error","-select_streams","v:0","-show_streams","-show_entries",
+            "stream=codec_name,pix_fmt,width,height,time_base,duration,avg_frame_rate,color_transfer,color_primaries,color_space:stream_tags=alpha_mode:stream_side_data=side_data_type,rotation:format=format_name,duration","-of","json"]).context("video inputs require ffprobe and ffmpeg on PATH")?;
         ensure!(probe.status.success(), "probe video {}: {}", path.display(), String::from_utf8_lossy(&probe.stderr));
         let value: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
         revision.check_format(value["format"]["format_name"].as_str().unwrap_or(""))?;
@@ -543,7 +586,9 @@ impl Video {
         PictureSpan { index: self.index.clone(), timebase: self.timebase.clone(), fps }
     }
     fn open(path: &Path) -> Result<Self> {
-        let revision = vork_media::MediaRevision::open(path)?;
+        Self::open_revision(vork_media::MediaRevision::open(path)?)
+    }
+    pub(super) fn open_revision(revision: Arc<vork_media::MediaRevision>) -> Result<Self> {
         let header = MovieHeader::read(&revision)?;
         Self::from_header(revision, &header)
     }
@@ -579,7 +624,7 @@ impl Video {
         Ok(self.index.seek_anchor(index)?.filter(|(i, _)| *i != 0))
     }
     fn decoder_command(alpha_decoder: Option<&str>, hardware: bool) -> Command {
-        let mut command=Command::new("ffmpeg");
+        let mut command=vork_media::tool_command("ffmpeg");
         command.args(["-v","error","-nostdin","-nostats","-copyts"]);
         if !hardware {
             // Preserve the signalled left crop even when its first pixel is not
@@ -894,7 +939,7 @@ mod tests {
             let fps = scene_rate.parse()?;
             let source_fps = embedded.map(str::parse).transpose()?;
             let nominal_rate = source_fps.unwrap_or(fps);
-            let source=Source::Sequence {files:vec![PathBuf::new();107893],fps:source_fps};
+            let source=Source::Sequence {files:vec![PathBuf::new();107893],fps:source_fps,inputs:Default::default()};
             assert_eq!(source.length(fps)?, vork_time::Request::Frame(107893, nominal_rate).exact()?.value().clone());
             let timeline=source.exact_timeline(fps)?;
             for (n,time) in timeline.iter().enumerate() {

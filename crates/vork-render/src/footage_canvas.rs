@@ -2,9 +2,10 @@
 //! texture consumer samples the deep intermediate and uses its own session.
 use super::footage::{DecoderProcess, Video};
 use anyhow::{Context, Result};
+#[cfg(test)]
+use std::process::Command;
 use moda_assets::PreparedImage;
 use std::{
-    process::Command,
     sync::{Arc, mpsc},
     thread,
 };
@@ -18,9 +19,7 @@ const RGBA_FILTER: &str = "format=rgba64le,lutrgb=r=round(val/257)*256:g=round(v
 
 fn canvas_filter(opaque: bool) -> &'static str {
     if opaque
-        && Command::new("ffmpeg")
-            .args(["-hide_banner", "-filters"])
-            .output()
+        && vork_inputs::tool_output("ffmpeg", &["-hide_banner", "-filters"])
             .is_ok_and(|output| {
                 output.status.success()
                     && String::from_utf8_lossy(&output.stdout)

@@ -15,7 +15,7 @@ flo_curves = "=0.8.1"
 # boolean / Pathfinder solver's polygon lane (path_bool/overlay.rs).
 i_overlay = { version = "=9.0.0", default-features = false }
 # Typed paint stacks (src/paint.rs), the first serde structs in the scene layer.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Insertion-ordered objects of typed scene values (src/value); the map serde_json's `preserve_order` uses.
 indexmap = "2"

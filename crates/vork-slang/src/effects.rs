@@ -1451,6 +1451,23 @@ fn environment_depends_on(wgsl: &str, entry: &str, origin: bool) -> Result<bool>
         Value::Parts(vec![Value::Parts(vec![Value::Number(0.);4]);2]),
     ],4)
 }
+/// Inspect reads after Slang's inlining and dead-code elimination. An argument can
+/// occur in the entry signature even when the authored paint never observes it.
+pub(super) fn paint_reads(wgsl: &str, entry: &str) -> Result<(bool, bool)> {
+    let source = format!("fn {MATERIAL_WORD}(i:u32)->u32{{return i;}}\n{wgsl}");
+    let module = naga::front::wgsl::parse_str(&source)
+        .map_err(|e| anyhow::anyhow!(e.emit_to_string(&source)))?;
+    let (_, function) = module.functions.iter().find(|(_, f)| f.name.as_deref() == Some(entry))
+        .context("paint entry missing")?;
+    // Slang can retain a constructor that takes the whole context. Follow its
+    // fields through callees, including dependencies that select control flow.
+    let reads = |index: usize| {
+        let mut args = vec![Value::Independent; 5];
+        args[index] = Value::Time;
+        evaluate(&module, function, &args, 0, false, None, None, false).0.time()
+    };
+    Ok((reads(2), reads(3)))
+}
 fn output_uses_time(wgsl: &str, entry: &str, args:&[Value], output:usize) -> Result<bool> {
     let source = format!("fn {MATERIAL_WORD}(i:u32)->u32{{return i;}}\nfn {SAMPLE_IMAGE}(slot:u32,uv:vec2<f32>,dx:vec2<f32>,dy:vec2<f32>)->vec4<f32>{{return vec4<f32>(f32(slot)+dot(uv+dx+dy,vec2<f32>(1.)));}}\n{wgsl}");
     let module = naga::front::wgsl::parse_str(&source)

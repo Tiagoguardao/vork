@@ -25,25 +25,30 @@ pub(crate) fn for_image(mut error: anyhow::Error, name: &str) -> anyhow::Error {
         && declared.image.is_none() { declared.image = Some(name.to_owned()); }
     error
 }
-/// Keep the path separate so a session can name the authored file after decoding a private revision.
+/// The authored location and remedy for a failed image read.
 #[derive(Debug)]
 pub(crate) struct DecodeLocation {
-    pub(crate) path: PathBuf,
+    path: PathBuf,
     what: &'static str,
-    damaged: bool,
+    remedy: Option<&'static str>,
 }
 impl std::fmt::Display for DecodeLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.what, self.path.display())?;
-        if self.damaged {
-            write!(f, "; restore a valid image or correct its path")?;
+        if let Some(remedy) = self.remedy {
+            write!(f, "; {remedy}")?;
         }
         Ok(())
     }
 }
+impl DecodeLocation {
+    pub(crate) fn image_info(path: PathBuf) -> Self {
+        Self { path, what: "ask: read image info", remedy: Some("restore a readable image") }
+    }
+}
 pub(crate) fn decode_context(error: anyhow::Error, what: &'static str, path: &std::path::Path) -> anyhow::Error {
-    let damaged = !error.is::<DeclaredColour>();
-    error.context(DecodeLocation { path: path.to_owned(), what, damaged })
+    let remedy = (!error.is::<DeclaredColour>()).then_some("restore a valid image or correct its path");
+    error.context(DecodeLocation { path: path.to_owned(), what, remedy })
 }
 pub(crate) fn missing_image(path: &std::path::Path) -> image::DynamicImage {
     crate::warnings::dropped("missing_image", serde_json::json!({"file":path}),
@@ -125,6 +130,17 @@ pub(crate) fn decode_light(
 ) -> anyhow::Result<image::DynamicImage> {
     crate::failure::contain("the colour decoder", || decode_color_impl(path,bytes,max_side,explicit,destination,true)).map(|(image,_)|image)
 }
+/// Decode an upright still for canvas paint. The pattern owner keeps the
+/// association and sizing policy, including straight texels for float canvases.
+pub(crate) fn decode_canvas_still(
+    path: &std::path::Path, bytes: &[u8], explicit: Option<vork_scene::v2::ColorSpace>,
+) -> anyhow::Result<image::DynamicImage> {
+    crate::failure::contain("the colour decoder", || {
+        let (decoded, description) = prepare(path, bytes, u32::MAX, explicit.is_none(), true)?;
+        convert_described(decoded, description, explicit, vork_scene::v2::WorkingColorSpace::Srgb, true)
+    })
+}
+
 /// Whether a float image has a colour sample that is not light: negative, or not finite.
 fn not_light(image: &image::DynamicImage) -> bool {
     let bad = |v: &f32| !(*v >= 0. && v.is_finite());
@@ -151,28 +167,60 @@ pub(crate) fn limit_to_gamut(image: image::DynamicImage) -> image::DynamicImage 
 /// What a file says about its own colour, as its format holds it.
 #[derive(Default)]
 struct Description {
+    /// The decoder's format, absent for IES photometry.
+    format: Option<image::ImageFormat>,
     /// A named space: PNG cICP, or an EXR's `vork:color_space`.
     named: Option<vork_scene::v2::WorkingColorSpace>,
     /// An embedded ICC profile.
     icc: Option<Vec<u8>>,
     /// The PNG sRGB chunk.
     srgb: bool,
-    /// CIE xy of red, green, blue and white: PNG cHRM, EXR chromaticities.
-    chromaticities: Option<[[f32; 2]; 4]>,
+    chromaticities: Option<Chromaticities>,
     /// The file gamma: PNG gAMA; one for EXR.
     gamma: Option<f32>,
 }
+
+enum Chromaticities {
+    Png(png::SourceChromaticities),
+    /// CIE xy of red, green, blue and white.
+    Exr([[f32; 2]; 4]),
+}
+
+fn usable_png_chromaticities(points: [(png::ScaledFloat, png::ScaledFloat); 4]) -> bool {
+    let points = points.map(|(x, y)| [i64::from(x.into_scaled()), i64::from(y.into_scaled())]);
+    let one = png::ScaledFloat::SCALING as i64;
+    if points.iter().any(|&[x, y]| y == 0 || x + y > one) {
+        return false;
+    }
+
+    // The triangle area gives the basis determinant up to a nonzero
+    // factor. Substituting white for a primary gives that scale's numerator.
+    let area = |[ax, ay]: [i64; 2], [bx, by]: [i64; 2], [cx, cy]: [i64; 2]| {
+        (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    };
+    let [red, green, blue, white] = points;
+    area(red, green, blue) != 0
+        && area(white, green, blue) != 0
+        && area(red, white, blue) != 0
+        && area(red, green, white) != 0
+}
+
 /// One preparation of an image for the colour decoder: its bounds, its own description (read only when
 /// `describe`: a declaration makes it irrelevant) and its stored pixels. One image decoder supplies the size,
 /// the ICC profile and the pixels. The image crate's decoders do not expose a PNG's colour chunks or an EXR's
 /// attributes, so those come from one read of the format's header, which also bounds an EXR's data windows;
 /// it stands where the dimensions-only decoder of `bounded` stands for other callers.
-fn prepare(path: &std::path::Path, bytes: &[u8], max_side: u32, describe: bool) -> anyhow::Result<(image::DynamicImage, Description)> {
+fn prepare(path: &std::path::Path, bytes: &[u8], max_side: u32, describe: bool, canvas: bool) -> anyhow::Result<(image::DynamicImage, Description)> {
     use image::ImageDecoder;
     use vork_scene::v2::WorkingColorSpace as S;
     let mut description = Description::default();
-    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies")) {return Ok((crate::ies::decode(bytes)?, description));}
-    let format = image::ImageFormat::from_path(path)?;
+    if !canvas && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies")) {
+        return Ok((crate::ies::decode(bytes)?, description));
+    }
+    // Canvas sources have already been admitted as PNG or JPEG, and their store key may be a
+    // canonical path whose extension differs from the authored path.
+    let format = if canvas { image::guess_format(bytes)? } else { image::ImageFormat::from_path(path)? };
+    description.format = Some(format);
     if format == image::ImageFormat::OpenExr {
         // The EXR decoder allocates each part's data window, which a header may place far outside the image
         // it displays.
@@ -185,7 +233,7 @@ fn prepare(path: &std::path::Path, bytes: &[u8], max_side: u32, describe: bool) 
             let part = metadata.headers.iter().find(|header| !header.deep && ["R","G","B"].iter()
                 .all(|&channel|header.channels.find_index_of_channel(&exr::meta::attribute::Text::from(channel)).is_some()));
             description.chromaticities = part.and_then(|h|h.shared_attributes.chromaticities)
-                .map(|c|[c.red,c.green,c.blue,c.white].map(|xy|[xy.0,xy.1]));
+                .map(|c| Chromaticities::Exr([c.red,c.green,c.blue,c.white].map(|xy|[xy.0,xy.1])));
             description.gamma = Some(1.);
             if let Some(exr::meta::attribute::AttributeValue::Text(space)) = part
                 .and_then(|h|h.own_attributes.other.get(&exr::meta::attribute::Text::from("vork:color_space"))) {
@@ -199,40 +247,54 @@ fn prepare(path: &std::path::Path, bytes: &[u8], max_side: u32, describe: bool) 
         let info = reader.info();
         description.srgb = info.srgb.is_some();
         description.gamma = info.gama_chunk.map(|g| g.into_value());
-        description.chromaticities = info.chrm_chunk.map(|c| [c.red,c.green,c.blue,c.white].map(|(x,y)|[x.into_value(),y.into_value()]));
+        description.chromaticities = info.chrm_chunk.map(Chromaticities::Png);
         // PNG Third Edition: cICP takes precedence over ICC and legacy chunks.
         if let Some(cicp) = info.coding_independent_code_points {
-            if cicp.matrix_coefficients != 0 || !cicp.is_video_full_range_image {
-                return Err(declared_colour("the image's cICP tag is not full-range RGB, which is not read"));
-            }
-            description.named = Some(match (cicp.color_primaries, cicp.transfer_function) {
-                (1,13) => S::Srgb,
-                (12,13) => S::DisplayP3,
-                (1,8) => S::LinearRec709,
-                (9,8) => S::LinearRec2020,
-                (_,16|18) => return Err(declared_colour("the image is tagged PQ or HLG, which is not decoded yet")),
-                _ => return Err(declared_colour(format!("the image's cICP tag (primaries {}, transfer {}) is not read yet",cicp.color_primaries,cicp.transfer_function))),
-            });
+            let named = match (cicp.matrix_coefficients, cicp.is_video_full_range_image,
+                cicp.color_primaries, cicp.transfer_function) {
+                (0,true,1,13) => Ok(S::Srgb),
+                (0,true,12,13) => Ok(S::DisplayP3),
+                (0,true,1,8) => Ok(S::LinearRec709),
+                (0,true,9,8) => Ok(S::LinearRec2020),
+                (0,true,_,16|18) => Err(declared_colour("the image is tagged PQ or HLG, which is not decoded yet")),
+                (0,true,_,_) => Err(declared_colour(format!("the image's cICP tag (primaries {}, transfer {}) is not read yet",cicp.color_primaries,cicp.transfer_function))),
+                _ => Err(declared_colour("the image's cICP tag is not full-range RGB, which is not read")),
+            };
+            description.named = match named {
+                Ok(space) => Some(space),
+                // Preserve paint's ICC-or-stored reading for unsupported tags.
+                Err(_) if canvas => {
+                    description.gamma = None;
+                    description.chromaticities = None;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
         }
     }
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
     // As `bounded`: sides are checked on the decoder's header below, before any pixel is decoded.
-    reader.no_limits();
+    if !canvas { reader.no_limits(); }
     let mut decoder = reader.into_decoder()?;
     let (width, height) = decoder.dimensions();
     side(max_side, "image", width as usize, height as usize)?;
-    if describe && description.named.is_none() {description.icc = decoder.icc_profile()?;}
-    Ok((image::DynamicImage::from_decoder(decoder)?, description))
+    if describe && description.named.is_none() {
+        description.icc = if canvas { decoder.icc_profile().ok().flatten() } else { decoder.icc_profile()? };
+    }
+    let orientation = canvas.then(|| moda_assets::decode::raster_orientation(&mut decoder));
+    let mut decoded = image::DynamicImage::from_decoder(decoder)?;
+    if let Some(orientation) = orientation { decoded.apply_orientation(orientation); }
+    Ok((decoded, description))
 }
 fn decode_color_impl(path:&std::path::Path,bytes:&[u8],max_side:u32,explicit:Option<vork_scene::v2::ColorSpace>,destination:vork_scene::v2::WorkingColorSpace,light:bool) -> anyhow::Result<(image::DynamicImage, image::ColorType)> {
-    let (decoded, description) = prepare(path, bytes, max_side, explicit.is_none())?;
+    let (decoded, description) = prepare(path, bytes, max_side, explicit.is_none(), false)?;
     let stored = decoded.color();
     // Light is finite and not negative. The file's own samples are judged here, as stored, before a conversion
     // can hide them; what conversion then carries outside the gamut is limited to it.
     let light = light && explicit != Some(vork_scene::v2::ColorSpace::NonColor);
     anyhow::ensure!(!(light && not_light(&decoded)), "the image has negative or non-finite colour samples; environment radiance must be finite and nonnegative");
     // Without a declaration the pixels are decoded by now: what fails here is the reading of the file's description.
-    let image = convert_described(decoded, description, path, explicit, destination)
+    let image = convert_described(decoded, description, explicit, destination, false)
         .map_err(|error| if explicit.is_some() || error.is::<DeclaredColour>() {error} else {declared_colour(format!("the image's colour description is not usable ({error:#})"))})?;
     Ok((if light {limit_to_gamut(image)} else {image}, stored))
 }
@@ -267,12 +329,18 @@ fn icc_is_srgb(profile: &moxcms::ColorProfile) -> bool {
         && srgb(&profile.red_trc) && srgb(&profile.green_trc) && srgb(&profile.blue_trc)
 }
 /// The stored image converted into the upload encoding by what describes it: the declaration, else the file.
-fn convert_described(decoded:image::DynamicImage,description:Description,path:&std::path::Path,explicit:Option<vork_scene::v2::ColorSpace>,destination:vork_scene::v2::WorkingColorSpace) -> anyhow::Result<image::DynamicImage> {
+fn convert_described(decoded:image::DynamicImage,description:Description,explicit:Option<vork_scene::v2::ColorSpace>,destination:vork_scene::v2::WorkingColorSpace,canvas:bool) -> anyhow::Result<image::DynamicImage> {
     use vork_scene::v2::WorkingColorSpace as S;
-    let extension = |name: &str| path.extension().is_some_and(|e|e.eq_ignore_ascii_case(name));
     // EXR pixels are stored associated, and stay so.
-    let associated = extension("exr");
-    let convert = |image,source,destination|convert_associated_image(image,source,destination,associated);
+    let associated = description.format == Some(image::ImageFormat::OpenExr);
+    let convert = |image,source: S,destination| {
+        if canvas {
+            let conversion = source.conversion(destination);
+            if conversion.is_identity() { image } else { map_straight_rgba8(image, |rgb| conversion.apply(rgb)) }
+        } else {
+            convert_associated_image(image,source,destination,associated)
+        }
+    };
     if let Some(explicit) = explicit {
         use vork_scene::v2::ColorSpace as C;
         return match explicit {
@@ -284,11 +352,18 @@ fn convert_described(decoded:image::DynamicImage,description:Description,path:&s
             C::DisplayP3 => Ok(convert(decoded,S::DisplayP3,destination)),
         };
     }
-    if extension("ies") {return Ok(decoded);}
-    let format = image::ImageFormat::from_path(path)?;
-    let Description {named: source, icc: profile, srgb: tagged_srgb, chromaticities, gamma} = description;
+    let Some(format) = description.format else {return Ok(decoded)};
+    let Description {named: source, icc: profile, srgb: tagged_srgb, chromaticities, gamma, ..} = description;
     if let Some(source) = source {return Ok(convert(decoded,source,destination));}
     if let Some(icc) = profile {
+        if canvas {
+            let source = decoded.color();
+            let mut pixels = decoded.into_rgba8();
+            // Canvas paints have always accepted an unusable profile as stored
+            // sRGB. The 8-bit transform also preserves the paint's ICC rounding.
+            let _ = moda_assets::decode::apply_icc_to_srgb(pixels.as_mut(), &icc, source);
+            return Ok(image::DynamicImage::ImageRgba8(pixels));
+        }
         use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions};
         let profile = ColorProfile::new_from_slice(&icc)?;
         if !matches!(profile.color_space,DataColorSpace::Rgb|DataColorSpace::Gray) {
@@ -321,29 +396,81 @@ fn convert_described(decoded:image::DynamicImage,description:Description,path:&s
     }
     if tagged_srgb {return Ok(convert(decoded,S::Srgb,destination));}
     if chromaticities.is_some() || gamma.is_some() {
-        let primaries = chromaticities.unwrap_or(S::LinearRec709.chromaticities());
+        let primaries = match chromaticities {
+            Some(Chromaticities::Png(c)) => {
+                let points = [c.red, c.green, c.blue, c.white];
+                if canvas && !usable_png_chromaticities(points) {
+                    return Ok(convert(decoded, S::Srgb, destination));
+                }
+                points.map(|(x, y)| [x.into_value(), y.into_value()])
+            }
+            Some(Chromaticities::Exr(xy)) => xy,
+            None => S::LinearRec709.chromaticities(),
+        };
         anyhow::ensure!(gamma.is_none_or(|g|g.is_finite() && g > 0.), "image gamma must be positive");
         // The description resolved: Rec.709 primaries with no gamma are sRGB, with gamma one linear Rec.709.
         // Those are named spaces, converted (or left as they are) like any other.
         let identity = primaries.iter().flatten().zip(S::LinearRec709.chromaticities().iter().flatten()).all(|(a,b)|(a-b).abs()<1e-5);
         if identity && gamma.is_none() {return Ok(convert(decoded,S::Srgb,destination));}
         if identity && gamma == Some(1.) {return Ok(convert(decoded,S::LinearRec709,destination));}
-        let matrix = chromaticities_to_rec709(primaries)?;
+        let matrix = match chromaticities_to_rec709(primaries) {
+            Err(_) if canvas && format == image::ImageFormat::Png => {
+                return Ok(convert(decoded, S::Srgb, destination));
+            }
+            result => result?,
+        };
         let encode = S::LinearRec709.conversion(destination);
+        let convert = |rgb: [f32; 3]| {
+            let rgb = rgb.map(|v|gamma.map_or_else(||decode_srgb(v),|g|v.signum()*v.abs().powf(1./g)));
+            encode.apply((matrix * glam::Vec3::from_array(rgb)).to_array())
+        };
+        if canvas {
+            return Ok(map_straight_rgba8(decoded, convert));
+        }
         let mut pixels = decoded.to_rgba32f();
         for pixel in pixels.pixels_mut() {
             let alpha = if associated && (gamma != Some(1.) || !destination.is_linear()) {pixel[3]} else {1.};
-            let rgb = [pixel[0],pixel[1],pixel[2]].map(|v|if alpha>0. {v/alpha} else {0.})
-                .map(|v|gamma.map_or_else(||decode_srgb(v),|g|v.signum()*v.abs().powf(1./g)));
-            let rgb = glam::Vec3::from_array(rgb);
-            let rgb = (matrix*rgb).to_array();
-            let rgb = encode.apply(rgb).map(|v|v*alpha);
-            pixel.0[..3].copy_from_slice(&rgb);
+            let rgb = [pixel[0],pixel[1],pixel[2]].map(|v|if alpha>0. {v/alpha} else {0.});
+            pixel.0[..3].copy_from_slice(&convert(rgb).map(|v|v*alpha));
         }
         return Ok(image::DynamicImage::ImageRgba32F(pixels));
     }
     let fallback = if matches!(format,image::ImageFormat::OpenExr|image::ImageFormat::Hdr) {S::LinearRec709} else {S::Srgb};
     Ok(convert(decoded,fallback,destination))
+}
+
+/// Convert straight SDR source samples into the paint upload without an
+/// intermediate float image. Preserve 16-bit input precision until quantization.
+fn map_straight_rgba8(decoded: image::DynamicImage, convert: impl Fn([f32; 3]) -> [f32; 3]) -> image::DynamicImage {
+    use image::{DynamicImage as D, Pixel, Rgba};
+
+    let quantize = |v: f32| (v.min(1.).max(0.) * 255.).round() as u8;
+    let convert_pixel = |[r, g, b, a]: [f32; 4], max: f32| {
+        let [r, g, b] = convert([r / max, g / max, b / max]).map(quantize);
+        Rgba([r, g, b, quantize(a / max)])
+    };
+    macro_rules! convert_pixels {
+        ($pixels:expr) => {{
+            let pixels = $pixels;
+            image::RgbaImage::from_fn(pixels.width(), pixels.height(), |x, y| {
+                convert_pixel(pixels.get_pixel(x, y).to_rgba().0.map(f32::from), 65535.)
+            })
+        }};
+    }
+    let pixels = match decoded {
+        D::ImageLuma16(pixels) => convert_pixels!(pixels),
+        D::ImageLumaA16(pixels) => convert_pixels!(pixels),
+        D::ImageRgb16(pixels) => convert_pixels!(pixels),
+        D::ImageRgba16(pixels) => convert_pixels!(pixels),
+        decoded => {
+            let mut pixels = decoded.into_rgba8();
+            for pixel in pixels.pixels_mut() {
+                *pixel = convert_pixel(pixel.0.map(f32::from), 255.);
+            }
+            pixels
+        }
+    };
+    D::ImageRgba8(pixels)
 }
 
 /// Convert an image's colour between two spaces. `associated`: its colour is multiplied by alpha (EXR); a
@@ -503,6 +630,67 @@ mod tests {
     }
 
     #[test]
+    fn canvas_still_keeps_stored_pixels_for_malformed_icc_and_pq() {
+        let path = std::path::Path::new("picture.png");
+        let mut info = png::Info::with_size(1, 1);
+        info.color_type = png::ColorType::Rgba;
+        info.icc_profile = Some(std::borrow::Cow::Borrowed(b"not an ICC profile"));
+        let mut malformed = Vec::new();
+        {
+            let mut writer = png::Encoder::with_info(&mut malformed, info)
+                .unwrap().write_header().unwrap();
+            writer.write_image_data(&[64, 100, 150, 128]).unwrap();
+        }
+        for (bytes, expected) in [
+            (malformed, [64, 100, 150, 128]),
+            (tagged_png(9, 16), [255, 0, 0, 128]),
+        ] {
+            let pixels = super::decode_canvas_still(path, &bytes, None).unwrap().into_rgba8();
+            assert_eq!(pixels.get_pixel(0, 0).0, expected);
+        }
+    }
+
+    #[test]
+    fn canvas_still_keeps_stored_pixels_for_unusable_chromaticities() {
+        let path = std::path::Path::new("picture.png");
+        let pixel = [64, 100, 150, 128];
+        let d65 = (31_270, 32_900);
+        let red = (64_000, 33_000);
+        let green = (30_000, 60_000);
+        let blue = (15_000, 6_000);
+        let scaled = |(x, y)| (png::ScaledFloat::from_scaled(x), png::ScaledFloat::from_scaled(y));
+        for (white, red, green, native_refuses, keeps_samples) in [
+            (d65, red, red, true, true), // Singular primary basis.
+            (d65, (64_000, 0), green, true, true),
+            (d65, (64_000, 70_000), green, false, true),
+            (red, red, green, false, true),
+            ((47_000, 46_500), red, green, false, true),
+            ((39_500, 19_500), red, green, false, true),
+            ((22_500, 33_000), red, green, false, true),
+            ((67_400, 30_300), red, green, false, true), // Beyond the red–green edge.
+            ((47_000, 46_499), red, green, false, false), // One PNG unit off the edge.
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_source_chromaticities(png::SourceChromaticities {
+                    white: scaled(white),
+                    red: scaled(red),
+                    green: scaled(green),
+                    blue: scaled(blue),
+                });
+                encoder.set_source_gamma(png::ScaledFloat::new(1.));
+                let mut writer = encoder.write_header().unwrap();
+                writer.write_image_data(&pixel).unwrap();
+            }
+            let paint = super::decode_canvas_still(path, &bytes, None).unwrap().into_rgba8();
+            assert_eq!(paint.get_pixel(0, 0).0 == pixel, keeps_samples, "{white:?}");
+            assert_eq!(super::decode_color(path, &bytes, 16, None, super::upload(false)).is_err(), native_refuses);
+        }
+    }
+
+    #[test]
     fn icc_rgb_gray_and_cicp_precedence_preserve_alpha() {
         fn png(profile:moxcms::ColorProfile,gray:bool,cicp:bool)->Vec<u8> {
             let mut info=png::Info::with_size(1,1);
@@ -551,6 +739,10 @@ mod tests {
         let bytes=png(moxcms::ColorProfile::new_display_p3(),false,true);
         let decoded=super::decode_color(path,&bytes,16,None,super::upload(true)).unwrap();
         assert_eq!(decoded.as_rgba8().unwrap().get_pixel(0,0).0,[255,0,0,128]);
+        let bytes=png(moxcms::ColorProfile::new_gray_with_gamma(1.),true,false);
+        let paint=super::decode_canvas_still(path,&bytes,None).unwrap().into_rgba8();
+        assert!(paint.get_pixel(0,0).0[..3].iter().all(|&code| code.abs_diff(188) <= 1));
+        assert_eq!(paint.get_pixel(0,0).0[3],64);
         let bytes=png(moxcms::ColorProfile::new_gray_with_gamma(2.2),true,false);
         let pixel=super::decode_color(path,&bytes,16,None,super::upload(false)).unwrap().to_rgba32f().get_pixel(0,0).0;
         for value in &pixel[..3] {assert!((*value-(128f32/255.).powf(2.2)).abs()<0.001,"{pixel:?}");}

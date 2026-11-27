@@ -50,6 +50,7 @@ mod arc;
 mod bounds;
 pub mod connector_text;
 mod dash;
+mod sampled_dash;
 pub mod line_to_path;
 pub mod curve_quality;
 pub(crate) mod paint_order;
@@ -86,17 +87,20 @@ pub(crate) fn tessellate_body(
     let trim = curve_quality::trim_params_from_node(node);
     with_dash_alignment(style.dash_aligned(), || {
         with_miter_limit(node.miter_limit(), || {
-            tessellate_combined_cached(
+            tessellator::tessellate_with_pattern_cached(
                 cmds,
                 stroke_width,
                 closure,
                 trim,
-                style.dash.as_deref().filter(|dash| !dash.is_empty()),
+                style.sampled_dash.as_ref().map(sampled_dash::DashPattern::Sampled).or_else(|| {
+                    style.dash.as_deref().filter(|dash| !dash.is_empty()).map(sampled_dash::DashPattern::Static)
+                }),
                 style.dash_offset.unwrap_or(0.0),
                 pt::line_cap_from_str(style.cap.as_deref()),
                 pt::line_join_from_str(style.join.as_deref()),
                 fill_rule,
                 pt::stroke_align_from_str(style.align.as_deref()),
+                stroke_param::needs_stroke_uv(node),
             )
         })
     })

@@ -1,6 +1,5 @@
 GEOMETRY
-Std builders accept scene geometry shorthand; signatures and shape conventions:
-vork help std --all. SDK setup: vork help sdk.
+Std scene geometry shorthand and builder signatures: vork help std --all.
 
 Instance columns are node-relative.
 
@@ -12,15 +11,15 @@ only imported glTF materials multiply base colour by COLOR_0 automatically.
 Attribute values use the same linear Rec.709 space as constant material colours;
 an sRGB picker value must be converted to linear before storing it.
 
-Std extrude supports inward rounded rims: bevel_depth (metres), bevel_resolution
-(quarter-circle steps). Total depth/bounds stay fixed.
+Std extrude rounds inward with bevel_depth (metres) and bevel_resolution
+(quarter-circle steps); depth/bounds stay fixed.
 Missing NORMAL attributes use face normals; authored NORMAL values control smoothing.
 Std builders emit UVs but no TANGENT attribute.
 Anisotropy uses TANGENT or material geometry_tangent; without either it uses a
 fallback frame, not the UV direction.
-Text size is the font em in metres, not visible cap height. Finite pixel/shutter
-sampling can leave small strokes and bevel highlights unresolved; extra bevel
-segments and denoising do not guarantee recovery. Samples cannot add missing geometry.
+Text size is metres per font em. Small strokes/bevel highlights can be undersampled;
+try more camera samples. Shutter sampling matters for moving detail. Extra bevel
+segments and denoising cannot guarantee recovery. Samples cannot recover missing geometry.
 
 Normal maps use glTF/MikkTSpace: B = cross(N,T.xyz)*T.w. Derivative frames
 recover handedness from UVs and the original normal, with no image-V sign flip.
@@ -39,7 +38,7 @@ node transforms place the domain. Boundary samples must be strictly positive.
 Ordinary mesh materials shade the surface, including OpenPBR transmission.
 Use surface materials without subsurface shading or displacement on implicit geometry.
 
-Std builders expand in the author loader before scene decoding. Expanded geometry uses buffers; CPU expansion usage and coverage: `vork help std --all`.
+Std builders expand to buffers before decoding. CPU expansion: vork help std --all.
 
 GEOMETRY STAGE ORDER
 scene.geometry_stages defaults to ["deform","compute","displace"]. Each named

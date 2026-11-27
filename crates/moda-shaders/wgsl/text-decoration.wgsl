@@ -1,6 +1,7 @@
 // #include "working-color.wgsl"
 
 struct VSOut { @builtin(position) pos: vec4f, @location(0) @interpolate(flat) clip: vec4f };
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
 @group(0) @binding(1) var<uniform> model: mat4x4<f32>;
 @group(0) @binding(2) var<uniform> color: vec4f;

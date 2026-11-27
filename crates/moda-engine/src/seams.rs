@@ -67,20 +67,21 @@ pub struct PaintInstance {
 
 const _: () = assert!(core::mem::size_of::<PaintInstance>() == 144);
 
-/// The 128-byte `PathData` instance of the path-solid pipeline (WGSL struct in
+/// The paint and clipping portion of the `PathData` instance of the path-solid pipeline (WGSL struct in
 /// `wgsl/path-solid.wgsl`; packing `WebGPUPathRenderer.ts:1471-1485`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SolidPathInstance {
-    pub model_matrix: [f32; 16],
     pub fill_color: [f32; 4],
     pub stroke_color: [f32; 4],
-    /// [vertexOffset, vertexCount, strokeWidth(|| 1), depth]
-    pub path_info: [f32; 4],
+    /// Logical draw occurrence, independent of vertex and phase-local instance indices.
+    pub slot: u32,
+    pub _reserved: [u32; 2],
+    pub depth: f32,
     pub page_clip_bounds: [f32; 4],
 }
 
-const _: () = assert!(core::mem::size_of::<SolidPathInstance>() == 128);
+const _: () = assert!(core::mem::size_of::<SolidPathInstance>() == 64);
 
 /// The 112-byte `PageInstance` of the page-fill/page-stroke pipelines
 /// (WGSL struct in `wgsl/page-fill.wgsl`; packing
@@ -336,6 +337,12 @@ pub struct MaskDraw {
 /// `luma(rgb) × a`) and composites it source-over.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MaskPaint {
+    Program {
+        body: ProgramBody,
+        opacity: f32,
+        stroke: bool,
+        stroke_uv: std::sync::Arc<[f32]>,
+    },
     /// A constant straight colour; `a` carries layer × node opacity. A vector
     /// mask draws opaque white.
     Solid([f32; 4]),
@@ -681,6 +688,12 @@ pub enum CoverageSource {
 /// blend/depth state for each variant comes from the manifest pipeline
 /// descriptors — by module id — never hand-coded.
 ///
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramBody {
+    pub binding: moda_scene::paint::PathProgram,
+    pub bounds: [f32; 4],
+}
+
 /// M3b interface-change note (SEAMS.md change log): `Gradient` and `Pattern`
 /// now CARRY their packed instance payloads (`PathGradientData` 1552 B /
 /// `PathPatternData` 432 B mirrors of the extracted WGSL structs, plus the
@@ -689,6 +702,7 @@ pub enum CoverageSource {
 /// (vertexOffset/vertexCount) are executor-time values fixed up at upload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BodyPaint {
+    Program(ProgramBody),
     /// path-solid module; instance = `SolidPathInstance`.
     Solid,
     /// path-gradient module (M3b): packed `PathGradientData` (fill gradient,
@@ -1125,7 +1139,7 @@ pub enum Phase {
 /// pipeline. [`BlendMode::fixed_function`] is only the fallback for a node that
 /// can't take the split (region renders): overlay keeps its manifest state
 /// (`src-alpha` over), the modes added later draw plain source-over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlendMode {
     Normal,
     Multiply,

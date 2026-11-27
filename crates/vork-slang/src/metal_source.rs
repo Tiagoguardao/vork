@@ -24,6 +24,12 @@ pub fn finalize<S: AsRef<OsStr>>(args: &[S], code: Vec<u8>) -> Result<Vec<u8>> {
         source.push_str("#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n");
     }
     source.push_str(&initialize_locals(std::str::from_utf8(&code)?));
+    // No function reaches Apple's compiler marked noinline. Slang's outlining
+    // bounds its own optimization graph; the hint is not semantics. With it,
+    // scene-linked path stages never returned from a dispatch on M5 Max
+    // (#2580, bisected there) and the GPU watchdog can freeze the machine.
+    // The 3D revert to 0.6.1 (#2708) dropped this; restored here.
+    let source = source.replace("__attribute__((noinline))\n", "").replace("__attribute__((noinline))", "");
     Ok(source.into_bytes())
 }
 

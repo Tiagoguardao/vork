@@ -1670,6 +1670,7 @@ dependencies = [
  "moda-shaders",
  "moda-text",
  "moda-text-draw",
+ "num-bigint",
  "png",
  "pollster",
  "rayon",
@@ -1731,6 +1732,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-properties",
  "unicode-segmentation",
+ "vork-inputs",
 ]
 
 [[package]]
@@ -3388,7 +3390,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vork-audio"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "hound",
@@ -3399,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "vork-cli"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3419,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "vork-encode"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "ash",
@@ -3428,13 +3430,23 @@ dependencies = [
  "objc2-metal",
  "pollster",
  "tempfile",
+ "vork-inputs",
  "vork-time",
  "wgpu",
 ]
 
 [[package]]
+name = "vork-inputs"
+version = "0.6.3"
+dependencies = [
+ "blake3",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "vork-json"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3442,18 +3454,19 @@ dependencies = [
 
 [[package]]
 name = "vork-media"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "libc",
  "serde_json",
  "tempfile",
+ "vork-inputs",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "vork-mesh"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "glam",
@@ -3464,7 +3477,7 @@ dependencies = [
 
 [[package]]
 name = "vork-render"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "ash",
@@ -3505,6 +3518,7 @@ dependencies = [
  "urlencoding",
  "vork-audio",
  "vork-encode",
+ "vork-inputs",
  "vork-json",
  "vork-media",
  "vork-mesh",
@@ -3521,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "vork-scene"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "cssparser",
@@ -3536,7 +3550,7 @@ dependencies = [
 
 [[package]]
 name = "vork-slang"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3545,13 +3559,14 @@ dependencies = [
  "libloading",
  "naga",
  "serde",
+ "vork-inputs",
  "vork-json",
  "vork-scene",
 ]
 
 [[package]]
 name = "vork-splat"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3560,7 +3575,7 @@ dependencies = [
 
 [[package]]
 name = "vork-std"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3575,6 +3590,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "svgtypes",
+ "vork-inputs",
  "vork-json",
  "vork-scene",
  "vork-time",
@@ -3584,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "vork-time"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "num-bigint",

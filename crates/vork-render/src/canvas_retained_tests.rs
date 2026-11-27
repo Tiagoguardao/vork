@@ -194,7 +194,7 @@
         doc.plan(&[])?;
         let before = doc.retained.borrow().as_ref().unwrap().picture_scene();
         let refused = crate::canvas_host_memory::with_workers(|| doc.frame(&at)).err().expect("unreserved subtree");
-        assert!(refused.is::<wgpu::optional_allocations::Refused>());
+        assert!(refused.is::<crate::canvas_host_memory::SerialGrowth>());
         assert_eq!(doc.retained.borrow().as_ref().unwrap().picture_scene(), before);
         doc.frame(&at)?;
         assert!(!doc.plan(&[])?.items.is_empty());
@@ -1321,7 +1321,7 @@
             let scene = Scene::from_json(&serde_json::to_vec(&json)?)?;
             let doc = Document::new(&scene, &port.path())?;
             let nodes: Vec<_> = doc.items.iter().map(|i| &i.node).collect();
-            crate::canvas_draw::install_images(&nodes, &[])?;
+            crate::canvas_draw::install_images(&Default::default(), &nodes, &[])?;
             let frames = (duration * fps).round() as usize;
             let mut elapsed = std::time::Duration::ZERO;
             for f in (0..frames).chain((0..frames).rev().step_by(17)) {

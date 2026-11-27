@@ -37,11 +37,35 @@ pub fn model_axis_scales(model_matrix: &[f32; 16]) -> [f64; 2] {
     [sx.min(sy), sx.max(sy)]
 }
 
-/// Size of the vector-text `DrawUniforms` WGSL struct: model(64) + color(16)
-/// + params(16) + pageClip(16) + distort0/1/2(48, the warp rows)
-/// = 160 bytes. The per-draw packer and the bind-group binding size must both
-/// match the struct or wgpu rejects every vector-text draw.
-const VECTOR_DRAW_UNIFORM_BYTES: u64 = 160;
+/// The packed operation record indexes a compact placement shared by all operations of this batch.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VectorUniform {
+    placement: u32,
+    _pad: [u32; 3],
+    color: [f32; 4],
+    params: [f32; 4],
+    clip: [f32; 4],
+    distort: [[f32; 4]; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VectorPlacement {
+    model: [f32; 16],
+    padding: [f32; 2],
+    _pad: [f32; 2],
+}
+
+impl VectorPlacement {
+    fn new(model: [f32; 16], padding: Option<f64>) -> Self {
+        Self { model, padding: padding.map_or([-1., 0.], padding_words), _pad: [0.; 2] }
+    }
+    fn of(batch: &TextQuadBatch) -> Self {
+        let pad = batch.vector.as_ref().and_then(|v| v.uniform_padding).map(|_| batch.quad_padding());
+        Self::new(batch.model_matrix, pad)
+    }
+}
 
 /// Each image op indexes the placed glyph that owns its face, raster scale and effect.
 fn vector_emoji_ops(emojis: &[moda_text::vector::VectorEmoji]) -> Vec<TextOp> {
@@ -266,13 +290,9 @@ struct TextLayouts {
     texture_bgl: wgpu::BindGroupLayout,
     layout_textured: wgpu::PipelineLayout,
     layout_solid: wgpu::PipelineLayout,
-    // Track C — vector text engine (`--text-engine vector`). Group-0 BGLs
-    // mirror the production factories in vectorTextShaders.ts: tess
-    // (createVectorTessPipeline: frame + DrawUniforms), analytic
-    // (+ curvePoints storage), gradient (+ GradientUniforms); the per-draw
-    // DrawUniforms/GradientUniforms bind with dynamic offsets into the
-    // prepare() arena (the production code creates per-draw bind groups at
-    // explicit offsets — same windows, same 256 alignment).
+    // Tessellation and analytic pipelines share the frame, packed operation
+    // records and batch placements. Analytic draws add curve storage and
+    // gradient draws also bind a dynamically aligned gradient uniform.
     vec_tess_bgl: wgpu::BindGroupLayout,
     vec_analytic_bgl: wgpu::BindGroupLayout,
     vec_gradient_bgl: wgpu::BindGroupLayout,
@@ -288,14 +308,8 @@ pub struct TextDraw {
     pipelines: RefCell<Arc<HashMap<(String, u32), wgpu::RenderPipeline>>>,
     /// Shaped run, resolution and optional silhouette effect → texture bind group.
     emoji_bind_groups: RefCell<ByteLruCache<(u64, u32, Option<[u32; 9]>), Arc<wgpu::BindGroup>>>,
-    /// T9 (perf): content-addressed GPU buffer cache for the node-LOCAL text
-    /// arenas (`verts` / `indices` / per-node curve storage). Those are
-    /// byte-identical across a transform-only drag — only the per-batch model
-    /// matrix in the SMALL `uniforms` arena changes — so caching them by content
-    /// lets a re-`prepare` skip the ~1.5 MB/frame re-upload (the intermittent
-    /// drag-jank spikes). Tracks retained mode (synced via the engine's
-    /// `set_retained` / `set_vec_arena_cache_enabled`): ON in the wasm editor lane,
-    /// OFF in CLI/export and other non-retained lanes.
+    /// Node-local vertices, indices and curves can be shared across placement
+    /// edits. The owning engine enables this cache when it retains GPU geometry.
     vec_arena_cache: RefCell<crate::vec_arena_cache::VecArenaCache<Arc<wgpu::Buffer>>>,
     /// The owning engine's immutable frame color format — every text
     /// pipeline's color target (text draws straight into the main-pass frame
@@ -374,28 +388,15 @@ impl TextDraw {
             bind_group_layouts: &[Some(&bgl0)],
             ..Default::default()
         });
-        // Track C — vector text BGLs (vectorTextShaders.ts pipeline
-        // factories). binding 0: frame projection and pixel transform (VERTEX); binding 1:
-        // DrawUniforms (VERTEX|FRAGMENT, 160 B, dynamic — model + color +
-        // params + pageClip + the distort rows); binding 2: glyph
-        // curves (FRAGMENT read-only storage); binding 3: GradientUniforms
-        // (FRAGMENT uniform, 176 B, dynamic).
+        // All vector pipelines read frame projection, the packed operation
+        // records, and the shared batch placement. The analytic pipelines also
+        // bind glyph curves and, for a gradient, its dynamic uniform.
         let frame_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let draw_uniform_entry = wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
                 min_binding_size: None,
             },
             count: None,
@@ -410,19 +411,28 @@ impl TextDraw {
             },
             count: None,
         };
+        let draw_uniform_entry = wgpu::BindGroupLayoutEntry {
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ..curve_entry(1)
+        };
+        let placement_entry = wgpu::BindGroupLayoutEntry {
+            visibility: wgpu::ShaderStages::VERTEX,
+            ..curve_entry(4)
+        };
         let vec_tess_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Vector Text Tess BGL"),
-            entries: &[frame_entry, draw_uniform_entry],
+            entries: &[frame_entry, draw_uniform_entry, placement_entry],
         });
         let vec_analytic_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Vector Text Analytic BGL"),
-            entries: &[frame_entry, draw_uniform_entry, curve_entry(2)],
+            entries: &[frame_entry, draw_uniform_entry, curve_entry(2), placement_entry],
         });
         let vec_gradient_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Vector Text Analytic Gradient BGL"),
             entries: &[
                 frame_entry,
                 draw_uniform_entry,
+                placement_entry,
                 curve_entry(2),
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
@@ -891,7 +901,7 @@ impl TextDraw {
         // Track C: vector-engine resources. Curve buffers are created
         // immediately (no arena dependency); group-0 bind groups are
         // recorded as (flavor, curve buffer index) and created once the
-        // uniform arena buffer exists.
+        // operation and placement buffers exist.
         // T9: curve buffers are `Arc` so a cache hit shares the handle (an Arc
         // pointer-bump, no re-upload) and `PreparedText` still keeps them alive.
         let mut curve_bufs: Vec<Arc<wgpu::Buffer>> = Vec::new();
@@ -899,11 +909,10 @@ impl TextDraw {
         // (0 for each cache hit) — folded into `uploaded_bytes`/`pf_text_bytes`.
         let mut curve_uploaded_bytes: u64 = 0;
         let mut pending_vec_groups: Vec<(usize, Option<usize>)> = Vec::new();
-        // The frame and uniform arena are shared by this chunk. A pipeline layout
-        // and its actual curve buffer identify the complete group; draws select
-        // their own uniform records through the existing dynamic offsets.
+        // Every draw in the chunk uses the same operation and placement buffers.
+        // The layout and the curve buffer identify its bind group.
         let mut group_indices = HashMap::new();
-        let any_vector = batches.iter().any(|b| b.vector.is_some());
+        let mut operations = Vec::new();
         // Size the vertex arena for the vector ops up front (their triangles and per-glyph
         // analytic instances are nearly all of it): grown by doubling, a frame with every
         // text node of a large document in view held up to three times its final size at
@@ -918,8 +927,7 @@ impl TextDraw {
                 .sum(),
         );
         for b in batches {
-            // Vector operations carry their own model and clip in DrawUniforms. Only
-            // quad draws bind separate dynamic ranges for these two fields.
+            // Quad draws bind separate dynamic ranges for the model and clip.
             let mut quad_uniforms = None;
             let mut quad_offsets = |uniforms: &mut Vec<UniformSlot>, color, params| {
                 let (model, clip) = *quad_uniforms.get_or_insert_with(|| (
@@ -1068,12 +1076,7 @@ impl TextDraw {
                 };
 
                 for op in &v.ops {
-                    // DrawUniforms record: model + color + params + pageClip
-                    // + distort0/1/2 (160 B; the warp rows —
-                    // distort0.w is the enabled flag, disabled draws carry
-                    // identity rows).
-                    let uniform = vector_uniform(b, op, depth);
-                    let draw_off = alloc(bytemuck::bytes_of(&uniform), &mut uniforms);
+                    let operation = operations.len() as u32;
 
                     use moda_text::vector::VectorOpPipeline as VP;
                     match op.pipeline {
@@ -1089,7 +1092,7 @@ impl TextDraw {
                                     vertex_count: (op.tris.len() / 2) as u32,
                                 },
                                 group: Some(group_for(VEC_FLAVOR_TESS)),
-                                dynamic_offsets: vec![draw_off],
+                                operation, gradient_offset: None,
                                 v_off,
                                 v_len: (op.tris.len() * 4) as u64,
                             });
@@ -1141,7 +1144,7 @@ impl TextDraw {
                                     },
                                     kind,
                                     group: Some(group_for(VEC_FLAVOR_ANALYTIC)),
-                                    dynamic_offsets: vec![draw_off],
+                                    operation, gradient_offset: None,
                                     v_off,
                                     v_len,
                                 }),
@@ -1160,8 +1163,7 @@ impl TextDraw {
                                         module: "vector-text-analytic-gradient".into(),
                                         kind,
                                         group: Some(group_for(VEC_FLAVOR_GRADIENT)),
-                                        // dynamic offsets in binding order: 1 (draw), 3 (gradient)
-                                        dynamic_offsets: vec![draw_off, g],
+                                        operation, gradient_offset: Some(g),
                                         v_off,
                                         v_len,
                                     });
@@ -1170,6 +1172,7 @@ impl TextDraw {
                             }
                         }
                     }
+                    operations.push(vector_uniform(b, op, depth, prepared_batches.len() as u32));
                 }
             }
             let params = b.vector.as_ref().and_then(|v| v.uniform_padding);
@@ -1182,22 +1185,20 @@ impl TextDraw {
             });
         }
 
-        if uniforms.is_empty() {
+        if uniforms.is_empty() && operations.is_empty() {
             return Ok(PreparedText { batches: prepared_batches, padding, sample_count, ..Default::default() });
         }
         let device = &gpu.device;
         let mk = |label: &str, data: &[u8], usage: wgpu::BufferUsages| -> wgpu::Buffer {
             create_filled_buffer(gpu, label, data, usage)
         };
-        // The `uniforms` arena carries the per-batch MODEL MATRICES (and per-draw
-        // depth/opacity/gradient), which change every pointermove — so it is
-        // ALWAYS rebuilt + uploaded, never cached.
-        let uniform_buf = mk("text uniforms", bytemuck::cast_slice(&uniforms), wgpu::BufferUsages::UNIFORM);
-        // T9: the `verts`/`indices` arenas are node-LOCAL (position-independent —
-        // the model matrix lives in `uniforms`), so they are byte-identical across
-        // a transform-only drag and content-addressable. A hit reuses the
-        // already-uploaded buffer; the draw offsets are recomputed identically
-        // from the same byte-identical batches, so the slices stay valid.
+        // Quad and gradient bindings require aligned dynamic uniform offsets.
+        // Vector draws index dense operation records and independently writable
+        // batch placements. Their node-local geometry can stay in the arena cache.
+        let uniform_buf = (!uniforms.is_empty()).then(|| mk("text uniforms",
+            bytemuck::cast_slice(&uniforms), wgpu::BufferUsages::UNIFORM));
+        let operation_buf = (!operations.is_empty()).then(|| mk("vector text operations",
+            bytemuck::cast_slice(&operations), wgpu::BufferUsages::STORAGE));
         let (vbuf, verts_uploaded) = self.cache_buffer(
             gpu,
             VEC_ROLE_VERTS,
@@ -1213,37 +1214,30 @@ impl TextDraw {
             wgpu::BufferUsages::INDEX,
         );
 
-        // Track C: the static unit quad (6 verts, 48 B — `VectorText Quad`,
-        // VectorTextRenderer.ts:330-336) + the recorded group-0 bind groups.
-        let quad_buf: Option<wgpu::Buffer> = any_vector.then(|| {
-            let quad: [f32; 12] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-            mk(
-                "vector text quad",
-                bytemuck::cast_slice(&quad),
-                wgpu::BufferUsages::VERTEX,
-            )
-        });
-        let draw_uniform_size = std::num::NonZeroU64::new(VECTOR_DRAW_UNIFORM_BYTES);
+        let placements: Vec<_> = if pending_vec_groups.is_empty() { Vec::new() }
+            else { batches.iter().map(|b| VectorPlacement::of(b)).collect() };
+        let placement_buf = (!placements.is_empty()).then(|| mk("vector text placements",
+            bytemuck::cast_slice(&placements), wgpu::BufferUsages::STORAGE));
         let gradient_uniform_size = std::num::NonZeroU64::new(176);
         let mut vector_binds: Vec<wgpu::BindGroup> = Vec::new();
         for (flavor, curve_idx) in &pending_vec_groups {
             let draw_binding = wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniform_buf,
-                    offset: 0,
-                    size: draw_uniform_size,
-                }),
+                resource: operation_buf.as_ref().expect("vector operations").as_entire_binding(),
             };
             let frame_binding = wgpu::BindGroupEntry {
                 binding: 0,
                 resource: frame_uniform.as_entire_binding(),
             };
+            let placement_binding = wgpu::BindGroupEntry {
+                binding: 4,
+                resource: placement_buf.as_ref().expect("vector placement buffer").as_entire_binding(),
+            };
             let bg = match flavor {
                 &VEC_FLAVOR_TESS => device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("vector text tess bind0"),
                     layout: &self.layouts.vec_tess_bgl,
-                    entries: &[frame_binding, draw_binding],
+                    entries: &[frame_binding, draw_binding, placement_binding],
                 }),
                 &VEC_FLAVOR_ANALYTIC => {
                     let curve = &curve_bufs[curve_idx.expect("analytic group needs curves")];
@@ -1253,6 +1247,7 @@ impl TextDraw {
                         entries: &[
                             frame_binding,
                             draw_binding,
+                            placement_binding,
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: curve.as_entire_binding(),
@@ -1268,6 +1263,7 @@ impl TextDraw {
                         entries: &[
                             frame_binding,
                             draw_binding,
+                            placement_binding,
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: curve.as_entire_binding(),
@@ -1275,7 +1271,7 @@ impl TextDraw {
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer: &uniform_buf,
+                                    buffer: uniform_buf.as_ref().expect("gradient uniform"),
                                     offset: 0,
                                     size: gradient_uniform_size,
                                 }),
@@ -1291,38 +1287,40 @@ impl TextDraw {
         // ring buffers with per-draw dynamic offsets).
         let vec4 = std::num::NonZeroU64::new(16);
         let mat4 = std::num::NonZeroU64::new(64);
-        let arena = |size: Option<std::num::NonZeroU64>| {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &uniform_buf,
-                offset: 0,
-                size,
+        let bind0 = uniform_buf.as_ref().filter(|_| prepared_batches.iter().any(|b| !b.draws.is_empty())).map(|buffer| {
+            let arena = |size: Option<std::num::NonZeroU64>| {
+                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size,
+                })
+            };
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("text bind0"),
+                layout: &self.layouts.bgl0,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: frame_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: arena(mat4),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: arena(vec4),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: arena(vec4),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: arena(vec4),
+                    },
+                ],
             })
-        };
-        let bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("text bind0"),
-            layout: &self.layouts.bgl0,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: frame_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: arena(mat4),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: arena(vec4),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: arena(vec4),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: arena(vec4),
-                },
-            ],
         });
         // The pipelines the draws use, resolved once: a draw looks its module up here (a handful of entries)
         // instead of cloning its name into a hashed key into the shared map every frame.
@@ -1347,27 +1345,23 @@ impl TextDraw {
         };
         Ok(PreparedText {
             pipes,
-            _uniform_buf: Some(uniform_buf),
+            operation_buf,
             vbuf: Some(vbuf),
             ibuf: Some(ibuf),
-            bind0: Some(bind0),
+            bind0,
             textures,
             batches: prepared_batches, padding,
             sample_count,
-            quad_buf,
             vector_binds,
             _curve_bufs: curve_bufs,
-            // T9: bytes ACTUALLY uploaded this `prepare` — the always-uploaded
-            // `uniforms` plus only the node-local arenas that MISSED the cache
-            // (0 each on a hit). Now includes the per-node curve storage
-            // (`curve_uploaded_bytes`), which was previously omitted, so
-            // `pf_text_bytes` reflects reality and plateaus to ~uniforms-only
-            // once a transform-only drag hits the arena cache every frame.
-            uploaded_bytes: uniforms.len() as u64 * UNIFORM_ALIGN
+            uploaded_bytes: std::mem::size_of_val(operations.as_slice()) as u64 + std::mem::size_of_val(placements.as_slice()) as u64
+                + uniforms.len() as u64 * UNIFORM_ALIGN
                 + verts_uploaded
                 + indices_uploaded
                 + curve_uploaded_bytes,
-            uniforms: std::cell::RefCell::new(Column::of(uniforms)),
+            placement_buf,
+            placements: RefCell::new(Column::of(placements)),
+            operations: RefCell::new(Column::of(operations)),
         })
     }
 
@@ -1383,8 +1377,7 @@ impl TextDraw {
         let Some(batch) = prepared.batches.get(batch_index) else {
             return;
         };
-        let (Some(vbuf), Some(ibuf), Some(bind0)) =
-            (&prepared.vbuf, &prepared.ibuf, &prepared.bind0)
+        let (Some(vbuf), Some(ibuf)) = (&prepared.vbuf, &prepared.ibuf)
         else {
             return;
         };
@@ -1395,7 +1388,7 @@ impl TextDraw {
                 pass.set_pipeline(p);
                 current_module = Some(d.module.as_str());
             }
-            pass.set_bind_group(0, Some(bind0), &d.offsets);
+            pass.set_bind_group(0, Some(prepared.bind0.as_ref().expect("quad uniforms")), &d.offsets);
             if let Some(tex) = d.tex {
                 pass.set_bind_group(1, Some(prepared.textures[tex].as_ref()), &[]);
             }
@@ -1416,17 +1409,18 @@ impl TextDraw {
                 current_module = Some(d.module.as_str());
             }
             let group = &prepared.vector_binds[d.group.expect("vector group")];
-            pass.set_bind_group(0, Some(group), &d.dynamic_offsets);
+            pass.set_bind_group(0, Some(group), d.gradient_offset.as_slice());
             match d.kind {
                 VectorDrawKind::Tess { vertex_count } => {
                     pass.set_vertex_buffer(0, vbuf.slice(d.v_off..d.v_off + d.v_len));
-                    pass.draw(0..vertex_count, 0..1);
+                    pass.draw(0..vertex_count, d.operation..d.operation + 1);
                 }
                 VectorDrawKind::Analytic { instance_count } => {
-                    let quad = prepared.quad_buf.as_ref().expect("vector quad buffer");
-                    pass.set_vertex_buffer(0, quad.slice(..));
-                    pass.set_vertex_buffer(1, vbuf.slice(d.v_off..d.v_off + d.v_len));
-                    pass.draw(0..6, 0..instance_count);
+                    // The six vertices of this operation select the quad corners.
+                    // Instance zero still addresses the first glyph in this slice.
+                    let first = d.operation * 6;
+                    pass.set_vertex_buffer(0, vbuf.slice(d.v_off..d.v_off + d.v_len));
+                    pass.draw(first..first + 6, 0..instance_count);
                 }
             }
         }
@@ -1488,7 +1482,7 @@ const VEC_FLAVOR_GRADIENT: usize = 2;
 enum VectorDrawKind {
     /// `drawSolidTriangles`: slot 0 = flat xy triangles, non-indexed.
     Tess { vertex_count: u32 },
-    /// Instanced glyph quads: slot 0 = unit quad, slot 1 = packed VectorAnalyticRecord instances.
+    /// Instanced glyph quads: slot 0 = packed VectorAnalyticRecord instances.
     Analytic { instance_count: u32 },
 }
 
@@ -1497,8 +1491,8 @@ struct PreparedVectorDraw {
     kind: VectorDrawKind,
     /// Index into `PreparedText::vector_binds`.
     group: Option<usize>,
-    /// Dynamic offsets in binding order (DrawUniforms[, GradientUniforms]).
-    dynamic_offsets: Vec<u32>,
+    operation: u32,
+    gradient_offset: Option<u32>,
     v_off: u64,
     v_len: u64,
 }
@@ -1537,28 +1531,15 @@ pub(crate) fn padding_words(pad: f64) -> [f32; 2] {
 }
 
 /// The same DrawUniforms words for collection and for updates of the retained slot.
-fn vector_uniform(batch: &TextQuadBatch, op: &moda_text::vector::VectorOp, depth: f32) -> [f32; 40] {
-    let mut u = [0.; 40];
-    u[..16].copy_from_slice(&batch.model_matrix);
-    u[16..20].copy_from_slice(&op.color);
-    u[20..24].copy_from_slice(&[depth, op.opacity, op.blur_px, op.stroke_px]);
-    u[24..28].copy_from_slice(&batch.page_clip_bounds);
-    if let Some(h) = &batch.distort {
-        u[28..31].copy_from_slice(&h[..3]);
-        u[31] = 1.;
-        u[32..35].copy_from_slice(&h[3..6]);
-        u[36..39].copy_from_slice(&h[6..]);
-    } else {
-        u[28] = 1.;
-        u[33] = 1.;
-        u[38] = 1.;
+fn vector_uniform(batch: &TextQuadBatch, op: &moda_text::vector::VectorOp, depth: f32, placement: u32) -> VectorUniform {
+    let distort = match batch.distort {
+        Some(h) => [[h[0], h[1], h[2], 1.], [h[3], h[4], h[5], 0.], [h[6], h[7], h[8], 0.]],
+        None => [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]],
+    };
+    VectorUniform {
+        placement, _pad: [0; 3], color: op.color, params: [depth, op.opacity, op.blur_px, op.stroke_px],
+        clip: batch.page_clip_bounds, distort,
     }
-    let words = if batch.vector.as_ref().is_some_and(|v| v.uniform_padding.is_some()) {
-        padding_words(batch.quad_padding())
-    } else { [-1., 0.] };
-    u[35] = words[0];
-    u[39] = words[1];
-    u
 }
 
 struct PreparedBatch {
@@ -1576,9 +1557,10 @@ struct PreparedBatch {
 pub struct PreparedText {
     /// The pipelines this text's draws use, by module name (see `prepare`).
     pipes: Vec<(String, wgpu::RenderPipeline)>,
-    /// Kept for ownership clarity; the bind groups hold their own refs.
-    _uniform_buf: Option<wgpu::Buffer>,
-    uniforms: std::cell::RefCell<Column<UniformSlot>>,
+    operation_buf: Option<wgpu::Buffer>,
+    operations: RefCell<Column<VectorUniform>>,
+    placement_buf: Option<wgpu::Buffer>,
+    placements: RefCell<Column<VectorPlacement>>,
     /// T9: `Arc` so a content-cache hit shares the already-uploaded buffer with
     /// the cache (an `Arc` pointer-bump, not a re-upload) while this
     /// `PreparedText` still keeps it alive for the frame.
@@ -1590,19 +1572,12 @@ pub struct PreparedText {
     /// Run starts in batch order. Fonts and render scales usually agree across a text chunk.
     padding: Vec<(usize, Option<(f64, f64)>)>,
     sample_count: u32,
-    /// Track C — vector engine: static unit quad, group-0 bind groups
-    /// (tess/analytic/gradient flavors), shader-fill curve groups, and the
-    /// per-node curve storage buffers (kept alive for the frame).
-    quad_buf: Option<wgpu::Buffer>,
+    /// Prepared bind groups for tessellated, analytic and gradient draws.
     vector_binds: Vec<wgpu::BindGroup>,
     /// T9: `Arc` per-node curve storage (shared with the content cache on a hit).
     _curve_bufs: Vec<Arc<wgpu::Buffer>>,
-    /// M2 prepared-frame counter: bytes ACTUALLY uploaded to the text arenas this
-    /// `prepare` — uniform + vertex + index + per-node curve storage (T9). The
-    /// always-rebuilt `uniforms` are counted every prepare; `verts`/`indices`/curve
-    /// bytes count only on a content-cache MISS (0 on a hit). Surfaced as
-    /// `pf_text_bytes`, so it plateaus to ~uniforms-only once a transform-only drag
-    /// hits the arena cache every frame.
+    /// Bytes uploaded by collection, including operation, placement and uniform
+    /// records. Geometry and curves contribute only on cache misses.
     uploaded_bytes: u64,
 }
 
@@ -1615,10 +1590,6 @@ impl PreparedText {
         self.batches.get(at).is_some_and(|b| b.geometry.is_some()
             && new.vector.as_ref().is_some_and(|v| v.emojis.is_empty() && v.ops.len() == b.vector_draws.len())
             && (placement_only || b.geometry == uniform_geometry(new)))
-    }
-
-    pub fn retain_uniform_tails(&self, budget: &mut usize) {
-        self.uniforms.borrow_mut().retain_tails(budget);
     }
 
     pub fn padding_bytes(&self) -> usize {
@@ -1635,38 +1606,40 @@ impl PreparedText {
     }
 
     pub fn stage_matrix(&self, at: usize, matrix: &[f32; 16]) {
+        if self.batches[at].vector_draws.is_empty() { return; }
         let params = self.padding_at(at).expect("certified uniform padding");
-        let padding = padding_words(TextQuadBatch::matrix_padding(matrix, params));
-        let mut column = self.uniforms.borrow_mut();
-        for draw in &self.batches[at].vector_draws {
-            let index = draw.dynamic_offsets[0] / UNIFORM_ALIGN as u32;
-            column.put_matrix(index, matrix, Some(padding)).expect("prepared text uniform");
-        }
+        let pad = TextQuadBatch::matrix_padding(matrix, params);
+        self.placements.borrow_mut().put(at as u32, &VectorPlacement::new(*matrix, Some(pad)))
+            .expect("prepared text placement");
     }
 
     pub fn fit_uniforms(&self, bytes: usize) -> usize {
-        self.uniforms.borrow_mut().fit_budget(bytes)
+        let used = self.placements.borrow_mut().fit_budget(bytes);
+        used + self.operations.borrow_mut().fit_budget(bytes - used)
     }
 
-    /// Stage values by batch address; commit once for this retained uniform column.
-    pub fn stage_paint(&self, at: usize, batch: &TextQuadBatch, translated: bool) {
-        let mut column = self.uniforms.borrow_mut();
+    pub fn stage_paint(&self, at: usize, batch: &TextQuadBatch, placement_only: bool) {
+        if self.batches[at].vector_draws.is_empty() { return; }
+        self.placements.borrow_mut().put(at as u32, &VectorPlacement::of(batch))
+            .expect("prepared text placement");
+        if placement_only { return; }
+        let mut column = self.operations.borrow_mut();
         let depth = crate::depth::linear_depth(batch.z) as f32;
         for (draw, op) in self.batches[at].vector_draws.iter().zip(&batch.vector.as_ref().unwrap().ops) {
-            let index = draw.dynamic_offsets[0] / UNIFORM_ALIGN as u32;
-            let mut slot = [0; UNIFORM_ALIGN as usize];
-            let uniform = vector_uniform(batch, op, depth);
-            let data = bytemuck::bytes_of(&uniform);
-            slot[..data.len()].copy_from_slice(data);
-            let range = if translated { 48..56 } else { 0..data.len() };
-            column.put_words(index, &slot, range).expect("prepared text uniform");
+            let record = vector_uniform(batch, op, depth, at as u32);
+            column.put_words(draw.operation, &record, 0..std::mem::size_of::<VectorUniform>())
+                .expect("prepared vector operation");
         }
     }
 
     pub fn commit_paint(&self, mut write: impl FnMut(&wgpu::Buffer, u64, &[u8])) -> u64 {
         let mut written = 0;
-        self.uniforms.borrow_mut().commit(&mut |offset, bytes| {
-            write(self._uniform_buf.as_ref().unwrap(), offset, bytes);
+        self.placements.borrow_mut().commit(&mut |offset, bytes| {
+            write(self.placement_buf.as_ref().unwrap(), offset, bytes);
+            written += bytes.len() as u64;
+        });
+        self.operations.borrow_mut().commit(&mut |offset, bytes| {
+            write(self.operation_buf.as_ref().unwrap(), offset, bytes);
             written += bytes.len() as u64;
         });
         written
@@ -1690,6 +1663,18 @@ impl PreparedText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_vector_run_moves_without_a_placement_buffer() {
+        let prepared = PreparedText {
+            batches: vec![PreparedBatch { geometry: Some(7), draws: vec![], vector_draws: vec![] }],
+            padding: vec![(0, Some((16., 1.)))],
+            ..Default::default()
+        };
+        assert!(prepared.admits_matrix(0));
+        prepared.stage_matrix(0, &[0.; 16]);
+        assert_eq!(prepared.commit_paint(|_, _, _| panic!("empty batch uploaded bytes")), 0);
+    }
 
     #[test]
     fn uniform_updates_reject_recollected_baked_padding_at_another_scale() {

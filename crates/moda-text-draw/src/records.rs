@@ -24,7 +24,6 @@ struct RecordTail<T> {
 struct PartialMatrix {
     index: u32,
     matrix: [f32; 16],
-    padding: Option<[f32; 2]>,
 }
 
 impl<T: bytemuck::Pod> RecordTail<T> {
@@ -88,9 +87,8 @@ impl<T: bytemuck::Pod> Column<T> {
         }
     }
 
-    /// The placement proof covers the matrix and, for vector text, the two
-    /// padding words. Every other word stays at its value on the GPU.
-    pub fn put_matrix(&mut self, index: u32, matrix: &[f32; 16], padding: Option<[f32; 2]>) -> Result<(), &'static str> {
+    /// Only the matrix of an interleaved gradient or pattern record changes.
+    pub fn put_matrix(&mut self, index: u32, matrix: &[f32; 16]) -> Result<(), &'static str> {
         if index as usize >= self.len { return Err("matrix destination"); }
         let i = index as usize;
         let old = self.records.get(i).copied().or_else(|| {
@@ -99,13 +97,9 @@ impl<T: bytemuck::Pod> Column<T> {
         if let Some(mut record) = old {
             let bytes = bytemuck::bytes_of_mut(&mut record);
             bytes[..64].copy_from_slice(bytemuck::bytes_of(matrix));
-            if let Some(words) = padding {
-                bytes[140..144].copy_from_slice(&words[0].to_ne_bytes());
-                bytes[156..160].copy_from_slice(&words[1].to_ne_bytes());
-            }
-            self.pending.push((index, 0..if padding.is_some() { 160 } else { 64 }, record));
+            self.pending.push((index, 0..64, record));
         } else {
-            self.partial.push(PartialMatrix { index, matrix: *matrix, padding });
+            self.partial.push(PartialMatrix { index, matrix: *matrix });
         }
         Ok(())
     }
@@ -190,10 +184,6 @@ impl<T: bytemuck::Pod> PendingRecords for Column<T> {
         for write in std::mem::take(&mut self.partial) {
             let offset = u64::from(write.index) * std::mem::size_of::<T>() as u64;
             upload(offset, bytemuck::bytes_of(&write.matrix));
-            if let Some(words) = write.padding {
-                upload(offset + 140, bytemuck::bytes_of(&words[0]));
-                upload(offset + 156, bytemuck::bytes_of(&words[1]));
-            }
         }
         if self.pending.is_empty() { return; }
         if !self.pending.is_sorted_by_key(|(index, ..)| *index) {
@@ -261,13 +251,10 @@ mod tests {
         });
         for round in 1..=2 {
             let matrix = [round as f32; 16];
-            let padding = [0.75, 0.001];
             for &i in &[1, 2, 255, 256, 290] {
-                column.put_matrix(i, &matrix, Some(padding)).unwrap();
+                column.put_matrix(i, &matrix).unwrap();
                 let row = &mut expected[i as usize];
                 row[..16].copy_from_slice(&matrix.map(f32::to_bits));
-                row[35] = padding[0].to_bits();
-                row[39] = padding[1].to_bits();
             }
             commit(&mut column, &mut gpu);
             assert_eq!(gpu, bytemuck::cast_slice::<Slot, u8>(&expected));
@@ -275,7 +262,7 @@ mod tests {
             column.put(2, &expected[2]).unwrap();
             commit(&mut column, &mut gpu);
         }
-        column.put_matrix(1, &[9.; 16], None).unwrap();
+        column.put_matrix(1, &[9.; 16]).unwrap();
         column.discard();
         commit(&mut column, &mut gpu);
         assert_eq!(gpu, bytemuck::cast_slice::<Slot, u8>(&expected));

@@ -29,10 +29,11 @@
 
 use moda_scene::path_length::{distance_tolerance, elevated_controls};
 use super::arc::{arc_to_beziers, ArcParams};
+use super::sampled_dash::{CompactDash, ContourDash, DashPattern};
 use super::dash::{
     aligned_dash_intervals, cubic_arc_length, dash_pieces, extract_path_segments_by_arc_length,
     intervals_as_walk_pattern, normalize_dash_pattern, quadratic_arc_length, scale_dash_pattern,
-    segment_corner_positions, split_cubic, walk_path_by_arc_length, walk_path_by_arc_length_phased,
+    segment_corner_positions, split_cubic, walk_path_by_arc_length, walk_path_by_arc_length_phased, walk_path_runs,
     Cubic, PathSegment, Pt, Seg, BASE_DASH_STROKE_WIDTH,
 };
 use super::moda_engine_path_types::*;
@@ -526,6 +527,24 @@ pub fn tessellate_combined_cached<'a>(
     fill_rule: FillRule,
     stroke_align: StrokeAlign,
 ) -> std::sync::Arc<TessellatedGeometry> {
+    tessellate_with_pattern_cached(points, stroke_width, closure, trim,
+        dash.map(DashPattern::Static), dash_offset, line_cap, line_join, fill_rule, stroke_align, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tessellate_with_pattern_cached<'a>(
+    points: &'a [PathCmd],
+    stroke_width: f64,
+    closure: impl Into<PathClosure<'a>>,
+    trim: Option<TrimParams>,
+    dash: Option<DashPattern<'_>>,
+    dash_offset: f64,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    fill_rule: FillRule,
+    stroke_align: StrokeAlign,
+    stroke_uv: bool,
+) -> std::sync::Arc<TessellatedGeometry> {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
@@ -549,10 +568,16 @@ pub fn tessellate_combined_cached<'a>(
     }
 
     let closure = closure.into();
-    if CAP_HIT.with(std::cell::Cell::get) {
-        return Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closure,
+    let build = || {
+        let geometry = geometry_from_oracle(tessellate_pattern(points, stroke_width, closure,
             trim, dash, dash_offset, line_cap, line_join, fill_rule, stroke_align));
-    }
+        let annotated = stroke_uv.then(|| {
+            let line = super::stroke_param::centerline(points, closure, super::stroke_param::CENTERLINE_TOLERANCE);
+            super::stroke_param::stroke_uv(&geometry, &line, true)
+        }).flatten();
+        Arc::new(annotated.unwrap_or(geometry))
+    };
+    if CAP_HIT.with(std::cell::Cell::get) { return build(); }
 
     let mut key = vec![
         stroke_width.to_bits(), dash_offset.to_bits(), line_cap as u64,
@@ -564,16 +589,23 @@ pub fn tessellate_combined_cached<'a>(
         FILL_VERTEX_CAP.with(std::cell::Cell::get) as u64,
         COARSEN.with(std::cell::Cell::get) as u64,
         LEGACY.with(std::cell::Cell::get) as u64,
-        trim.is_some() as u64,
+        trim.is_some() as u64, stroke_uv as u64,
     ];
     if let Some(trim) = trim {
         key.extend([trim.start.to_bits(), trim.end.to_bits(), trim.offset.to_bits(),
             trim.individual as u64, trim.by as u64]);
     }
     key.push(dash.is_some() as u64);
-    if let Some(dash) = dash {
-        key.push(dash.len() as u64);
-        key.extend(dash.iter().map(|value| value.to_bits()));
+    match dash {
+        Some(DashPattern::Static(dash)) => {
+            key.extend([0, dash.len() as u64]);
+            key.extend(dash.iter().map(|value| value.to_bits()));
+        }
+        Some(DashPattern::Sampled(dash)) => {
+            key.push(1);
+            dash.append_key(&mut key);
+        }
+        None => {}
     }
     match closure {
         PathClosure::Uniform(closed) => key.push(closed as u64),
@@ -609,8 +641,7 @@ pub fn tessellate_combined_cached<'a>(
     }) {
         return geometry;
     }
-    let geometry = Arc::new(tessellate_combined_with_dash_trim(points, stroke_width, closure,
-        trim, dash, dash_offset, line_cap, line_join, fill_rule, stroke_align));
+    let geometry = build();
     let bytes = 2 * key.capacity() * std::mem::size_of::<u64>()
         + geometry.positions.capacity() * std::mem::size_of::<f32>()
         + geometry.vertex_types.capacity() * std::mem::size_of::<f32>()
@@ -691,6 +722,19 @@ fn geometry_from_oracle(o: OracleGeometry) -> TessellatedGeometry {
 mod exact_cache_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn shared_contours_cache_only_the_requested_stroke_stream() {
+        let points = [PathCmd::Move { x: 0., y: 0. }, PathCmd::Line { x: 20., y: 0. }];
+        let mesh = |stroke_uv| tessellate_with_pattern_cached(&points, 2., false, None, None, 0.,
+            LineCap::Round, LineJoin::Round, FillRule::NonZero, StrokeAlign::Center, stroke_uv);
+        let plain = mesh(false);
+        let annotated = mesh(true);
+        assert!(plain.stroke_uv.is_empty());
+        assert!(!annotated.stroke_uv.is_empty());
+        assert!(Arc::ptr_eq(&annotated, &mesh(true)));
+        assert!(Arc::ptr_eq(&plain, &mesh(false)));
+    }
 
     #[test]
     fn mixed_closure_keeps_the_compound_fill_and_each_stroke_seam() {
@@ -856,6 +900,23 @@ pub fn tessellate_combined_oracle<'a>(
     fill_rule: FillRule,
     stroke_align: StrokeAlign,
 ) -> OracleGeometry {
+    tessellate_pattern(points, stroke_width, closure, trim, dash.map(DashPattern::Static),
+        dash_offset, line_cap, line_join, fill_rule, stroke_align)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tessellate_pattern<'a>(
+    points: &'a [PathCmd],
+    stroke_width: f64,
+    closure: impl Into<PathClosure<'a>>,
+    trim: Option<TrimParams>,
+    dash: Option<DashPattern<'_>>,
+    dash_offset: f64,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    fill_rule: FillRule,
+    stroke_align: StrokeAlign,
+) -> OracleGeometry {
     if points.is_empty() {
         return OracleGeometry {
             positions: Vec::new(),
@@ -898,7 +959,7 @@ pub fn tessellate_combined_oracle<'a>(
 #[allow(clippy::too_many_arguments)]
 fn stroke_geometry(
     path: PathContours<'_>, stroke_width: f64, trim: Option<TrimParams>,
-    dash: Option<&[f64]>, dash_offset: f64, line_cap: LineCap, line_join: LineJoin,
+    dash: Option<DashPattern<'_>>, dash_offset: f64, line_cap: LineCap, line_join: LineJoin,
     fill_rule: FillRule, stroke_align: StrokeAlign,
 ) -> (Option<(Vec<f64>, [f64; 4])>, Option<String>) {
     if stroke_width <= 0.0 || stroke_width.is_nan() {
@@ -908,7 +969,7 @@ fn stroke_geometry(
     // Cuts have open ends. For aligned strokes, keep track of which pieces
     // came from closed contours so only those are clipped to the compound fill.
     let trim = trim.filter(|t| !is_trim_identity(t.start, t.end, t.offset));
-    let dash = dash.filter(|d| !d.is_empty());
+    let dash = dash.filter(|d| !matches!(d, DashPattern::Static(v) if v.is_empty()));
     let clip_aligned = stroke_align != StrokeAlign::Center && (dash.is_some() || trim.is_some());
     let trimmed = trim.map(|t| trim_contours(path, t, clip_aligned));
     // Use one cap and retry budget for the entire stroke, including every contour.
@@ -917,12 +978,24 @@ fn stroke_geometry(
         Some([ordinary, aligned]) if ordinary.is_empty() => aligned.as_slice(),
         _ => path.points,
     };
-    let on_fraction = dash.map_or(1.0, |d| {
-        let n = normalize_dash_pattern(scale_dash_pattern(d, stroke_width));
-        let total: f64 = n.iter().sum();
-        let on: f64 = n.iter().step_by(2).sum();
-        if total > 0.0 { (on / total).clamp(0.0, 1.0) } else { 1.0 }
-    });
+    let compact = match dash {
+        Some(DashPattern::Sampled(dash)) => match CompactDash::new(dash, stroke_width, line_cap, dash_alignment_now()) {
+            Ok(dash) => Some(dash),
+            Err(reason) => return (None, Some(reason)),
+        },
+        _ => None,
+    };
+    let dash = dash.filter(|_| !compact.as_ref().is_some_and(CompactDash::is_solid));
+    let on_fraction = match dash {
+        Some(DashPattern::Static(values)) => {
+            let n = normalize_dash_pattern(scale_dash_pattern(values, stroke_width));
+            let total: f64 = n.iter().sum();
+            let on: f64 = n.iter().step_by(2).sum();
+            if total > 0.0 { (on / total).clamp(0.0, 1.0) } else { 1.0 }
+        }
+        Some(DashPattern::Sampled(_)) => compact.as_ref().unwrap().on_fraction(),
+        None => 1.0,
+    };
     let reach = match stroke_align {
         StrokeAlign::Center => stroke_width / 2.0,
         _ => stroke_width,
@@ -937,6 +1010,10 @@ fn stroke_geometry(
         });
         let contours = source.chain(cuts);
         let (ordinary, aligned) = if let Some(d) = dash {
+            let d = match d {
+                DashPattern::Static(values) => ContourDash::Static(values),
+                DashPattern::Sampled(_) => ContourDash::Compact(compact.as_ref().unwrap()),
+            };
             let [ordinary, aligned] = match dash_contours(contours, d, stroke_width, dash_offset) {
                 Ok(pieces) => pieces,
                 Err(reason) => {
@@ -1502,6 +1579,11 @@ fn clip_half_plane(poly: &[P], axis: usize, at: f64, keep_above: bool) -> Vec<P>
 // Dash (:205-432)
 // ---------------------------------------------------------------------------
 
+pub(super) const MAX_DASH_STEPS: usize = 1_000_000;
+pub(super) fn dash_work_error() -> String {
+    format!("stroke-dasharray expansion exceeds the {MAX_DASH_STEPS} step budget")
+}
+
 /// A dashed stroke's input, split by how it is stroked: `open` pieces (caps at
 /// both ends, joins at interior vertices) and `closed` pieces (whole contours).
 #[derive(Debug, Default, PartialEq)]
@@ -1515,22 +1597,34 @@ pub struct DashedStroke {
 /// trimmed shape's wrap runs, a connector body split around a text-gap label).
 fn dash_contours<'a>(
     contours: impl Iterator<Item = (Contour<'a>, bool)>,
-    dash_pattern: &[f64],
+    dash_pattern: ContourDash<'_>,
     stroke_width: f64,
     dash_offset: f64,
 ) -> Result<[DashedStroke; 2], String> {
-    let normalized = normalize_dash_pattern(scale_dash_pattern(dash_pattern, stroke_width));
+    let aligned = dash_alignment_now();
+    let static_pattern;
+    let normalized: &[f64] = match dash_pattern {
+        ContourDash::Static(values) => {
+            static_pattern = normalize_dash_pattern(scale_dash_pattern(values, stroke_width));
+            &static_pattern
+        }
+        ContourDash::Compact(pattern) if aligned => pattern.corners().ok_or_else(dash_work_error)?,
+        ContourDash::Compact(_) => &[],
+    };
     // `dashOffset` (marching ants) is authored in the same units as the dash
     // array and scaled the same way, so one full loop = the authored pattern
     // sum.
     let scaled_offset = dash_offset * stroke_width / BASE_DASH_STROKE_WIDTH;
-    let aligned = dash_alignment_now();
     let mut out = [DashedStroke::default(), DashedStroke::default()];
     // Bound work, including gaps and runs too short to emit vertices. The stroke vertex
     // cap cannot bound those: tiny positive lengths can take billions of walk steps.
-    const MAX_DASH_STEPS: f64 = 1_000_000.0;
     let period: f64 = normalized.iter().sum();
     let mut steps = 0.0;
+    let mut compact_steps = MAX_DASH_STEPS;
+    let phase = match dash_pattern {
+        ContourDash::Compact(pattern) if !aligned => Some(pattern.phase(scaled_offset)?),
+        _ => None,
+    };
     for (Contour { points, closed }, clip_aligned) in contours {
         let raw = path_points_to_segments(points, closed);
         let total: f64 = raw.iter().map(|s| s.arc_length).sum();
@@ -1538,15 +1632,15 @@ fn dash_contours<'a>(
         if period > 0.0 {
             // Each segment can start/end in a partial period; a phase adds at most one.
             steps += ((total / period).ceil() + raw.len() as f64 + 1.0) * normalized.len() as f64;
-            if !steps.is_finite() || steps > MAX_DASH_STEPS {
-                return Err(format!("stroke-dasharray expansion exceeds the {MAX_DASH_STEPS} step budget"));
+            if !steps.is_finite() || steps > MAX_DASH_STEPS as f64 {
+                return Err(dash_work_error());
             }
         }
         // Aligned dashes: the pattern is re-fitted per span between corners, as an explicit on/off run over the
         // sub-path (the offset does not apply). Corners come from the unflattened segments.
         let aligned_pattern = aligned.then(|| {
             let corners = segment_corner_positions(&raw, closed);
-            intervals_as_walk_pattern(&aligned_dash_intervals(total, &corners, closed, &normalized), total)
+            intervals_as_walk_pattern(&aligned_dash_intervals(total, &corners, closed, normalized), total)
         });
         // Dashes follow the curve: the walk runs over the path flattened like
         // the stroke (each curve's pieces keep its measured arc length, so dash
@@ -1565,12 +1659,18 @@ fn dash_contours<'a>(
         let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
             continue;
         };
-        let walked = if let Some(p) = &aligned_pattern {
+        let walked = if let Some(phase) = &phase {
+            let mut cursor = phase.cursor.clone();
+            walk_path_runs(&segments, phase.is_on, phase.remaining, || {
+                compact_steps = compact_steps.checked_sub(1).ok_or_else(dash_work_error)?;
+                Ok(cursor.next_length())
+            })?
+        } else if let Some(p) = &aligned_pattern {
             walk_path_by_arc_length(&segments, p)
         } else if dash_offset == 0.0 {
-            walk_path_by_arc_length(&segments, &normalized)
+            walk_path_by_arc_length(&segments, normalized)
         } else {
-            walk_path_by_arc_length_phased(&segments, &normalized, scaled_offset)
+            walk_path_by_arc_length_phased(&segments, normalized, scaled_offset)
         };
         let out = &mut out[usize::from(clip_aligned)];
         for piece in dash_pieces(&walked, closed, seg_start(&first.seg), seg_end(&last.seg)) {
@@ -3916,7 +4016,7 @@ mod trim_tests {
     fn apply_dash_to_path(
         points: &[PathCmd], dash: &[f64], width: f64, closed: bool, offset: f64,
     ) -> Result<DashedStroke, String> {
-        dash_contours(PathContours::new(points, closed).iter().map(|c| (c, false)), dash, width, offset)
+        dash_contours(PathContours::new(points, closed).iter().map(|c| (c, false)), ContourDash::Static(dash), width, offset)
             .map(|[ordinary, _]| ordinary)
     }
 

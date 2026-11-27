@@ -17,9 +17,6 @@ impl Sample {
         (self.available / 8).max(512 * MIB).saturating_add(32 * MIB)
     }
 
-    pub(crate) fn resident_peak(self) -> u64 {
-        self.peak.max(self.rss)
-    }
 }
 
 /// Capacity promised to constructors which can run concurrently. Make the whole
@@ -42,6 +39,7 @@ impl Reservations {
 // contain a different set of drawing nodes, batches and tessellations. The
 // current history's reservation cannot authorize that second working set.
 std::thread_local! {
+    static SERIAL_GROWTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WORKERS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -54,15 +52,67 @@ pub(crate) fn with_workers<T>(work: impl FnOnce() -> T) -> T {
     work()
 }
 
-pub(crate) fn require_serial_growth() -> Result<(), wgpu::optional_allocations::Refused> {
-    if WORKERS_ACTIVE.get() { Err(wgpu::optional_allocations::Refused) } else { Ok(()) }
+/// A producer checkpoint, distinct from a failed native allocation. Once
+/// optional draw histories have been released the same output frame can proceed.
+#[derive(Debug)]
+pub(crate) struct SerialGrowth;
+
+impl std::fmt::Display for SerialGrowth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("canvas plan needs the serial working set")
+    }
+}
+
+impl std::error::Error for SerialGrowth {}
+
+pub(crate) fn require_serial_growth() -> Result<(), SerialGrowth> {
+    if WORKERS_ACTIVE.get() { return Err(SerialGrowth); }
+    SERIAL_GROWTH.set(true);
+    Ok(())
+}
+
+/// Whether the serial producer reached a growth checkpoint since the last observation.
+pub(crate) fn take_serial_growth() -> bool {
+    SERIAL_GROWTH.replace(false)
 }
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// The native high-water mark catches transients between samples, but only a
+/// new record belongs to this export. Below the old record, retain the largest
+/// live RSS seen since the start of this job, including its initial residency.
+struct JobPeak {
+    initial_high_water: u64,
+    output_growth: u64,
+    observed: AtomicU64,
+}
+
+impl JobPeak {
+    fn new(initial: Sample) -> Self {
+        Self { initial_high_water: initial.peak, output_growth: 0, observed: AtomicU64::new(initial.rss) }
+    }
+
+    fn observe(&self, sample: Sample) -> u64 {
+        let rss = if sample.peak > self.initial_high_water { sample.peak.max(sample.rss) } else { sample.rss };
+        let replica = rss.saturating_sub(self.output_growth);
+        self.observed.fetch_max(replica, Ordering::Relaxed).max(replica)
+    }
+
+    // The ordered encoders open synchronously, before any worker starts, and
+    // stay on the export thread. Keep the pre-open peak and charge subsequent
+    // drawing growth above the post-open baseline. Actual headroom still sees
+    // the complete process, including the encoders.
+    fn output_opened(&mut self, before: Sample, after: Sample) {
+        self.output_growth = after.rss.saturating_sub(before.rss);
+        self.initial_high_water = self.initial_high_water.max(after.peak);
+    }
+}
 
 pub(crate) struct Guard {
     monitor: Monitor,
+    job_peak: JobPeak,
     diagnostics: bool,
     pressure: Mutex<Pressure>,
 }
@@ -77,8 +127,11 @@ struct Pressure {
 
 impl Guard {
     pub(crate) fn new(diagnostics: bool) -> Option<Self> {
+        let monitor = Monitor::new()?;
+        let job_peak = JobPeak::new(monitor.sample()?);
         Some(Self {
-            monitor: Monitor::new()?,
+            monitor,
+            job_peak,
             diagnostics,
             pressure: Mutex::default(),
         })
@@ -86,6 +139,7 @@ impl Guard {
 
     pub(crate) fn sample(&self, baseline: Option<Sample>) -> Option<Sample> {
         let mut sample = self.monitor.sample()?;
+        self.job_peak.observe(sample);
         if let Some(baseline) = baseline.filter(|_| cfg!(target_os = "macos")) {
             // XNU can return cached VM statistics. Debit new RSS immediately.
             sample.available = sample.available.min(
@@ -95,6 +149,16 @@ impl Guard {
             );
         }
         Some(sample)
+    }
+
+    pub(crate) fn output_opened(&mut self, before: Sample) {
+        if let Some(after) = self.monitor.sample() {
+            self.job_peak.output_opened(before, after);
+        }
+    }
+
+    pub(crate) fn replica_residency(&self) -> u64 {
+        self.job_peak.observed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn claim_workers(&self, sample: Sample, floor: u64, worker_bytes: u64, slots: u64) -> bool {
@@ -172,6 +236,19 @@ mod platform {
             let mut fields = line.strip_prefix(field)?.split_whitespace();
             let value = fields.next()?.parse::<u64>().ok()?;
             (fields.next()? == "kB").then(|| value.saturating_mul(1024))
+        })
+    }
+
+    fn peak_resident_bytes(status: &str) -> Option<u64> {
+        kib(status, "VmHWM:").or_else(|| {
+            // Some Linux procfs implementations omit VmHWM. getrusage reports
+            // the same process high-water mark in KiB.
+            let mut usage = std::mem::MaybeUninit::uninit();
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let kib = u64::try_from(unsafe { usage.assume_init() }.ru_maxrss).ok()?;
+            (kib > 0).then_some(kib)?.checked_mul(1024)
         })
     }
 
@@ -266,7 +343,7 @@ mod platform {
             let status = fs::read_to_string("/proc/self/status").ok()?;
             Some(Sample {
                 rss: kib(&status, "VmRSS:")?,
-                peak: kib(&status, "VmHWM:")?,
+                peak: peak_resident_bytes(&status)?,
                 available: physical.min(cgroup),
                 source: if cgroup <= physical {
                     "cgroup"
@@ -280,6 +357,12 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn peak_rss_is_available_with_or_without_proc_high_water() {
+            assert_eq!(peak_resident_bytes("VmHWM: 123 kB"), Some(123 * 1024));
+            assert!(peak_resident_bytes("VmRSS: 42 kB").is_some_and(|bytes| bytes > 0));
+        }
 
         #[test]
         fn resolves_mount_roots_and_namespace_membership() {
@@ -409,6 +492,33 @@ pub(crate) use platform::Monitor;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_claim_tracks_only_this_exports_peak() {
+        let sample = |rss, peak| Sample { rss, peak, available: 4096, source: "test" };
+        let job = JobPeak::new(sample(500, 900));
+        assert_eq!(job.observe(sample(450, 900)), 500);
+        assert_eq!(job.observe(sample(640, 900)), 640);
+        assert_eq!(job.observe(sample(520, 900)), 640);
+        // The OS saw a new peak between two samples.
+        assert_eq!(job.observe(sample(600, 950)), 950);
+        let next_job = JobPeak::new(sample(520, 950));
+        assert_eq!(next_job.observe(sample(550, 950)), 550);
+    }
+
+    #[test]
+    fn a_single_encoder_does_not_multiply_with_the_draw_lanes() {
+        let sample = |rss, peak| Sample { rss, peak, available: 4096, source: "test" };
+        let mut job = JobPeak::new(sample(500, 900));
+        assert_eq!(job.observe(sample(650, 900)), 650);
+        let before = sample(600, 900);
+        job.observe(before);
+        job.output_opened(before, sample(800, 1000));
+        assert_eq!(job.observe(sample(820, 1000)), 650);
+        assert_eq!(job.observe(sample(910, 1000)), 710);
+        // Retain a transient drawing peak recorded between samples.
+        assert_eq!(job.observe(sample(940, 1100)), 900);
+    }
 
     #[test]
     fn concurrent_constructors_cannot_spend_the_same_headroom() {

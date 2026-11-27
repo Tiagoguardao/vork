@@ -533,7 +533,20 @@ pub enum Paint {
     Freeform(FreeformGradientPaint),
     Image(ImagePaint),
     Video(VideoPaint),
+    Program(PathProgram),
 
+}
+
+/// An installed path fragment and the two indices its draw reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PathProgram {
+    pub unit: u32,
+    #[serde(default)]
+    pub site: u32,
+    pub inputs: u32,
+    #[serde(default)]
+    pub clock: u32,
+    pub stroke_uv: bool,
 }
 
 impl Paint {
@@ -600,6 +613,8 @@ pub struct Stroke {
     pub miter_limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dash: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_dash: Option<crate::dash::SampledDash>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dash_offset: Option<f64>,
     /// How the dash pattern is laid along the path: absent / `exact` = as
@@ -682,6 +697,7 @@ impl Stroke {
             join: None,
             miter_limit: None,
             dash: None,
+            sampled_dash: None,
             dash_offset: None,
             dash_alignment: None,
 
@@ -703,6 +719,7 @@ impl Stroke {
             join: self.join.clone(),
             miter_limit: self.miter_limit,
             dash: zero_dashes_as_dots(self.dash.as_deref(), self.cap.as_deref(), self.width),
+            sampled_dash: self.sampled_dash.clone(),
             dash_offset: self.dash_offset,
             dash_alignment: self.dash_alignment.clone(),
 
@@ -721,7 +738,7 @@ const ZERO_DASH_PX: f64 = 0.01;
 /// dash walk drops pieces of 0.001 px or less, so such a dash would draw nothing; it is drawn as a 0.01 px piece taken
 /// from the gap after it, which keeps the pattern's period. A butt cap draws nothing for it, and the pattern is
 /// unchanged. Stored dashes are in units of half the stroke width (`scale_dash_pattern`).
-fn zero_dashes_as_dots(dash: Option<&[f64]>, cap: Option<&str>, width: f64) -> Option<Vec<f64>> {
+pub fn zero_dashes_as_dots(dash: Option<&[f64]>, cap: Option<&str>, width: f64) -> Option<Vec<f64>> {
     let d = dash?;
     let capped = matches!(cap, Some("round") | Some("square"));
     let unit = width / 2.0;
@@ -734,14 +751,21 @@ fn zero_dashes_as_dots(dash: Option<&[f64]>, cap: Option<&str>, width: f64) -> O
     if out.len() % 2 == 1 {
         out.extend_from_slice(d);
     }
-    let eps = ZERO_DASH_PX / unit;
-    for i in (0..out.len()).step_by(2) {
-        if is_zero(out[i]) && out[i + 1] > 2.0 * eps {
-            out[i + 1] -= eps - out[i];
-            out[i] = eps;
-        }
+    for pair in out.chunks_exact_mut(2) {
+        let lengths = zero_dash_pair_as_dot(pair[0], pair[1], unit);
+        pair.copy_from_slice(&lengths);
     }
     Some(out)
+}
+
+/// Apply the capped zero-length dash rule to a single on/off pair.
+pub fn zero_dash_pair_as_dot(dash: f64, gap: f64, unit: f64) -> [f64; 2] {
+    let eps = ZERO_DASH_PX / unit;
+    if (0.0..=0.001).contains(&(dash * unit)) && gap > 2.0 * eps {
+        [eps, gap - (eps - dash)]
+    } else {
+        [dash, gap]
+    }
 }
 
 impl Fill {
@@ -1039,6 +1063,7 @@ pub struct StrokeStyle {
     pub join: Option<String>,
     pub miter_limit: Option<f64>,
     pub dash: Option<Vec<f64>>,
+    pub sampled_dash: Option<crate::dash::SampledDash>,
     pub dash_offset: Option<f64>,
     /// [`Stroke::dash_alignment`].
     pub dash_alignment: Option<String>,

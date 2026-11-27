@@ -164,7 +164,7 @@ node.composition: composition|null; 2d: a canvas, its children painted to one pi
 node.content (text): string|run[]; position by the text box's top-left; switch content with STEP keys; runs set font and paint; white-space controls newlines; JSON shape: string|Run object[]
 node.d (path): string; SVG path data, px; "none" or empty paints nothing; default none; JSON shape: string
 node.direction (text): ltr|rtl; default ltr; JSON shape: "ltr"|"rtl"
-node.fill (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default #000; JSON shape: "none"|string|ImagePaint object
+node.fill (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}; default #000; JSON shape: "none"|string|ImagePaint object|MaterialPaint object
 node.fill (text): "none"|CSS colour|CSS gradient|{image, fit}; default #000; JSON shape: "none"|string|ImagePaint object
 node.fill-opacity (path): number; 0..1; default 1; JSON shape: number
 node.fill-rule (path): nonzero|evenodd; default nonzero; JSON shape: "nonzero"|"evenodd"
@@ -201,7 +201,7 @@ node.pass_index: u32|null; 1..65535; object ID; JSON shape: integer|null
 node.pathLength (path): number|null; the author's total length of d; dash lengths and offset scale by computed/pathLength; JSON shape: number|null
 node.rotation: [x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ); default [0,0,0,1]; JSON shape: [number, number, number, number]|object
 node.scale: [x,y,z]; any zero world-scale component hides geometry, including children; default [1,1,1]; JSON shape: [number, number, number]
-node.stroke (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default none; JSON shape: "none"|string|ImagePaint object
+node.stroke (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}; default none; JSON shape: "none"|string|ImagePaint object|MaterialPaint object
 node.stroke (text): "none"|CSS colour|CSS gradient|{image, fit}; the glyph outlines; default none; JSON shape: "none"|string|ImagePaint object
 node.stroke-dasharray (path): "none"|number[]; px; an odd count repeats; scaled by pathLength; default none; JSON shape: "none"|number[]
 node.stroke-dashoffset (path): number; px; default 0; JSON shape: number
@@ -238,6 +238,7 @@ output.peak_luminance: positive cd/m²; omitted: SDR 100, HDR 1000; JSON shape: 
 output.reference_white: positive cd/m², at most peak_luminance; omitted: SDR 100, HDR 203; JSON shape: number
 paint.fit: contain|cover|fill|none|null; centred in the shape's box; null = natural size from the box's top-left, repeated as the image's wrap_s and wrap_t say; JSON shape: "contain"|"cover"|"fill"|"none"|null
 paint.image: image-name; PNG or JPEG, sRGB; clipped by the shape; JSON shape: string
+paint.material: material-name|inline material; path fill or stroke; float4 paint(PaintContext, Inputs) returns premultiplied canvas working RGBA; JSON shape: string|Material object
 profile.description: string; default ""; JSON shape: string
 profile.level: u8; 0..3; quality/cost level; 3 is previs; JSON shape: integer
 profile.settings: Settings; seed, samples and denoise only; default {}; JSON shape: Settings object

@@ -15,6 +15,7 @@ macro_rules! ensure_usage {
 use std::{
     path::{Path, PathBuf},
     time::Instant,
+    sync::Arc,
 };
 use vork_encode::{Backend, EncodeSettings, Encoder};
 use vork_scene::Scene;
@@ -382,21 +383,20 @@ impl Shot {
     /// A device that lacks what the scene needs is replaced by one that provides it
     /// (`Renderer::providing`), and the installation is built again on that one.
     pub fn render_retained(self, retained: Retained) -> Result<RenderedShot> {
-        std::thread::scope(|scope| self.render_scoped_with(scope, Some(retained), None, None, None))
+        std::thread::scope(|scope| self.render_scoped_with(scope, Some(retained), None, None, None, Default::default()))
     }
 
     /// Render the exact expansion against which the worker established identity,
     /// with what the worker holds: nothing before its first device.
-    fn render_retained_decoded(self, retained: Option<Retained>, decoded: Scene, pages: crate::install::StaticResources, opened: crate::footage::Opened) -> Result<RenderedShot> {
-        std::thread::scope(|scope| self.render_scoped_with(scope, retained, Some(decoded), Some(pages), Some(opened)))
+    fn render_retained_decoded(self, retained: Option<Retained>, decoded: worker::SessionInput<'_>, pages: crate::install::StaticResources, opened: crate::footage::Opened) -> Result<RenderedShot> {
+        std::thread::scope(|scope| self.render_scoped_with(scope, retained, Some(decoded), Some(pages), Some(opened), Default::default()))
     }
 
     pub(crate) fn render_scoped<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>) -> Result<RenderedShot> {
-        self.render_scoped_with(scope, None, None, None, None)
+        self.render_scoped_with(scope, None, None, None, None, Default::default())
     }
 
-    fn render_scoped_with<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>, retained: Option<Retained>, decoded: Option<Scene>, pages: Option<crate::install::StaticResources>, opened: Option<crate::footage::Opened>) -> Result<RenderedShot> {
-        let warnings = crate::warnings::Collector::default();
+    fn render_scoped_with<'scope>(self, scope: &'scope std::thread::Scope<'scope, '_>, retained: Option<Retained>, decoded: Option<worker::SessionInput<'_>>, pages: Option<crate::install::StaticResources>, opened: Option<crate::footage::Opened>, warnings: crate::warnings::Collector) -> Result<RenderedShot> {
         let _warning_scope = warnings.enter();
         let wall = Instant::now();
         let kept = retained.is_some() || decoded.is_some();
@@ -467,7 +467,7 @@ impl Shot {
         let settings = vork_scene::test_settings(&settings, &test_techniques)?;
         // Until the device is asked for, everything that fails is the document, its files or
         // the call: each refusal below is the scene's unless it says otherwise.
-        let base = scene_path.parent().unwrap_or(Path::new("."));
+        let base = decoded.as_ref().map_or_else(|| scene_path.parent().unwrap_or(Path::new(".")), |input| input.base);
         // Session revisions can read private snapshots and carry live state.
         // Chunk manifests are for independent, one-shot renders.
         let identify_export = !kept && !no_write && !gpu_only
@@ -475,39 +475,56 @@ impl Shot {
             && (audio_only || out.iter().any(|path| mp4_destination(path)));
         let opened = opened.or_else(|| previous_canvas.as_ref().map(|kept| kept.opened().clone()))
             .or_else(|| previous_install.as_ref().map(|(scene, _)| scene.opened.clone())).unwrap_or_default();
+        let warnings = warnings.with_sources(&opened.files);
+        let _warning_scope = warnings.enter();
         let identity = if identify_export { crate::InputIdentity::Export } else { crate::InputIdentity::Reuse };
         // Picture admission validates the edited scene. Audio admission validates before an edit.
         // Only a subsequent change can invalidate the content checks for this render.
         let revalidate_content = overrides.resolution.is_some() || overrides.fps.is_some() || (audio_only && edit.is_some());
-        let (mut scene, files) = if audio_only {
-            let mut scene = match (decoded, &document) {
-                (Some(scene), _) => scene,
-                (None, Some(bytes)) => crate::decode_scene_document(bytes, &scene_path)?,
-                (None, None) => crate::load_scene_document(&scene_path)?,
-            };
-            scene.render.settings = settings;
-            scene.validate_content(false).map_err(scene_error)?;
-            if let Some(edit) = edit { edit(&mut scene, base).map_err(scene_error)?; }
-            // An audio-only render can succeed even when picture inputs cannot be identified.
-            let files = if identify_export { crate::inspect_files(&scene, base, identity, &opened).ok().flatten() } else { None };
-            (scene, files)
+        let call = crate::canvas::LookOverrides::new(&overrides, resolution);
+        let admitted = decoded.as_ref().filter(|input| input.published_canvas() && !audio_only)
+            .and_then(|_| previous_canvas.as_ref()?.admitted(base, &settings, call));
+        let ((scene, files), admission_warnings) = if let Some((scene, notices)) = admitted {
+            ((scene, None), notices)
         } else {
-            match &document {
-                Some(bytes) => admit_document_with_settings(bytes, &scene_path, settings, &profile.name, edit, decoded, identity, &opened).map_err(scene_error)?,
-                None => {
-                    let mut scene = crate::load_scene_document(&scene_path).with_context(|| format!("load scene {}", scene_path.display()))?;
+            crate::warnings::Notices::capture(|| {
+                let (mut scene, files) = if audio_only {
+                    let mut scene = match (decoded, &document) {
+                        (Some(input), _) => input.into_scene()?,
+                        (None, Some(bytes)) => crate::decode_scene_document(bytes, &scene_path)?,
+                        (None, None) => crate::load_scene_document(&scene_path)?,
+                    };
                     scene.render.settings = settings;
-                    crate::admit_scene(scene, &scene_path, &profile.name, edit, identity, &opened)?
+                    scene.validate_content(false).map_err(scene_error)?;
+                    if let Some(edit) = edit { edit(&mut scene, base).map_err(scene_error)?; }
+                    // An audio-only render can succeed even when picture inputs cannot be identified.
+                    let files = if identify_export { crate::inspect_files(&scene, base, identity, &opened).ok().flatten() } else { None };
+                    (scene, files)
+                } else {
+                    match (decoded, &document) {
+                        (Some(input), _) => admit_decoded_with_settings(input.into_scene()?, &scene_path, settings, &profile.name, edit, identity, &opened).map_err(scene_error)?,
+                        (_, Some(bytes)) => {
+                            let scene = crate::decode_scene_document(bytes, &scene_path)
+                                .with_context(|| format!("load scene {}", scene_path.display())).map_err(scene_error)?;
+                            admit_decoded_with_settings(scene, &scene_path, settings, &profile.name, edit, identity, &opened).map_err(scene_error)?
+                        }
+                        (None, None) => {
+                            let mut scene = crate::load_scene_document(&scene_path).with_context(|| format!("load scene {}", scene_path.display()))?;
+                            scene.render.settings = settings;
+                            crate::admit_scene(scene, &scene_path, &profile.name, edit, identity, &opened)?
+                        }
+                    }
+                };
+                if let Some(resolution)=overrides.resolution {scene.render.resolution=resolution;}
+                if let Some(fps)=overrides.fps {scene.render.fps=fps;}
+                if revalidate_content { scene.validate_content(!audio_only).map_err(scene_error)?; }
+                if !audio_only && let Some(resolution) = resolution {
+                    ensure_usage!(resolution.iter().all(|&v| v > 0), "resolution must be positive");
+                    scene.render.resolution = resolution;
                 }
-            }
+                Ok((Arc::new(scene), files))
+            })?
         };
-        if let Some(resolution)=overrides.resolution {scene.render.resolution=resolution;}
-        if let Some(fps)=overrides.fps {scene.render.fps=fps;}
-        if revalidate_content { scene.validate_content(!audio_only).map_err(scene_error)?; }
-        if !audio_only && let Some(resolution) = resolution {
-            ensure_usage!(resolution.iter().all(|&v| v > 0), "resolution must be positive");
-            scene.render.resolution = resolution;
-        }
         // What the scene can encode for the display is refused with the scene's other errors, before device work.
         crate::output_device::admit(&scene, &destinations, target).map_err(scene_error)?;
         let raw_colors: std::collections::BTreeMap<_, _> = destinations.iter()
@@ -544,7 +561,6 @@ impl Shot {
             );
             ensure_usage!(outputs.is_empty() && !provisional && png_depth != crate::PngDepth::Sixteen,
                 "WAV does not accept picture outputs, provisional output or PNG depth");
-            let base = scene_path.parent().unwrap_or(Path::new("."));
             let mix = crate::audio::Mix::new_in(&scene, base, &opened).map_err(scene_error)?;
             let root = scene
                 .render
@@ -620,7 +636,7 @@ impl Shot {
         let sound = if !no_audio && !no_write && !gpu_only && out.iter().any(|p| video_destination(p)) {
             crate::audio::MovieSound::prepare(
                 &scene,
-                scene_path.parent().unwrap_or(Path::new(".")),
+                base,
                 first_frame,
                 last_frame,
                 &out, &opened,
@@ -648,11 +664,12 @@ impl Shot {
         // A 2D canvas (composition: {space: "2d"}) renders through the canvas stage.
         if scene.is_canvas() {
             return crate::canvas::render(crate::canvas::Request {
-                base: scene_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                scene, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display: target, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused,
-                sound, opened, kept: previous_canvas,
+                base: base.to_path_buf(),
+                scene, call, out, outputs, still, first_frame, last_frame, selected, png_depth, exr_codec, raw_colors, display: target, no_write, gpu_only, diagnostics, stop, profile_record, export_identity, device_reused,
+                sound, opened, kept: previous_canvas, admission_warnings,
             }, device_worker, &warnings, wall);
         }
+        let scene = Arc::unwrap_or_clone(scene);
         // HDR code values are written in 16 bits, whatever depth was asked for.
         let png_depth = target.png_depth(png_depth);
         for output in &outputs {
@@ -827,13 +844,16 @@ impl Shot {
                             let mut scene = scene;
                             let mut plan = install_plan(&renderer, &mut scene, default_denoise.as_ref(), install_readback, frames == 1, video || gpu_only, &outputs.0, frame_request(0), target)?;
                             if let Some((installed, key)) = previous_install.take() {
-                                if key == plan.delivery { return Ok((installed, plan.delivery, true)); }
+                                if key == plan.delivery {
+                                    installed.warnings.replay();
+                                    return Ok((installed, plan.delivery, true));
+                                }
                                 // Release the stale installation before the new one allocates.
                                 drop(installed);
                             }
                             plan.options.previous_resources = pages;
                             plan.options.opened = opened;
-                            renderer.install_with_options(scene, scene_path.parent().unwrap_or(Path::new(".")), plan.options)
+                            install_world(&renderer, scene, base, plan.options)
                             .with_context(|| format!("install scene {}", scene_path.display()))
                             .map(|installed| (installed, plan.delivery, false))
                         }).expect("start the scene install worker");
@@ -1373,6 +1393,14 @@ impl Shot {
     }
 }
 
+/// The warnings belong to the installation produced here. Delivery planning
+/// and frame work run in the request's own warning scope.
+fn install_world(renderer: &Renderer, scene: Scene, base: &Path, options: crate::InstallOptions) -> Result<InstalledScene> {
+    let (mut installed, warnings) = crate::warnings::Notices::capture(|| renderer.install_with_options(scene, base, options))?;
+    installed.warnings = warnings;
+    Ok(installed)
+}
+
 /// Everything below the document that an installation depends on, and how to
 /// install it: the delivery identity (readback shape, single frame, GPU colour,
 /// output set, the display encoded for, the resolved render block) and the install options. One place for
@@ -1407,13 +1435,10 @@ pub(crate) fn install_plan(renderer: &Renderer, scene: &mut vork_scene::Scene, d
     } })
 }
 
-fn admit_document_with_settings(bytes: &[u8], path: &Path, settings: vork_scene::Settings, profile: &str,
-    edit: Option<SceneEdit>, decoded: Option<Scene>, identity: crate::InputIdentity, opened: &crate::footage::Opened) -> Result<(Scene, Option<std::collections::BTreeSet<PathBuf>>)> {
-    let mut scene = (|| -> Result<Scene> {
-        let scene = match decoded { Some(scene) => scene, None => crate::decode_scene_document(bytes, path)? };
-        scene.validate().map_err(|error| scene.authored_error(error))?;
-        Ok(scene)
-    })().with_context(|| format!("load scene {}", path.display()))?;
+fn admit_decoded_with_settings(mut scene: Scene, path: &Path, settings: vork_scene::Settings, profile: &str,
+    edit: Option<SceneEdit>, identity: crate::InputIdentity, opened: &crate::footage::Opened) -> Result<(Scene, Option<std::collections::BTreeSet<PathBuf>>)> {
+    scene.validate().map_err(|error| scene.authored_error(error))
+        .with_context(|| format!("load scene {}", path.display()))?;
     scene.apply_settings(settings, profile)
         .with_context(|| format!("load scene {} with profile {profile}", path.display()))?;
     crate::admit_scene(scene, path, profile, edit, identity, opened)

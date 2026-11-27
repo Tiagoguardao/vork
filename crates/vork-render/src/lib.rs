@@ -88,6 +88,10 @@ mod resolve_native;
 mod slang_forward;
 mod passes;
 mod pipelines;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod compile_idle;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub use compile_idle::after_compile_reply;
 mod plan;
 mod probes;
 mod output_run;
@@ -172,6 +176,7 @@ mod canvas_host_memory;
 mod canvas_parallel;
 mod canvas_timing;
 mod canvas_draw;
+mod canvas_program;
 mod canvas_world;
 
 use lights::{LightPlan, Light};
@@ -653,8 +658,13 @@ impl Renderer {
         }
         report!("Ray queries: {}", if self.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) { "available; the renderer can select scene queries" } else { "unavailable; profiles refuse effects that need scene queries" });
         let mut failures = Vec::new();
-        match vork_slang::Compiler::discover().version() {
-            Ok(version) => report!("Slang: {version} ready"),
+        let slang = vork_slang::Compiler::discover();
+        match slang.version() {
+            Ok(version) => {
+                // Keep the readiness probe live and publish its result for render workers.
+                programs::admit(&|key| self.disk_cache.path("slang-input", 1, key), &slang)?;
+                report!("Slang: {version} ready");
+            }
             Err(error) => { report!("Slang: {error:#}"); failures.push("Slang"); }
         }
         match denoise::open_fast(self) {
@@ -1357,7 +1367,7 @@ impl Renderer {
         let opened = options.opened.clone();
         animation::fold_material_inputs(&mut scene, base, &opened)?;
         if scene.propagation.is_some() && !scene.render.settings.integrator.is_path() {
-            eprintln!("warning: authored curved propagation uses std/path transport for this scene and its render-image captures");
+            crate::warnings::diagnostic("warning: authored curved propagation uses std/path transport for this scene and its render-image captures");
             rt::promote_to_path(&mut scene);
         }
         let camera_controls=camera_program::promote_in(self,&mut scene,base,&options.initial_time,&opened)?;
@@ -1492,7 +1502,7 @@ fn load_scene_document(path: &Path) -> Result<Scene> {
 /// The ordinary expansion/parser path, also used for in-memory session documents.
 fn decode_scene_document(bytes: &[u8], path: &Path) -> Result<Scene> {
     let base = path.parent().unwrap_or(Path::new("."));
-    let expansion_files = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let expansion_files = std::cell::RefCell::default();
     let expanded = || -> Result<serde_json::Value> {
         let mut document = vork_scene::v2::diagnostics::read_document(bytes)?;
         expansion_files.replace(expand_standard_geometry(&mut document, base)?);
@@ -1506,14 +1516,10 @@ fn decode_scene_document(bytes: &[u8], path: &Path) -> Result<Scene> {
 
 /// Setup and scene loading share the pure builders' ordinary JSON results.
 /// Validation still consumes the expanded scene before any device is opened.
-fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Result<std::collections::BTreeSet<PathBuf>> {
-    let sources = std::cell::RefCell::new(std::collections::BTreeSet::new());
+fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Result<std::collections::BTreeMap<PathBuf, [u8; 32]>> {
+    let sources = std::cell::RefCell::new(std::collections::BTreeMap::new());
     let cache = std::cell::OnceCell::new();
     vork_std::expand_scene_with(document, base, &|function, argument| {
-        if function == "text" {
-            let options: serde_json::Value = serde_json::from_str(argument)?;
-            if let Some(font) = options["font"].as_str() { sources.borrow_mut().insert(PathBuf::from(font)); }
-        }
         let mut key = blake3::Hasher::new();
         // Conservatively bind every builder source and the target/build options.
         key.update(env!("VORK_BUILD_ID").as_bytes());
@@ -1523,7 +1529,12 @@ fn expand_standard_geometry(document: &mut serde_json::Value, base: &Path) -> Re
         let key = key.finalize();
         // Expanded-buffer scenes and file-dependent native builders never open the store.
         let path = || cache.get_or_init(disk_cache::Store::host).path("std-geometry", 1, key);
-        vork_std::evaluate_with_cache(function, argument,
+        vork_std::evaluate_observed(function, argument, &|path, bytes| {
+            let hash = *blake3::hash(bytes).as_bytes();
+            let old = sources.borrow_mut().insert(path.to_owned(), hash);
+            anyhow::ensure!(old.is_none_or(|old| old == hash), "asset {} changed during expansion; retry the command", path.display());
+            Ok(())
+        },
             || String::from_utf8(disk_cache::read(&path())?).ok(),
             |result| { let _ = disk_cache::write(&path(), result.as_bytes()); })
     })?;
@@ -1608,9 +1619,13 @@ fn validate_inputs(scene: &Scene, base: &Path) -> Result<Option<std::collections
 /// Preserve the existing schema-first failure category while reporting all
 /// typed scene and source problems, including after an author-side edit.
 fn validate_inputs_for(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+    Ok(validate_sources(scene, base, identity, opened)?.into_identity())
+}
+
+fn validate_sources(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<InputSources> {
     let mut errors = Vec::new();
     let mut files = None;
-    for result in [validate(scene), inspect_files(scene, base, identity, opened).map(|paths| files = paths)] {
+    for result in [validate(scene), inspect_sources(scene, base, identity, opened).map(|paths| files = Some(paths))] {
         if let Err(error) = result { errors.push(scene.authored_error(error)); }
     }
     if errors.is_empty() {
@@ -1625,7 +1640,7 @@ fn validate_inputs_for(scene: &Scene, base: &Path, identity: InputIdentity, open
         if let Err(error) = result { errors.push(error); }
     }
     vork_scene::v2::diagnostics::joined(errors).map_err(failure::scene)?;
-    Ok(files)
+    Ok(files.expect("source inspection succeeded"))
 }
 
 /// File-backed sources must be readable regular files, not directories that
@@ -1655,15 +1670,31 @@ fn validate_files(scene: &Scene, base: &Path) -> Result<Option<std::collections:
 /// Return the same sources for installation or export identity, or None when
 /// their complete dependency set is unknown. This never adds an admission requirement.
 fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<Option<std::collections::BTreeSet<PathBuf>>> {
+    Ok(inspect_sources(scene, base, identity, opened)?.into_identity())
+}
+
+struct InputSources {
+    paths: std::collections::BTreeSet<PathBuf>,
+    optional_stills: std::collections::BTreeSet<PathBuf>,
+    complete: bool,
+}
+impl InputSources {
+    fn into_identity(self) -> Option<std::collections::BTreeSet<PathBuf>> {
+        self.complete.then_some(self.paths)
+    }
+}
+
+fn inspect_sources(scene: &Scene, base: &Path, identity: InputIdentity, opened: &footage::Opened) -> Result<InputSources> {
     let base = if base.as_os_str().is_empty() {Path::new(".")} else {base};
     let mut errors = Vec::new();
-    let mut files = scene.expansion_files.clone();
+    let mut files: std::collections::BTreeSet<_> = scene.expansion_files.keys().cloned().collect();
+    let mut optional_stills = std::collections::BTreeSet::new();
     // A canvas with no world inside reads images through its paints, which `canvas::sources` lists, and through
     // its view and its image graph, whose image files the walk below lists: a rendered image is not read there.
     let paints_only = scene.is_canvas() && !canvas::has_worlds(&scene.nodes);
-    // A session collecting proof and native observations can identify a world
-    // installation's authored programs. Canvas and simulation have other readers.
-    let compiler_tracked = identity == InputIdentity::Reuse && !scene.is_canvas() && !scene.has_composition_parts()
+    // Standalone canvas graph and view stages use the same observed program
+    // compiler as worlds. Embedded compositions still have independent readers.
+    let compiler_tracked = identity == InputIdentity::Reuse && !scene.has_composition_parts()
         && programs::session_inputs::current().is_some();
     // One-shot exports have no compiler observation for transitive imports.
     let mut complete = (scene.programs.is_empty() || compiler_tracked) && scene.simulation.is_none()
@@ -1747,7 +1778,7 @@ fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &f
             let path = base.join(file);
             if footage::is_media(&path) && !footage::is_sequence(&path) {
                 opened.revision(&path).map(|_| ())
-            } else { source_file(&path).map(|_| ()).map_err(anyhow::Error::from) }
+            } else { opened.files.source(&path).open_regular().map(|_| ()).map_err(anyhow::Error::from) }
                 .with_context(||format!("restore display image {file} or correct its path"))?;
             files.insert(path);
             Ok(())
@@ -1822,17 +1853,18 @@ fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &f
         };
         let result = (|| -> Result<()> {
             if footage::is_sequence(&path) {
-                files.extend(footage::sequence(&path)?);
+                files.extend(opened.sequence_files(&path)?);
             } else {
                 files.insert(path.clone());
                 if footage::is_media(&path) {
                     opened.revision(&path)?;
                     return Ok(());
                 }
-                match source_file(&path) {
+                let allows_missing = !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies"));
+                if allows_missing { optional_stills.insert(path.clone()); }
+                match opened.files.source(&path).open_regular() {
                     Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                        && !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ies")) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && allows_missing => {}
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -1842,13 +1874,19 @@ fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &f
             errors.push(error.context(format!("image {name} ({}): restore valid image/media frames or correct the path", path.display())));
         }
     }
+    // A published glTF container rewrites its external URIs to verified copies.
+    // A missing sidecar still takes the ordinary live import path.
+    let mut container_dependencies = Vec::new();
     for file in paths {
         let path = base.join(file);
         files.insert(path.clone());
         let result=if splats::is_file(&path) {splats::inspect(&path).map(|_|Default::default())}
             else {import::validate_file(&path,path.parent().unwrap_or(base))};
         match result {
-            Ok(dependencies) => files.extend(dependencies),
+            Ok(dependencies) => {
+                files.extend(dependencies.iter().cloned());
+                container_dependencies.extend(dependencies);
+            }
             Err(error) => errors.push(error.context(format!("asset {file}: restore a valid asset and its referenced files"))),
         }
     }
@@ -1856,12 +1894,13 @@ fn inspect_files(scene: &Scene, base: &Path, identity: InputIdentity, opened: &f
     // part of what a session must see unchanged before it reuses the document.
     let for_export = identity == InputIdentity::Export;
     if (scene.is_canvas() || (for_export && scene.has_composition_parts()))
-        && !canvas::sources(scene, base, &mut files, for_export, opened)
+        && !canvas::sources(scene, base, &mut files, &mut optional_stills, for_export, opened)
     {
         complete = false;
     }
     vork_scene::v2::diagnostics::joined(errors).context("scene input problems").map_err(failure::scene)?;
-    Ok(complete.then_some(files))
+    for path in container_dependencies { optional_stills.remove(&path); }
+    Ok(InputSources { paths: files, optional_stills, complete })
 }
 pub fn load(path: &Path) -> Result<Scene> {
     let scene = load_scene_document(path).with_context(|| format!("load scene {}", path.display()))?;

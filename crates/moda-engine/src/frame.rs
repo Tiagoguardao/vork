@@ -24,7 +24,7 @@ use crate::device::GpuContext;
 use crate::paint;
 use crate::seams::{
     BlendMode, BodyPaint, CoveragePlan, DrawItem, PageInstance, PaintInstance, Phase,
-    SolidPathInstance, TessellatedGeometry, INFINITE_CLIP,
+    ProgramBody, SolidPathInstance, TessellatedGeometry, INFINITE_CLIP,
 };
 use crate::shape_to_path;
 use crate::tess::{self, moda_engine_path_types as pt};
@@ -392,7 +392,7 @@ fn local_path_placement(scene: &Scene, node: &moda_scene::types::RawNode) -> Opt
 }
 
 fn translation_body(item: &DrawItem) -> bool {
-    matches!(item, DrawItem::Body { mask: None, paint: BodyPaint::Solid
+    matches!(item, DrawItem::Body { mask: None, paint: BodyPaint::Solid | BodyPaint::Program(_)
         | BodyPaint::Gradient(_) | BodyPaint::Pattern(_), .. })
 }
 
@@ -417,7 +417,7 @@ fn certify_placement(scene: &Scene, mut recipe: TranslationPlacement, items: &[D
         translation_body(item) && instance.model_matrix == matrix && match paint {
             BodyPaint::Gradient(g) => g.model_matrix == matrix,
             BodyPaint::Pattern(p) => p.instance.model_matrix == matrix,
-            BodyPaint::Solid => true,
+            BodyPaint::Solid | BodyPaint::Program(_) => true,
             _ => false,
         }
     });
@@ -525,7 +525,7 @@ impl Placed {
             match paint {
                 BodyPaint::Gradient(g) => g.model_matrix = matrix,
                 BodyPaint::Pattern(p) => p.instance.model_matrix = matrix,
-                BodyPaint::Solid => {},
+                BodyPaint::Solid | BodyPaint::Program(_) => {},
                 _ => unreachable!("placed_span admits these paints"),
             }
             if let Some(([fill, stroke], _)) = self.alphas {
@@ -2630,7 +2630,7 @@ fn worker_chunks(scene: &Scene, dl: &moda_scene::DisplayList, opts: &RenderOptio
             let node = scene.effective_node(&item.node_id)?;
             if item.kind != PaintKind::ShapeFill || !item.fallback_reasons.is_empty()
                 || item.blend_mode.is_some() || node.compact_points().is_none()
-                || !node.plain_solid_fill() || crate::text_draw::has_text_content(node)
+                || !node.plain_path_fill() || crate::text_draw::has_text_content(node)
             { return None; }
             z += 1;
         }
@@ -5838,6 +5838,7 @@ fn build_body_item_inner(
     let perspective = distort.as_ref().map(paint::NodeDistort::as_pattern_warp);
 
     let outline_band = tess::curve_quality::current_band();
+    let parameterized = tess::stroke_param::needs_stroke_uv(node);
     let tessellate = || tess::tessellate_body(node, &cmds, closure, stroke_width, fill_rule, &style);
     let resident = caches
         .as_ref()
@@ -5848,7 +5849,7 @@ fn build_body_item_inner(
     // lookup. Outlines and networks have no such cache, so they hash the node here.
     let keyed = resident.is_some();
     let geometry: std::sync::Arc<TessellatedGeometry> = if let Some((cache, _)) = caches.filter(|_| keyed) {
-        let key = resident.unwrap_or_else(|| crate::residency::node_hashes_in(scene, node).geom);
+        let key = resident.unwrap_or_else(|| crate::residency::node_hashes_in(scene, node).geom) ^ if parameterized { 0x5597_ee15_f6c0_c498 } else { 0 };
         let tess_id = node.id();
         {
             let band = outline_band;
@@ -5939,9 +5940,7 @@ fn build_body_item_inner(
     }
     // E8.18: a gradient stroke laid along or across the path reads each stroke
     // vertex's (along, across) coordinates, from the outline's centreline.
-    let geometry = tess::stroke_param::with_stroke_uv(geometry, node, true, || {
-        tess::stroke_param::centerline(&cmds, closure, tess::stroke_param::CENTERLINE_TOLERANCE)
-    });
+
 
     // Colors + opacity (WebGPUPathRenderer.ts:1250-1285, 1480-1481).
     let opacity = node.f64("opacity").unwrap_or(1.0);
@@ -5992,7 +5991,7 @@ fn build_body_item_inner(
     // the body transparent by themselves (render-semantics §1.5).
     let has_inner_shadow = crate::effects::has_inner_shadow_quad(node);
 
-    let is_transparent = fill_transparent
+    let is_transparent = matches!(route, paint::FillRoute::Program(_)) || fill_transparent
         || stroke_transparent
         || node_transparent
         || gradient_stop_transparent
@@ -6080,6 +6079,13 @@ fn build_body_item_inner(
                 })
         });
     let body_paint = match route {
+        paint::FillRoute::Program(program) => {
+            let paint_bounds = tess::path_bounds(&cmds).map_or([0.; 4], |[x, y, right, bottom]|
+                [x as f32, y as f32, (right-x) as f32, (bottom-y) as f32]);
+            instance.fill_color[3] = if matches!(fill_paint, Some(moda_scene::paint::Paint::Program(_))) { opacity as f32 } else { 0. };
+            instance.stroke_color[3] = if matches!(stroke_paint, Some(moda_scene::paint::Paint::Program(_))) { opacity as f32 } else { 0. };
+            BodyPaint::Program(ProgramBody { binding: program, bounds: paint_bounds })
+        }
         paint::FillRoute::Gradient => {
             // Intended semantic, per the donor spike: gradient
             // fills on a distorted shape re-fit to the WARPED AABB
@@ -6772,8 +6778,12 @@ impl ZeroedBox for PaintInstance {
 struct Layouts {
     frame_bgl: wgpu::BindGroupLayout,
     storage_bgl: wgpu::BindGroupLayout,
+    solid_bgl: wgpu::BindGroupLayout,
+    solid_layout: wgpu::PipelineLayout,
     mask_bgl: wgpu::BindGroupLayout,
     path_layout: wgpu::PipelineLayout,
+    program_layout: wgpu::PipelineLayout,
+    program_inputs_bgl: wgpu::BindGroupLayout,
     page_layout: wgpu::PipelineLayout,
     /// M3b: pattern texture BGL (manifest BGL 15: sampler + texture).
     pattern_texture_bgl: wgpu::BindGroupLayout,
@@ -6799,18 +6809,23 @@ impl Layouts {
                 count: None,
             }],
         });
+        let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let storage_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Path Storage Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[storage_entry(0)],
+        });
+        let solid_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Solid Path Paint and Placement"),
+            entries: &[storage_entry(0), storage_entry(1)],
         });
         let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Path Mask Bind Group Layout"),
@@ -6848,6 +6863,24 @@ impl Layouts {
             bind_group_layouts: &[Some(&frame_bgl), Some(&storage_bgl), Some(&mask_bgl)],
             ..Default::default()
         });
+        let solid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Solid Path Pipeline Layout"),
+            bind_group_layouts: &[Some(&frame_bgl), Some(&solid_bgl), Some(&mask_bgl)],
+            ..Default::default()
+        });
+        let program_inputs_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Path paint words and diagnostics"),
+            entries: &[storage_entry(0), wgpu::BindGroupLayoutEntry {
+                binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None }, count: None,
+            }],
+        });
+        let program_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Path program layout"),
+            bind_group_layouts: &[Some(&frame_bgl), Some(&solid_bgl), Some(&mask_bgl), Some(&program_inputs_bgl)],
+            ..Default::default()
+        });
         let page_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Page Pipeline Layout"),
             bind_group_layouts: &[Some(&frame_bgl), Some(&storage_bgl)],
@@ -6866,7 +6899,7 @@ impl Layouts {
             ..Default::default()
         });
 
-        Self { frame_bgl, storage_bgl, mask_bgl, path_layout, page_layout, pattern_texture_bgl, pattern_layout }
+        Self { frame_bgl, storage_bgl, solid_bgl, solid_layout, mask_bgl, path_layout, program_layout, program_inputs_bgl, page_layout, pattern_texture_bgl, pattern_layout }
     }
 }
 
@@ -6990,7 +7023,7 @@ pub fn prepare_capture_pipelines(device: &wgpu::Device) {
                     if samples > 1 && !features.contains(wgpu::Features::MULTISAMPLE_ARRAY) { continue; }
                     for desc in 0..2 {
                         if history.has_capture_hint(&CapturePipelines::layer_hint(module, desc, samples, BlendMode::Normal)) {
-                            profile.layer(&device, &layouts.path_layout, module, desc, samples, BlendMode::Normal);
+                            profile.layer(&device, &layouts.solid_layout, module, desc, samples, BlendMode::Normal);
                         }
                     }
                 }
@@ -7028,6 +7061,7 @@ pub struct Engine {
     working: Option<moda_shaders::WorkingColor>,
     layouts: std::sync::Arc<Layouts>,
     /// (module id, pipeline label index, sample_count, blend key, color target format) → pipeline.
+    path_programs: std::cell::RefCell<path_program::Installed>,
     pipelines: std::cell::RefCell<std::sync::Arc<PipelineMap>>,
     captures: std::sync::Arc<CapturePipelines>,
     shader_modules: std::cell::RefCell<std::sync::Arc<std::collections::HashMap<String, wgpu::ShaderModule>>>,
@@ -7140,6 +7174,7 @@ pub struct Engine {
     prepared_page_cost: std::cell::Cell<Option<PreparedPageCost>>,
     /// Installed scene owning this render and all recursive mask captures.
     mask_capture_owner: std::cell::Cell<Option<u64>>,
+    serial_mask_captures: std::cell::Cell<u64>,
     /// A worker may sample captures already drawn by the serial engine. A miss
     /// returns the frame to its owner before lowering or planning any mask.
     serial_masks: std::cell::RefCell<Option<SharedCaptures>>,
@@ -7280,6 +7315,30 @@ pub struct PlanKey {
     pub revision: u64,
 }
 
+/// Shared placement for the contiguous logical slots [first, end). The recorded
+/// matrix holds an ordinary world position. Subtract the anchor and, if needed,
+/// round on the certified grid to recover the exact local origin.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GroupTranslation {
+    first: u32,
+    end: u32,
+    anchor: [f32; 2],
+    high: [f32; 2],
+    tail: [f32; 2],
+    grid: [f32; 2],
+    _pad: [u32; 2],
+}
+impl GroupTranslation {
+    #[cfg(test)]
+    pub(crate) fn range(&self) -> std::ops::Range<usize> { self.first as usize..self.end as usize }
+
+    pub(crate) fn new(first: u32, end: u32, anchor: [f32; 2], position: [f64; 2], grid: [f32; 2]) -> Self {
+        let high = position.map(|v| v as f32);
+        Self { first, end, anchor, high, grid, _pad: [0; 2], tail: std::array::from_fn(|i| (position[i] - f64::from(high[i])) as f32) }
+    }
+}
+
 /// What its owner did to a plan between revision `from` and the one being drawn.
 pub struct PlanChange<'a> {
     pub from: u64,
@@ -7307,11 +7366,11 @@ pub struct ItemWrite {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum BodyFields { All, Matrix, Translation, CompositeOpacity }
+enum BodyFields { All, SolidPaint, Matrix, Translation, CompositeOpacity }
 
 impl ItemWrite {
     pub(crate) fn opacity(at: usize) -> Self { Self { at: at as u32, fields: BodyFields::CompositeOpacity } }
-    pub(crate) fn is_full(&self) -> bool { matches!(self.fields, BodyFields::All) }
+    pub(crate) fn is_full(&self) -> bool { matches!(self.fields, BodyFields::All | BodyFields::SolidPaint) }
     pub(crate) fn full(at: usize) -> Self { Self { at: at as u32, fields: BodyFields::All } }
 }
 
@@ -7323,8 +7382,10 @@ impl Placed {
             _ => unreachable!("certified placement"),
         };
         let matrix = self.model.matrix();
-        let fields = if self.alphas.is_some() { BodyFields::All }
-            else if bytemuck::cast_slice::<f32, u8>(&old[..12]) == bytemuck::cast_slice::<f32, u8>(&matrix[..12])
+        let fields = if self.alphas.is_some() {
+                if matches!(item, DrawItem::Body { paint: BodyPaint::Solid, .. })
+                    && bytemuck::bytes_of(old) == bytemuck::bytes_of(&matrix) { BodyFields::SolidPaint } else { BodyFields::All }
+            } else if bytemuck::cast_slice::<f32, u8>(&old[..12]) == bytemuck::cast_slice::<f32, u8>(&matrix[..12])
                 && bytemuck::cast_slice::<f32, u8>(&old[14..]) == bytemuck::cast_slice::<f32, u8>(&matrix[14..]) { BodyFields::Translation }
             else { BodyFields::Matrix };
         ItemWrite { at: at as u32, fields }
@@ -7427,7 +7488,7 @@ impl RecordColumn {
             DrawItem::Body { phase, paint, .. } => {
                 let lane = u8::from(*phase == Phase::Transparent);
                 match paint {
-                    BodyPaint::Solid => Self::Solid(lane),
+                    BodyPaint::Solid | BodyPaint::Program(_) => Self::Solid(lane),
                     BodyPaint::Gradient(_) => Self::Gradient(lane),
                     BodyPaint::Pattern(_) => Self::Pattern(lane),
                     _ => Self::Other,
@@ -7546,6 +7607,7 @@ struct PacketRecords {
     at: Destinations,
     page: Column<PageInstance>,
     solid: [Column<SolidPathInstance>; 2],
+    solid_models: [Column<[f32; 16]>; 2],
     gradient: [Column<paint::GradientInstance>; 2],
     pattern: [Column<paint::PatternInstance>; 2],
 
@@ -7566,34 +7628,43 @@ impl PacketRecords {
     }
 
     /// Ask for a body's packed record at `index` of its family's column in phase `k` (`Column::put`).
-    fn put_body(&mut self, k: usize, index: u32, packed: &PackedBody, fields: BodyFields) -> std::result::Result<bool, &'static str> {
+    fn put_body(&mut self, k: usize, index: u32, packed: &PackedBody, fields: BodyFields, before: Option<&DrawItem>) -> std::result::Result<bool, &'static str> {
         const _: () = {
-            assert!(std::mem::offset_of!(SolidPathInstance, model_matrix) == 0);
             assert!(std::mem::offset_of!(paint::GradientInstance, model_matrix) == 0);
             assert!(std::mem::offset_of!(paint::PatternInstance, model_matrix) == 0);
         };
         let range = |size| match fields {
-            BodyFields::All => 0..size,
+            BodyFields::All | BodyFields::SolidPaint => 0..size,
             BodyFields::Matrix => 0..std::mem::size_of::<[f32; 16]>(),
             BodyFields::Translation => 12 * 4..14 * 4,
             BodyFields::CompositeOpacity => unreachable!("composite parameter has no body buffer"),
         };
         match packed {
-            PackedBody::Solid(record) => self.solid[k].put_range(index, record, range(std::mem::size_of_val(record))),
+            PackedBody::Solid(model, paint) => {
+                // A paint-only replacement keeps its matrix even after CPU mirrors are evicted.
+                let same_model = matches!(fields, BodyFields::SolidPaint) || matches!(before, Some(DrawItem::Body {instance, ..})
+                    if bytemuck::bytes_of(&instance.model_matrix) == bytemuck::bytes_of(model));
+                let placed = !same_model && self.solid_models[k].put_range(index, model, range(std::mem::size_of_val(model)))?;
+                let painted = matches!(fields, BodyFields::All | BodyFields::SolidPaint) && self.solid[k].put(index, paint)?;
+                Ok(placed || painted)
+            }
             PackedBody::Gradient(record) => self.gradient[k].put_range(index, record, range(std::mem::size_of_val(record))),
             PackedBody::Pattern(record, _) => self.pattern[k].put_range(index, record, range(std::mem::size_of_val(record))),
         }
     }
 
     /// Every column with the pooled buffer it mirrors.
-    fn columns(&mut self) -> [(&'static str, &mut dyn PendingRecords); 12] {
+    fn columns(&mut self) -> [(&'static str, &mut dyn PendingRecords); 14] {
         let [solid_opaque, solid_trans] = &mut self.solid;
+        let [model_opaque, model_trans] = &mut self.solid_models;
         let [gradient_opaque, gradient_trans] = &mut self.gradient;
         let [pattern_opaque, pattern_trans] = &mut self.pattern;
         let [solid_sdf_opaque, solid_sdf_trans] = &mut self.solid_sdf;
         let [gradient_sdf_opaque, gradient_sdf_trans] = &mut self.gradient_sdf;
         [
             (PAGE_STORAGE, &mut self.page),
+            (SOLID_MODELS[0], model_opaque),
+            (SOLID_MODELS[1], model_trans),
             (SOLID_STORAGE[0], solid_opaque),
             (SOLID_STORAGE[1], solid_trans),
             (GRADIENT_STORAGE[0], gradient_opaque),
@@ -7611,6 +7682,7 @@ impl PacketRecords {
 
 /// The pooled storage buffers of a frame's instance records: per phase or SDF lane, opaque then transparent.
 const PAGE_STORAGE: &str = "Page Storage Buffer";
+const SOLID_MODELS: [&str; 2] = ["Path Models (Opaque)", "Path Models (Transparent)"];
 const SOLID_STORAGE: [&str; 2] = ["Path Storage (Opaque)", "Path Storage (Transparent)"];
 const GRADIENT_STORAGE: [&str; 2] = ["Path Gradient Storage (Opaque)", "Path Gradient Storage (Transparent)"];
 const PATTERN_STORAGE: [&str; 2] = ["Path Pattern Storage (Opaque)", "Path Pattern Storage (Transparent)"];
@@ -7683,7 +7755,7 @@ struct NodeSlots {
 fn solid_geometry_uses(items: &[DrawItem]) -> [crate::residency::HashMap<usize, u32>; 2] {
     let mut uses: [crate::residency::HashMap<usize, u32>; 2] = Default::default();
     for item in items {
-        if let DrawItem::Body { phase, geometry, paint: BodyPaint::Solid, .. } = item {
+        if let DrawItem::Body { phase, geometry, paint: BodyPaint::Solid | BodyPaint::Program(_), .. } = item {
             *uses[usize::from(*phase == Phase::Transparent)]
                 .entry(std::sync::Arc::as_ptr(geometry) as usize).or_insert(0) += 1;
         }
@@ -7700,7 +7772,7 @@ impl PhaseResidency {
         self.assigned += 1;
         let assigned = self.assigned;
         for (at, item) in items.iter().enumerate() {
-            let DrawItem::Body { phase, paint: BodyPaint::Solid, node_id, geometry, .. } = item else { continue };
+            let DrawItem::Body { phase, paint: BodyPaint::Solid | BodyPaint::Program(_), node_id, geometry, .. } = item else { continue };
             if usize::from(*phase == Phase::Transparent) != k { continue; }
             let node = if shared.contains(&(std::sync::Arc::as_ptr(geometry) as usize)) {
                 &mut self.instances
@@ -7816,7 +7888,7 @@ impl TakeAll for [Option<PhaseResidency>; 2] {
 
 /// One body's packed instance record (`Engine::pack_body`), by pipeline family.
 enum PackedBody {
-    Solid(SolidPathInstance),
+    Solid([f32; 16], SolidPathInstance),
     /// `true`: the Q-116 post-shader gradient-stroke slot.
     Gradient(paint::GradientInstance),
     Pattern(paint::PatternInstance, (String, bool)),
@@ -7984,6 +8056,18 @@ const RETAINED_TARGET_SLOTS: usize = 3;
 /// R2d GPU texture budgets (PLAN §4).
 const PATTERN_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// A shared plan refers to a capture which needs the producing renderer's text and asset state.
+#[derive(Debug)]
+pub struct MissingSharedCapture;
+
+impl std::fmt::Display for MissingSharedCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("canvas mask requires a serial capture")
+    }
+}
+
+impl std::error::Error for MissingSharedCapture {}
+
 /// The serial engine's exact rendered masks. Readers acquire a view of an
 /// existing result. Only the renderer that produced a capture publishes it.
 #[derive(Clone)]
@@ -8005,6 +8089,8 @@ pub struct DrawResources {
     inactive_mask: Option<wgpu::BindGroup>,
     text: crate::text_draw::TextDraw,
 }
+
+mod path_program;
 
 impl Engine {
     /// Engine with the default `Rgba8Unorm` frame format — the native / CLI /
@@ -8075,6 +8161,7 @@ impl Engine {
             gpu: resources.gpu, frame_format: resources.frame_format, working: resources.working,
             captures: resources.captures, layouts: resources.layouts, pipelines: resources.pipelines.into(),
             shader_modules: resources.shader_modules.into(), inactive_mask: resources.inactive_mask,
+            path_programs: Default::default(),
             text: resources.text,
             retained: false,
             reuse_frame_targets: true,
@@ -8114,6 +8201,7 @@ impl Engine {
             caller_filter_demand: std::cell::Cell::new(None),
             prepared_page_cost: Default::default(),
             mask_capture_owner: std::cell::Cell::new(None),
+            serial_mask_captures: Default::default(),
             serial_masks: Default::default(),
             publish_masks: Default::default(),
             capture_scene: Default::default(),
@@ -8286,6 +8374,10 @@ impl Engine {
         }
         if let Some(cache) = self.retained_patterns.borrow_mut().as_mut() { cache.stop_sharing(); }
     }
+
+    /// Captures that needed the serial draw's text and asset context. A worker
+    /// would have been unable to use the shared capture store for these draws.
+    pub fn serial_mask_captures(&self) -> u64 { self.serial_mask_captures.get() }
 
     pub fn publish_mask_captures(&self, enabled: bool) -> SharedCaptures {
         self.publish_masks.set(enabled);
@@ -8741,7 +8833,13 @@ impl Engine {
     }
 
     /// R2b: frame uniform buffer + bind group created once, written per frame.
-    fn frame_uniform_and_bg(&self, uniforms: &[f32; 20]) -> (wgpu::Buffer, wgpu::BindGroup) {
+    fn frame_uniform_and_bg(&self, projection: &[f32; 20], translation: Option<GroupTranslation>) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let mut words = [0f32; 32];
+        words[..20].copy_from_slice(projection);
+        if let Some(translation) = translation {
+            bytemuck::cast_slice_mut(&mut words[20..]).copy_from_slice(bytemuck::bytes_of(&translation));
+        }
+        let uniforms = &words;
         let device = &self.gpu.device;
         let queue = &self.gpu.queue;
         let desc = wgpu::BufferDescriptor {
@@ -9029,16 +9127,18 @@ impl Engine {
                 PackedBody::Pattern(pi, self.body_binding(body_paint).1.expect("a pattern binds its texture"))
             }
 
-            _ => PackedBody::Solid(SolidPathInstance {
-                model_matrix: instance.model_matrix,
+            BodyPaint::Program(p) => PackedBody::Solid(instance.model_matrix, SolidPathInstance {
+                fill_color: p.bounds,
+                stroke_color: [instance.fill_color[3], instance.stroke_color[3], f32::from_bits(p.binding.site), 0.],
+                slot: 0, _reserved: [p.binding.inputs, p.binding.clock], depth: instance.path_info[3],
+                page_clip_bounds: instance.page_clip_bounds,
+            }),
+            _ => PackedBody::Solid(instance.model_matrix, SolidPathInstance {
+                slot: 0,
                 fill_color: instance.fill_color,
                 stroke_color: instance.stroke_color,
-                path_info: [
-                    vertex_offset as f32,
-                    geometry.vertex_count as f32,
-                    instance.path_info[2],
-                    instance.path_info[3],
-                ],
+                _reserved: [0; 2],
+                depth: instance.path_info[3],
                 page_clip_bounds: instance.page_clip_bounds,
             }),
         }
@@ -9187,7 +9287,7 @@ impl Engine {
         if self.pipelines.borrow().contains_key(&key) { return true; }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let task = self.captures.layer(&self.gpu.device, &self.layouts.path_layout, module, desc, samples, blend);
+            let task = self.captures.layer(&self.gpu.device, &self.layouts.solid_layout, module, desc, samples, blend);
             if let Some(pipeline) = task.ready() {
                 std::sync::Arc::make_mut(&mut *self.pipelines.borrow_mut()).insert(key, pipeline.clone());
                 return true;
@@ -9572,10 +9672,8 @@ impl Engine {
             let body_bytes: u64 = p.records.columns().iter().map(|(_, c)| c.bytes()).sum();
             if body_bytes + (p.text_items.len() as u64 * 256) > available as u64 {
                 let mut room = available;
-                for col in &mut p.records.solid { col.retain_tails(&mut room); }
                 for col in &mut p.records.gradient { col.retain_tails(&mut room); }
                 for col in &mut p.records.pattern { col.retain_tails(&mut room); }
-                for chunk in &p.text.chunks { chunk.retain_uniform_tails(&mut room); }
                 p.placement_tail_bytes = available - room;
             }
         }
@@ -9594,6 +9692,11 @@ impl Engine {
     /// that need another recording request a materialized plan, which may involve evicted spans.
     pub fn try_owned_bundle(&self, plan: &CoveragePlan, key: PlanKey, change: Option<&PlanChange<'_>>,
         addresses: Option<&crate::residency::ItemAddresses>) -> Option<wgpu::Texture> {
+        self.try_translated_bundle(plan, key, change, addresses, None)
+    }
+
+    pub fn try_translated_bundle(&self, plan: &CoveragePlan, key: PlanKey, change: Option<&PlanChange<'_>>,
+        addresses: Option<&crate::residency::ItemAddresses>, translation: Option<GroupTranslation>) -> Option<wgpu::Texture> {
         let _lease = self.frame_cache_gate.lock().unwrap();
         self.refresh_capture_sample_mode();
         if self.buffers_reclaimed.load(std::sync::atomic::Ordering::Acquire) || !self.prepared_patch.get() { return None; }
@@ -9616,12 +9719,13 @@ impl Engine {
         // Validate the recording before committing any buffer writes or adopting the new key.
         // A moved capture or changed binding goes through the ordinary encode with its plan.
         if old != key {
+            if translation.is_some() { return None; }
             let change = change.filter(|change| change.from == old.revision)?;
             if !matches!(change.items, ChangedItems::Written { masks_changed: false, .. }) { return None; }
             self.patch_prepared(packet, plan, sample_count, opaque, None, true).ok()?;
         }
         let (uniforms, _) = frame_projection(plan, None, None, plan.width_px, plan.height_px);
-        self.frame_uniform_and_bg(&uniforms);
+        self.frame_uniform_and_bg(&uniforms, translation);
         let (target, msaa, depth) = self.frame_targets(plan.width_px, plan.height_px, sample_count);
         let view = target.create_view(&Default::default());
         let msaa = msaa.map(|t| t.create_view(&Default::default()));
@@ -9945,6 +10049,7 @@ impl Engine {
                     h.write(b"rendered-mask-result");
                     source.hash(&mut h);
                     owner.hash(&mut h);
+                    if let Some(paint) = self.path_programs.borrow().capture_identity { paint.hash(&mut h); }
                     for value in mask.origin.into_iter().chain(mask.size).chain([scale]) {
                         value.to_bits().hash(&mut h);
                     }
@@ -9966,8 +10071,9 @@ impl Engine {
                 continue;
             }
             if serial_masks.is_some() {
-                return Err(wgpu::optional_allocations::Refused.into());
+                return Err(MissingSharedCapture.into());
             }
+            self.serial_mask_captures.set(self.serial_mask_captures.get().wrapping_add(1));
             // The isolated camera plan and its nested draws resolve assets on this thread.
             let reads = reads.or_else(|| cache_key.map(|_| moda_assets::engine_seam::CaptureReads::begin()));
             let shader_time_s = cam_override.map_or(rendered.shader_time_s, |camera| camera.shader_time_s);
@@ -10556,7 +10662,7 @@ impl Engine {
                 frame.direct_offscreen = replay_setup;
             }
         }
-        let (frame_uniform, frame_bg) = self.frame_uniform_and_bg(&uniforms);
+        let (frame_uniform, frame_bg) = self.frame_uniform_and_bg(&uniforms, None);
         // A hit whose packet holds its pass as a render bundle: the camera uniform (just written) is all that changed,
         // so replay the bundle into this frame's targets and skip collecting, packing and recording every draw.
         if let Some(bundle) = self.replayable_bundle(
@@ -10606,6 +10712,7 @@ impl Engine {
         // type streams (zeros where a body carries none); path-gradient reads them.
         let mut opaque_uvs: Vec<f32> = Vec::new();
         let mut trans_uvs: Vec<f32> = Vec::new();
+        let mut models = [Vec::new(), Vec::new()];
         let mut opaque_instances: Vec<SolidPathInstance> = Vec::new();
         let mut opaque_draws: Vec<PathDraw> = Vec::new();
         let mut trans_vertices: Vec<f32> = Vec::new();
@@ -10881,7 +10988,7 @@ impl Engine {
                     };
                     let k = usize::from(*phase == Phase::Transparent);
                     // A resident solid's record sits at its slot; a packed one's at its place in the stream.
-                    let solid_slot = (resident_lane && matches!(body_paint, BodyPaint::Solid)).then(|| item_slots[item_at]);
+                    let solid_slot = (resident_lane && matches!(body_paint, BodyPaint::Solid | BodyPaint::Program(_))).then(|| item_slots[item_at]);
                     let instanced = solid_slot.is_some()
                         && shared_solids[k].contains(&(std::sync::Arc::as_ptr(geometry) as usize));
                     let owner = matches!(body_paint, BodyPaint::Solid).then(|| match solid_slot {
@@ -10932,17 +11039,21 @@ impl Engine {
                                 idx
                             }
 
-                            PackedBody::Solid(solid) => {
+                            PackedBody::Solid(model, mut solid) => {
+                                solid.slot = item_at as u32;
                                 let idx = match solid_slot {
                                     Some(slot) => {
                                         if instances.len() <= slot as usize {
                                             instances.resize(slot as usize + 1, bytemuck::Zeroable::zeroed());
+                                            models[k].resize(slot as usize + 1, [0.; 16]);
                                         }
                                         instances[slot as usize] = solid;
+                                        models[k][slot as usize] = model;
                                         slot
                                     }
                                     None => {
                                         instances.push(solid);
+                                        models[k].push(model);
                                         instances.len() as u32 - 1
                                     }
                                 };
@@ -10953,12 +11064,13 @@ impl Engine {
                     // blend override is selected by the draw itself during recording.
                     if layer.is_none() && *phase == Phase::Transparent && draw.blend != BlendMode::Normal {
                         let (module, layout) = match draw.kind {
-                            PaintDrawKind::Solid => ("path-solid", &self.layouts.path_layout),
+                            PaintDrawKind::Solid => ("path-solid", &self.layouts.solid_layout),
                             PaintDrawKind::Gradient => ("path-gradient", &self.layouts.path_layout),
                             PaintDrawKind::Pattern => ("path-pattern", &self.layouts.pattern_layout),
                         };
                         self.pipeline(module, 1, sample_count, draw.blend, layout)?;
                     }
+                    if let Some(unit) = draw.program { self.prepare_path_program(unit, sample_count, draw.blend)?; }
                     note(item_at, instance_index, vertex_offset);
                     draw.instance_index = instance_index;
                     draw.instanced = instanced;
@@ -11084,8 +11196,8 @@ impl Engine {
         // no pipeline, including a clear-only page or a text-only capture.
         for (module, desc, used, layout) in [
             ("page-fill", 0, !page_instances.is_empty(), &self.layouts.page_layout),
-            (solid_module, 0, !opaque_instances.is_empty(), &self.layouts.path_layout),
-            (solid_module, 1, !trans_instances.is_empty(), &self.layouts.path_layout),
+            (solid_module, 0, !opaque_instances.is_empty(), &self.layouts.solid_layout),
+            (solid_module, 1, !trans_instances.is_empty(), &self.layouts.solid_layout),
             ("path-gradient", 0, !opaque_grad_instances.is_empty(), &self.layouts.path_layout),
             ("path-gradient", 1, !trans_grad_instances.is_empty(), &self.layouts.path_layout),
             ("path-pattern", 0, !opaque_pat_instances.is_empty(), &self.layouts.pattern_layout),
@@ -11499,13 +11611,13 @@ impl Engine {
         ));
 
         let page_bg = self.make_storage_bg("page storage bg", PAGE_STORAGE, &page_buf);
-        let opaque_bg =
-            self.make_storage_bg("opaque storage bg", SOLID_STORAGE[0], &opaque_ib);
-        let trans_bg = self.make_storage_bg(
-            "transparent storage bg",
-            SOLID_STORAGE[1],
-            &trans_ib,
-        );
+        let solid_group = |k: usize, paint: wgpu::Buffer| {
+            let model = self.make_buffer(SOLID_MODELS[k], bytemuck::cast_slice(&models[k]), wgpu::BufferUsages::STORAGE);
+            self.scratch.bind(&self.gpu.device, SOLID_STORAGE[k], &self.layouts.solid_bgl,
+                &[crate::scratch::Bound::Buffer(paint), crate::scratch::Bound::Buffer(model)])
+        };
+        let opaque_bg = solid_group(0, opaque_ib);
+        let trans_bg = solid_group(1, trans_ib);
         let mask_bg = self.inactive_mask.as_ref().expect("inactive mask group");
 
         // M3b: gradient/pattern storage buffers + texture bind groups.
@@ -11775,15 +11887,17 @@ impl Engine {
         // render every mask fresh. Coverage renders at the frame's canvas→pixel
         // scale (the VP's x/y scale over the raster the viewport maps onto), so a
         // mask edge is anti-aliased at output resolution.
-        let mask_px_scale = {
+        let picture_scale = {
             let (rw, rh) = match region_viewport {
                 Some(r) => (r.raster_w, r.raster_h),
                 None => (eff_width_px, eff_height_px),
             };
             let sx = (uniforms[0] as f64).abs() * rw as f64 * 0.5;
             let sy = (uniforms[5] as f64).abs() * rh as f64 * 0.5;
-            sx.max(sy)
+            [sx, sy]
         };
+        let mask_px_scale = picture_scale[0].max(picture_scale[1]);
+        let mask_programs = self.mask_programs(&plan.masks, uniforms[16..20].try_into().unwrap())?;
         let mask_atlas = if self.retained && !plan.masks.is_empty() {
             let mut guard = self.retained_masks.borrow_mut();
             if guard.is_none() {
@@ -11804,7 +11918,7 @@ impl Engine {
                         // A live canvas present packs its small masks into shared atlas passes; a readback of the
                         // same plan (a thumbnail) renders each exactly.
                         present_view.is_some(),
-                        &mask_surfaces, &self.scratch,
+                        &mask_surfaces, &self.scratch, &mask_programs,
                     )?
                 }
                 _ => crate::effects::MaskAtlas::build_cached(
@@ -11816,7 +11930,7 @@ impl Engine {
                     mask_px_scale,
                     cache,
                     false,
-                    &mask_surfaces, &self.scratch,
+                    &mask_surfaces, &self.scratch, &mask_programs,
                 )?,
             }
         } else {
@@ -11827,13 +11941,14 @@ impl Engine {
                 &self.layouts.mask_bgl,
                 &plan.masks,
                 mask_px_scale,
-                &mask_surfaces, &self.scratch,
+                &mask_surfaces, &self.scratch, &mask_programs,
                 self.working.as_ref(),
             )?
         };
 
         // The pipelines the passes below bind, the engine's map shared: borrowed from here they outlive the pass, which
         // a render bundle recording needs (`CountedPass::Bundle`).
+        let (program_pipelines, program_inputs) = self.path_programs.borrow().snapshot();
         let pipeline_snapshot = PipeSnap {
             map: self.pipelines.borrow().clone(),
             format: self.frame_format,
@@ -12152,6 +12267,7 @@ impl Engine {
                 enum Bound {
                     Shadow,
                     Path(BlendMode),
+                    Program(u32, BlendMode),
                     /// M3b: path-gradient / path-pattern pipelines.
                     Gradient(BlendMode),
                     Pattern(BlendMode),
@@ -12178,6 +12294,7 @@ impl Engine {
                 // own. Its triangles then rasterize and blend in the same order under the same state, and pass the
                 // same depth tests, as its own draw would: the same pixels.
                 struct SolidRun {
+                    program: Option<u32>,
                     chunk: usize,
                     start: u32,
                     end: u32,
@@ -12369,7 +12486,7 @@ impl Engine {
                             }
                             let z = f64::from_bits(d.z_bucket);
                             if let Some(r) = solid_run.as_mut() {
-                                let extends = d.kind == PaintDrawKind::Solid
+                                let extends = d.program == r.program && d.kind == PaintDrawKind::Solid
                                     && d.blend == r.blend
                                     && d.mask == r.mask
                                     && d.vertex_count > 0
@@ -12431,6 +12548,17 @@ impl Engine {
                                     bound_mask = None; // group 2 holds texture
                                     mask_at_group_3 = true;
                                 }
+                                PaintDrawKind::Solid if d.program.is_some() => {
+                                    let unit = d.program.unwrap();
+                                    if bound != Some(Bound::Program(unit, d.blend)) {
+                                        pass.set_pipeline(&program_pipelines[&(unit, sample_count, d.blend)]);
+                                        pass.set_bind_group(0, &frame_bg, &[]);
+                                        pass.set_bind_group(1, &trans_bg, &[]);
+                                        pass.set_bind_group(3, program_inputs.as_ref().expect("installed paint table"), &[]);
+                                        bound = Some(Bound::Program(unit, d.blend));
+                                        bound_mask = None;
+                                    }
+                                }
                                 PaintDrawKind::Solid => {
                                     if bound != Some(Bound::Path(d.blend)) {
                                         pass.set_pipeline(snap_pipe(&pipeline_snapshot, (solid_module, 1, sample_count, d.blend)));
@@ -12455,7 +12583,7 @@ impl Engine {
                                 pass.set_bind_group(2, bg, &[]);
                                 bound_mask = Some(d.mask);
                             }
-                            if d.kind == PaintDrawKind::Solid && d.vertex_count > 0 && self.solid_run_merging.get() {
+                            if (d.program.is_none() || d.instanced) && d.kind == PaintDrawKind::Solid && d.vertex_count > 0 && self.solid_run_merging.get() {
                                 // Held as a run: the next solid body may join it (drawn at the next flush).
                                 solid_run = Some(SolidRun {
                                     chunk: trans_streams.chunk(d.vertex_offset),
@@ -12466,7 +12594,7 @@ impl Engine {
                                     z0: z,
                                     blend: d.blend,
                                     mask: d.mask,
-                                    instanced: d.instanced,
+                                    instanced: d.instanced, program: d.program,
                                     bodies: 1,
                                 });
                             } else {
@@ -12704,6 +12832,7 @@ impl Engine {
                 records: PacketRecords {
                     at: Destinations::collect(record_at, if packet_plan.is_some_and(|p| p.key.owner != 0) { &plan.items } else { &[] }),
                     page: Column::of(page_instances),
+                    solid_models: models.map(Column::of),
                     solid: [Column::of(opaque_instances), Column::of(trans_instances)],
                     gradient: [Column::of(opaque_grad_instances), Column::of(trans_grad_instances)],
                     pattern: [Column::of(opaque_pat_instances), Column::of(trans_pat_instances)],
@@ -12888,7 +13017,7 @@ impl Engine {
                             return Err("body paint family");
                         }
                         // The same family draws through the same pipeline when it binds the same module and texture.
-                        if self.body_binding(qa) != self.body_binding(qb) {
+                        if matches!((qa, qb), (BodyPaint::Program(a), BodyPaint::Program(b)) if a.binding.unit != b.binding.unit) || self.body_binding(qa) != self.body_binding(qb) {
                             return Err("body pipeline");
                         }
                         if let (BodyPaint::Pattern(a), BodyPaint::Pattern(b)) = (qa, qb) {
@@ -13018,8 +13147,9 @@ impl Engine {
             }
             let changed = match n {
                 DrawItem::Body { phase, geometry, instance, paint, .. } => {
-                    let packed = self.pack_body(paint, instance, geometry, rec.first_vertex, present_shader_time);
-                    records.put_body(ph(phase), rec.index, &packed, fields)?
+                    let mut packed = self.pack_body(paint, instance, geometry, rec.first_vertex, present_shader_time);
+                    if let PackedBody::Solid(_, paint) = &mut packed { paint.slot = slot as u32; }
+                    records.put_body(ph(phase), rec.index, &packed, fields, old)?
                 }
                 DrawItem::PageFill { instance } => records.page.put(rec.index, instance)?,
                 DrawItem::Shadow { instance, .. } => records.shadow.put(rec.index, instance)?,
@@ -13078,9 +13208,9 @@ impl Engine {
                 record_again |= moved_direct(write.logical);
                 let rec = records.at.get(write.logical).ok_or("matrix address")?;
                 match records.at.column(write.logical).ok_or("matrix column")? {
-                    RecordColumn::Solid(k) => records.solid[usize::from(k)].put_matrix(rec.index, &model.matrix(), None)?,
-                    RecordColumn::Gradient(k) => records.gradient[usize::from(k)].put_matrix(rec.index, &model.matrix(), None)?,
-                    RecordColumn::Pattern(k) => records.pattern[usize::from(k)].put_matrix(rec.index, &model.matrix(), None)?,
+                    RecordColumn::Solid(k) => { records.solid_models[usize::from(k)].put(rec.index, &model.matrix())?; }
+                    RecordColumn::Gradient(k) => records.gradient[usize::from(k)].put_matrix(rec.index, &model.matrix())?,
+                    RecordColumn::Pattern(k) => records.pattern[usize::from(k)].put_matrix(rec.index, &model.matrix())?,
                     RecordColumn::Other => return Err("matrix draw kind"),
                     RecordColumn::Text => {
                         let at = rec.index as usize;
@@ -13234,7 +13364,7 @@ impl Engine {
             }
             for (chunk, range) in paint_chunks {
                 for &(at, batch, fields) in &text_writes[range] {
-                    p.text.chunks[chunk].stage_paint(at % TEXT_CHUNK, batch, matches!(fields, BodyFields::Translation));
+                    p.text.chunks[chunk].stage_paint(at % TEXT_CHUNK, batch, !matches!(fields, BodyFields::All));
                 }
                 written += p.text.chunks[chunk].commit_paint(|buffer, offset, data| {
                     crate::gpu_profile::count_buffer_write(data.len());
@@ -13463,6 +13593,7 @@ struct PathDraw {
     segment: usize,
     /// A solid whose vertices are shared with other bodies: the draw's instance names its record.
     instanced: bool,
+    program: Option<u32>,
 }
 
 impl PathDraw {
@@ -13470,18 +13601,27 @@ impl PathDraw {
     /// while a layer batch places it in a stream shared by independent targets.
     fn from_body(item: &DrawItem, vertex_offset: u32, segment: usize,
         packed: &mut PackedBody) -> Option<Self> {
-        let DrawItem::Body { phase, geometry, blend_mode, mask, z, .. } = item else {
+        let DrawItem::Body { phase, geometry, blend_mode, mask, z, paint, instance, .. } = item else {
             return None;
         };
         let (kind, tex) = match packed {
-            PackedBody::Solid(_) => (PaintDrawKind::Solid, None),
+            PackedBody::Solid(..) => (PaintDrawKind::Solid, None),
             PackedBody::Gradient(_) => (PaintDrawKind::Gradient, None),
             PackedBody::Pattern(_, texture) => (PaintDrawKind::Pattern, Some(std::mem::take(texture))),
         };
+        let (program, start, count) = if let BodyPaint::Program(body) = paint {
+            // Lyon emits fill triangles followed by the stroke. Only submit the
+            // covered band, including when a stroke-only contour encloses area.
+            let fill = geometry.vertex_types.partition_point(|&kind| kind < 0.5) as u32;
+            let start = if instance.fill_color[3] == 0. { fill } else { 0 };
+            let end = if instance.stroke_color[3] == 0. { fill } else { geometry.vertex_count };
+            (Some(body.binding.unit), start, end - start)
+        } else { (None, 0, geometry.vertex_count) };
         Some(Self {
-            kind, instance_index: 0, vertex_offset, vertex_count: geometry.vertex_count,
+            kind, instance_index: 0, vertex_offset: vertex_offset + start, vertex_count: count,
             z_bucket: z.to_bits(), blend: if *phase == Phase::Opaque { BlendMode::Normal } else { *blend_mode },
             mask: mask.as_ref().map(|m| m.mask_id), tex, segment, instanced: false,
+            program,
         })
     }
 
@@ -13628,10 +13768,10 @@ impl CapturePage {
         // Only single unmasked solids join a speculative group. All other pages
         // price the real packed streams, text arenas and textures during preparation.
         if !self.solid() { return 0; }
-        let mut uploads = std::mem::size_of::<[f32; 20]>() as u64;
+        let mut uploads = std::mem::size_of::<[f32; 32]>() as u64;
         for item in &self.plan.items {
             if let DrawItem::Body { geometry, paint: BodyPaint::Solid, .. } = item {
-                uploads += std::mem::size_of::<SolidPathInstance>() as u64
+                uploads += std::mem::size_of::<SolidPathInstance>() as u64 + std::mem::size_of::<[f32; 16]>() as u64
                     + ((geometry.positions.len() + geometry.vertex_types.len() * 3) * 4) as u64;
             }
         }

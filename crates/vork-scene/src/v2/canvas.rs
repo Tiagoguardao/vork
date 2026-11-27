@@ -104,13 +104,30 @@ impl AspectRatio {
     }
 }
 
-/// `fill` and `stroke` (§7): `"none"`, a CSS colour, a CSS gradient function, or an image.
+/// Path fill or stroke. Material paints shade the path's existing coverage.
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Paint {
     None(NoPaint),
     /// A CSS colour (`"#fff"`, `"rgb(255 0 0)"`, `"white"`) or a CSS `linear-gradient()`,
     /// `radial-gradient()` or `conic-gradient()` over the shape's bounding box.
+    Css(String),
+    Image(ImagePaint),
+    /// A path fragment program, evaluated inside the fill or stroke coverage.
+    Material(MaterialPaint),
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialPaint {
+    #[schemars(with = "NameOr<Material>", extend("x-source" = "END-STATE-API §7", "x-help-path" = "paint.material", "x-help" = "material-name|inline material; path fill or stroke; float4 paint(PaintContext, Inputs) returns premultiplied canvas working RGBA"))]
+    pub material: String,
+}
+/// Paints admitted in shaped text positions.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub(super) enum TextPaint {
+    None(NoPaint),
     Css(String),
     Image(ImagePaint),
 }
@@ -125,14 +142,14 @@ impl Paint {
     pub const NONE: Paint = Paint::None(NoPaint::None);
     pub fn is_none(&self) -> bool { matches!(self, Paint::None(_)) }
 }
-const PAINT_FORM: &str = "a paint is \"none\", a CSS colour (\"#fff\", \"rgb(255 0 0)\", \"white\"), a CSS linear-gradient(), radial-gradient() or conic-gradient(), or {\"image\": name, \"fit\": \"contain\"|\"cover\"|\"fill\"|\"none\"}";
+const PAINT_FORM: &str = "a path paint can name a material with {\"material\": name}. A paint is \"none\", a CSS colour (\"#fff\", \"rgb(255 0 0)\", \"white\"), a CSS linear-gradient(), radial-gradient() or conic-gradient(), or {\"image\": name, \"fit\": \"contain\"|\"cover\"|\"fill\"|\"none\"}";
 impl<'de> Deserialize<'de> for Paint {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         match serde_json::Value::deserialize(deserializer)? {
             serde_json::Value::String(none) if none == "none" => Ok(Self::NONE),
             serde_json::Value::String(css) => Ok(Self::Css(css)),
-            serde_json::Value::Object(map) if map.contains_key("material") || map.contains_key("program") =>
-                Err(serde::de::Error::custom("a program paint is not built yet; write \"none\", a CSS colour or gradient, or {\"image\": name}")),
+            serde_json::Value::Object(map) if map.contains_key("material") =>
+                MaterialPaint::deserialize(serde_json::Value::Object(map)).map(Self::Material).map_err(serde::de::Error::custom),
             serde_json::Value::Object(map) => ImagePaint::deserialize(serde_json::Value::Object(map)).map(Self::Image).map_err(serde::de::Error::custom),
             serde_json::Value::Array(_) => Err(serde::de::Error::custom(format!("{PAINT_FORM}; not an RGB array: 2D colours are CSS colours"))),
             _ => Err(serde::de::Error::custom(PAINT_FORM)),
@@ -363,7 +380,7 @@ pub(super) fn refuse_unbuilt(document: &serde_json::Value) -> Result<()> {
                         if let Some(value) = value.get(field) {
                             if let Some(paint) = value.as_object() {
                                 ensure!(!paint.contains_key("program") && !paint.contains_key("material"),
-                                    "{}.{field}: a program paint is not built yet; write a CSS colour or gradient, or {{\"image\": name}}",
+                                    "{}.{field}: program paint is supported on paths only; for text write a CSS colour or gradient, or {{\"image\": name}}",
                                     match run { Some(i) => format!("{here}.content[{i}]"), None => here.to_string() });
                             }
                         }
@@ -373,8 +390,8 @@ pub(super) fn refuse_unbuilt(document: &serde_json::Value) -> Result<()> {
             if kind == "path" {
                 for field in ["fill", "stroke"] {
                     if let Some(serde_json::Value::Object(paint)) = node.get(field) {
-                        ensure!(!paint.contains_key("material") && !paint.contains_key("program"),
-                            "{here}.{field}: a program paint is not built yet; write \"none\", a CSS colour or gradient, or {{\"image\": name}}");
+                        ensure!(!paint.contains_key("program"),
+                            "{here}.{field}: put the program in a material: {{\"material\": {{\"program\": name}}}}");
                     }
                 }
                 if let Some(serde_json::Value::String(join)) = node.get("stroke-linejoin") {
@@ -439,6 +456,17 @@ impl Scene {
     /// The view this scene's picture passes through: its own composition's, or the world default.
     pub fn view(&self) -> NameOr<Material> {
         self.composition.as_ref().map_or_else(|| default_view(Space::World), Composition::local_view)
+    }
+    pub(super) fn validate_path_material(&self, paint: &Paint) -> Result<()> {
+        if let Paint::Material(binding) = paint {
+            let name = &binding.material;
+            let material = self.materials.get(name).with_context(|| format!("unknown paint material {name:?}"))?;
+            for (field, value) in &material.inputs {
+                ensure!(matches!(value, Input::Number(_) | Input::Vector(_)),
+                    "materials.{name}.inputs.{field}: path paint accepts numeric inputs only");
+            }
+        }
+        Ok(())
     }
     /// That view's material and, for a named one, its name.
     pub fn view_material(&self) -> Result<(Option<String>, Material)> {
@@ -533,6 +561,7 @@ impl Scene {
                         ensure!(length.is_finite() && *length > 0., "path {name:?}: pathLength is the author's length of d and must be positive");
                     }
                     for (field, paint) in [("fill", fill), ("stroke", stroke)] {
+                        scene.validate_path_material(paint).with_context(|| format!("path {name:?}.{field}"))?;
                         if let Paint::Image(image) = paint {
                             ensure!(scene.images.contains_key(&image.image), "path {name:?}: {field} names image {:?}, which is not in images", image.image);
                         }
@@ -574,6 +603,40 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn named_and_inline_keyed_path_paints_share_the_resource_table() -> Result<()> {
+        let material = serde_json::json!({"program":"ink","inputs":{"width":0.5}});
+        let doc = serde_json::json!({"version":2,"composition":{"space":"2d"},
+            "programs":{"ink":{"source":"struct Inputs { float width; }; float4 paint(PaintContext c, Inputs i) { return i.width; }"}},
+            "materials":{"fine":material},
+            "nodes":[{"type":"path","name":"p","d":"M0 0H9V9Z","fill":{"material":"fine"}}],
+            "animation":[{"tracks":[{"path":["nodes","p","fill"],"interpolation":"STEP",
+                "keys":[[0,{"material":"fine"}],[1,{"material":material}]]}]}]});
+        let scene = Scene::from_json(&serde_json::to_vec(&doc)?)?;
+        assert_eq!(scene.materials.len(), 2);
+        let track = &scene.animation[0].tracks.as_ref().unwrap()[0];
+        let super::super::Values::Inline(values) = &track.values else { panic!("inline keys") };
+        let name = values[1]["material"].as_str().unwrap();
+        assert_eq!(scene.materials[name], scene.materials["fine"]);
+
+        for depth in 0..=2 {
+            let mut doc = doc.clone();
+            let mut animation = doc.as_object_mut().unwrap().remove("animation").unwrap();
+            let mut node = doc["nodes"][0].take();
+            let mut path = vec![serde_json::json!("fill")];
+            for group in 0..depth {
+                path.splice(0..0, [serde_json::json!("children"), node["name"].clone()]);
+                node = serde_json::json!({"name":format!("group{group}"),"children":[node]});
+            }
+            animation[0]["tracks"][0]["path"] = path.into();
+            node["animation"] = animation;
+            doc["nodes"][0] = node;
+            let relative = Scene::from_json(&serde_json::to_vec(&doc)?)?;
+            assert_eq!(relative.materials, scene.materials);
+        }
+        Ok(())
+    }
+
     #[test]
     fn the_compositor_belongs_to_a_composition() -> Result<()> {
         let grade = serde_json::json!({"materials":{"grade":{"program":"grade"}},
@@ -806,7 +869,7 @@ mod tests {
         let canvas = |nodes: serde_json::Value| serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":nodes});
         for (document, line) in [
             (canvas(serde_json::json!([{"type":"path","clip-path":"nobody"}])), "node \"\": clip-path names \"nobody\", which is no node in the canvas"),
-            (canvas(serde_json::json!([{"type":"path","fill":{"material":"m"}}])), "a program paint is not built yet"),
+            (canvas(serde_json::json!([{"type":"path","fill":{"material":"m"}}])), "unknown paint material"),
             (canvas(serde_json::json!([{"type":"path","stroke-linejoin":"arcs"}])), "scene.nodes[0].stroke-linejoin: \"arcs\" (SVG 2) is not built yet; use miter, round or bevel"),
             (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"background":"environment"},"nodes":[]}), "render.background: a 2D canvas has no environment; write \"transparent\" or a CSS colour"),
             (serde_json::json!({"version":2,"composition":{"space":"2d","preserveAspectRatio":"xMidYMid zoom"},"nodes":[]}), "scene.composition.preserveAspectRatio \"xMidYMid zoom\": write none, or x(Min|Mid|Max)Y(Min|Mid|Max) optionally followed by meet or slice"),

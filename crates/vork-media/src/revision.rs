@@ -9,9 +9,48 @@ use std::{
     sync::Arc,
 };
 
+/// An open file's native identity, or a per-open identity on filesystems that
+/// cannot supply one. In that case a new live capture always adopts its new handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MediaBinding {
+    File { volume: u64, index: u128 },
+    Open(u64),
+}
+
+impl MediaBinding {
+    fn from_file(file: &File, metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let _ = file;
+            if metadata.ino() != 0 {
+                return Self::File { volume: metadata.dev(), index: metadata.ino().into() };
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
+            let _ = metadata;
+            let mut info = FILE_ID_INFO::default();
+            // The live handle and the entire writable FILE_ID_INFO outlive the call.
+            if unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), FileIdInfo,
+                (&raw mut info).cast(), std::mem::size_of::<FILE_ID_INFO>() as u32) } != 0 {
+                let index = u128::from_le_bytes(info.FileId.Identifier);
+                if index != 0 { return Self::File { volume: info.VolumeSerialNumber, index }; }
+            }
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_OPEN: AtomicU64 = AtomicU64::new(0);
+        Self::Open(NEXT_OPEN.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 pub struct MediaRevision {
+    binding: MediaBinding,
     original: PathBuf,
-    file: File,
+    file: Arc<File>,
+    signal: Option<vork_inputs::FileSignal>,
 }
 
 #[cfg(unix)]
@@ -56,6 +95,12 @@ impl Seek for MediaReader {
 
 impl MediaRevision {
     pub fn open(path: &Path) -> Result<Arc<Self>> {
+        Self::open_named(path, path)
+    }
+
+    /// Private revision files can supply the descriptor, but only the live
+    /// author-visible binding may reach a decoder, a verifier or a diagnostic.
+    pub fn open_named(backing: &Path, path: &Path) -> Result<Arc<Self>> {
         let mut options = File::options();
         options.read(true);
         #[cfg(windows)]
@@ -71,10 +116,11 @@ impl MediaRevision {
             options.custom_flags(libc::O_NONBLOCK);
         }
         let mut file = options
-            .open(path)
+            .open(backing)
             .with_context(|| format!("open media {}", path.display()))?;
+        let metadata = file.metadata()?;
         ensure!(
-            file.metadata()?.is_file(),
+            metadata.is_file(),
             "{} is not a regular file; restore a readable regular file or correct its path",
             path.display()
         );
@@ -83,8 +129,12 @@ impl MediaRevision {
         let mut signature = Vec::new();
         (&mut file).take(20).read_to_end(&mut signature)?;
         file.rewind()?;
+        let binding = MediaBinding::from_file(&file, &metadata);
+        let file = Arc::new(file);
         let revision = Self {
+            binding,
             original: path.into(),
+            signal: vork_inputs::FileSignal::held(path, file.clone()),
             file,
         };
         if signature == b"ffconcat version 1.0" {
@@ -109,6 +159,12 @@ impl MediaRevision {
     pub fn original(&self) -> &Path {
         &self.original
     }
+
+    /// Identity of the file object behind the live descriptor. While the descriptor
+    /// is held, replacing its name cannot recycle the old object's identity.
+    pub fn signal(&self) -> Option<&vork_inputs::FileSignal> { self.signal.as_ref() }
+
+    pub fn binding(&self) -> MediaBinding { self.binding }
 
     pub fn reader(&self) -> io::Result<MediaReader> {
         #[cfg(unix)]
@@ -188,8 +244,17 @@ impl MediaRevision {
         ))
     }
 
+    /// The file publication protects the input and the worker owns the decoder installation.
+    pub fn probe(&self, args: &'static [&'static str]) -> Result<std::process::Output> {
+        Ok(self.attach(vork_inputs::tool_command("ffprobe").args(args))?.output()?)
+    }
+
     /// Set stdin and append the decoder input operand (after -i for FFmpeg).
     pub fn input<'a>(&self, command: &'a mut Command) -> Result<&'a mut Command> {
+        self.attach(command)
+    }
+
+    pub(crate) fn attach<'a>(&self, command: &'a mut Command) -> Result<&'a mut Command> {
         let file = self.independent_file()?;
         command.stdin(Stdio::from(file));
         #[cfg(unix)]
@@ -212,28 +277,14 @@ fn has_fd_input(protocols: &str) -> bool {
 }
 
 fn require_fd_protocol(program: &std::ffi::OsStr) -> Result<()> {
-    use std::{
-        collections::HashSet,
-        ffi::OsString,
-        sync::{LazyLock, Mutex},
-    };
-    static CHECKED: LazyLock<Mutex<HashSet<(OsString, Option<OsString>)>>> =
-        LazyLock::new(Default::default);
-    let mut checked = CHECKED.lock().unwrap();
-    let key = (program.to_owned(), std::env::var_os("PATH"));
-    if !checked.contains(&key) {
-        let output = Command::new(program)
-            .args(["-hide_banner", "-protocols"])
-            .output()
-            .with_context(|| format!("check input protocols for {}", program.to_string_lossy()))?;
-        let protocols = String::from_utf8_lossy(&output.stdout);
-        ensure!(
-            output.status.success() && has_fd_input(&protocols),
-            "{} lacks the fd: input protocol; install an FFmpeg build with fd input support",
-            program.to_string_lossy()
-        );
-        checked.insert(key);
-    }
+    let output = vork_inputs::tool_output(program, &["-hide_banner", "-protocols"])
+        .with_context(|| format!("check input protocols for {}", program.to_string_lossy()))?;
+    let protocols = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        output.status.success() && has_fd_input(&protocols),
+        "{} lacks the fd: input protocol; install an FFmpeg build with fd input support",
+        program.to_string_lossy()
+    );
     Ok(())
 }
 
@@ -270,6 +321,18 @@ mod tests {
                 assert!(err.contains(expected), "{err}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_private_backing_cannot_become_the_decoder_name() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = dir.path().join("private-copy");
+        let name = dir.path().join("plate.mp4");
+        std::fs::write(&backing, b"ffconcat version 1.0\nfile relative.mp4\n")?;
+        let error = MediaRevision::open_named(&backing, &name).err().context("accepted playlist")?;
+        assert!(error.to_string().contains(name.to_str().unwrap()));
+        assert!(!error.to_string().contains("private-copy"));
         Ok(())
     }
 

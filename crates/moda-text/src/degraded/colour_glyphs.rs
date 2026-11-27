@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub(super) struct EmojiFonts {
     lists: HashMap<String, Vec<(u64, fontdb::ID)>>,
     system_loaded: bool,
+    pub(super) ambient: Option<FontInputs>,
     state: OnceLock<Mutex<ColourState>>,
 }
 
@@ -22,14 +23,15 @@ struct ColourState {
     effects: crate::lru::ByteLruCache<(u64, u32, [u32; 9]), Arc<crate::host::RgbaImage>>,
 }
 
-fn colour_face(db: &fontdb::Database, id: fontdb::ID) -> bool {
-    db.with_face_data(id, |data, index| {
-        rustybuzz::ttf_parser::Face::parse(data, index).is_ok_and(|face| {
-            let t = face.tables();
-            t.cbdt.is_some() || t.colr.is_some() || t.sbix.is_some()
-        })
+pub(super) fn colour_data(data: &[u8], index: u32) -> bool {
+    rustybuzz::ttf_parser::Face::parse(data, index).is_ok_and(|face| {
+        let t = face.tables();
+        t.cbdt.is_some() || t.colr.is_some() || t.sbix.is_some()
     })
-    .unwrap_or(false)
+}
+
+fn colour_face(db: &fontdb::Database, id: fontdb::ID) -> bool {
+    db.with_face_data(id, colour_data).unwrap_or(false)
 }
 
 impl EmojiFonts {
@@ -43,6 +45,7 @@ impl EmojiFonts {
         Self {
             lists,
             system_loaded,
+            ambient: None,
             state: OnceLock::new(),
         }
     }
@@ -65,7 +68,11 @@ impl EmojiFonts {
         drop(inner);
         if !self.system_loaded {
             let mut system = fontdb::Database::new();
-            system.load_system_fonts();
+            if let Some(ambient) = &self.ambient {
+                for blob in ambient.system_colours() { system.load_font_source(fontdb::Source::Binary(blob.clone())); }
+            } else {
+                system.load_system_fonts();
+            }
             ambient.extend(
                 system
                     .faces()

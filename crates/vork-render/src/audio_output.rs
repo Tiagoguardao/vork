@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
 };
 use vork_time::Time;
@@ -88,7 +88,7 @@ pub(crate) fn mux_file(
     let unreadable = || {
         format!("cannot read audio {file:?}; convert it to a mono or stereo PCM WAV file and retry")
     };
-    let probe = Command::new("ffprobe")
+    let probe = vork_inputs::tool_command("ffprobe")
         .args([
             "-v",
             "error",
@@ -144,7 +144,7 @@ pub(crate) fn mux_file(
             Err(e) => return Err(e).context("reserve audio output beside the movie"),
         }
     };
-    let status = Command::new("ffmpeg")
+    let status = vork_inputs::tool_command("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y", "-xerror", "-i"])
         .arg(movie)
         .arg("-i")
@@ -186,6 +186,7 @@ pub(crate) fn mux_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     struct Workspace(PathBuf);
     impl Workspace {

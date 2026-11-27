@@ -276,29 +276,38 @@ impl Grid {
     /// resolve toward `near` — the arc position of the triangle the vertex
     /// belongs to — so a triangle measures against the leg it lies along.
     fn nearest_near(&self, p: [f64; 2], near: Option<Foot>) -> Foot {
-        let cx = ((p[0] - self.origin[0]) / self.cell).floor() as i64;
-        let cy = ((p[1] - self.origin[1]) / self.cell).floor() as i64;
+        // A wide cap on a short (or zero-length) subpath can be arbitrarily far outside the
+        // segment grid. Start at the closest grid cell, but measure every foot against p.
+        let last_col = self.cols as i64 - 1;
+        let last_row = self.rows as i64 - 1;
+        let cell_at = |axis: usize, last| {
+            (((p[axis] - self.origin[axis]) / self.cell).floor() as i64).clamp(0, last)
+        };
+        let cx = cell_at(0, last_col);
+        let cy = cell_at(1, last_row);
         let mut found: Vec<(f64, Foot)> = Vec::new();
         let mut best = f64::INFINITY;
-        let max_ring = self.cols.max(self.rows) as i64 + 1 + cx.abs().max(cy.abs());
+        let max_ring = cx.max(last_col - cx).max(cy).max(last_row - cy);
         for ring in 0..=max_ring {
             // Every point in a cell `ring` away is at least (ring − 1) cells from p.
             if (ring - 1) as f64 * self.cell > best + TIE {
                 break;
             }
-            for r in cy - ring..=cy + ring {
-                for c in cx - ring..=cx + ring {
-                    if (r - cy).abs() != ring && (c - cx).abs() != ring {
-                        continue;
-                    }
-                    if r < 0 || c < 0 || r >= self.rows as i64 || c >= self.cols as i64 {
-                        continue;
-                    }
+            for r in (cy - ring).max(0)..=(cy + ring).min(last_row) {
+                let mut visit = |c: i64| {
                     for &i in &self.cells[r as usize * self.cols + c as usize] {
                         let (dist, foot) = self.foot_on(i as usize, p);
                         best = best.min(dist);
                         found.push((dist, foot));
                     }
+                };
+                if (r - cy).abs() == ring {
+                    for c in (cx - ring).max(0)..=(cx + ring).min(last_col) {
+                        visit(c);
+                    }
+                } else {
+                    if cx >= ring { visit(cx - ring); }
+                    if cx + ring <= last_col { visit(cx + ring); }
                 }
             }
         }
@@ -595,6 +604,10 @@ pub fn with_stroke_uv(
 /// Whether `node`'s top stroke is a visible linear or radial gradient laid
 /// along or across it.
 pub fn needs_stroke_uv(node: &moda_scene::types::RawNode) -> bool {
+    if moda_scene::paint::with_top_stroke(node, |s| s.is_some_and(|s|
+        matches!(s.paint, moda_scene::paint::Paint::Program(p) if p.stroke_uv))) {
+        return true;
+    }
     crate::paint::has_visible_gradient_stroke(node)
         && crate::paint::gradient::top_stroke(node)
             .is_some_and(|s| s.gradient_mode() != moda_scene::paint::StrokeGradientMode::Within)
@@ -669,6 +682,16 @@ mod tests {
         assert_eq!((uv[2], uv[3]), (1.0, 0.0), "square cap corner, left side");
         assert_eq!((uv[4], uv[5]), (1.0, 1.0), "square cap corner, right side");
         assert_eq!((uv[10], uv[11]), (0.5, 0.5), "on the centreline, halfway");
+    }
+
+    #[test]
+    fn zero_length_segment_parameterizes_its_cap() {
+        let line = centerline(
+            &[PathCmd::Move { x: 4.0, y: 3.0 }, PathCmd::Line { x: 4.0, y: 3.0 }],
+            false, CENTERLINE_TOLERANCE,
+        );
+        let cap = geometry(&[[4.0, 3.0], [-5.0, 3.0], [4.0, 12.0]]);
+        assert_eq!(stroke_uv(&cap, &line, true).unwrap().stroke_uv, [0., 0., 0., 1., 0., 1.]);
     }
 
     #[test]

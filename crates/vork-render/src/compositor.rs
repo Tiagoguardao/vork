@@ -53,39 +53,50 @@ impl Program {
 }
 /// Walk the ordered image DAG backwards, following previous and named edges.
 /// A replacement root kills its previous image, including unread earlier entries.
-pub(crate) fn dependencies(programs:&std::collections::HashMap<String,Program>, names:&[vork_scene::v2::CompositeEntry]) -> (Dependencies,Vec<bool>) {
-    let mut result=Dependencies {color:true,..Default::default()};
-    let mut live=vec![false;names.len()];
-    let mut previous=true;
-    let mut nodes=std::collections::HashSet::new();
-    for (i,entry) in names.iter().enumerate().rev() {
-        if !previous && !entry.name().is_some_and(|n|nodes.contains(n)) {continue;}
-        live[i]=true;
-        let program=&programs[entry.material()];
-        previous=program.reads(0);
-        for (i,channel) in program.channels.iter().enumerate() {
-            if !program.reads(i as u32+1) {continue;}
+pub(crate) fn dependencies(programs: &std::collections::HashMap<String, Program>, names: &[vork_scene::v2::CompositeEntry]) -> (Dependencies, Vec<Option<usize>>) {
+    let mut result = Dependencies { color: true, ..Default::default() };
+    // None prunes the entry. Index names.len() consumes the final image (resample or publish).
+    let mut last_reader = vec![None; names.len()];
+    let mut previous = Some(names.len());
+    let mut named = std::collections::HashMap::new();
+    let mut next_dispatch = names.len();
+    for (index, entry) in names.iter().enumerate().rev() {
+        let named_reader = entry.name().and_then(|name| named.remove(name));
+        let Some(reader) = previous.max(named_reader) else { continue };
+        // Binding 1 is the previous *recorded* output, even across pruned entries and
+        // when the shader ignores its value. Its storage cannot also bind as writable.
+        last_reader[index] = Some(reader.max(next_dispatch));
+        next_dispatch = index;
+        let program = &programs[entry.material()];
+        previous = program.reads(0).then_some(index);
+        for (slot, channel) in program.channels.iter().enumerate() {
+            if !program.reads(slot as u32 + 1) { continue; }
             match channel.as_str() {
-                "color"=>result.beauty=true,
-                "depth"=>result.depth=true,
-                "object_index"=>result.ids=true,
-                "view_normal"=>result.normals=true,
-                "motion"=>result.motion=true,
-                "shadow_catcher"=>result.catcher=true,
-                c if c.starts_with("aov:")=>result.aovs=true,
-                c if c.starts_with("step:")=>{nodes.insert(c[5..].to_owned());},
-                c if c.starts_with("image:")=>result.images=true,
-                _=>(),
+                "color" => result.beauty = true,
+                "depth" => result.depth = true,
+                "object_index" => result.ids = true,
+                "view_normal" => result.normals = true,
+                "motion" => result.motion = true,
+                "shadow_catcher" => result.catcher = true,
+                c if c.starts_with("aov:") => result.aovs = true,
+                c if c.starts_with("step:") => {
+                    // The optional final resample rebinds the last material's named
+                    // inputs. Keep them distinct from its destination through that call.
+                    let reader = if index + 1 == names.len() { names.len() } else { index };
+                    named.entry(&c[5..]).or_insert(reader);
+                }
+                c if c.starts_with("image:") => result.images = true,
+                _ => (),
             }
         }
     }
-    result.beauty |= previous;
-    (result,live)
+    result.beauty |= previous.is_some();
+    (result, last_reader)
 }
 
 pub(crate) fn image_reads(programs:&std::collections::HashMap<String,Program>, names:&[vork_scene::v2::CompositeEntry]) -> std::collections::BTreeSet<String> {
     let (_,live)=dependencies(programs,names);
-    names.iter().zip(live).filter(|(_,live)|*live).flat_map(|(entry,_)| {
+    names.iter().zip(live).filter(|(_,reader)|reader.is_some()).flat_map(|(entry,_)| {
         let program=&programs[entry.material()];
         program.channels.iter().enumerate().filter(|(i,_)|program.reads(*i as u32+1))
             .filter_map(|(_,name)|name.strip_prefix("image:").map(str::to_owned))
@@ -157,7 +168,7 @@ impl FrameInputs {
 pub(crate) fn channel_flags(s: &InstalledScene, names: &[vork_scene::v2::CompositeEntry]) -> u32 {
     use vork_slang::registry::{COMPOSITOR_IDS, COMPOSITOR_MOTION};
     let (_,live)=dependencies(&s.compositor,names);
-    names.iter().zip(live).filter(|(_,live)|*live)
+    names.iter().zip(live).filter(|(_,reader)|reader.is_some())
         .flat_map(|(name,_)| {
             let program=&s.compositor[name.material()];
             program.channels.iter().enumerate().filter(|(i,_)|program.reads(*i as u32+1)).map(|(_,channel)|channel)
@@ -370,7 +381,7 @@ pub(crate) fn record(
 /// Record a graph's entries over `source` (associated RGBA, row-major, `size`): one dispatch per live entry,
 /// and a last one that resamples to `size` when the last entry works at another resolution. A world's and a
 /// canvas's graph are recorded here; `sources` is where the entries' world channels and image inputs come
-/// from, and `allocate` makes each entry's image.
+/// from, and `allocate` supplies new working storage when the live images need it.
 #[allow(clippy::too_many_arguments)]
 fn record_images(
     sources: images::Sources<'_>,
@@ -391,9 +402,27 @@ fn record_images(
     let original_normalization = accumulated;
     let mut previous_size = size;
     let mut nodes = std::collections::BTreeMap::new();
-    let (_, live) = dependencies(programs, names);
+    let (_, last_readers) = dependencies(programs, names);
+    // All step outputs are row-major FP32 storage buffers. Within this recording,
+    // equal byte lengths are interchangeable: logical extents are separate uniforms.
+    // Index by (last reader, writer) so even a wide fork finds a free buffer in log time.
+    let mut by_size = std::collections::HashMap::<u64, std::collections::BTreeMap<(usize, usize), wgpu::Buffer>>::new();
+    let mut working_image = |index: usize, last_reader: usize, bytes: u64| {
+        let slots = by_size.entry(bytes).or_default();
+        let image = if slots.first_key_value().is_some_and(|(&(reader, _), _)| reader < index) {
+            slots.pop_first().unwrap().1
+        } else {
+            // The world pool keys on label, size and usage across ordered views.
+            // Name a new slot by its ordinal at this size so a different chain
+            // can request the same backing even when its writer index differs.
+            let ordinal = slots.len();
+            allocate(&format!("{stage:?} image {ordinal}"), bytes, wgpu::BufferUsages::STORAGE)
+        };
+        slots.insert((last_reader, index), image.clone());
+        image
+    };
     for (index, entry) in names.iter().enumerate() {
-        if !live[index] {continue;}
+        let Some(last_reader) = last_readers[index] else { continue };
         let name = entry.material();
         let program = &programs[name];
         let words = inputs.get(name).unwrap_or(&program.words);
@@ -404,9 +433,7 @@ fn record_images(
         let limits = r.device.limits();
         ensure!(bytes <= u64::from(limits.max_storage_buffer_binding_size) && bytes <= limits.max_buffer_size,
             crate::gpu_memory::device_limit(format_args!("compositor entry {index}"), format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce compositor image resolution"));
-        let output = allocate(&format!("{stage:?} image {index}"),
-            bytes,
-            wgpu::BufferUsages::STORAGE);
+        let output = working_image(index, last_reader, bytes);
         // Size queries use authored metadata even when the previous producer is dead.
         previous_size=if index==0 {size} else {names[index-1].extent(size)?};
         dispatches.push(images::pass(sources, r, uniform, program, words, &source,
@@ -417,7 +444,8 @@ fn record_images(
     }
     if previous_size != size {
         let program = &programs[names.last().unwrap().material()];
-        let output = allocate("compositor output", u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES, wgpu::BufferUsages::STORAGE);
+        let bytes = u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES;
+        let output = working_image(names.len(), names.len(), bytes);
         dispatches.push(images::pass(sources, r, uniform, program, &program.words, &source,
             size, size, previous_size, Normalization::None, "vork_copy", &output, &nodes, &original, original_normalization)?);
         source = output;

@@ -98,7 +98,7 @@ impl InputIdentity {
 
     pub fn valid(&self) -> bool { self.current() }
     fn current(&self) -> bool {
-        current_observations(&self.observations)
+        current_observations(&self.observations, None)
     }
     /// A portable proof key must cover every resolver input of code generation.
     /// Native composition separately permits target-only inputs through `verify`.
@@ -119,17 +119,73 @@ impl InputIdentity {
     }
 }
 
+/// Keep source bytes for rollback and the same file witness used for other
+/// authored assets. A source replayed from a prior revision has no live stamp.
+#[derive(Clone, Debug)]
+struct ModuleSource {
+    bytes: std::sync::Arc<[u8]>,
+    reads: Option<vork_inputs::Receipt>,
+}
+impl ModuleSource {
+    fn capture(path: &Path) -> Result<Self> {
+        if !filesystem::RevisionFiles::current().is_live() {
+            return Ok(Self { bytes: filesystem::RevisionFiles::read(path)?.into(), reads: None });
+        }
+        let reads = vork_inputs::Receipt::default();
+        let bytes = { let _scope = reads.enter(); vork_inputs::bytes(path)? };
+        Ok(Self { bytes, reads: Some(reads) })
+    }
+}
+
 /// Shared resolver queries for one installed generation. Stage identities remain
 /// separate cache keys, but a path is revalidated only once for the generation.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct InstalledInputs {
-    source_bytes: BTreeMap<PathBuf, Vec<u8>>,
-    observations: filesystem::Observations,
+    pub host: vork_inputs::Receipt,
+    source_bytes: std::sync::Arc<BTreeMap<PathBuf, ModuleSource>>,
+    observations: std::sync::Arc<filesystem::Observations>,
+}
+impl Clone for InstalledInputs {
+    fn clone(&self) -> Self {
+        Self { host: self.host.fork(), source_bytes: self.source_bytes.clone(), observations: self.observations.clone() }
+    }
+}
+impl Default for InstalledInputs {
+    fn default() -> Self {
+        Self { host: vork_inputs::Receipt::active(), source_bytes: Default::default(), observations: Default::default() }
+    }
 }
 impl InstalledInputs {
+    pub fn is_empty(&self) -> bool { self.observations.is_empty() && self.host.is_empty() }
+
+    /// Clones share this table until a stage records a new resolver query.
+    pub fn shares_observations(&self, prior: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.observations, &prior.observations) && self.host.same(&prior.host)
+    }
+
+    /// Commit another reader's observations without losing a native worker's
+    /// concurrent additions. A conflicting read leaves this capture untouched.
+    pub fn include(&mut self, other: &Self) -> Result<()> {
+        if self.shares_observations(other) || other.is_empty() { return Ok(()); }
+        let mut combined = self.clone();
+        for (query, value) in other.observations.iter() {
+            if let Some(prior) = combined.observations.get(query) {
+                ensure!(prior == value, "Slang filesystem observation {} changed during rendering; retry the command", query.path.display());
+            } else {
+                std::sync::Arc::make_mut(&mut combined.observations).insert(query.clone(), value.clone());
+                if query.op == 0 && let Some(bytes) = other.source_bytes.get(&query.path) {
+                    std::sync::Arc::make_mut(&mut combined.source_bytes).insert(query.path.clone(), bytes.clone());
+                }
+            }
+        }
+        combined.host.include(&other.host)?;
+        *self = combined;
+        Ok(())
+    }
+
     /// The supplied root module was read by the renderer before Slang ran.
     pub fn record_source(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
-        let path = std::env::current_dir()?.join(path);
+        let path = vork_inputs::current_dir()?.join(path);
         let canonical = filesystem::observe(&filesystem::Query { op: 1, path: path.clone() })
             .context("resolve installed program source")?;
         for (op, value) in [(0, blake3::hash(bytes).as_bytes().to_vec()),
@@ -148,18 +204,19 @@ impl InstalledInputs {
             ensure!(previous == value, "Slang filesystem observation {} changed during installation; retry the command", query.path.display());
         } else {
             if query.op == 0 && let Some(hash) = value {
-                let bytes = filesystem::RevisionFiles::read(&query.path)?;
-                ensure!(blake3::hash(&bytes).as_bytes().as_slice() == hash,
+                let bytes = ModuleSource::capture(&query.path)?;
+                ensure!(blake3::hash(&bytes.bytes).as_bytes().as_slice() == hash,
                     "program source {} changed during installation; retry the command", query.path.display());
-                self.source_bytes.insert(query.path.clone(), bytes);
+                std::sync::Arc::make_mut(&mut self.source_bytes).insert(query.path.clone(), bytes);
             }
-            self.observations.insert(query.clone(), value.clone());
+            std::sync::Arc::make_mut(&mut self.observations).insert(query.clone(), value.clone());
         }
         Ok(())
     }
     /// Compare the filesystem that caused an open to fail with later edits.
     pub fn live_stamp(&self) -> blake3::Hash {
         let mut hash = blake3::Hasher::new();
+        hash.update(self.host.live_stamp().as_bytes());
         for query in self.observations.keys() {
             match filesystem::fingerprint(query, &filesystem::observe(query)) {
                 Some(value) => { hash.update(&(value.len() as u64).to_le_bytes()); hash.update(&value); }
@@ -169,16 +226,16 @@ impl InstalledInputs {
         hash.finalize()
     }
     pub fn revision(&self) -> filesystem::RevisionFiles {
-        let mut files = self.observations.clone();
-        for (path, bytes) in &self.source_bytes {
-            files.insert(filesystem::Query { op: 0, path: path.clone() }, Some(bytes.clone()));
+        let mut files = (*self.observations).clone();
+        for (path, bytes) in self.source_bytes.iter() {
+            files.insert(filesystem::Query { op: 0, path: path.clone() }, Some(bytes.bytes.to_vec()));
         }
         filesystem::RevisionFiles::new(files)
     }
-    pub fn valid(&self) -> bool { current_observations(&self.observations) }
+    pub fn valid(&self) -> bool { self.host.valid() && current_observations(&self.observations, Some(&self.source_bytes)) }
 }
 
-fn current_observations(observations: &filesystem::Observations) -> bool {
+fn current_observations(observations: &filesystem::Observations, sources: Option<&BTreeMap<PathBuf, ModuleSource>>) -> bool {
     // Failed searches commonly probe hundreds of module names below one
     // missing include directory. Resolve that parent once for this check;
     // existing directories still use the exact original filesystem query.
@@ -193,6 +250,10 @@ fn current_observations(observations: &filesystem::Observations) -> bool {
     let absent: std::collections::BTreeSet<_> = parents.into_iter()
         .filter_map(|(parent, count)| (count >= 8 && missing(parent)).then_some(parent)).collect();
     observations.iter().all(|(query, value)| {
+        if query.op == 0 && filesystem::RevisionFiles::current().is_live()
+            && let Some(reads) = sources.and_then(|map| map.get(&query.path)).and_then(|source| source.reads.as_ref()) {
+            return reads.valid();
+        }
         (query.op == 2 && value.is_none() && query.path.parent().is_some_and(|parent| absent.contains(parent)))
             || filesystem::fingerprint(query, &filesystem::observe(query)) == *value
     }) && absent.iter().all(|parent| missing(parent))
@@ -318,11 +379,17 @@ pub(super) fn capture_command(
 /// The compiler's part of every receipt key. Only an admitted compiler has one, so no
 /// receipt is looked up, reused or written for an executable that has not been checked.
 impl Admitted<'_> {
+    fn stage_policy(&self, mut policy: String) -> String {
+        if let Some((name, source)) = self.compiler.stage_module {
+            write!(policy, ":{name}:{}", blake3::hash(source.as_bytes())).unwrap();
+        }
+        policy
+    }
     pub fn portable_input_policy(&self) -> String {
-        format!("closed-filesystem-inputs-v1:{}:{INITIALIZATION}:{}",self.version(),std::env::consts::OS)
+        self.stage_policy(format!("closed-filesystem-inputs-v1:{}:{INITIALIZATION}:{}",self.version(),std::env::consts::OS))
     }
     pub fn input_policy(&self) -> String {
-        format!("filesystem-callbacks-v2:{}:{}", self.version(), self.compiler.executable.display())
+        self.stage_policy(format!("filesystem-callbacks-v2:{}:{}", self.version(), self.compiler.executable.display()))
     }
 }
 
@@ -330,7 +397,7 @@ impl Compiler {
     /// Search roots used by the filesystem adapter, in request order. Unknown
     /// external observations cannot be exported as a closed-input receipt.
     pub fn input_roots(&self, includes: &[PathBuf]) -> Result<Vec<PathBuf>> {
-        let cwd = std::env::current_dir()?;
+        let cwd = vork_inputs::current_dir()?;
         let mut roots: Vec<_> = includes.iter().map(|p| cwd.join(p)).collect();
         roots.push(self.executable.canonicalize()?.parent().context("Slang compiler directory")?.to_path_buf());
         // Windows canonicalize adds a verbatim prefix that the adapter removes
@@ -345,8 +412,10 @@ impl Compiler {
     pub fn with_identity(&self, identity: &InputIdentity) -> Self {
         Self {
             executable: self.executable.clone(),
+            installation: self.installation.clone(),
             expected: Some(identity.clone()),
             captured: self.captured.clone(),
+            stage_module: self.stage_module,
         }
     }
     /// The current exact receipt associated with a caller's normalized proof key.
@@ -359,8 +428,11 @@ impl Compiler {
     pub fn capture_inputs<T>(&self, build: impl FnOnce(&Compiler) -> Result<T>) -> Result<(T, InputIdentity)> {
         let captured = std::sync::Arc::new(Mutex::new(None));
         let compiler = Self {
-            executable: self.executable.clone(), expected: self.expected.clone(),
+            executable: self.executable.clone(),
+            installation: self.installation.clone(),
+            expected: self.expected.clone(),
             captured: Some(captured.clone()),
+            stage_module: self.stage_module,
         };
         let result = build(&compiler)?;
         let receipt = captured.lock().unwrap().take().context("proof did not capture Slang inputs")?;
@@ -408,7 +480,7 @@ impl Compiler {
     ) -> Result<PreparedModules> {
         let _progress = crate::progress::Job::front_end().named(main);
         self.version()?;
-        let cwd = std::env::current_dir()?;
+        let cwd = vork_inputs::current_dir()?;
         let mut include = false;
         let absolute_args: Vec<String> = args.iter().map(|arg| {
             let value = if include { cwd.join(arg).components().collect::<PathBuf>().to_string_lossy().into_owned() } else { (*arg).to_owned() };
@@ -587,7 +659,7 @@ impl Compiler {
         &self, abi: &Abi, source: &str, origin: &Path, bindings: &str,
     ) -> Result<PreparedProgram> {
         let work = Workspace::new()?;
-        write_modules(&work, abi, source)?;
+        self.write_program_modules(&work, abi, source)?;
         let mut modules = Vec::new();
         fn visit(root: &Path, path: &Path, modules: &mut Vec<(String, String)>) -> Result<()> {
             for entry in fs::read_dir(path)? {
@@ -614,7 +686,7 @@ impl Compiler {
         let mut args = vec!["-target", "wgsl"];
         let include_strings: Vec<_> = includes
             .iter()
-            .map(|p| std::env::current_dir().map(|cwd| cwd.join(p).display().to_string()))
+            .map(|p| vork_inputs::current_dir().map(|cwd| cwd.join(p).display().to_string()))
             .collect::<std::io::Result<_>>()?;
         for include in &include_strings {
             args.extend(["-I", include]);
@@ -635,8 +707,10 @@ impl Compiler {
         Ok(PreparedProgram {
             compiler: Compiler {
                 executable: self.executable.clone(),
+                installation: self.installation.clone(),
                 expected: Some(expected),
                 captured: self.captured.clone(),
+                stage_module: self.stage_module,
             },
             prepared,
         })
@@ -708,6 +782,36 @@ impl PreparedModules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishing_stage_inputs_preserves_native_reads_and_refuses_conflicts_atomically() -> Result<()> {
+        let work = Workspace::new()?;
+        let record = |inputs: &mut InstalledInputs, name: &str, bytes: &[u8]| -> Result<()> {
+            let path = work.0.join(name);
+            fs::write(&path, bytes)?;
+            inputs.record_source(&path, bytes)
+        };
+        let mut published = InstalledInputs::default();
+        record(&mut published, "base.slang", b"base")?;
+        let mut stage = published.clone();
+        record(&mut stage, "display.slang", b"display")?;
+        record(&mut published, "native.slang", b"native")?;
+        published.include(&stage)?;
+        let snapshot = published.clone();
+
+        let mut conflicting = InstalledInputs::default();
+        record(&mut conflicting, "added-before-conflict.slang", b"new")?;
+        record(&mut conflicting, "native.slang", b"changed")?;
+        assert!(published.include(&conflicting).is_err());
+        assert!(published.shares_observations(&snapshot));
+        assert_eq!(published.source_bytes.len(), 3);
+        let revision = published.revision();
+        let _scope = revision.enter();
+        for (name, expected) in [("base", "base"), ("display", "display"), ("native", "native")] {
+            assert_eq!(filesystem::RevisionFiles::read(&work.0.join(format!("{name}.slang")))?, expected.as_bytes());
+        }
+        Ok(())
+    }
 
     #[test]
     fn identified_modules_sweep_workspace_path_lengths() -> Result<()> {

@@ -331,7 +331,7 @@ pub fn solid_fill_color(paint: Option<&Paint>) -> Rgba {
 pub fn fill_paints(node: &RawNode) -> bool {
     match fill_paint(node) {
         Some(ref p) if is_gradient(p) => gradient_colors(p).iter().any(|c| c.a > 0.0),
-        Some(Paint::Image(_) | Paint::Video(_)) => true,
+        Some(Paint::Image(_) | Paint::Video(_) | Paint::Program(_)) => true,
         p => solid_fill_color(p.as_ref()).a > 0.0,
     }
 }

@@ -135,7 +135,7 @@ pub struct NodeLayer {
 
 /// Rules 3 to 5 and 10: the trimmed section `[offset, E)` and how a raw forward
 /// clock value (offset plus the integral of |speed|) becomes the node's local time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Section {
     pub offset: Rational,
     /// E: written `offset + duration`, else inferred from the one source, else none.

@@ -40,7 +40,13 @@ fn clamp_radii(radii: &[f32], edges: &[(f32, &[usize])]) -> Vec<f32> {
 }
 
 pub fn evaluate(function: &str, argument: &str) -> Result<String> {
-    evaluate_with_cache(function, argument, || None, |_| {})
+    evaluate_uncached(function, argument, &|_, _| Ok(()))
+}
+
+fn evaluate_uncached(function: &str, argument: &str,
+    observed: &dyn Fn(&std::path::Path, &[u8]) -> Result<()>,
+) -> Result<String> {
+    evaluate_observed(function, argument, observed, || None, |_| {})
 }
 
 /// Only the embedded geometry builders have closed inputs. The caller owns the
@@ -52,14 +58,27 @@ pub fn evaluate_with_cache(
     read: impl FnOnce() -> Option<String>,
     write: impl FnOnce(&str),
 ) -> Result<String> {
+    evaluate_observed(function, argument, &|_, _| Ok(()), read, write)
+}
+
+/// Report the bytes used by native builders, including recursive expansion.
+/// Pure builders can still use their ordinary host cache.
+pub fn evaluate_observed(
+    function: &str,
+    argument: &str,
+    observed: &dyn Fn(&std::path::Path, &[u8]) -> Result<()>,
+    read: impl FnOnce() -> Option<String>,
+    write: impl FnOnce(&str),
+) -> Result<String> {
     match function {
         "expand" => {
             let mut scene = serde_json::from_str(argument)?;
-            expand_scene(&mut scene, &std::env::current_dir()?)?;
+            expand_scene_with(&mut scene, &vork_inputs::current_dir()?, &|name, args|
+                evaluate_uncached(name, args, observed))?;
             return Ok(serde_json::to_string(&scene)?);
         }
         "sky" => return sky::evaluate(argument),
-        "text" => return text::evaluate(argument),
+        "text" => return text::evaluate(argument, observed),
         "extrude" => return extrude::evaluate(argument),
         "sweep" => return sweep::evaluate(argument),
         _ => {}

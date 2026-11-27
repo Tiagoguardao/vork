@@ -1,3 +1,8 @@
+// Preserve the glyph quad diagonal used to interpolate outline coordinates.
+const quadCorners = array<vec2<f32>, 6>(
+  vec2<f32>(0, 0), vec2<f32>(1, 0), vec2<f32>(0, 1),
+  vec2<f32>(1, 0), vec2<f32>(1, 1), vec2<f32>(0, 1));
+
 fn kineticGlyphLocal(
   pen: vec2<f32>, em: vec2<f32>, emBox: vec4<f32>, fontSizePx: f32,
   glyphLin: vec4<f32>, glyphOff: vec2<f32>,

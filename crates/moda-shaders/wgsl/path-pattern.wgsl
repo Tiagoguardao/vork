@@ -314,6 +314,7 @@ fn applyColorChange(
 
         
         // Frame-level uniforms
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
         // Mask sampling (optional)
         struct MaskUniforms {

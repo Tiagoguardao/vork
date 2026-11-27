@@ -1,56 +1,39 @@
 vork — 2D and 3D rendering from scene JSON.
-Supported GPUs: Apple Silicon (Metal), recent NVIDIA (Vulkan), and AMD GPUs on a Vulkan driver that exposes ray queries and storage buffer arrays (tested with Mesa RADV on RDNA3).
-Linux CPU rendering: opt in with --gpu cpu or VORK_GPU=cpu; see vork help limits.
-Unknown fields are errors; omit anything at its default.
-Colour: composition.color_space is working RGB; composition.view is local (worlds std/agx, canvases std/standard).
-Choose each destination with output.display; see vork help outputs for supported pairs.
 
 FIRST IMAGE
 vork init my-shot
 cd my-shot
 vork render scene.json --out shot.png
-vork help
-Scaffold languages, files and conflict policy: vork help init. SDK setup: vork help sdk.
-Edit SDK source, regenerate JSON, then render.
-For repeated looks, keep the GPU open with SDK Session. See the Python example in vork help sdk
-and the SESSION section of vork help render.
-Paths are relative to scene.json. RGB background changes the backdrop, not lighting.
-
-Sun angular size: `vork help lights`. Tone curve and grain: `vork help render`.
-Shape builders: `vork help geometry`. Movie rendering: `vork help render`.
-
-Supported features and known limits: vork help limits. Source builds: vork help build.
+Use vork help init for scaffold languages and vork help sdk for SDK setup.
+Edit SDK source, regenerate JSON, then render. Use SDK Session for repeated looks.
+GPU and CPU requirements: vork help limits. Source builds: vork help build.
 Authoring skill: vork skills add
 
 RENDERING
-vork render SCENE --out PATH [--at SECONDS | --frame-start N --frame-end N] [--profile P]
+vork render SCENE --out PATH [--at SECONDS | [--frame-start N] [--frame-end N]] [--profile P]
   [--set KEY=VALUE ...] [--channels LIST] [--exr-codec CODEC] [--png-depth 8|16] [--diagnostics]
-  repeat --out PATH; the extension picks the output: .png one still (t=0 unless --at); a directory
-  gets every frame as NNNNNN.png; PATH/%06d.exr frames; .mp4; .mov (keeps alpha).
-  --channels color (default), depth, object_index, view_normal, motion, camera, shadow_catcher, aov:NAME;
-  all includes render.aovs; applies to every --out.
-  --profile: std/previs (blocking), std/draft (quick scene-ray lighting), std/final (delivery, default), std/path (accuracy).
-
-Quality, sample budgets and denoising: vork help profiles.
-
+For multiple destinations, repeat --out PATH. Use .png for a still (t=0 unless --at),
+a directory for NNNNNN.png frames, PATH/%06d.exr for EXR, .mp4 for opaque video,
+or .mov for alpha. Channels: color (default), depth, object_index, view_normal,
+motion, camera, shadow_catcher, aov:NAME; all includes render.aovs. --channels applies to every --out.
+Encoding and sidecars: vork help outputs.
+Profiles: std/previs for framing, std/draft for lighting previews, std/final
+for delivery (default), std/path for full bounce lighting. See vork help profiles.
 <!-- generated-call-keys:start -->
 --set KEY=VALUE accepts resolution, fps, seed, samples, denoise.
 <!-- generated-call-keys:end -->
 Values are JSON; resolution also accepts WxH or W,H.
-vork check SCENE|- [--profile P]       CPU-only validation; see vork help check.
-vork ask SCENE QUESTIONS|-  Read scene values without rendering; see vork help ask.
-vork export SCENE --out ASSET.glb [--root NODE] [--at SECONDS]  static asset; vork help export
-vork std FUNCTION JSON                 JSON argument; '-' reads stdin; JSON result
-vork setup                             GPU report; builds the path engine, warms the init starter at std/final (10 min shader budget)
-vork setup --all                       Warm bundled program/profile catalog and built-in descriptors (no shader time limit)
-vork setup --skip-warmup               GPU/tools report without shader warmup
-vork setup --skip-warmup --verbose     Include raw encoder probe diagnostics
-Without setup, on an NVIDIA L4: first path render about 8 s with shipped shaders, about 40 s
-when compilation is needed; repeats 1 to 3 s. See vork help limits.
-Other scene kinds compile once on first use unless their shaders ship with vork.
-vork help [TOPIC [--all] | field PATH]  topic details or exact field/object lookup
-Animation recipes: vork help springs, vork help sequences, vork help captions.
-2D canvas (text, paths, CSS paint): vork help nodes, then vork help composition, vork help text, vork help path.
+
+COMMANDS
+vork check SCENE|- [--profile P] [--shaders]    Validate on CPU
+vork ask SCENE QUESTIONS|-                    Read values without rendering
+vork export SCENE --out ASSET.glb [--root NODE] [--at SECONDS]
+vork std FUNCTION JSON    JSON argument and result; '-' reads stdin
+vork setup                Check GPU/tools and warm the std/final starter and path engine (10 min shader budget)
+vork setup --all          Warm bundled programs/profiles and built-in descriptors without a shader time limit
+vork setup --skip-warmup  Check GPU/tools only; add --verbose for raw encoder probes
+vork help [TOPIC [--all] | field PATH]
+2D canvas: vork help nodes, then vork help composition, vork help text, vork help path.
 
 CONVENTIONS
 Units: metres, seconds, radians; lens/sensor mm; linear Rec.709.
@@ -64,13 +47,14 @@ lights: follows Blender 5.2.1 lights, except radius (Blender: shadow_soft_size)
 materials: follows OpenPBR Surface 1.1.1
 textures: follows glTF 2.0 samplers; KHR_texture_transform lowered on import
 <!-- generated-standards:end -->
-Coordinates: right-handed Y-up; camera local -Z. Names exclude '/'; paths are scene-relative.
-Resources accept a name or inline definition. Named tables use {name: definition}.
-Node type fields are flat siblings; type: node has only common fields.
-A field path names one object, not its table: node.font-size, material.inputs, render.fps; the table is scene.nodes.
-Normal maps: tangent-space +Y; TEXCOORD v=0 is the image top. Topology and program code are fixed during rendering.
+Use right-handed Y-up; camera local -Z. Names exclude '/'; paths are scene-relative.
+Use names or inline resources; tables use {name: definition}. Node type fields
+are flat siblings. Unknown fields refuse; defaults can be omitted.
+A field path names one object, not its table: node.font-size (table: scene.nodes).
+Normal maps: tangent-space +Y; TEXCOORD v=0 at image top.
+Topology and program code are fixed during rendering.
 
-COMMON FIELDS (advanced fields: vork help TOPIC --all; exact field: vork help field PATH)
+COMMON FIELDS (advanced: vork help TOPIC --all; exact: vork help field PATH)
 <!-- generated-api:start -->
 
 Scene {
@@ -152,7 +136,7 @@ Text (type: text, canvas) {
 
 Path (type: path, canvas) {
   d: string = none; SVG path data, px; "none" or empty paints nothing
-  fill: paint = #000; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}
+  fill: paint = #000; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}|{material}
 }
 
 Material {
@@ -184,23 +168,17 @@ Render {
   resolution: uvec2 = [1920,1080]
 }
 <!-- generated-api:end -->
-Asset nodes also take materials and nodes overrides (vork help nodes).
-SPZ and Gaussian PLY: import through asset; replace the radiance material through materials.
+Asset overrides and imported nodes: vork help nodes. Load SPZ and Gaussian PLY
+as assets; replace their radiance material through materials overrides.
 
 LIBRARIES
-Std builders return {buffers,geometry}; name sets standalone CLI/SDK fragment prefixes.
-Shapes are centred; dimensions are metres.
-Text, bevelled extrusion and rounded boxes: vork help std --all.
+Std builders return {buffers,geometry}; name prefixes standalone CLI/SDK fragments.
+Shapes are centred, in metres. See vork help std --all.
 <!-- generated-shapes:start -->
 Scene geometry: {std: NAME, ...options}; omit name: the table key or inline position owns identity.
 
 <!-- generated-shapes:end -->
-Compositor: composition.compositor, an ordered {material,name?,resolution?} image graph; material may be inline.
-Image inputs bind earlier results with {step:name}; last entry is output; see vork help compositor.
-Environment: light.material evaluates radiance; std/environment_image reads ordinary Image inputs.
-vork std environment preprocesses HDR lighting; vork std sky declares atmosphere and an ordinary sun.
-
-Topics (vork help TOPIC [--all]):
+TOPICS
 check: validate without rendering
 upgrade: breaking changes
 contract: validation and installation
@@ -208,6 +186,7 @@ nodes: assets, skins, morphs, object IDs
 cameras: optics and focus
 lights: lighting and sky
 materials: surface inputs and media ownership
+paint: 2D path fill and stroke programs
 fog: medium programs and admission
 geometry: mesh attributes and implicit fields
 buffers: binary and computed data
@@ -229,14 +208,18 @@ errors: exit codes
 diagnostics: timings and environment variables
 limits: hardware and rendering limits
 build: source build prerequisites
+init: scene scaffolds
+ask: scene queries
+parallel-mp4: join worker renders
+export: glTF assets
+springs, sequences, captions: animation recipes
+blender: imported shader nodes
 
-Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.2/packages/ts/scene.schema.json"` for editor
-completion and validation. `vork init` includes it; SDK writers preserve an explicit
-$schema but do not insert one. vork never fetches it or changes the render.
+Editor schema: "$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.3/packages/ts/scene.schema.json"
+vork init adds it. SDK writers preserve an explicit value. vork never fetches it; it does not affect rendering.
 
 UPDATE NOTICES
-Vork checks npm for stable updates at most daily after command completion and caches
-results locally. Notices appear on stderr on later runs, including redirected logs.
-VORK_NO_UPDATE_NOTIFIER (any value) or CI disables checks and notices.
-Only a package-version request is sent; no identifiers or telemetry. Network/cache
-failures are silent and never affect outputs or exit status.
+vork checks npm for stable updates at most daily after commands and caches the result.
+Notices go to stderr on later runs, including redirected logs. Set
+VORK_NO_UPDATE_NOTIFIER (any value) or CI to disable checks and notices. Only a package-version request is sent; no identifiers or telemetry.
+Network/cache failures are silent and affect neither output nor status.

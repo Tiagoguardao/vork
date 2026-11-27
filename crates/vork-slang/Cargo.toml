@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vork-inputs = { path = "../vork-inputs" }
 anyhow = "1"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }

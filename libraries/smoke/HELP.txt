@@ -1,15 +1,14 @@
 smoke: bounded dense-grid smoke/fire simulation using ordinary compute and media.
-Source shapes and fire looks are authored in the scene, not library presets.
-Use vork help smoke --all for the inclusion and scheduling contract.
+Author source shapes and fire looks in the scene. First use compiles the stages. Later runs reuse them.
+See vork help smoke --all.
 
 <!-- all -->
 # Smoke simulation
 
 Use #include "smoke/<operation>.slang" after declaring the configuration and
-callbacks below in an authored compute wrapper. These are inclusion templates,
-not standalone import modules. The library owns staggered
-MAC transport and pressure projection; source shapes, combustion, buoyancy and
-optical coefficients belong to the author. No scene types or renderer switches.
+callbacks in an authored compute wrapper. Use #include, not import. Author
+sources, combustion, buoyancy and optical coefficients; the templates handle
+staggered MAC transport and pressure projection.
 
 Each wrapper declares SMOKE_DIMS (int3, each axis >= 2), SMOKE_CELL (positive
 finite float3 cell sizes in metres), SMOKE_ORIGIN (float3 minimum corner in metres),
@@ -55,10 +54,8 @@ produce artistic fire looks; they are not calibrated combustion chemistry.
 Publish d and t through ordinary FloatGrid material inputs and a medium callback
 on a topology:volume carrier. Dense grid coordinates are local [-1,1]³: place the
 carrier at SMOKE_ORIGIN + .5*SMOKE_CELL*SMOKE_DIMS and scale it by half that size.
-Absorption/scattering are per metre; emission is independent of extinction.
-Use std/path. Rendering and simulation costs are separate: lower image resolution
-does not reduce grid, replay or pressure work. First use compiles the stages;
-subsequent renders reuse them. Start coarse, inspect motion, then refine.
+Medium units: vork help fog. Use std/path. Start with a coarse grid; lower image
+resolution leaves grid, replay and pressure work unchanged.
 
 METHOD AND LIMITS
 Midpoint backtracing with trilinear semi-Lagrangian transport is bounded by the
@@ -71,8 +68,4 @@ A finite iteration count leaves a residual: check divergence and refine the solv
 Use authored scalar sinks near the walls when a plume should fade before reaching
 them; this is a closed box, not an open outflow or obstacle solver. No sparse
 simulation, moving solids, oxygen chemistry, detonation/shock waves or adaptive
-meshing. An explosion puff demonstrates a buoyant impulse, not compressible gas.
-The five examples remain editable authoring code.
-
-Numerical reference: Bridson and Müller-Fischer, Fluid Simulation (SIGGRAPH 2007),
-https://www.cs.ubc.ca/~rbridson/fluidsimulation/ . Implementation is original.
+meshing.

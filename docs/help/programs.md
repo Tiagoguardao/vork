@@ -1,19 +1,16 @@
 PROGRAMS
-For standard geometry use std box, sphere, grid, cylinder, cone, torus, capsule,
-revolve and sweep builders; options and units: vork help std --all.
-Use std/openpbr data inputs first (vork help materials). Data materials share
-the shipped evaluator; custom surfaces can add code to the scene kernel and
-increase first-render compilation time. Use programs for custom logic.
-Custom Slang programs provide surface shading,
-displacement, media, environments, cameras, sensors, compositing and compute.
-Medium coefficient units, bounds and admission: vork help fog.
-Use vork help programs --all for the advanced reference and stage declarations.
+For a canvas path fill or stroke, implement float4 paint(PaintContext c, Inputs i). See vork help paint.
+Geometry builders (box, sphere, grid, cylinder, cone, torus, capsule, revolve,
+sweep): vork help std --all. For data-only surfaces use std/openpbr (vork help
+materials). Data bindings share shipped code; custom surfaces can add first-render compilation.
+For custom Slang stages, bindings and ABI use vork help programs --all.
+Medium coefficients and admission: vork help fog.
 <!-- all -->
 PROGRAM REFERENCE
 Imported Blender node semantics: vork help blender --all.
-Slang modules: `import vork;`, one `struct Inputs {...}` whose initializers are
-defaults; surface meshes require surface (lit/displace supplement surface);
-medium-only carriers require medium instead (vork help fog):
+Use `import vork;` and one `struct Inputs {...}` with initializers as defaults.
+Surface meshes need surface (lit/displace supplement it); medium-only carriers
+need medium (vork help fog).
   Closure|Blend|Hair surface(ShadingContext, Inputs)
     OpenPBR emission, including unlit, is shared by hits and light samples and added to the shaded lit result.
     Light samples use zero differentials; hits retain their shading footprint.
@@ -65,15 +62,13 @@ Hit fields: hit, distance, position, geometric_normal, shading_normal, object_id
 instance_index, primitive_id, barycentrics (three weights), uv (UV0), front_facing.
 Object selection is exact public identity; mask selects the low eight AS visibility bits.
 Miss: distance=-1, identities=0xffffffffu, other fields zero.
-Reached calls count as work even when hit data is ignored; dead branches do not.
-Use fixed bounded loops. Work exhaustion refuses the exposure; it never publishes
-partial output. Compute queries require immutable triangle targets: select a static
-collider's pass_index with the object argument.
-Animated or computed target geometry/placement is refused, including self-dependencies.
-Compute queries retain that installed snapshot through ticks and replay. Implicit
-geometry queries are not yet qualified. Raster installs ray resources when queries
-need them. Real-time queries require
-a separately qualified profile and frame budget.
+Every reached call counts toward the work limit, even if its result is unused; dead branches cost no work.
+Raster installs ray resources on demand. Prefer fixed loop bounds; exhaustion refuses
+the exposure without publishing its partial output. For compute queries
+select an immutable triangle collider by pass_index (object). Animated, computed
+and self-dependent targets refuse. Ticks and replay use the installed snapshot.
+Implicit queries are unqualified. Real-time queries require a qualified profile
+and frame budget.
 
 SIMULATION
 Use scene.simulation with t0, positive dt, seed, state buffer names, and ordered init/steps
@@ -87,14 +82,13 @@ _atomic_add(index,value). All return the previous value. Out-of-bounds does noth
 and returns zero (UINT_MAX for u32 min).
 Seeking replays from initialization or a compatible bounded shared-cache checkpoint.
 Floating atomic accumulation replays within float noise on the same backend.
-Integer commutative reductions replay exactly with stable operands; exchange/CAS
-and use of returned prior values depend on invocation order. Keep other accesses race-free. Use computed
-placement for opaque, unskinned geometry. Computed instance material attributes
-follow GPU updates; displacement cannot read them. Author transparent placements.
+Integer commutative reductions replay exactly with stable operands. Exchange/CAS
+and returned prior values depend on invocation order. Keep other accesses race-free.
+Computed placement rules: vork help buffers --all.
 
 
 GEOMETRY PROGRAM INPUTS
-Geometry programs automatically receive read-only predecessor attributes. Built-in channels
+Geometry programs automatically receive read-only predecessor attributes. Reads cannot publish writes; there are no stores or atomics on these inputs. Built-in channels
 use geometry_POSITION_load(index), geometry_NORMAL_load(index), and the other
 present glTF semantics. All authored channels also have typed
 geometry_attribute_N_load(index), numbered in attribute-name order, starting at zero;
@@ -122,9 +116,8 @@ proxy alternative. Static trace() queries retain their separate snapshot contrac
 Every compute binding also has previous_<binding>_load(index) and _count, with its
 ordinary element type. These read the state before the whole scheduled tick, including
 when several ordered simulation steps write that binding. Initialization reads the initial
-buffer bytes; the first simulation step reads initialized S0. Frame schedules follow their
-existing nominal frame clock. These inputs expose no stores or atomics and need no new
-binding fields. Reads do not publish writes or become checkpoint state.
+buffer bytes; the first simulation step reads initialized S0. Frame schedules use nominal frame time. These accessors are read-only and use the
+existing binding; they add no checkpoint state.
 
 EnvironmentContext: normalized direction, time (seconds), camera (camera escape versus lighting).
 Environment programs depend on direction and may sample file images. Camera rays

@@ -278,15 +278,22 @@ impl Reader {
                     }
                 }
                 let _images = RestoreImages(moda_assets::engine_seam::installed());
-                let document = crate::canvas::Document::new_with_paints(scene, base, None, opened)?;
-                document.install_images()?;
+                // Header and audio questions do not evaluate any painted frame.
+                // Open the canvas only when a query actually needs its clock or layout.
+                let evaluation = std::cell::OnceCell::new();
+                let document = || -> Result<&crate::canvas::Document> {
+                    if evaluation.get().is_none() {
+                        let document = crate::canvas::Document::new_with_paints(scene, base, None, opened)?;
+                        document.install_images()?;
+                        let _ = evaluation.set(document);
+                    }
+                    Ok(evaluation.get().unwrap())
+                };
                 let mut answers = Vec::with_capacity(questions.len());
-                let mut bounds = document.bounds_batch(questions.iter()
-                    .filter(|q| q.kind == "node" && q.read.as_deref() != Some("transform"))
-                    .map(|q| q.name.as_str()));
-                for q in questions {
+                let mut bounds = None;
+                for q in &questions {
                     if q.kind == "audio" {
-                        answers.push(audio_answer(audio.get().unwrap(), &q)?);
+                        answers.push(audio_answer(audio.get().unwrap(), q)?);
                         continue;
                     }
                     ensure!(
@@ -299,16 +306,20 @@ impl Reader {
                         values.push(if q.kind == "image" {
                             let image = scene.images.get(&q.name)
                                 .with_context(|| format!("ask: unknown image {:?}", q.name))?;
-                            info::image_info(image, base, opened, scene.render.fps, || {
-                                document.measure_image_time(&q.name, image, &request)
+                            info::image_info(image, base, opened, scene.render.fps, info::StillAxes::CanvasPaint, || {
+                                document()?.measure_image_time(&q.name, image, &request)
                             })?
                         } else {
+                            let document = document()?;
+                            let bounds = bounds.get_or_insert_with(|| document.bounds_batch(questions.iter()
+                                .filter(|q| q.kind == "node" && q.read.as_deref() != Some("transform"))
+                                .map(|q| q.name.as_str())));
                             document.measure(
                                 &q.name,
                                 &q.kind,
                                 q.read.as_deref().unwrap_or(""),
                                 &request,
-                                &mut bounds,
+                                bounds,
                             )?
                         });
                     }

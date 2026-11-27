@@ -108,6 +108,9 @@ pub use openpbr::openpbr_fields;
 mod compute;
 pub use compute::{ComputeProgram,compute_used_bindings};
 mod composite;
+#[path = "../paint/mod.rs"]
+mod paint;
+pub use paint::PaintProgram;
 mod display;
 mod propagation;
 pub use propagation::PropagationProgram;
@@ -191,8 +194,12 @@ const WAVELENGTH_EFFECT: &str = "vork_effect_wavelength";
 /// Image input with no image bound; the kernel's sampler returns its fallback.
 pub const NO_IMAGE: u32 = u32::MAX;
 
+#[derive(Clone)]
 pub struct Compiler {
+    /// Optional module re-exported by the program workspace for this stage.
+    stage_module: Option<(&'static str, &'static str)>,
     executable: PathBuf,
+    installation: Option<PathBuf>,
     expected: Option<InputIdentity>,
     captured: Option<std::sync::Arc<Mutex<Option<InputIdentity>>>>,
 }
@@ -883,6 +890,9 @@ pub trait AdmissionLedger {
     fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf>;
     fn admitted(&self, entry: &Path, toolchain: blake3::Hash) -> bool;
     fn record(&self, entry: &Path, toolchain: blake3::Hash);
+    /// The content identity admitted for a bundled installation's file stamp.
+    fn installed(&self, stamp: blake3::Hash) -> Option<blake3::Hash>;
+    fn record_installation(&self, stamp: blake3::Hash, toolchain: blake3::Hash);
 }
 
 /// What the environment tells the dynamic loader when the compiler starts.
@@ -902,7 +912,7 @@ impl Loader {
         let (prefix, lists): (&str, &[&str]) = if cfg!(target_os = "macos") {
             ("DYLD_", &["DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_VERSIONED_LIBRARY_PATH"])
         } else if cfg!(unix) { ("LD_", &["LD_LIBRARY_PATH"]) } else { ("", &[]) };
-        let mut loader = Self { searched: Vec::new(), other: Vec::new(), started_in: std::env::current_dir().unwrap_or_default() };
+        let mut loader = Self { searched: Vec::new(), other: Vec::new(), started_in: vork_inputs::current_dir().unwrap_or_default() };
         if prefix.is_empty() { return loader; }
         let mut variables: Vec<_> = std::env::vars_os()
             .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value)))
@@ -915,10 +925,32 @@ impl Loader {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ToolchainRead<'a> {
+    Content,
+    Installation(&'a Path),
+}
+impl ToolchainRead<'_> {
+    fn file(self, path: &Path) -> Result<(PathBuf, blake3::Hash)> {
+        match self {
+            Self::Content => Ok(vork_inputs::installed_content(path)?),
+            Self::Installation(root) => {
+                let signal = vork_inputs::FileSignal::open(path)
+                    .with_context(|| format!("bind Slang installation file {}", path.display()))?;
+                ensure!(signal.target().starts_with(root), "Slang runtime file {} is outside the bundled installation", path.display());
+                let stamp = signal.binding_stamp(path)
+                    .with_context(|| format!("Slang installation file {} has no stable stamp", path.display()))?;
+                Ok((signal.target().to_path_buf(), stamp))
+            }
+        }
+    }
+}
+
 /// This process's verdict on one selected executable that passed.
 struct Checked {
     /// The toolchain vouched for: the files that were run, or that a ledger held.
     toolchain: Option<blake3::Hash>,
+    installation: Option<blake3::Hash>,
     /// The ledger entries known to hold it.
     published: std::collections::BTreeSet<PathBuf>,
 }
@@ -929,6 +961,10 @@ impl Checked {
         let Some(entry) = ledger.entry(toolchain) else { return };
         if self.published.contains(&entry) { return; }
         if !ledger.admitted(&entry, toolchain) { ledger.record(&entry, toolchain); }
+        if let Some(stamp) = self.installation
+            && ledger.installed(stamp) != Some(toolchain) {
+            ledger.record_installation(stamp, toolchain);
+        }
         self.published.insert(entry);
     }
 }
@@ -957,44 +993,48 @@ fn compiler_start_advice(macos: bool) -> &'static str {
 impl Compiler {
     /// Explicit override, installed companion toolchain, then developer PATH.
     pub fn discover() -> Self {
-        let executable = std::env::var_os("VORK_SLANGC")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()?
-                    .canonicalize().ok()?
-                    .parent()
-                    .map(|p| {
-                        p.join("slang/bin")
-                            .join(format!("slangc{}", std::env::consts::EXE_SUFFIX))
-                    })
-                    .filter(|p| p.is_file())
-            })
-            .unwrap_or_else(|| PathBuf::from("slangc"));
-        Self::new(executable)
+        static SELECTED: OnceLock<(PathBuf, Option<PathBuf>)> = OnceLock::new();
+        let (executable, installation) = SELECTED.get_or_init(|| Self::resolve_executable(None));
+        Self { stage_module: None, executable: executable.clone(), installation: installation.clone(), expected: None, captured: None }
     }
+
     pub fn new(executable: impl Into<PathBuf>) -> Self {
-        let executable=executable.into();
-        // The executable directory is an implicit Slang module search path.
-        // An exact-input receipt must not survive selection of another compiler
-        // through PATH, even when both report the pinned version.
-        let name=if cfg!(windows) && executable.extension().is_none() {executable.with_extension("exe")} else {executable.clone()};
-        let resolved=if executable.components().count()==1 && !executable.is_absolute() {
-            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
-                .map(|directory|directory.join(&name))
-                .find(|path|path.is_file()))
-        } else {Some(executable.clone())};
-        let resolved=resolved.map(|path|std::env::current_dir().map_or(path.clone(),|cwd|cwd.join(path)));
-        let executable=resolved.and_then(|path|if cfg!(windows) {Some(path)} else {path.canonicalize().ok()}).unwrap_or(executable);
-        Self {
-            executable,
-            expected: None,
-            captured: None,
-        }
+        let path = executable.into();
+        static SELECTED: OnceLock<Mutex<BTreeMap<PathBuf, PathBuf>>> = OnceLock::new();
+        let mut selected = SELECTED.get_or_init(Mutex::default).lock().unwrap();
+        Self::from_executable(selected.entry(path.clone()).or_insert_with(|| Self::resolve_executable(Some(path)).0).clone())
     }
+
+    fn from_executable(executable: PathBuf) -> Self {
+        Self { stage_module: None, executable, installation: None, expected: None, captured: None }
+    }
+
+    fn bundled_root() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+        Some(exe.parent()?.join("slang"))
+    }
+
+    fn resolve_executable(explicit: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
+        let explicit = explicit.or_else(|| std::env::var_os("VORK_SLANGC").map(PathBuf::from));
+        let bundled = explicit.is_none().then(Self::bundled_root).flatten();
+        let executable = explicit.or_else(|| {
+            let sibling = bundled.as_ref()?.join("bin").join(format!("slangc{}", std::env::consts::EXE_SUFFIX));
+            sibling.is_file().then_some(sibling)
+        }).unwrap_or_else(|| "slangc".into());
+        let resolved = if executable.components().count() == 1 && !executable.is_absolute() {
+            let name = if cfg!(windows) && executable.extension().is_none() { executable.with_extension("exe") } else { executable.clone() };
+            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
+                .map(|dir| dir.join(&name)).find(|path| path.is_file()))
+        } else { Some(executable.clone()) };
+        let executable = resolved.and_then(|path| path.canonicalize().ok()).unwrap_or(executable);
+        let installation = bundled.and_then(|root| root.canonicalize().ok())
+            .filter(|root| executable.parent() == Some(root.join("bin").as_path()));
+        (executable, installation)
+    }
+
     /// The pinned version, once this process has checked the selected toolchain by running it.
     pub fn version(&self) -> Result<String> {
-        self.checked(None)
+        self.checked(None).map(|_| VERSION.to_owned())
     }
 
     /// Admit the selected toolchain as a value. A cache key that names the compiler is built
@@ -1009,19 +1049,20 @@ impl Compiler {
         Ok(Admitted { compiler: self })
     }
 
-    fn checked(&self, ledger: Option<&dyn AdmissionLedger>) -> Result<String> {
+    fn checked(&self, ledger: Option<&dyn AdmissionLedger>) -> Result<Option<blake3::Hash>> {
+        filesystem::observe_adapter();
         // Compiler instances are short-lived and used concurrently during install.
         // Keep both success and failure for each selected executable for this process.
         static CHECKS: OnceLock<Mutex<BTreeMap<PathBuf, Result<Checked, String>>>> = OnceLock::new();
         let mut checks = CHECKS.get_or_init(Mutex::default).lock().unwrap();
         let check = checks
             .entry(self.executable.clone())
-            .or_insert_with(|| self.check(ledger, &Loader::environment()).map_err(|e| format!("{e:#}")));
+            .or_insert_with(|| vork_inputs::Receipt::live(|| self.check(ledger, &Loader::environment())).map_err(|e| format!("{e:#}")));
         match check {
             Ok(checked) => {
                 // A check made with another ledger, or none, is published to this one.
                 checked.publish(ledger);
-                Ok(VERSION.to_owned())
+                Ok(checked.toolchain)
             }
             Err(reason) => Err(anyhow::Error::new(CompilerUnavailable(reason.clone()))),
         }
@@ -1029,14 +1070,29 @@ impl Compiler {
 
     /// One check of the selected toolchain, outside the process memo.
     fn check(&self, ledger: Option<&dyn AdmissionLedger>, loader: &Loader) -> Result<Checked> {
-        let before = self.toolchain_under(loader).ok();
+        let installation = || self.installation.as_deref().and_then(|root|
+            self.observe_toolchain(loader, ToolchainRead::Installation(root)).ok());
+        let stamp = installation();
+        let cached = stamp.and_then(|stamp| ledger?.installed(stamp));
+        let before = cached.or_else(|| self.toolchain_under(loader).ok());
+        // Bundled installations are replaced as units and stay fixed for a
+        // worker. Independently scan all bindings again before accepting the
+        // digest. Overrides, external libraries and ambiguous timestamps
+        // still use two independent content observations.
+        let unchanged = || match stamp {
+            Some(stamp) => installation() == Some(stamp),
+            None => self.toolchain_under(loader).ok() == before,
+        };
         // An admission is taken from the ledger only for files that are the same when
         // looked at again; files changing under the look take the run below.
         if let (Some(ledger), Some(toolchain)) = (ledger, before)
             && let Some(entry) = ledger.entry(toolchain)
             && ledger.admitted(&entry, toolchain)
-            && self.toolchain_under(loader).ok() == before {
-            return Ok(Checked { toolchain: before, published: [entry].into() });
+            && unchanged() {
+            if let Some(stamp) = stamp && cached.is_none() {
+                ledger.record_installation(stamp, toolchain);
+            }
+            return Ok(Checked { toolchain: before, installation: stamp, published: [entry].into() });
         }
         self.probe_version()?;
         // The verdict vouches for an identity only when the same files were there before
@@ -1044,8 +1100,8 @@ impl Compiler {
         // changed meanwhile, which a shared `bin` does for unrelated reasons) the toolchain
         // passed for this process on the strength of the run alone: nothing is recorded and
         // the next process runs it again.
-        let stable = before.filter(|toolchain| self.toolchain_under(loader).ok() == Some(*toolchain));
-        let mut checked = Checked { toolchain: stable, published: Default::default() };
+        let stable = before.filter(|_| unchanged());
+        let mut checked = Checked { toolchain: stable, installation: stamp, published: Default::default() };
         checked.publish(ledger);
         Ok(checked)
     }
@@ -1054,7 +1110,7 @@ impl Compiler {
     /// permissions, modification time and content, and Slang's own files in its directory
     /// and in the `lib` directory next to it. Slang's files are the ones named `slang*` or
     /// `libslang*` (its tools, the compiler library that carries the version, the libraries
-    /// and standard-module directory it loads at run time), each by name, size, permissions
+    /// and standard-module directory it loads at run time), each by resolved name, content, size, permissions
     /// and modification time. Other files beside the compiler, in a shared `bin` say, are
     /// not part of it. The directories the environment tells the loader to search
     /// (`LD_LIBRARY_PATH`, with glibc's `glibc-hwcaps` subdirectories; the `DYLD_*_LIBRARY_PATH` lists on macOS) are
@@ -1070,6 +1126,13 @@ impl Compiler {
 
     /// [`Self::toolchain`] under a given loader environment.
     fn toolchain_under(&self, loader: &Loader) -> Result<blake3::Hash> {
+        self.observe_toolchain(loader, ToolchainRead::Content)
+    }
+
+    fn observe_toolchain(&self, loader: &Loader, read: ToolchainRead<'_>) -> Result<blake3::Hash> {
+        // An ordinary compiler check also encounters aliases of the same library.
+        let local = vork_inputs::Receipt::default();
+        let _reads = local.enter_worker();
         fn part(hash: &mut blake3::Hasher, bytes: &[u8]) {
             hash.update(&(bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
@@ -1098,14 +1161,11 @@ impl Compiler {
             name.strip_prefix("lib").unwrap_or(&name).starts_with("slang")
         }
         fn children(directory: &Path) -> Result<Vec<PathBuf>> {
-            let mut paths = fs::read_dir(directory)
-                .and_then(|entries| entries.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>())
-                .with_context(|| format!("list the Slang toolchain directory {}", directory.display()))?;
-            paths.sort();
-            Ok(paths)
+            Ok(vork_inputs::directory(directory)
+                .with_context(|| format!("list the Slang toolchain directory {}", directory.display()))?.to_vec())
         }
         /// One of Slang's files, or everything under one of its directories.
-        fn observe(hash: &mut blake3::Hasher, path: &Path) -> Result<()> {
+        fn observe(hash: &mut blake3::Hasher, path: &Path, read: ToolchainRead<'_>) -> Result<()> {
             part(hash, path.file_name().unwrap_or_default().as_encoded_bytes());
             // Through links: a library is usually a link to its versioned file.
             match fs::metadata(path) {
@@ -1113,9 +1173,15 @@ impl Compiler {
                     let paths = children(path)?;
                     hash.update(&[2]);
                     hash.update(&(paths.len() as u64).to_le_bytes());
-                    for path in paths { observe(hash, &path)?; }
+                    for path in paths { observe(hash, &path, read)?; }
                 }
-                Ok(meta) => { hash.update(&[1]); state(hash, &meta); }
+                Ok(meta) => {
+                    let (target, bytes) = read.file(path)?;
+                    hash.update(&[1]);
+                    state(hash, &meta);
+                    part(hash, target.as_os_str().as_encoded_bytes());
+                    hash.update(bytes.as_bytes());
+                }
                 // A link to nothing is a complete observation; anything else is not.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => { hash.update(&[0]); }
                 Err(error) => return Err(error).with_context(|| format!("examine the Slang toolchain file {}", path.display())),
@@ -1123,17 +1189,22 @@ impl Compiler {
             Ok(())
         }
         let mut hash = blake3::Hasher::new();
-        part(&mut hash, b"slang-toolchain-v5");
+        part(&mut hash, match read {
+            ToolchainRead::Content => b"slang-toolchain-v6",
+            ToolchainRead::Installation(_) => b"slang-installation-v1",
+        });
         part(&mut hash, VERSION.as_bytes());
         part(&mut hash, self.executable.as_os_str().as_encoded_bytes());
         let file = fs::File::open(&self.executable)
             .with_context(|| format!("read Slang at {}", self.executable.display()))?;
         state(&mut hash, &file.metadata()?);
-        let mut content = blake3::Hasher::new();
-        content.update_reader(file)?;
-        hash.update(content.finalize().as_bytes());
+        let executable = match read {
+            ToolchainRead::Content => blake3::Hasher::new().update_reader(file)?.finalize(),
+            ToolchainRead::Installation(_) => read.file(&self.executable)?.1,
+        };
+        hash.update(executable.as_bytes());
         /// Slang's files directly in one directory the loader may take them from.
-        fn directory(hash: &mut blake3::Hasher, directory: &Path) -> Result<()> {
+        fn directory(hash: &mut blake3::Hasher, directory: &Path, read: ToolchainRead<'_>) -> Result<()> {
             part(hash, directory.as_os_str().as_encoded_bytes());
             // Only a directory that is not there holds nothing; one that cannot be listed
             // leaves the toolchain without an identity.
@@ -1144,11 +1215,11 @@ impl Compiler {
             let owned: Vec<_> = children(directory)?.into_iter()
                 .filter(|path| path.file_name().is_some_and(slang_owned)).collect();
             hash.update(&(owned.len() as u64).to_le_bytes());
-            for path in owned { observe(hash, &path)?; }
+            for path in owned { observe(hash, &path, read)?; }
             // glibc prefers a library in a hardware-capability subdirectory of a searched one.
             let capabilities = directory.join("glibc-hwcaps");
             match fs::metadata(&capabilities) {
-                Ok(meta) if meta.is_dir() => under(hash, &capabilities)?,
+                Ok(meta) if meta.is_dir() => under(hash, &capabilities, read)?,
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).with_context(|| format!("examine {}", capabilities.display())),
@@ -1156,13 +1227,13 @@ impl Compiler {
             Ok(())
         }
         /// Slang's files anywhere under a directory.
-        fn under(hash: &mut blake3::Hasher, directory: &Path) -> Result<()> {
+        fn under(hash: &mut blake3::Hasher, directory: &Path, read: ToolchainRead<'_>) -> Result<()> {
             for path in children(directory)? {
                 if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
                     part(hash, path.file_name().unwrap_or_default().as_encoded_bytes());
-                    under(hash, &path)?;
+                    under(hash, &path, read)?;
                 } else if path.file_name().is_some_and(slang_owned) {
-                    observe(hash, &path)?;
+                    observe(hash, &path, read)?;
                 }
             }
             Ok(())
@@ -1170,7 +1241,7 @@ impl Compiler {
         let beside = self.executable.parent().filter(|p| !p.as_os_str().is_empty());
         let libraries = beside.and_then(Path::parent).map(|p| p.join("lib"));
         for path in beside.map(Path::to_path_buf).into_iter().chain(libraries) {
-            directory(&mut hash, &path)?;
+            directory(&mut hash, &path, read)?;
         }
         // The loader's own environment is followed only where it names directories. A list
         // it would interpret (an expansion like `$ORIGIN`, a `;` separator) or a library it
@@ -1187,7 +1258,7 @@ impl Compiler {
                 // An empty or relative entry is the directory the compiler is started in:
                 // this process's, for the version check. (A compile starts it in a fresh
                 // workspace that holds only the modules written there.)
-                directory(&mut hash, &loader.started_in.join(path))?;
+                directory(&mut hash, &loader.started_in.join(path), read)?;
             }
         }
         Ok(hash.finalize())
@@ -1483,7 +1554,7 @@ impl Compiler {
     pub fn reflect_inputs(&self, abi: &Abi, source: &str, origin: &Path) -> Result<InputLayout> {
         self.version()?;
         let work = Workspace::new()?;
-        write_modules(&work, abi, source)?;
+        self.write_program_modules(&work, abi, source)?;
         let mut includes = vec![work.0.clone()];
         includes.extend(include_paths(origin));
         let probe = format!("{}\nConstantBuffer<Inputs> vork_inputs;\n[shader(\"compute\")][numthreads(1,1,1)] void vork_entry() {{}}", program_text(source, origin));
@@ -1520,6 +1591,18 @@ impl Compiler {
         self.compile_with_capacity(abi, source, origin, tag, None, false, false, precise, wrapper)
     }
 
+    // Keep imports, reflection and proof preparation on the same stage-specific ABI.
+    fn write_program_modules(&self, work: &Workspace, abi: &Abi, source: &str) -> Result<()> {
+        write_modules(work, abi, source)?;
+        if let Some((name, module)) = self.stage_module {
+            use std::io::Write;
+            fs::write(work.0.join(format!("{name}.slang")), module)?;
+            let mut root = fs::OpenOptions::new().append(true).open(work.0.join("vork.slang"))?;
+            writeln!(root, "\n__exported import {name};")?;
+        }
+        Ok(())
+    }
+
     fn compile_with_capacity(
         &self,
         abi: &Abi,
@@ -1538,7 +1621,7 @@ impl Compiler {
         );
         self.version()?;
         let work = Workspace::new()?;
-        write_modules(&work, abi, source)?;
+        self.write_program_modules(&work, abi, source)?;
         if precise {
             // Medium proofs need a trusted bounded-work boundary around the
             // grid sampler. Rename only this compiler-owned proof module's
@@ -1618,7 +1701,7 @@ impl Compiler {
             command.arg("-I").arg(if include.is_absolute() {
                 include.clone()
             } else {
-                std::env::current_dir()?.join(include)
+                vork_inputs::current_dir()?.join(include)
             });
         }
         command
@@ -1912,6 +1995,102 @@ mod ast_tests {
         Ok(())
     }
 
+    #[test]
+    fn runtime_replacement_with_preserved_length_and_mtime_changes_the_toolchain() -> Result<()> {
+        let work = Workspace::new()?;
+        let bin = work.0.join("bin");
+        let lib = work.0.join("lib");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&lib)?;
+        let exe = bin.join("slangc");
+        fs::write(&exe, "fixture compiler")?;
+        let runtime = lib.join("libslang-fixture.so");
+        fs::write(&runtime, "first")?;
+        let timestamp = fs::metadata(&runtime)?.modified()?;
+        let compiler = Compiler::new(exe);
+        let before = compiler.toolchain()?;
+        fs::write(&runtime, "other")?;
+        fs::File::open(&runtime)?.set_times(fs::FileTimes::new().set_modified(timestamp))?;
+        assert_ne!(before, compiler.toolchain()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_admission_rechecks_the_installation_before_reusing_content() -> Result<()> {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        #[derive(Default)]
+        struct Ledger {
+            admitted: RefCell<BTreeMap<PathBuf, blake3::Hash>>,
+            installations: RefCell<HashMap<blake3::Hash, blake3::Hash>>,
+            replace_on_read: RefCell<Option<(PathBuf, std::time::SystemTime)>>,
+        }
+        impl AdmissionLedger for Ledger {
+            fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf> {
+                Some(PathBuf::from(toolchain.to_hex().as_str()))
+            }
+            fn admitted(&self, entry: &Path, toolchain: blake3::Hash) -> bool {
+                if let Some((library, mtime)) = self.replace_on_read.take() {
+                    fs::write(&library, "two").unwrap();
+                    fs::File::open(library).unwrap().set_modified(mtime).unwrap();
+                }
+                self.admitted.borrow().get(entry) == Some(&toolchain)
+            }
+            fn record(&self, entry: &Path, toolchain: blake3::Hash) {
+                self.admitted.borrow_mut().insert(entry.to_owned(), toolchain);
+            }
+            fn installed(&self, stamp: blake3::Hash) -> Option<blake3::Hash> {
+                self.installations.borrow().get(&stamp).copied()
+            }
+            fn record_installation(&self, stamp: blake3::Hash, toolchain: blake3::Hash) {
+                self.installations.borrow_mut().insert(stamp, toolchain);
+            }
+        }
+
+        let work = Workspace::new()?;
+        let root = work.0.canonicalize()?;
+        let bin = root.join("bin");
+        let lib = root.join("lib");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&lib)?;
+        let executable = bin.join("slangc");
+        let count = root.join("probe-count");
+        let library = lib.join("libslang.so");
+        crate::test_support::write_executable(&executable,
+            format!("#!/bin/sh\necho checked >> '{}'\necho '{VERSION}' >&2\n", count.display()))?;
+        fs::write(&library, "one")?;
+        let mtime = fs::metadata(&library)?.modified()?;
+        let loader = Loader { searched: vec![], other: vec![], started_in: root.clone() };
+        let mut compiler = Compiler::from_executable(executable);
+        compiler.installation = Some(root.clone());
+        let ledger = Ledger::default();
+        // The input reader treats a file written during the last two seconds as ambiguous
+        // on a coarse filesystem. Establish the stable case before testing its reuse.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let stamp = compiler.observe_toolchain(&loader, ToolchainRead::Installation(&root))?;
+        let expected = compiler.toolchain_under(&loader)?;
+        let mut setup = compiler.check(None, &loader)?;
+        assert_eq!(setup.toolchain, Some(expected));
+        assert_eq!(ledger.installed(stamp), None);
+        setup.publish(Some(&ledger));
+        assert_eq!(ledger.installed(stamp), Some(expected));
+        assert_eq!(compiler.check(Some(&ledger), &loader)?.toolchain, Some(expected));
+        assert_eq!(fs::read_to_string(&count)?, "checked\n");
+
+        // Change the same inode and restore its mtime between the two looks.
+        // A memoized digest on both sides would accept this stale admission.
+        ledger.replace_on_read.replace(Some((library, mtime)));
+        assert_eq!(compiler.check(Some(&ledger), &loader)?.toolchain, None);
+        assert_eq!(fs::read_to_string(&count)?, "checked\nchecked\n");
+        assert_eq!(ledger.installations.borrow().len(), 1);
+        let changed = compiler.check(Some(&ledger), &loader)?;
+        assert_ne!(changed.toolchain, Some(expected));
+        assert_eq!(changed.toolchain, Some(compiler.toolchain_under(&loader)?));
+        assert_eq!(fs::read_to_string(&count)?, "checked\nchecked\nchecked\n");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_toolchain_is_run_once_and_again_only_when_its_files_change() -> Result<()> {
@@ -1922,6 +2101,8 @@ mod ast_tests {
             fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf> { Some(PathBuf::from(self.0).join(toolchain.to_hex().as_str())) }
             fn admitted(&self, entry: &Path, _: blake3::Hash) -> bool { self.1.lock().unwrap().iter().any(|held| held == entry) }
             fn record(&self, entry: &Path, _: blake3::Hash) { self.1.lock().unwrap().push(entry.to_path_buf()) }
+            fn installed(&self, _: blake3::Hash) -> Option<blake3::Hash> { None }
+            fn record_installation(&self, _: blake3::Hash, _: blake3::Hash) { unreachable!("the developer toolchain has no installation stamp") }
         }
         use std::os::unix::fs::PermissionsExt;
         let work = Workspace::new()?;

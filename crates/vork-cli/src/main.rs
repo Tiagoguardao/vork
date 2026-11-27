@@ -472,7 +472,8 @@ fn topic_for_line(line: &str) -> Option<&'static str> {
     let area = line.split(['.', ':', ' ']).next()?;
     Some(match area {
         "scene" | "names" | "paths" | "structure" | "coordinates" => "contract",
-        "node" | "composition" | "paint" | "run" => "nodes",
+        "node" | "composition" | "run" => "nodes",
+        "paint" => "paint",
         "camera" | "asset" => "cameras",
         "light" | "lights" => "lights",
         "material" | "normal" => "materials",

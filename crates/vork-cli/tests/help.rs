@@ -134,7 +134,7 @@ fn styled_run_fields_are_listed_with_text_nodes() {
 
 #[test]
 fn every_field_remains_addressable_without_duplicate_topic_listings() {
-    let topics: String = ["contract", "nodes", "cameras", "lights", "materials", "geometry", "buffers",
+    let topics: String = ["contract", "nodes", "cameras", "lights", "materials", "paint", "geometry", "buffers",
         "images", "animation", "render", "outputs", "profiles", "programs", "compositor", "std"]
         .iter().map(|topic| help_args(&[topic, "--all"])).collect();
     let root = help_args(&[]);

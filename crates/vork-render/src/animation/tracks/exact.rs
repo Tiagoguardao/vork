@@ -1,6 +1,9 @@
 //! The consumed image-time slice of the shared animation plan.
 use super::*;
-use vork_time::exact::{Germ, Rational, decimal, ieee};
+use std::sync::OnceLock;
+use vork_time::exact::{Germ, Rational, ieee};
+#[cfg(test)]
+use vork_time::exact::decimal;
 
 pub(super) struct DeferredTimeCurve {
     source: v2::Track,
@@ -14,6 +17,10 @@ impl DeferredTimeCurve {
     pub(super) fn get(&self)->Result<&TimeCurve> {
         self.value.get_or_init(||TimeCurve::compile(&self.source,&self.decoded).map_err(|e|format!("{e:#}")))
             .as_ref().map_err(|error|anyhow::anyhow!("{error}"))
+    }
+    #[cfg(test)]
+    pub(super) fn is_materialized(&self) -> bool {
+        self.value.get().is_some()
     }
 }
 pub(super) struct TimeSpan {
@@ -37,6 +44,7 @@ pub(super) fn raw_times(track:&v2::Track,decoded:&[f32])->Result<Vec<vork_time::
     }
 }
 
+#[derive(PartialEq, Eq, Hash)]
 pub(super) struct TimeCurve {
     times: Vec<Rational>,
     values: Vec<Rational>,
@@ -48,11 +56,9 @@ fn scalar(value: &serde_json::Value) -> Result<Rational> {
         ensure!(array.len() == 1, "time track must be scalar or width one");
         &array[0]
     } else { value };
-    match value {
-        serde_json::Value::Number(number) => decimal(&number.to_string()),
-        serde_json::Value::String(text) if text.contains('/') => decimal(text),
-        _ => anyhow::bail!("time track needs numeric seconds or a rational clock"),
-    }
+    let clock: vork_time::Clock = serde_json::from_value(value.clone())
+        .context("time track needs numeric seconds or a rational clock")?;
+    Ok(clock.exact())
 }
 
 pub(super) fn times(track: &v2::Track, decoded: &[f32]) -> Result<Vec<Rational>> {
@@ -103,25 +109,14 @@ impl Plan {
     pub fn image_time_exact(&self, samples: &Samples, time: &Germ, name: &str, base: Germ) -> Result<Germ> {
         let mut result = base;
         let mut index = 0;
+        let times = ExactTimes::new(self);
         for layer in &self.layers {
-            let mut local = None;
             for track in &layer.tracks {
                 if matches!(&track.target, Some(v2::TrackTarget::ImageTime {image}) if image == name)
                     && samples.weights[index] != 0.
                 {
                     let curve = track.time_curve.as_ref().context("image time curve is installed")?.get()?;
-                    if local.is_none() {
-                        let mut mapped = time.scale(&ieee(layer.source.speed)?)
-                            .add(&Germ::point(ieee(layer.source.offset)?));
-                        if layer.source.looping {
-                            if let Some(span) = &layer.time_span {
-                                let (a,b)=span.get();
-                                if b > a { mapped = mapped.euclidean_loop(a,b)?; }
-                            }
-                        }
-                        local = Some(mapped);
-                    }
-                    let value = curve.sample(local.as_ref().unwrap());
+                    let value = curve.sample(samples.scene_layer_time(layer, time, &times)?);
                     let weight = ieee(samples.weights[index])?;
                     result = if matches!(layer.source.blend, v2::Blend::Add) {
                         result.add(&value.scale(&weight))
@@ -259,6 +254,117 @@ mod tests {
     }
 }
 
+/// A remap is materialized on first exact use. Identity reads borrow the input germ.
+#[derive(Clone, Default)]
+pub(super) struct ExactTimes {
+    count: usize,
+    slots: OnceLock<Vec<OnceLock<Germ>>>,
+}
+
+pub(super) fn get_or_try<T>(cell: &OnceLock<T>, make: impl FnOnce() -> Result<T>) -> Result<&T> {
+    if cell.get().is_none() {
+        let _ = cell.set(make()?);
+    }
+    Ok(cell.get().unwrap())
+}
+
+impl ExactTimes {
+    pub(super) fn new(plan: &Plan) -> Self { Self { count: plan.exact_domains, slots: OnceLock::new() } }
+
+    pub(super) fn read<'a>(&'a self, layer: &CompiledLayer, parent: &'a Germ) -> Result<&'a Germ> {
+        if layer.source.speed == 1. && layer.source.offset == 0.
+            && (!layer.source.looping || layer.time_span.is_none()) {
+            return Ok(parent);
+        }
+        let slots = self.slots.get_or_init(|| vec![OnceLock::new(); self.count]);
+        get_or_try(&slots[layer.exact_domain], || layer.exact_local(parent))
+    }
+}
+
+/// Camera and image selection take an explicit scene germ. It may differ from the
+/// numeric sample (e.g. two sides of a cut). Reuse only readings of this exact input.
+impl Samples {
+    fn scene_layer_time<'a>(&'a self, layer: &CompiledLayer, scene: &'a Germ, other: &'a ExactTimes) -> Result<&'a Germ> {
+        let times = if layer.owner_node.is_none() && self.scene_time.get() == Some(scene) {
+            &self.exact_times
+        } else { other };
+        times.read(layer, scene)
+    }
+}
+
+pub(super) struct LayerTimes {
+    pub(super) remaps: ExactTimes,
+    projection: Vec<std::cell::Cell<Option<f32>>>,
+    numeric: Vec<std::cell::Cell<Option<f32>>>,
+}
+
+impl LayerTimes {
+    pub(super) fn new(plan: &Plan) -> Self {
+        Self { remaps: ExactTimes::new(plan), projection: vec![Default::default(); plan.exact_domains],
+            numeric: vec![Default::default(); plan.numeric_domains] }
+    }
+
+    pub(super) fn record_counts(&self) {
+        let count = |name, n: usize| moda_engine::prof::add_work(name, 0, n as u64);
+        count("animation.layer_remaps", self.remaps.slots.get().map_or(0, |s| s.iter().filter(|t| t.get().is_some()).count()));
+        count("animation.numeric_projections", self.projection.iter().filter(|t| t.get().is_some()).count());
+        count("animation.numeric_domains", self.numeric.iter().filter(|t| t.get().is_some()).count());
+    }
+
+    pub(super) fn numeric(&self, layer: &CompiledLayer, scene: f32, owner: Option<&Germ>) -> Result<Option<f32>> {
+        let slot = &self.numeric[layer.numeric_domain];
+        if let Some(t) = slot.get() { return Ok(Some(t)); }
+        let t = if layer.owner_node.is_some() {
+            let Some(owner) = owner else { return Ok(None) };
+            let projection = &self.projection[layer.exact_domain];
+            if let Some(t) = projection.get() { t } else {
+                let t = self.remaps.read(layer, owner)?.numeric()?;
+                projection.set(Some(t));
+                t
+            }
+        } else { layer.source.offset + scene * layer.source.speed };
+        let t = layer.looped(t);
+        slot.set(Some(t));
+        Ok(Some(t))
+    }
+}
+
+impl Plan {
+    pub(super) fn bind_layer_domains(&mut self) {
+        use std::collections::HashMap;
+        // A singleton looping operation can keep its span deferred. Compare exact bounds
+        // only when two loops on the same affine clock could actually share a result.
+        let affine = |layer: &CompiledLayer| (layer.owner_node.map_or(0, |n| self.domains.by_node[n]),
+            layer.source.speed.to_bits(), layer.source.offset.to_bits());
+        let mut loops = HashMap::new();
+        for layer in &self.layers {
+            if layer.source.looping && layer.time_span.is_some() {
+                *loops.entry(affine(layer)).or_insert(0usize) += 1;
+            }
+        }
+        let mut exact = HashMap::new();
+        let mut numeric = HashMap::new();
+        let ids: Vec<_> = self.layers.iter().map(|layer| {
+            let base = affine(layer);
+            let unique_loop = layer.source.looping && layer.time_span.is_some() && loops[&base] == 1;
+            let span = if unique_loop { None } else { layer.loop_span() };
+            let next = exact.len();
+            let id = *exact.entry((base, unique_loop, span)).or_insert(next);
+            let wrap = layer.span.filter(|(a,b)| layer.source.looping && b > a)
+                .map(|(a,b)| (a.to_bits(), b.to_bits()));
+            let next = numeric.len();
+            let number = *numeric.entry((id, layer.owner_node.is_some(), wrap)).or_insert(next);
+            (id, number)
+        }).collect();
+        self.exact_domains = exact.len();
+        self.numeric_domains = numeric.len();
+        for (layer, (exact, numeric)) in self.layers.iter_mut().zip(ids) {
+            layer.exact_domain = exact;
+            layer.numeric_domain = numeric;
+        }
+    }
+}
+
 impl CompiledLayer {
     /// The exact span a looping layer's clock wraps over.
     pub(super) fn loop_span(&self)->Option<&(Rational,Rational)> {
@@ -286,15 +392,14 @@ impl Plan {
     pub(super) fn camera_selection<'a>(&'a self,samples:&Samples,time:&vork_time::Request)->Result<Option<&'a str>> {
         let mut result=None;
         let mut index=0;
-        let mut request=None;
+        let request = OnceLock::new();
+        let times = ExactTimes::new(self);
         for layer in &self.layers {
-            let mut local=None;
             for track in &layer.tracks {
                 if let Some(keys)=&track.camera_keys {
                     if samples.weights[index]>=0.5 && !matches!(layer.source.blend,v2::Blend::Add) {
-                        if request.is_none() {request=Some(time.exact()?);}
-                        if local.is_none() {local=Some(layer.exact_local(request.as_ref().unwrap())?);}
-                        let key=keys.partition_point(|key|local.as_ref().unwrap().compare_point(key).is_ge()).saturating_sub(1);
+                        let local = samples.scene_layer_time(layer, get_or_try(&request, || time.exact())?, &times)?;
+                        let key=keys.partition_point(|key|local.compare_point(key).is_ge()).saturating_sub(1);
                         let Channel::Discrete {values,..}=&track.channel else {unreachable!()};
                         let Sample::String(name)=&values[key] else {unreachable!()};
                         result=Some(name.as_ref());
@@ -462,7 +567,7 @@ pub(super) struct DiscreteKeys {
 }
 impl DiscreteKeys {
     pub(super) fn new(source:Vec<vork_time::Clock>)->Self {Self {source,keys:Default::default()}}
-    fn exact_keys(&self)->&[Rational] {self.keys.get_or_init(||self.source.iter().map(vork_time::Clock::exact).collect())}
+    pub(super) fn exact_keys(&self)->&[Rational] {self.keys.get_or_init(||self.source.iter().map(vork_time::Clock::exact).collect())}
     pub(super) fn upper(&self,time:&Germ)->usize {
         self.exact_keys().partition_point(|key|time.compare_point(key).is_ge())
     }
@@ -480,20 +585,19 @@ impl Plan {
     pub fn append_discrete_key(&self,request:&vork_time::Request,out:&mut Vec<u8>)->Result<()> {
         if self.has_clocks() {self.append_clock_key(&request.exact()?,out)?;}
         if !self.discrete_tracks {return Ok(());}
-        let mut exact=None;
+        let exact = OnceLock::new();
+        let times = ExactTimes::new(self);
         for layer in &self.layers {
             if layer.owner_node.is_some() {continue;}
-            let mut local=None;
             for track in &layer.tracks {
                 if let Some(keys)=&track.discrete_keys {
-                    if exact.is_none() {exact=Some(request.exact()?);}
-                    if local.is_none() {local=Some(layer.exact_local(exact.as_ref().unwrap())?);}
-                    out.extend_from_slice(&(keys.upper(local.as_ref().unwrap()) as u64).to_le_bytes());
+                    let local = times.read(layer, get_or_try(&exact, || request.exact())?)?;
+                    out.extend_from_slice(&(keys.upper(local) as u64).to_le_bytes());
                     if let Channel::Style(style)=&track.channel {
                         if let Some(clocks)=&style.clocks {
                             for pair in clocks.windows(2) {
                                 let midpoint=(pair[0].exact()+pair[1].exact())/Rational::from_integer(2.into());
-                                out.push(u8::from(local.as_ref().unwrap().compare_point(&midpoint).is_ge()));
+                                out.push(u8::from(local.compare_point(&midpoint).is_ge()));
                             }
                         }
                     }
@@ -721,14 +825,14 @@ mod discrete_tests {
 
 impl Plan {
     pub(super) fn weight_step_keys(&self,request:&vork_time::Request)->Result<Vec<Option<usize>>> {
-        let mut keys=Vec::new();let mut exact=None;
+        let mut keys=Vec::new();
+        let exact = OnceLock::new();
+        let times = ExactTimes::new(self);
         for layer in &self.layers {
-            let mut local=None;
             for track in &layer.tracks {
                 keys.push(if let Some(keys)=track.discrete_keys.as_ref().filter(|_|track.weight_target.is_some()) {
-                    if exact.is_none() {exact=Some(request.exact()?);}
-                    if local.is_none() {local=Some(layer.exact_local(exact.as_ref().unwrap())?);}
-                    Some(keys.upper(local.as_ref().unwrap()).saturating_sub(1))
+                    let local = times.read(layer, get_or_try(&exact, || request.exact())?)?;
+                    Some(keys.upper(local).saturating_sub(1))
                 }else{None});
             }
         }

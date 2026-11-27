@@ -232,7 +232,7 @@ fn intervening_pixels(
             ..
         } => {
             let model = match paint {
-                BodyPaint::Solid => &instance.model_matrix,
+                BodyPaint::Solid | BodyPaint::Program(_) => &instance.model_matrix,
                 BodyPaint::Gradient(g) => &g.model_matrix,
                 BodyPaint::Pattern(p) => &p.instance.model_matrix,
             };

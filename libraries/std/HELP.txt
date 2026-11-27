@@ -5,10 +5,8 @@ Programs: std/hair (curves), std/sky
 (environment). Depth of field: std/camera use_dof; motion blur: render.motion_blur.
 std/agx (default) and std/standard: Blender 5.2.1 view programs; bind at composition.view.
 Inputs: exposure (stops), gamma; AgX also look, lut and destination_lut.
-Display P3 and Rec.2100 outputs take AgX's own rendering for that display: look none
-and the library lut only (the other looks are sRGB renderings and refuse them);
-Rec.2100 at peak_luminance 1000 with reference_white 203 or 100.
-Named view instances animate with material-input tracks; looks use STEP.
+AgX display and luminance limits: vork help outputs.
+Animate named view inputs with material tracks (STEP for look).
 <!-- all -->
 SHAPE REFERENCE
 For vork std NAME JSON, name defaults to NAME and prefixes geometry and buffers.

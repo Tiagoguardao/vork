@@ -14,3 +14,8 @@ VORK_OIDN, VORK_BIN (SDK executable), VORK_GPU (hardware GPU index or cpu, as --
 World and canvas timing reports use version 4 and record frame times as numeric evaluation seconds.
 WAV timing reports use version 1. Completion metadata records FPS as a number or rational string.
 See vork help outputs for completion metadata and overwrite ownership.
+
+Render progress counts delivered frames and CPU-prepared sample passes. GPU
+completion updates at existing submission boundaries, sometimes in groups; preparation can finish before GPU, denoise or output. On Windows, Ctrl+C or Ctrl+Break finishes submitted
+frames, closes outputs, prints the saved count and paths, and exits 130.
+A long GPU frame or compile can delay cancellation.

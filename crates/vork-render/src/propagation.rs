@@ -16,7 +16,7 @@ pub(crate) fn prepare(r:&Renderer,scene:&vork_scene::v2::Scene,base:&Path)->Resu
     let program=programs::cached(r,key,&vork_slang::Compiler::discover(),
         &abi, &source, &origin,
         |compiler|compiler.compile_propagation(&abi,&source,&origin,&tag[..12]))?;
-    if !program.warnings.trim().is_empty() {eprintln!("{}",program.warnings);}
+    if !program.warnings.trim().is_empty() {crate::warnings::diagnostic(&program.warnings);}
     let words=program.inputs.pack(&std::collections::BTreeMap::new(),|_,_|unreachable!())?;
     let mut text=program.native.clone();
     for dependency in &program.dependencies {text.push_str(&format!("\n// dependency {}\n",blake3::hash(&vork_slang::RevisionFiles::read(dependency)?)));}

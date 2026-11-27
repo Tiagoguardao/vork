@@ -153,7 +153,7 @@ fn segment_window(start: f64, length: f64, from: f64, to: f64) -> Option<(f64, f
 /// already-scaled+normalized dash pattern (marching-ants / `stroke-dashoffset`).
 /// Returns the index, on/off state and remaining distance. Offset wraps
 /// modulo the pattern length and may be negative.
-fn seed_dash_phase(dash_pattern: &[f64], offset: f64) -> Option<(usize, bool, f64)> {
+pub(super) fn seed_dash_phase(dash_pattern: &[f64], offset: f64) -> Option<(usize, bool, f64)> {
     let period: f64 = dash_pattern.iter().sum();
     if period <= 0. { return None; }
     let mut phase = offset.rem_euclid(period);
@@ -173,11 +173,22 @@ pub fn walk_path_by_arc_length_phased(
     dash_pattern: &[f64],
     offset: f64,
 ) -> Vec<WalkCmd> {
-    let mut points: Vec<WalkCmd> = Vec::new();
-
-    let Some((mut index, mut is_dash, first_end)) = seed_dash_phase(dash_pattern, offset) else {
-        return points;
+    let Some((mut index, is_dash, first_end)) = seed_dash_phase(dash_pattern, offset) else {
+        return Vec::new();
     };
+    walk_path_runs(segments, is_dash, first_end, || {
+        index = (index + 1) % dash_pattern.len();
+        Ok(dash_pattern[index])
+    }).expect("unlimited dash walk")
+}
+
+pub(super) fn walk_path_runs(
+    segments: &[PathSegment],
+    mut is_dash: bool,
+    first_end: f64,
+    mut next_length: impl FnMut() -> Result<f64, String>,
+) -> Result<Vec<WalkCmd>, String> {
+    let mut points = Vec::new();
     // The contour end truncates the pattern itself, unlike interior cuts.
     let total = segments.iter().map(|s| s.arc_length).sum();
     let mut dash_start = 0.;
@@ -199,9 +210,8 @@ pub fn walk_path_by_arc_length_phased(
                 }
             }
             if end == dash_end {
-                index = (index + 1) % dash_pattern.len();
                 dash_start = end;
-                dash_end = snap_distance(end + dash_pattern[index], total);
+                dash_end = snap_distance(end + next_length()?, total);
                 is_dash = !is_dash;
                 in_dash = false;
             }
@@ -209,7 +219,7 @@ pub fn walk_path_by_arc_length_phased(
         }
         start = segment_end;
     }
-    points
+    Ok(points)
 }
 
 // ---------------------------------------------------------------------------

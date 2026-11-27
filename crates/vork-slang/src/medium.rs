@@ -58,7 +58,7 @@ impl Compiler {
         let homogeneous = effects::medium_homogeneous(&module, &format!("vork_medium_{tag}_point_0_{tag}"),None)?;
         let native_point = format!("vork_medium_{tag}");
         let native = compiled.native.replace("export void", "public void");
-        let current = std::env::current_dir()?;
+        let current = vork_inputs::current_dir()?;
         Ok(MediumProgram {
             native,
             native_point,

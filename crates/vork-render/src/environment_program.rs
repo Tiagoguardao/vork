@@ -142,7 +142,7 @@ fn bake_animated(
     let key = program_key(&abi, source, origin)?;
     let program = compiled(r, source, origin)?;
     if !program.warnings.trim().is_empty() {
-        eprintln!("{}", program.warnings.trim());
+        crate::warnings::diagnostic(program.warnings.trim());
     }
     let (images, mut words) = if let Some((scene,base,_))=animation_source {
         let (images,words)=images::Images::new(r,scene,base,&program.inputs,values,opened)?;

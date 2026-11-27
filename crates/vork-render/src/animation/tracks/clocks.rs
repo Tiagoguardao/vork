@@ -20,7 +20,7 @@ impl ClockNode for crate::install::EvalNode {
     fn set_dynamic(&mut self) { self.dynamic = true; }
 }
 /// What decides a node's existence at its parent's instant.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ActiveSpec {
     On(bool),
     Window(Rational, Rational),
@@ -70,6 +70,19 @@ pub(super) struct State {
 impl State {
     pub(super) fn absent() -> Self { Self { local: None, map: None, audible: false, raw: None, standing: false } }
 }
+/// Domain zero is the scene. Each further domain evaluates one representative node.
+#[derive(Clone, Default)]
+pub(super) struct NodeDomains {
+    pub(super) by_node: Vec<usize>,
+    representatives: Vec<usize>,
+}
+
+impl NodeDomains {
+    pub(super) fn sample_count(&self, has_clocks: bool) -> usize {
+        if has_clocks { 1 + self.representatives.len() } else { 0 }
+    }
+}
+
 /// What a sound block reads of a keyed speed at one instant.
 pub(super) struct KeyedSpeed {
     /// The parent-local instants nearest above and below at which the integral changes
@@ -96,6 +109,57 @@ fn zero() -> Rational { Rational::from_integer(0.into()) }
 fn one() -> Rational { Rational::from_integer(1.into()) }
 
 impl Plan {
+    pub(crate) fn canvas_clock_domain(&self, node: usize) -> usize {
+        if self.has_clocks { self.domains.by_node[node] } else { 0 }
+    }
+
+    pub(super) fn node_domains(&self) -> NodeDomains {
+        let mut domains = NodeDomains::default();
+        let mut intern = std::collections::HashMap::new();
+        // Indexed by domain, with the always-present scene at zero.
+        let mut permanently_absent = vec![false];
+        for (node, spec) in self.clocks.iter().enumerate() {
+            let parent = spec.parent.map_or(0, |p| domains.by_node[p]);
+            let domain = if spec.time.is_none() && spec.active_track.is_none() && matches!(spec.active, ActiveSpec::On(true)) {
+                parent
+            } else {
+                let rest_active = spec.active_track.is_none().then_some(&spec.active);
+                let dormant = permanently_absent[parent]
+                    || matches!(rest_active, Some(ActiveSpec::On(false)));
+                let active = spec.active_track.map(|track| {
+                    let layer = &self.layers[self.layer_of(track)];
+                    let property = self.track_at(track);
+                    let Channel::Discrete { values, .. } = &property.channel else { unreachable!() };
+                    let keys = property.discrete_keys.as_ref().unwrap().exact_keys();
+                    (layer.owner_node.map_or(0, |n| domains.by_node[n]), layer.source.weight >= 0.5,
+                        keys, values.iter().map(|v| matches!(v, Sample::Bool(true))).collect::<Vec<_>>())
+                });
+                let speed = spec.speed_track.map(|track| {
+                    let parent_owned = self.layers[self.layer_of(track)].owner_node == spec.parent;
+                    // Use track identity when presence prevents reaching the speed curve.
+                    // Invalid curves use the same fallback and report errors on sampling.
+                    let curve = if dormant {
+                        Err(track)
+                    } else {
+                        self.track_at(track).time_curve.as_ref().unwrap().get().map_err(|_| track)
+                    };
+                    (parent_owned, curve)
+                });
+                // A keyed control replaces its rest value. The resolved section still
+                // carries the traversal direction and start, even for a keyed speed.
+                let time = spec.time.as_ref().map(|t| (&t.start, &t.section,
+                    spec.speed_track.is_none().then_some(&t.speed)));
+                let key = (parent, rest_active, active, time, speed);
+                *intern.entry(key).or_insert_with(|| {
+                    permanently_absent.push(dormant);
+                    domains.representatives.push(node);
+                    domains.representatives.len()
+                })
+            };
+            domains.by_node.push(domain);
+        }
+        domains
+    }
     pub(crate) fn has_clocks(&self) -> bool { self.has_clocks }
     /// Whether `node` or an ancestor has a clock, so its local time is not the scene's.
     pub(crate) fn under_clock(&self, mut node: usize) -> bool {
@@ -107,25 +171,25 @@ impl Plan {
     /// Whether installed node `node` is absent at this sample (rule 1).
     pub(crate) fn absent(&self, samples: &Samples, node: usize) -> bool {
         // Samples start with every clock unset; they are evaluated only when the scene has clocks.
-        self.has_clocks && samples.clocks.get(node).is_some_and(Option::is_none)
+        self.has_clocks && samples.clocks.get(self.domains.by_node[node]).is_some_and(Option::is_none)
     }
     /// Node `node`'s local instant at scene `request`; `None` while it is absent (rule 1).
     pub(crate) fn node_instant(&self, request: &vork_time::Request, node: usize) -> Result<Option<Germ>> {
         let scene = request.exact()?;
         if !self.has_clocks { return Ok(Some(scene)); }
-        Ok(self.clocks(&scene)?.swap_remove(node))
+        Ok(self.clocks(&scene)?.swap_remove(self.domains.by_node[node]))
     }
     /// Node `node`'s local instant at this sample (the scene instant `scene` when the plan has no clocks); `None`
     /// while it is absent (rule 1). A composition's content reads its node's instant (rule 7).
     pub(crate) fn local_instant(&self, samples: &Samples, node: usize, scene: &Germ) -> Option<Germ> {
         if !self.has_clocks { return Some(scene.clone()); }
-        samples.clocks.get(node).cloned().flatten()
+        samples.clocks.get(self.domains.by_node[node]).cloned().flatten()
     }
     /// The clock that selects a footage image's frames at this sample.
     pub(crate) fn footage_clock(&self, samples: &Samples, image: &str) -> FootageClock {
         match self.footage_owner.get(image) {
             None => FootageClock::Scene,
-            Some(&node) => samples.clocks.get(node).cloned().flatten().map_or(FootageClock::Absent, FootageClock::Node),
+            Some(&node) => samples.clocks.get(self.domains.by_node[node]).cloned().flatten().map_or(FootageClock::Absent, FootageClock::Node),
         }
     }
     /// Source time shared by picture selection, soundtrack remaps and field readback.
@@ -137,16 +201,22 @@ impl Plan {
         };
         self.image_time_exact(samples, scene, image, base).map(Some)
     }
-    /// Every node's local instant at scene instant `scene`, parents before children;
-    /// `None` is an absent node (rule 1), its subtree included.
-    pub(crate) fn clocks(&self, scene: &Germ) -> Result<Vec<Option<Germ>>> {
+    /// Every distinct picture clock at the scene instant, in dependency order.
+    pub(super) fn clocks(&self, scene: &Germ) -> Result<Vec<Option<Germ>>> {
         let _profile = moda_engine::prof::span("animation.clocks");
-        let mut states: Vec<State> = Vec::with_capacity(self.clocks.len());
-        for (index, spec) in self.clocks.iter().enumerate() {
-            let state = self.clock_state(index, spec, scene, &states, false, false)?;
+        let mut states = Vec::with_capacity(1 + self.domains.representatives.len());
+        states.push(State { local: Some(scene.clone()), audible: true, raw: None, standing: false,
+            map: Some(Affine { rate: one(), org: zero(), begin: None }) });
+        for &node in &self.domains.representatives {
+            let state = self.clock_state(node, &self.clocks[node], scene,
+                |n| &states[self.domains.by_node[n]], false, false)?;
             states.push(state);
         }
         Ok(states.into_iter().map(|state| state.local).collect())
+    }
+    pub(crate) fn camera_presence_at(&self, scene: &Germ, cameras: impl Iterator<Item=usize>) -> Result<bool> {
+        let clocks = self.clocks(scene)?;
+        Ok(cameras.into_iter().all(|node| clocks[self.domains.by_node[node]].is_some()))
     }
     /// The clocks of `nodes` alone (ascending, each node's parent and the owner of its keyed
     /// `active` among them), written into `states` by installed node; no other entry is touched.
@@ -156,20 +226,20 @@ impl Plan {
     /// whether its section holds it.
     pub(super) fn sound_states(&self, nodes: &[usize], scene: &Germ, states: &mut [State], motion: bool) -> Result<()> {
         for &node in nodes {
-            let state = self.clock_state(node, &self.clocks[node], scene, states, true, motion)?;
+            let state = self.clock_state(node, &self.clocks[node], scene, |n| &states[n], true, motion)?;
             states[node] = state;
         }
         Ok(())
     }
-    fn clock_state(&self, index: usize, spec: &ClockSpec, scene: &Germ, states: &[State], sound: bool, motion: bool) -> Result<State> {
+    fn clock_state<'a>(&self, index: usize, spec: &ClockSpec, scene: &Germ, state: impl Fn(usize) -> &'a State, sound: bool, motion: bool) -> Result<State> {
         let absent = State::absent();
-        let parent_audible = spec.parent.is_none_or(|p| states[p].audible);
+        let parent_audible = spec.parent.is_none_or(|p| state(p).audible);
         let (parent, parent_map) = match spec.parent {
-            Some(p) => match &states[p].local { Some(local) => (local.clone(), states[p].map.clone()), None => return Ok(absent) },
+            Some(p) => match &state(p).local { Some(local) => (local.clone(), state(p).map.clone()), None => return Ok(absent) },
             None => (scene.clone(), Some(Affine { rate: one(), org: zero(), begin: None })),
         };
         let exists = match (&spec.active, spec.active_track) {
-            (_, Some(track)) => self.discrete_bool(track, spec.parent, &parent, scene, states)?,
+            (_, Some(track)) => self.discrete_bool(track, spec.parent, &parent, scene, state)?,
             (ActiveSpec::On(on), None) => *on,
             (ActiveSpec::Window(a, b), None) => parent.compare_point(a) != Ordering::Less && parent.compare_point(b) == Ordering::Less,
         };
@@ -283,12 +353,12 @@ impl Plan {
         Ok(Some(KeyedSpeed { edges, ceiling, sloped }))
     }
     /// A boolean STEP track read at its owner's instant: the parent's local or the scene.
-    fn discrete_bool(&self, track: usize, parent: Option<usize>, parent_local: &Germ, scene: &Germ, states: &[State]) -> Result<bool> {
+    fn discrete_bool<'a>(&self, track: usize, parent: Option<usize>, parent_local: &Germ, scene: &Germ, state: impl Fn(usize) -> &'a State) -> Result<bool> {
         let layer = &self.layers[self.layer_of(track)];
         let owner_instant = match layer.owner_node {
             None => scene.clone(),
             Some(owner) if Some(owner) == parent => parent_local.clone(),
-            Some(owner) => match &states[owner].local { Some(local) => local.clone(), None => return Ok(false) },
+            Some(owner) => match &state(owner).local { Some(local) => local.clone(), None => return Ok(false) },
         };
         let property = self.track_at(track);
         let Channel::Discrete { values, .. } = &property.channel else { anyhow::bail!("active track must be boolean") };
@@ -400,8 +470,234 @@ mod tests {
         Ok(plan)
     }
     fn locals(plan: &Plan, at: &str) -> Vec<String> {
-        plan.clocks(&Germ::point(q(at))).unwrap().iter().map(|g| g.as_ref().map_or("absent".into(), reading)).collect()
+        let times = plan.clocks(&Germ::point(q(at))).unwrap();
+        plan.domains.by_node.iter().map(|&i| times[i].as_ref().map_or("absent".into(), reading)).collect()
     }
+    /// Reference the authored topology directly and give every layer a freshly mapped time.
+    /// Only the node clock arithmetic and the interpolation/blending of individual tracks
+    /// are shared with the compiled-domain evaluator.
+    fn fresh_sample(plan: &Plan, scene: &Germ, samples: &mut Samples) -> Result<Vec<State>> {
+        let mut nodes = Vec::new();
+        for (i, spec) in plan.clocks.iter().enumerate() {
+            nodes.push(plan.clock_state(i, spec, scene, |p| &nodes[p], false, false)?);
+        }
+        plan.start_sample(samples, 0..plan.layers.len());
+        for (i, layer) in plan.layers.iter().enumerate() {
+            let parent = match layer.owner_node { Some(n) => nodes[n].local.as_ref(), None => Some(scene) };
+            let exact = parent.map(|t| layer.exact_local(t)).transpose()?;
+            let local = if layer.owner_node.is_some() {
+                exact.as_ref().map(Germ::numeric).transpose()?
+            } else { Some(layer.source.offset + scene.numeric()? * layer.source.speed) }.map(|t| layer.looped(t));
+            let first = plan.layer_starts[i];
+            let indices = (first..first + layer.tracks.len()).map(|n| (n, ()));
+            plan.sample_layer(i, first, local, indices, |_, flat, track, ()| {
+                if plan.subjects[flat].is_some_and(|n| nodes[n].local.is_none()) { return Ok(None); }
+                let t = exact.as_ref().unwrap();
+                Ok(Some(TrackRead { upper: track.discrete_keys.as_ref().map(|keys| keys.upper(t)), exact_local: Some(t) }))
+            }, samples)?;
+        }
+        Ok(nodes)
+    }
+
+    #[test]
+    fn frame_aligned_step_keys_select_the_authored_drawing_through_seeks() -> Result<()> {
+        use serde_json::Value;
+
+        // Fixture generated with Python 3:
+        // for n in (3, 6, 7, 12, 24, 25, 30, 60):
+        //     print(f"[{n}, [{', '.join(repr(i/n) for i in range(n))}]]")
+        let python_times: [(u32, Vec<Value>); 8] = serde_json::from_str(include_str!("step_key_times.json"))?;
+        for (rate, numeric) in python_times {
+            let exact = (0..rate).map(|i| Value::String(format!("{i}/{rate}"))).collect::<Vec<_>>();
+            assert_frame_aligned_step_keys(rate, &exact).context("fraction strings")?;
+            assert_frame_aligned_step_keys(rate, &numeric).context("Python repr decimals")?;
+        }
+        Ok(())
+    }
+
+    fn assert_frame_aligned_step_keys(rate: u32, times: &[serde_json::Value]) -> Result<()> {
+        use serde_json::{Value, json};
+        use v2::{NodeProperty, TrackTarget};
+        use vork_time::{Request, Time};
+
+        assert_eq!(times.len(), rate as usize);
+        let keys = |value: fn(usize) -> Value| {
+            times.iter().enumerate().map(|(i, time)| json!([time, value(i)])).collect::<Vec<_>>()
+        };
+        let footage = times.iter().map(|time| json!([time, time])).collect::<Vec<_>>();
+        let plan = plan(json!({
+            "version": 2,
+            "render": {"duration": 1, "camera": "a"},
+            "images": {"plate": {"file": "plate-%02d.png"}},
+            "nodes": [
+                {"name": "a", "type": "camera"},
+                {"name": "b", "type": "camera"},
+                {"name": "gate"},
+                {"name": "drawing", "animation": [{"tracks": [
+                    {"path": ["translation"], "interpolation": "STEP", "keys": keys(|i| json!([i, 0, 0]))},
+                    {"path": ["scale"], "interpolation": "STEP", "keys": keys(|i| json!([i + 1, 1, 1]))}
+                ]}]}
+            ],
+            "animation": [{"tracks": [
+                {"path": ["render", "camera"], "keys": keys(|i| json!(if i % 2 == 0 { "a" } else { "b" }))},
+                {"path": ["nodes", "gate", "active"], "keys": keys(|i| json!(i % 2 == 0))},
+                {"path": ["images", "plate", "time"], "interpolation": "STEP", "keys": footage}
+            ]}]
+        }))?;
+        let plate = crate::footage::Source::Sequence {
+            files: (0..rate).map(|i| format!("plate-{i:02}.png").into()).collect(),
+            fps: Some(Time::integer(rate.into())),
+            inputs: Default::default(),
+        };
+
+        for fps in [24, 25, 30, 60] {
+            let output_rate = Time::integer(fps.into());
+            let mut samples = plan.samples();
+            for frame in (0..fps).chain((0..fps).rev()) {
+                let drawing = frame * rate / fps;
+                let context = format!("frame {frame} at {fps} fps, keys at {rate} Hz");
+                let request = Request::Frame(frame, output_rate);
+                let time = request.exact()?;
+                plan.sample_request_into(request.numeric()?, &request, &mut samples)?;
+                let transforms: Vec<_> = plan.sampled(&samples).filter_map(|(target, value, weight, _)| {
+                    match target {
+                        TrackTarget::Node { property: NodeProperty::Translation | NodeProperty::Scale, .. } => {
+                            Some((value.clone(), weight))
+                        }
+                        _ => None,
+                    }
+                }).collect();
+                assert_eq!(transforms, [
+                    (Sample::numeric(vec![drawing as f32, 0., 0.]), 1.),
+                    (Sample::numeric(vec![(drawing + 1) as f32, 1., 1.]), 1.),
+                ], "{context}");
+                let camera = (drawing % 2) as usize;
+                assert_eq!(plan.camera_for_request(&samples, &request, 0)?, camera, "{context}");
+                assert_eq!(plan.absent(&samples, 2), camera == 1, "{context}");
+                let media = plan.image_time_exact(&samples, &time, "plate", time.clone())?;
+                assert_eq!(plate.frame_index_exact(&media, output_rate)?, drawing as usize, "{context}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_clocks_match_fresh_random_trees_through_seeks() -> Result<()> {
+        use serde_json::{Value, json};
+
+        fn draw(seed: &mut u64, count: u32) -> u32 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (*seed >> 32) as u32 % count
+        }
+        fn tree(seed: &mut u64, name: String, depth: u32, value: u32) -> Value {
+            let mut node = json!({"name":name});
+            match draw(seed, 7) {
+                0 => node["active"] = json!([1, 4]),
+                1 => node["time"] = json!({"start":1,"offset":2,"duration":3,"speed":-1}),
+                2 => node["time"] = json!({"start":"1/3","offset":1,"duration":2,"loop":true}),
+                3 => node["time"] = json!({"speed":0}),
+                4 => node["time"] = json!({"offset":1,"duration":2}),
+                _ => {}
+            }
+            let end = 2 + draw(seed, 3);
+            let mut layers = vec![json!({
+                "offset":draw(seed, 2), "speed":([-1, 1, 2][draw(seed, 3) as usize]),
+                "loop":draw(seed, 2) == 0, "weight":([0.25, 1.][draw(seed, 2) as usize]),
+                "tracks":[
+                    {"path":["translation"],"keys":[[0,[value,0,0]],[end,[0,value,1]]]},
+                    {"path":["visible"],"interpolation":"STEP","keys":[[0,true],["1/3",false],[end,true]]}
+                ]
+            })];
+            if depth > 0 {
+                let mut children = Vec::new();
+                for i in 0..2 {
+                    let child = format!("{name}_{i}");
+                    let mut branch = tree(seed, child.clone(), depth - 1, value + i + 1);
+                    match draw(seed, 4) {
+                        0 => {
+                            branch["time"] = json!({"duration":4});
+                            layers.push(json!({"tracks":[{"path":["children",child,"time","speed"],
+                                "keys":[[0,0],[2,2],[4,2]]}]}));
+                        }
+                        1 => {
+                            branch["active"] = json!(true);
+                            layers.push(json!({"tracks":[{"path":["children",child,"active"],
+                                "keys":[[0,false],["1/3",true],[4,false]]}]}));
+                        }
+                        _ => {}
+                    }
+                    children.push(branch);
+                }
+                node["children"] = json!(children);
+            }
+            node["animation"] = json!(layers);
+            node
+        }
+
+        for seed in 0..24 {
+            let mut rng = seed;
+            let left = tree(&mut rng, "left".into(), 3, 1);
+            let mut twin = seed;
+            let right = tree(&mut twin, "right".into(), 3, 500);
+            let plan = plan(json!({"version":2,"render":{"background":[0,0,0]},
+                "nodes":[{"type":"camera","name":"cam"},left,right],
+                "animation":[{"tracks":[{"path":["animation","tint","weight"],
+                    "interpolation":"STEP","keys":[[0,0],["1/3",1],[4,0.5]]}]},
+                    {"name":"tint","tracks":[{"path":["render","background"],"keys":[[0,[0,0,0]],[4,[1,1,1]]]}]}]}))?;
+            assert!(plan.domains.representatives.len() < plan.clocks.len() / 2 + 1);
+            let mut shared = plan.samples_naming_changes();
+            let mut fresh = plan.samples_naming_changes();
+            for seek in 0..30 {
+                let t = match seek % 5 {
+                    0 => q("1/3"), 1 => q("2"), 2 => q("4"), 3 => q("1000000001/3000000000"),
+                    _ => Rational::new(draw(&mut rng, 32).into(), 3.into()),
+                };
+                let scene = [Germ::left, Germ::point, Germ::right][(seek % 3) as usize](t);
+                let nodes = fresh_sample(&plan, &scene, &mut fresh)?;
+                plan.sample_request_into(scene.numeric()?, &vork_time::Request::Exact(scene.clone()), &mut shared)?;
+                for (i,node) in nodes.iter().enumerate() {
+                    assert_eq!(node.local, plan.local_instant(&shared, i, &scene), "seed {seed} seek {seek} node {i}");
+                }
+                assert_eq!(fresh.values, shared.values, "seed {seed} seek {seek}");
+                assert_eq!(fresh.weights, shared.weights);
+                assert_eq!(fresh.layer_weights, shared.layer_weights);
+                assert_eq!(fresh.changed(), shared.changed());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equal_now_is_insufficient_for_clock_and_loop_bindings() -> Result<()> {
+        use serde_json::json;
+        let layer = |end: &str| json!({"loop":true,"tracks":[{"path":["visible"],
+            "interpolation":"STEP","keys":[[0,true],["1/2",false],[end,true]]}]});
+        let plan = plan(json!({"version":2,"nodes":[{"name":"cam","type":"camera"},
+            {"name":"a","time":{"duration":8},"animation":[layer("1/1")]},
+            {"name":"b","time":{"duration":8},"animation":[layer("1000000001/1000000000")]},
+            {"name":"c","time":{"duration":8,"speed":2},"animation":[layer("1/1")]},
+            {"name":"d","time":{"duration":8}}],
+            "animation":[{"tracks":[
+                {"path":["nodes","a","time","speed"],"keys":[[0,1],[2,1]]},
+                {"path":["nodes","b","time","speed"],"keys":[[0,1],[2,1]]},
+                {"path":["nodes","c","time","speed"],"keys":[[0,1],[2,1]]},
+                {"path":["nodes","d","time","speed"],"keys":[[0,1],[2,2]]}
+            ]}]}))?;
+        let domains = &plan.domains.by_node;
+        assert_eq!(domains[1..4], [domains[1]; 3]);
+        assert_ne!(domains[1], domains[4], "the last keyed speed diverges after zero");
+        let layer_for = |owner| plan.layers.iter().find(|layer| layer.owner_node == Some(owner)).unwrap();
+        assert_eq!(layer_for(1).exact_domain, layer_for(3).exact_domain);
+        assert_ne!(layer_for(1).exact_domain, layer_for(2).exact_domain, "the two loop ends project to the same f32");
+        let mut samples = plan.samples();
+        plan.sample_request_into(1., &vork_time::Request::Exact(Germ::point(q("1"))), &mut samples)?;
+        let visible: Vec<_> = plan.sampled(&samples).filter_map(|(_, s, _, _)| {
+            if let Sample::Bool(v) = s { Some(*v) } else { None }
+        }).collect();
+        assert_eq!(visible, [true, false, true]);
+        Ok(())
+    }
+
     #[test]
     fn part_b_ramp_integrates_to_12_14_13_13() -> Result<()> {
         // A scene-owned speed curve keyed [0,1],[2,1],[4,2],[10,2] on a plate trimmed 12..16, looping.
@@ -435,6 +731,37 @@ mod tests {
         assert_eq!(weights("1.5")?, [0., 1., 1.]);
         assert_eq!(plan.node_instant(&vork_time::Request::Exact(Germ::point(q("1.5"))), 3)?.map(|g| reading(&g)), Some("0.5".into()));
         assert!(plan.node_instant(&vork_time::Request::Exact(Germ::point(q("2"))), 3)?.is_none());
+        Ok(())
+    }
+    #[test]
+    fn dormant_speed_curves_stay_deferred_at_bind() -> Result<()> {
+        let plan = plan(serde_json::json!({"version":2,"nodes":[{"type":"camera","name":"cam"},
+            {"name":"gone","active":false,"time":{"duration":8},
+                "children":[{"name":"hidden","time":{"duration":8}}],
+                "animation":[{"tracks":[
+                    {"path":["children","hidden","time","speed"],"keys":[[0,2],[2,2]]}
+                ]}]},
+            {"name":"gate","active":false,"time":{"duration":8},
+                "children":[{"name":"later","time":{"duration":8}}],
+                "animation":[{"tracks":[
+                    {"path":["children","later","time","speed"],"keys":[[0,2],[2,2]]}
+                ]}]}],
+            "animation":[{"tracks":[
+                {"path":["nodes","gone","time","speed"],"keys":[[0,1],[2,1]]},
+                {"path":["nodes","gate","active"],"keys":[[0,false],[1,true]]},
+                {"path":["nodes","gate","time","speed"],"keys":[[0,1],[2,1]]}
+            ]}]}))?;
+        let materialized = |node: usize| {
+            let track = plan.clocks[node].speed_track.unwrap();
+            plan.track_at(track).time_curve.as_ref().unwrap().is_materialized()
+        };
+        assert!(!materialized(1), "fixed false presence");
+        assert!(!materialized(2), "fixed false ancestor");
+        assert!(materialized(3), "keyed presence overrides fixed false");
+        assert!(materialized(4), "the keyed parent can make its child present");
+        assert_eq!(locals(&plan, "0")[1..], ["absent"; 4]);
+        assert_eq!(locals(&plan, "2")[1..], ["absent", "absent", "2", "4"]);
+        assert!(!materialized(1) && !materialized(2), "seeks leave dormant curves deferred");
         Ok(())
     }
     #[test]
@@ -849,15 +1176,17 @@ impl Plan {
     /// interval of every owned discrete track at its owner's instant.
     pub(super) fn append_clock_key(&self, scene: &Germ, out: &mut Vec<u8>) -> Result<()> {
         let clocks = self.clocks(scene)?;
-        for (index, spec) in self.clocks.iter().enumerate() {
-            if spec.gated { out.push(u8::from(clocks[index].is_some())); }
+        for (index, &node) in self.domains.representatives.iter().enumerate() {
+            if self.clocks[node].gated { out.push(u8::from(clocks[index + 1].is_some())); }
         }
+        let times = exact::ExactTimes::new(self);
         for layer in &self.layers {
             let Some(owner) = layer.owner_node else { continue };
-            let Some(owner_local) = &clocks[owner] else { out.push(0xff); continue };
-            let local = layer.exact_local(owner_local)?;
+            let Some(owner_local) = &clocks[self.domains.by_node[owner]] else { out.push(0xff); continue };
             for track in &layer.tracks {
-                if let Some(keys) = &track.discrete_keys { out.extend_from_slice(&(keys.upper(&local) as u64).to_le_bytes()); }
+                if let Some(keys) = &track.discrete_keys {
+                    out.extend_from_slice(&(keys.upper(times.read(layer, owner_local)?) as u64).to_le_bytes());
+                }
             }
         }
         Ok(())

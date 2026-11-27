@@ -6,14 +6,15 @@
           let localPos = vertex.position;
 
           // Transform to world space
-          let worldPos = path.model * vec4<f32>(localPos.x, localPos.y, 0.0, 1.0);
+          let model = pathPlacement(models[owner], path.slot);
+          let worldPos = model * vec4<f32>(localPos.x, localPos.y, 0.0, 1.0);
           output.worldPos = worldPos.xy; // Pass world position to fragment shader
           output.position = frameUniforms.viewProjection * worldPos;
 
           // Use pre-calculated depth value
           // For stroke vertices, add a small offset to render on top of fill
           let depthOffset = select(0.0, STROKE_DEPTH_OFFSET, vertex.vertexType > 0.5);
-          output.position.z = path.pathInfo.w + depthOffset;
+          output.position.z = path.depth + depthOffset;
 
           output.instanceId = owner;
           output.isStroke = vertex.vertexType;

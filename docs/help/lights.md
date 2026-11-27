@@ -1,26 +1,18 @@
 LIGHTS
-Area lights emit along local -Z; use target to aim them at the subject.
-Aiming a finite area light rotates its whole emitting surface. Check its transformed
-extent against walls and glazing; its centre being outside does not ensure clearance.
-Inspect direct and reflected source visibility before attributing bright shapes to transport.
-Use one environment light for sky or HDR lighting; RGB render.background is only a backdrop.
-Without an environment light the world is dim grey (0.05).
-std/environment_image takes an Image input. vork std environment preprocesses HDR
-lighting into an environment and a sun; vork std sky provides a sky and sun.
-For `vork std environment`, fps is a positive number or rational string. Use a separate output directory/stem: generated EXR frames must
-not alias input frames, including through symlinks. Invalid rates and output/source
-collisions fail before frame writes. SDK helper fps options remain numeric.
-Sun angle is the full angular diameter in radians; 0 gives sharp shadows.
-Field reference: vork help field light.angle.
-
-Light energy is watts for local lights, W/m² for sun, and a multiplier for environment.
-OpenPBR emission_luminance is cd/m², not light watts; emission_color is linear RGB.
-AgX exposure is stops (radiance multiplied by 2^exposure), default 0; there is no auto-exposure.
-The stdout exposure summary and meta.json report clipped, near-black and mean values.
+Area lights emit along local -Z; target rotates the whole emitter. Check the whole transformed
+emitter against walls/glazing, not just its centre. Check direct and reflected emitter visibility.
+Use one environment for sky/HDR; render.background is camera-only. Without an
+environment the world is dim grey (0.05). std/environment_image takes an Image.
+vork std environment preprocesses HDR into environment + sun; vork std sky
+declares atmosphere + sun. Helper inputs: vork help std --all.
+vork std environment fps is positive numeric or rational; SDK options are numeric.
+Use a separate output directory/stem; EXRs cannot alias sources, even by symlink.
+Invalid rates and aliases refuse before frame writes.
+Sun angle is full diameter in radians; 0 gives sharp shadows.
+Energy: W for local lights, W/m² for sun, multiplier for environment. OpenPBR
+emission_luminance is cd/m²; emission_color is linear RGB. AgX exposure defaults
+to 0 stops (multiplier 2^exposure); no auto-exposure. See vork help render.
 <!-- all -->
-LIGHTING REFERENCE
-std/sky sun direction: [cos(el)*sin(rot),sin(el),-cos(el)*cos(rot)] (radians;
-rot 0 = -Z, pi/2 = +X, matching Blender).
-Use illuminates and shadowed_by for light linking; use shadowed_by: [] for a light without shadows.
-Use std/path for refracted caustics. Final's glass shadows attenuate along straight
-connections; roughness does not spread them with distance.
+std/sky sun direction is [cos(el)*sin(rot),sin(el),-cos(el)*cos(rot)] in radians;
+Rotation matches Blender: rot 0 = -Z, pi/2 = +X. Link with illuminates and shadowed_by; use shadowed_by: []
+for no shadows. Use std/path for refracted caustics; see vork help limits.

@@ -8,12 +8,16 @@ thread_local! {
     static CURRENT: RefCell<Option<Capture>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct Scope(Option<Capture>);
+pub(crate) struct Scope {
+    previous: Option<Capture>,
+    _host: Option<vork_inputs::Scope>,
+}
 impl Drop for Scope {
-    fn drop(&mut self) { CURRENT.with(|c| c.replace(self.0.take())); }
+    fn drop(&mut self) { CURRENT.with(|c| c.replace(self.previous.take())); }
 }
 pub(crate) fn enter(inputs: Option<Capture>) -> Scope {
-    Scope(CURRENT.with(|c| c.replace(inputs)))
+    let host = inputs.as_ref().and_then(|capture| capture.lock().unwrap().host.enter_worker());
+    Scope { previous: CURRENT.with(|c| c.replace(inputs)), _host: host }
 }
 pub(crate) fn current() -> Option<Capture> { CURRENT.with(|c| c.borrow().clone()) }
 pub(crate) fn record(identity: &vork_slang::InputIdentity) -> anyhow::Result<()> {

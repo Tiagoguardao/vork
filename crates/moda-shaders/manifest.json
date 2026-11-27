@@ -3248,17 +3248,6 @@
           "vertex": {
             "buffers": [
               {
-                "arrayStride": 8,
-                "attributes": [
-                  {
-                    "format": "float32x2",
-                    "offset": 0,
-                    "shaderLocation": 0
-                  }
-                ],
-                "stepMode": "vertex"
-              },
-              {
                 "arrayStride": 68,
                 "attributes": [
                   {
@@ -3363,17 +3352,6 @@
           "vertex": {
             "buffers": [
               {
-                "arrayStride": 8,
-                "attributes": [
-                  {
-                    "format": "float32x2",
-                    "offset": 0,
-                    "shaderLocation": 0
-                  }
-                ],
-                "stepMode": "vertex"
-              },
-              {
                 "arrayStride": 68,
                 "attributes": [
                   {
@@ -3477,17 +3455,6 @@
           },
           "vertex": {
             "buffers": [
-              {
-                "arrayStride": 8,
-                "attributes": [
-                  {
-                    "format": "float32x2",
-                    "offset": 0,
-                    "shaderLocation": 0
-                  }
-                ],
-                "stepMode": "vertex"
-              },
               {
                 "arrayStride": 68,
                 "attributes": [

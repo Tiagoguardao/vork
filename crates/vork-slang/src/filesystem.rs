@@ -188,7 +188,42 @@ fn library(executable: &Path) -> Result<PathBuf> {
         executable.display()
     )
 }
+const FILESYSTEM_PROTOCOL: u64 = 2;
+
+struct Adapter;
+impl vork_inputs::Query for Adapter {
+    type Value = Result<vork_inputs::Executable, String>;
+    fn key(&self) -> &Path { Path::new("") }
+    fn read(&self) -> std::io::Result<Self::Value> {
+        match adapter_path() {
+            Ok(path) => {
+                let executable = vork_inputs::Executable::open(&path)?;
+                // The child sends its protocol before reading a request. EOF
+                // after the greeting exercises the real OS launch, including
+                // permissions and the loader, without running a compilation.
+                let hello = Command::new(executable.path()).args(["", ""]).output()?;
+                if hello.status.success() && hello.stdout == FILESYSTEM_PROTOCOL.to_le_bytes() {
+                    Ok(Ok(executable))
+                } else {
+                    Ok(Err(format!("unsupported Slang filesystem protocol from {}", path.display())))
+                }
+            },
+            Err(error) => Ok(Err(format!("{error:#}"))),
+        }
+    }
+}
+pub(super) fn observe_adapter() {
+    let _ = vork_inputs::installed(Adapter);
+}
+
+fn adapter_identity() -> Result<vork_inputs::Executable> {
+    vork_inputs::installed(Adapter)?.map_err(anyhow::Error::msg)
+}
 fn adapter() -> Result<PathBuf> {
+    Ok(adapter_identity()?.path().to_owned())
+}
+
+fn adapter_path() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
     // Resolve launch symlinks when possible. Replacing a running executable
     // (including Cargo rebuilding a test binary) can remove its old directory
@@ -288,7 +323,7 @@ impl Worker {
             }
         });
         let mut worker = Self { child, input, output, stderr, diagnostics: Some(diagnostics) };
-        ensure!(integer(&mut worker.output)? == 2, "unsupported Slang filesystem protocol");
+        ensure!(integer(&mut worker.output)? == FILESYSTEM_PROTOCOL, "unsupported Slang filesystem protocol");
         Ok(worker)
     }
 }
@@ -346,11 +381,11 @@ pub(super) fn compile(
     let adapter = adapter()?;
     // Replacing a toolchain/adapter or changing loader search state cannot keep
     // using the previously loaded compiler. Unidentifiable loaders get one-shot workers.
-    let key = Compiler::new(command.get_program()).toolchain().ok().and_then(|toolchain| {
+    let key = Compiler::new(command.get_program()).checked(None)?.and_then(|toolchain| {
         let mut hash = blake3::Hasher::new();
         hash.update(toolchain.as_bytes());
         hash.update(adapter.as_os_str().as_encoded_bytes());
-        hash.update(&fs::read(&adapter).ok()?);
+        hash.update(adapter_identity().ok()?.digest().as_bytes());
         Some(hash.finalize())
     });
     let retained = WORKER.with(|slot| slot.borrow_mut().take());

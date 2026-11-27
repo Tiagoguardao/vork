@@ -1,19 +1,15 @@
 MATERIALS
+A 2D path can bind a material to its fill or stroke. See vork help paint for the fragment entry and coordinates.
 Use std/openpbr (the default) for constant, image and named attribute inputs.
 Instance attributes are equal-length columns in node.instances.attributes;
 material attribute bindings select a column by name.
-Constant, image and attribute bindings share the shipped evaluator. Custom logic
-needs a surface program; constant OpenPBR parameters do not.
+Custom logic needs a surface program. Data bindings share shipped code.
+Custom surfaces can add first-render compilation.
 OpenPBR defines emission_luminance in cd/m²; currently vork uses its value
 directly as scene-linear radiance. emission_color is linear RGB.
-coat_color tints light beneath the coat, including emission; coat_darkening reduces
-reflected base light. Coat absorption follows the refracted path through the layer.
-std/previs renders emissive-lit scenes using low-sample raster ray lighting and
-warns when material-emitter lighting is approximated. A fast GPU denoiser cleans
-up this preview unless denoise=false was requested. Indirect light, reflections
-and transmission may be noisy or incomplete; use std/final for delivery or std/path
-for more complete light transport. Proven unlit displays and null thin transmission need no warning.
-Emission alone does not make a surface unlit.
+Coat absorption follows the refracted path. coat_color tints beneath the coat, including emission; coat_darkening reduces
+reflected base light. Emission alone does not make a surface unlit. Preview
+emissive-lighting coverage: vork help profiles.
 base_color is linear RGB; base_metalness=1
 makes metal; specular_roughness controls highlight width. Inputs and defaults:
 vork help field material.inputs
@@ -31,13 +27,11 @@ approximation warning per material. Use a volume material for interior scatterin
 <!-- all -->
 MATERIAL REFERENCE
 Solid glass requires closed mesh boundaries; model hollow vessels with a shell.
-For overlapping glass and liquid, assign material.priority (see vork help field
-material.priority). The owning medium supplies both IOR and absorption; hidden
-lower-priority boundaries pass straight through. Equal priorities preserve nested
-replacement: the last entered solid wins. Touching faces cross directly between
-the two media, without an air interface. Thin sheets have no interior.
+Assign material.priority for overlapping solids (vork help field material.priority).
+The owner supplies IOR/absorption; lower-priority boundaries pass through. Touching
+faces cross directly between media; thin sheets have no interior.
 With transmission_depth=0, a closed solid shows the authored transmission_color;
-each thin sheet applies the full tint. Use thin-walled panes for windows.
+each thin sheet applies the full tint.
 Thin-walled subsurface suits leaves, paper and curtains: geometry_thin_walled=true,
 subsurface_weight>0. Set subsurface_color and subsurface_scatter_anisotropy;
 positive anisotropy favours transmission. Radius controls apply to thick objects.
@@ -53,8 +47,7 @@ shading, including mixed metals and thin subsurface. Raster transport remains an
 approximation; use std/path to assess indirect lighting.
 Use constant, texture or named attribute bindings for geometry_opacity and
 alpha_cutoff; camera and ray hits share evaluation, preserving custom surface
-programs and their material animation. Computed instance material
-attributes follow GPU publications, including shutter samples and seeks.
+programs and animation. Computed instance bindings: vork help buffers --all.
 Numeric inputs animate with material tracks. Weighted/additive program tracks
 start from the authored input, or zero when omitted. Untracked inputs retain
 program initializers. Custom shading: vork help programs --all.

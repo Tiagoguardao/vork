@@ -615,7 +615,11 @@ impl Plan {
                 horizon.reach(local.value(), &rate, a);
                 horizon.reach(local.value(), &rate, b);
             }
-            self.sample_layer(*index, self.layer_starts[*index], time, owner_local, tracks.iter().copied(),
+            let numeric = match layer.owner_node {
+                Some(_) => owner_local,
+                None => Some(layer.source.offset + time * layer.source.speed),
+            }.map(|t| layer.looped(t));
+            self.sample_layer(*index, self.layer_starts[*index], numeric, tracks.iter().copied(),
                 |_, flat, track, constant| {
                     if self.subjects[flat].is_some_and(|node| scratch.states[node].local.is_none()) { return Ok(None); }
                     let local = local.as_ref().expect("a sampled layer has a clock");
@@ -643,7 +647,7 @@ impl Plan {
                             spans = !layer.source.looping && if rate > zero() { t >= *times.last().unwrap() } else { t <= times[0] };
                         }
                     }
-                    Ok(Some(TrackRead { upper, exact_local: Some(local.clone()) }))
+                    Ok(Some(TrackRead { upper, exact_local: Some(local) }))
                 }, samples)?;
         }
         Ok(if spans { horizon.end(first, last) } else { first + 1 })

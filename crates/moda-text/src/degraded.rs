@@ -260,6 +260,8 @@ pub enum OutlineSegment {
 }
 
 mod colour_glyphs;
+mod ambient;
+pub use ambient::{FontInputs, FontScope};
 pub use colour_glyphs::{EmojiRaster, ShapedEmoji};
 use colour_glyphs::EmojiFonts;
 
@@ -438,45 +440,42 @@ pub fn install_engine_arc(engine: std::sync::Arc<DegradedEngine>) {
 /// So the blobs are read once and handed to each engine as shared `Arc`s via
 /// `Source::Binary`, the same sharing `from_font_sources_with_aliases` already does for
 /// the VFS lane. One copy in memory, however many engines reference it.
+#[derive(Eq, Hash, PartialEq)]
 struct BakedCatalog {
     sources: Vec<std::sync::Arc<Vec<u8>>>,
-    aliases: HashMap<String, String>,
+    aliases: std::collections::BTreeMap<String, String>,
     dir: PathBuf,
 }
 
 fn baked_catalog() -> Option<&'static BakedCatalog> {
     static BAKED: std::sync::OnceLock<Option<BakedCatalog>> = std::sync::OnceLock::new();
-    BAKED
-        .get_or_init(|| {
-            let dir = resolve_catalog_dir()?;
-            let raw = crate::host::read_file_string(&dir.join("MANIFEST.json")).ok()?;
-            let manifest = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-            let keys = manifest.get("keys")?.as_object()?;
+    BAKED.get_or_init(read_baked_catalog).as_ref()
+}
 
-            // Several keys share one ttfPath (multi-weight files) — read each once.
-            let mut seen: std::collections::BTreeSet<String> = Default::default();
-            let mut sources = Vec::new();
-            for (_, entry) in fallback_set_first(keys) {
-                let Some(rel) = entry.get("ttfPath").and_then(|p| p.as_str()) else {
-                    continue;
-                };
-                if !seen.insert(rel.to_string()) {
-                    continue;
-                }
-                if let Ok(bytes) = crate::host::read_file_bytes(&dir.join(rel)) {
-                    sources.push(std::sync::Arc::new(bytes));
-                }
-            }
-            let aliases = manifest_family_aliases(&manifest, |rel| {
-                crate::host::read_file_bytes(&dir.join(rel)).ok()
-            });
-            Some(BakedCatalog {
-                sources,
-                aliases,
-                dir,
-            })
-        })
-        .as_ref()
+fn read_baked_catalog() -> Option<BakedCatalog> {
+    let dir = resolve_catalog_dir()?;
+    let raw = crate::host::read_file_string(&dir.join("MANIFEST.json")).ok()?;
+    let manifest = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let keys = manifest.get("keys")?.as_object()?;
+
+    let mut by_path = HashMap::new();
+    let mut sources = Vec::new();
+    for (_, entry) in fallback_set_first(keys) {
+        let Some(rel) = entry.get("ttfPath").and_then(|p| p.as_str()) else { continue };
+        by_path.entry(rel).or_insert_with(|| {
+            let bytes = std::sync::Arc::new(crate::host::read_file_bytes(&dir.join(rel)).ok()?);
+            sources.push(bytes.clone());
+            Some(bytes)
+        });
+    }
+    let aliases = manifest_family_aliases(&manifest, |rel| {
+        by_path.get(rel)?.as_deref().cloned()
+    });
+    Some(BakedCatalog {
+        sources,
+        aliases: aliases.into_iter().collect(),
+        dir,
+    })
 }
 
 /// Build a Degraded engine layering `catalog_dir` OVER the shared baked catalog, keeping the
@@ -575,6 +574,17 @@ fn compose_catalog_engine_from_snapshot(
         db.load_fonts_dir(dir);
     }
 
+    compose_loaded(db, baked, catalog_dir, manifest, canvas, allow_system)
+}
+
+fn compose_loaded(
+    mut db: fontdb::Database,
+    baked: Option<&BakedCatalog>,
+    catalog_dir: &std::path::Path,
+    manifest: Option<&serde_json::Value>,
+    canvas: bool,
+    allow_system: bool,
+) -> DegradedEngine {
     // Baked first (shared blobs, one copy per process), per-canvas second so it WINS
     // the families it supplies — `a_per_canvas_family_beats_the_baked_one_of_the_same_name`
     // covers the alias route; the raw tie-break itself is tested separately.
@@ -3568,7 +3578,7 @@ mod tests {
 
         let baked = BakedCatalog {
             sources: vec![std::sync::Arc::new(std::fs::read(&lato).expect("read"))],
-            aliases: baked_aliases,
+            aliases: baked_aliases.into_iter().collect(),
             dir: baked_dir,
         };
         let html =
@@ -3645,7 +3655,7 @@ mod tests {
 
         let baked = BakedCatalog {
             sources: vec![std::sync::Arc::new(std::fs::read(&lato).expect("read"))],
-            aliases: baked_aliases,
+            aliases: baked_aliases.into_iter().collect(),
             dir: baked_dir,
         };
         let html =

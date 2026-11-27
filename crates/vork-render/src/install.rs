@@ -399,6 +399,7 @@ impl Default for InstallOptions {
 }
 
 pub struct InstalledScene {
+    pub(crate) warnings: crate::warnings::Notices,
     pub(crate) opened: crate::footage::Opened,
     pub(crate) static_resources: StaticResources,
     pub(crate) editable_bindings: std::collections::BTreeMap<String, (usize, vork_slang::InputLayout)>,
@@ -628,19 +629,23 @@ impl InstalledScene {
         let compiler_inputs = programs::session_inputs::current();
         let warnings = crate::warnings::Collector::current();
         let (display_program, mut environment, environment_install_ms) = std::thread::scope(|scope| -> Result<_> {
-            let environment = scope.spawn(|| -> Result<_> {
+            let environment = scope.spawn(|| {
                 let _revision = revision_files.enter();
                 let _inputs = programs::session_inputs::enter(compiler_inputs.clone());
                 let _warning_scope = warnings.as_ref().map(|collector| collector.enter());
-                let start = Instant::now();
-                let environment = if scene_inputs {environment::Environment::new_in(
-                    r, environment_node::Settings::from_scene(&scene)?, &scene, base, opened,
-                )?} else {environment::Environment::unused(r)};
-                Ok((environment, start.elapsed().as_secs_f64() * 1000.))
+                crate::warnings::Notices::defer(|| -> Result<_> {
+                    let start = Instant::now();
+                    let environment = if scene_inputs {environment::Environment::new_in(
+                        r, environment_node::Settings::from_scene(&scene)?, &scene, base, opened,
+                    )?} else {environment::Environment::unused(r)};
+                    Ok((environment, start.elapsed().as_secs_f64() * 1000.))
+                })
             });
             let display = crate::display_program::prepare(r, &scene, base, options.display, opened, options.view_picture)
                 .and_then(|program| program.install(r));
-            let environment = environment.join().map_err(|_| anyhow::anyhow!("environment installation worker panicked"))?;
+            let (environment, notices) = environment.join().map_err(|_| anyhow::anyhow!("environment installation worker panicked"))?;
+            // Publish after display preparation, in either worker completion order.
+            notices.replay();
             let (environment, elapsed) = environment?;
             Ok((display?, environment, elapsed))
         })?;
@@ -2114,7 +2119,7 @@ impl InstalledScene {
                     let image=input.images.get(name).context("missing emitter profile image")?;
                     let file=image.file.as_ref().context("local emission profiles require an IES file")?;
                     let path=base.join(file);
-                    let bytes = std::fs::read(&path).with_context(||format!("read emission profile {}",path.display()))?;
+                    let bytes = opened.files.source(&path).read().with_context(||format!("read emission profile {}",path.display()))?;
                     let profile = crate::ies::parse(&bytes)
                         .map_err(|error| crate::texture_source::decode_context(error, "decode IES emission profile", &path))
                         .with_context(|| format!("images.{name}.file: expected LM-63 Type C photometry"))?;
@@ -2239,7 +2244,7 @@ impl InstalledScene {
         let mut post_materials=std::collections::BTreeSet::new();
         let mut add=|names:&[vork_scene::v2::CompositeEntry]| {
             let (_,live)=compositor::dependencies(&compositor,names);
-            post_materials.extend(names.iter().zip(live).filter(|(_,live)|*live).map(|(entry,_)|entry.material().clone()));
+            post_materials.extend(names.iter().zip(live).filter(|(_,reader)|reader.is_some()).map(|(entry,_)|entry.material().clone()));
         };
         if output_dependencies.color {add(input.compositor());}
         for name in &planned_image_order {add(input.images[name].compositor());}
@@ -3072,6 +3077,7 @@ impl InstalledScene {
             ensure!(capture.lock().unwrap().valid(), "compiler inputs changed during installation; retry the command");
         }
         Ok(Self {
+            warnings: Default::default(),
             opened: opened.clone(),
             compiler_inputs,
             editable_bindings,

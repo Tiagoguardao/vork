@@ -140,8 +140,10 @@ pub(crate) struct PathItem {
     linejoin: v2::LineJoin,
     miterlimit: f32,
     dasharray: Vec<f32>,
+    sampled_dash: Option<moda_scene::dash::DashList>,
     path_length: Option<f32>,
     stroke_first: bool,
+    pub(super) paint_clock: u32,
     /// The static values the tracks key from.
     pub values: PathValues,
 }
@@ -159,15 +161,25 @@ impl PathItem {
             measure_path(&cmds, &self.closed)
         }
     }
+    pub(crate) fn set_dash(&mut self, dash: &moda_scene::dash::DashList) {
+        match dash {
+            moda_scene::dash::DashList::Lengths(lengths) => {
+                self.dasharray = lengths.iter().map(|value| *value as f32).collect();
+            }
+            moda_scene::dash::DashList::Mix(..) => self.sampled_dash = Some(dash.clone()),
+        }
+    }
+
     fn stroke_coverage(&self) -> bool {
         matches!(&self.stroke, PaintSource::Moda(p) if matches!(p["type"].as_str(), Some("image" | "conic")) && !missing_media(p))
     }
 }
-/// A paint resolved against its path: nothing, a colour, or Moda's paint JSON (a gradient or an image).
+/// A paint resolved against its path and the installed material table.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PaintSource {
     None,
     Color([f32; 4]),
+    Program(moda_scene::paint::PathProgram),
     Moda(Value),
 }
 
@@ -204,7 +216,7 @@ impl PathItem {
         match if fill { &self.fill } else { &self.stroke } {
             PaintSource::Color(_) => Some(PaintForm::Solid),
             PaintSource::Moda(paint) => PaintForm::of_gradient(paint),
-            PaintSource::None => None,
+            PaintSource::None | PaintSource::Program(_) => None,
         }
     }
 }
@@ -214,13 +226,23 @@ impl PaintSource {
     pub fn json(&self) -> Option<Value> { match self {
         Self::None => None,
         Self::Color(c) => Some(json!({"type": "solid", "color": vork_std::moda::moda_color(*c)})),
+        Self::Program(binding) => Some(program_record(*binding)),
         Self::Moda(p) => Some(p.clone()),
     } }
+}
+
+fn program_record(binding: moda_scene::paint::PathProgram) -> Value {
+    static LAYOUT: std::sync::LazyLock<RecordLayout<6>> = std::sync::LazyLock::new(|| {
+        RecordLayout::new([K::Type, K::Unit, K::Inputs, K::StrokeUv, K::Clock, K::Site])
+    });
+    LAYOUT.record(["program".into(), binding.unit.into(), binding.inputs.into(),
+        binding.stroke_uv.into(), binding.clock.into(), binding.site.into()])
 }
 
 pub(crate) fn resolve_paint(images: &v2::Table<v2::Image>, base: &Path, paint: &v2::Paint, bounds: Option<[f64; 4]>, here: &str, media: &Media) -> Result<PaintSource> {
     Ok(match paint {
         v2::Paint::None(_) => PaintSource::None,
+        v2::Paint::Material(p) => media.program(&p.material)?,
         v2::Paint::Css(text) if text.contains("gradient(") => {
             let Some(bounds) = bounds else { return Ok(PaintSource::None) };
             PaintSource::Moda(gradient_paint(text, bounds).with_context(|| here.to_string())?)
@@ -753,8 +775,9 @@ pub(crate) fn sampled_path_item(images: &v2::Table<v2::Image>, base: &Path, node
         linejoin: *stroke_linejoin,
         miterlimit: *stroke_miterlimit,
         dasharray: stroke_dasharray.lengths().to_vec(),
+        sampled_dash: None,
         path_length: *path_length,
-        stroke_first: paint_order.stroke_first(),
+        stroke_first: paint_order.stroke_first(), paint_clock: 0,
         values: PathValues {
             fill: fill_color,
             stroke: stroke_color,
@@ -780,8 +803,10 @@ pub(super) enum MediaPublication { Frame, Missing }
 
 /// Image names own clocks and publication keys. Visible source pictures own decoders.
 pub(crate) struct Media {
+    pub(super) files: crate::asset_revision::SourceFiles,
     /// Sound can resolve the same paints using metadata alone.
     pub(super) publish_assets: bool,
+    pub(super) paints: Arc<crate::canvas_program::Paints>,
     images: Vec<MediaImage>,
     reader_items: Vec<usize>,
     sources: Vec<crate::footage::Source>,
@@ -832,6 +857,11 @@ fn paint_is_srgb(image: &v2::Image) -> bool {
     image.is_srgb() && matches!(image.color_space, None | Some(v2::ColorSpace::Srgb))
 }
 impl Media {
+    fn program(&self, name: &str) -> Result<PaintSource> {
+        let binding = self.paints.bindings.get(name).with_context(|| format!("unknown path material {name:?}"))?;
+        Ok(PaintSource::Program(*binding))
+    }
+
 
     pub(super) fn reader_items(&self) -> &[usize] { &self.reader_items }
     pub(crate) fn is_empty(&self) -> bool { self.images.is_empty() }
@@ -910,7 +940,7 @@ impl Media {
             };
             images.push(MediaImage { src, name, path, source, size, time: image.time.clone(), frame });
         }
-        Ok(Self { publish_assets: wanted.is_none(), images, reader_items, sources, live,
+        Ok(Self { paints: Default::default(), files: opened.files.clone(), publish_assets: wanted.is_none(), images, reader_items, sources, live,
             device: Default::default(),
             fps: scene.render.fps, max_side: u32::MAX, decoded_texels })
     }
@@ -979,6 +1009,7 @@ pub(crate) fn resolve_animated_paint(images: &v2::Table<v2::Image>, base: &Path,
             Ok(match paint {
                 P::None => PaintSource::None,
                 P::Color(c) => PaintSource::Color(*c),
+                P::Material(name) => media.program(name)?,
                 P::Image(v) => PaintSource::Moda(image_paint(images,base,&serde_json::from_value(v.clone())?,bounds,media)?),
                 P::Gradient(s) => PaintSource::Moda(gradient_paint(s,bounds)?),
                 P::Mix(a,b,t) => {
@@ -999,6 +1030,7 @@ impl PathItem {
         let paint=match paint {
             P::None=>PaintSource::None,
             P::Color(color)=>PaintSource::Color(*color),
+            P::Material(name)=>media.program(name)?,
             _=>{let Some(bounds)=self.bounds else {return Ok(())};resolve_animated_paint(images,base,bounds,paint,media)?},
         };
         let color=if let PaintSource::Color(c)=&paint {Some(*c)} else {None};
@@ -1011,7 +1043,7 @@ pub(crate) fn blend_paint(a:&PaintSource,b:&PaintSource,t:f32,bounds:[f64;4])->R
     if t<=0. || a==b {return Ok(a.clone())} if t>=1. {return Ok(b.clone())}
     Ok(match (a,b) {
         (PaintSource::Color(a),PaintSource::Color(b))=>PaintSource::Color(crate::animation::style::color_mix(*a,*b,t)),
-        (PaintSource::Moda(a),PaintSource::Moda(b)) if a["type"]!="image" && b["type"]!="image"=>PaintSource::Moda(mix_gradient_values(a,b,t,bounds)?),
+        (PaintSource::Moda(a),PaintSource::Moda(b)) if a["stops"].is_array() && b["stops"].is_array()=>PaintSource::Moda(mix_gradient_values(a,b,t,bounds)?),
         _=>if t<0.5 {a.clone()}else{b.clone()},
     })
 }
@@ -1117,6 +1149,15 @@ fn mix_gradient_values(left:&Value,right:&Value,t:f32,bounds:[f64;4])->Result<Va
     Ok(result)
 }
 
+const EXPLICIT_SRGB_PAINT: &str = "vork-srgb-paint:";
+
+fn still_paint_source(key: &str) -> (&str, bool, bool) {
+    let natural = moda_assets::natural_source(key);
+    let source = natural.unwrap_or(key);
+    let declared = source.strip_prefix(EXPLICIT_SRGB_PAINT);
+    (crate::asset_revision::SourceFile::paint_name(declared.unwrap_or(source)), natural.is_some(), declared.is_some())
+}
+
 /// An image paint (`{image, fit}`) as Moda's: CSS `object-fit` in the path's box, or, without `fit`, the image at
 /// its natural size from the box's top-left corner, repeated (the image's `wrap_s` and `wrap_t`, glTF's
 /// `repeat` by default, as a CSS background repeats).
@@ -1137,10 +1178,10 @@ fn image_paint(images: &v2::Table<v2::Image>, base: &Path, paint: &v2::ImagePain
     let (nw, nh, src) = match binding {
         Some(item) => (item.size[0], item.size[1], item.src.as_ref().clone()),
         None => {
-            let (width, height, source) = match image::image_dimensions(&path) {
+            let input = media.files.source(&path);
+            let (width, height, source) = match input.dimensions(true) {
                 Ok((width, height)) => {
-                    let source = std::fs::canonicalize(&path).unwrap_or(path);
-                    (width, height, source.display().to_string())
+                    (width, height, input.paint_key()?)
                 }
                 Err(image::ImageError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     // Keep a texture so fit, crop and tiling keep their normal 1×1 semantics.
@@ -1148,12 +1189,15 @@ fn image_paint(images: &v2::Table<v2::Image>, base: &Path, paint: &v2::ImagePain
                         "data:image/png;base64,",
                         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z/AfAAQAAf8iCjrwAAAAAElFTkSuQmCC",
                     );
-                    crate::warnings::dropped("missing_image", serde_json::json!({"file":path}),
+                    crate::warnings::dropped("missing_image", serde_json::json!({"file":input.name}),
                         "using a 1x1 magenta texture; restore the image or correct its path.".into());
                     (1, 1, MAGENTA_PNG.into())
                 }
-                Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+                Err(error) => return Err(error).with_context(|| format!("read {}", input.name.display())),
             };
+            let source = if image.color_space == Some(v2::ColorSpace::Srgb) {
+                format!("{EXPLICIT_SRGB_PAINT}{source}")
+            } else { source };
             let source = if media.decoded_texels { moda_assets::natural_key(&source) } else { source };
             (width, height, source)
         }
@@ -1800,7 +1844,7 @@ impl Retained {
                                 let v = new.path.unwrap_or(path.values);
                                 let (fill, stroke) = paints.get_or_insert_with(|| {
                                     let writer = Writer { nodes: &[], values, list: Vec::new(), children: Vec::new(), bindings: Vec::new(), transform_path: Vec::new(), masks: 0, mask_paint_items: BTreeSet::new() };
-                                    writer.path_paints(path, &v)
+                                    writer.path_paints(item, path, &v)
                                 });
                                 // Each part's share of the paints, as `Writer::body_inner` gives it.
                                 match part {
@@ -2407,7 +2451,7 @@ impl Writer<'_> {
                     return Ok(None);
                 }
                 let v = self.values[i].path.unwrap_or(path.values);
-                let (fill, stroke) = self.path_paints(path, &v);
+                let (fill, stroke) = self.path_paints(i, path, &v);
                 static PATH: std::sync::LazyLock<RecordLayout<9>> = std::sync::LazyLock::new(|| RecordLayout::new([
                     K::Id, K::Type, K::X, K::Y, K::Points, K::Closed, K::FillRule, K::Fills, K::Strokes,
                 ]));
@@ -2461,11 +2505,14 @@ impl Writer<'_> {
         }
     }
 
-    fn path_paints(&self, path: &PathItem, v: &PathValues) -> (Option<Value>, Option<Value>) {
+    fn path_paints(&self, item: usize, path: &PathItem, v: &PathValues) -> (Option<Value>, Option<Value>) {
         static SOLID: std::sync::LazyLock<RecordLayout<2>> = std::sync::LazyLock::new(|| RecordLayout::new([K::Type, K::Color]));
         static FILL: std::sync::LazyLock<RecordLayout<3>> = std::sync::LazyLock::new(|| RecordLayout::new([K::Id, K::Paint, K::Opacity]));
         let [fill, stroke] = path.paints(v).map(|source| match source.as_ref() {
             PaintSource::Color(color) => Some(SOLID.record(["solid".into(), vork_std::moda::moda_color(*color).into()])),
+            PaintSource::Program(binding) => Some(program_record(moda_scene::paint::PathProgram {
+                clock: path.paint_clock, site: item as u32, ..*binding
+            })),
             PaintSource::Moda(paint) if missing_media(paint) => Some(SOLID.record(["solid".into(), "#00000000".into()])),
             PaintSource::Moda(paint) => Some(paint.clone()),
             PaintSource::None => None,
@@ -2484,10 +2531,14 @@ impl Writer<'_> {
             "join": match path.linejoin { v2::LineJoin::Miter => "miter", v2::LineJoin::Round => "round", v2::LineJoin::Bevel => "bevel" },
             "miterLimit": path.miterlimit});
         let sum: f32 = path.dasharray.iter().sum();
-        if sum > 0. {
+        if sum > 0. || path.sampled_dash.is_some() {
             let length_scale = path.path_length.map_or(1., |authored| path.length / f64::from(authored));
             let to_moda = |px: f64| px * length_scale * 2. / width;
-            layer["dash"] = path.dasharray.iter().map(|v| to_moda(f64::from(*v))).collect();
+            if let Some(list) = &path.sampled_dash {
+                layer["sampledDash"] = json!(moda_scene::dash::SampledDash { list: list.clone(), scale: length_scale });
+            } else {
+                layer["dash"] = path.dasharray.iter().map(|v| to_moda(f64::from(*v))).collect();
+            }
             layer["dashOffset"] = json!(to_moda(f64::from(v.stroke_dashoffset)));
         }
         layer
@@ -2535,10 +2586,10 @@ pub(crate) fn install_captures(captures: &[(String, [u32; 2], u64)]) {
 /// Every image the paths paint, read and decoded once into Moda's asset store (`moda_assets::engine_seam`),
 /// which Moda's frame walk reads them from. A paint's `src` is the store's key: a path, or the path's natural
 /// key for a canvas that takes decoded texels (`Media::decoded_texels`), which Moda's loader prepares so.
-pub(crate) fn install_images(nodes: &[&Node], text_paints: &[&PaintSource]) -> Result<()> {
+pub(crate) fn install_images(files: &crate::asset_revision::SourceFiles, nodes: &[&Node], text_paints: &[&PaintSource]) -> Result<()> {
     let _decode = moda_engine::prof::span("canvas.input_decode");
     let installed=moda_assets::engine_seam::installed();
-    let mut requests = Vec::new();
+    let mut requests = BTreeSet::new();
     let paints = nodes.iter().flat_map(|node| match &node.kind {
         Kind::Path(path) => vec![&path.fill, &path.stroke],
         _ => Vec::new(),
@@ -2548,17 +2599,30 @@ pub(crate) fn install_images(nodes: &[&Node], text_paints: &[&PaintSource]) -> R
             if let Some(src) = paint.get("src").and_then(Value::as_str) {
                 if src.starts_with(MEDIA_PREFIX) { continue; }
                 if installed.as_ref().is_some_and(|s|s.dimensions(src).is_some()){continue;}
-                requests.push(moda_assets::PrefetchRequest { src: src.to_string(), min_raster_size: None, node_id: None });
+                requests.insert(src.to_string());
             }
         }
     }
     if requests.is_empty() {
         return Ok(());
     }
-    let (store, report) = moda_assets::prefetch_blocking(requests, &moda_assets::PrefetchConfig::default());
-    if let Some(failure) = report.failures.first() {
-        bail!("image {}: {}", moda_assets::natural_source(&failure.url).unwrap_or(&failure.url), failure.reason);
-    }
+    let store = moda_assets::fetch::prefetch_canvas_rasters(&requests, still_paint_source, |src| {
+        let input = files.source(Path::new(src));
+        input.read().with_context(|| format!("read {}", input.name.display()))
+    }, |src, bytes, natural, srgb| {
+        // The missing-file swatch is an untagged PNG embedded in the renderer.
+        if src.starts_with("data:") {
+            return if natural { moda_assets::decode::prepare_raster_natural(bytes) }
+                else { moda_assets::decode::prepare_raster(bytes) };
+        }
+        let input = files.source(Path::new(src));
+        let path = &input.name;
+        let decoded = crate::texture_source::decode_canvas_still(path, bytes, srgb.then_some(v2::ColorSpace::Srgb))
+            .map_err(|error| crate::texture_source::decode_context(error, "image decode", path))?;
+        let (width, height) = (decoded.width(), decoded.height());
+        moda_assets::decode::prepare_rgba(decoded.into_rgba8().into_raw(), width, height, !natural, false)
+            .with_context(|| format!("prepare image {}", path.display()))
+    })?;
     // Animated paints can discover different images on concurrent frame workers.
     // Publish additions together: separate read/replace operations could lose another
     // worker's newly decoded image and leave its draw with a loading placeholder.
@@ -2594,6 +2658,7 @@ pub(crate) fn restore_images(held: Images) {
 
 /// A frame retains the host text builder for deferred mask captures as well as its initial walk.
 pub(crate) struct Plan {
+    translation: Option<moda_engine::frame::GroupTranslation>,
     picture_text: std::rc::Weak<CanvasTextFn>,
     resources: [u64; 2],
     coverage: std::sync::Arc<moda_engine::seams::CoveragePlan>,
@@ -2625,7 +2690,7 @@ pub(super) struct SharedPlan {
 
 impl Plan {
     pub(super) fn shared(&self) -> Option<SharedPlan> {
-        if self.addresses.is_some() { return None; }
+        if self.addresses.is_some() || self.translation.is_some() { return None; }
         Some(SharedPlan { coverage: self.coverage.clone(), record_budget: self.packet.then_some(self.record_budget.available), scene: self.scene, resources: self.resources, key: moda_engine::frame::PlanKey {
             owner: self.scene.0, revision: self.revision,
         } })
@@ -2710,12 +2775,17 @@ pub(crate) fn plan(
     text: CanvasTextBuilder,
 ) -> Result<Plan> {
 
-    let mut result = plan_for_draw(retained, page, text)?;
+    let mut result = plan_for_draw(retained, page, text, PlanUse::Snapshot)?;
     result.materialize(retained)?;
     Ok(result)
 }
 
-pub(super) fn plan_for_draw(retained: &mut Retained, page: &Page, text: CanvasTextBuilder) -> Result<Plan> {
+/// A serial packet can bind its parent's translation at submission. Readers of a
+/// snapshot (queries and independent GPU workers) need ordinary current matrices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanUse { Packet, Snapshot }
+
+pub(super) fn plan_for_draw(retained: &mut Retained, page: &Page, text: CanvasTextBuilder, usage: PlanUse) -> Result<Plan> {
     // Restoring trimmed spans can tessellate and shape text. Retire optional
     // lanes before growing the serial working set to restore those outputs.
     if retained.plan_index.needs_materialization() { crate::canvas_host_memory::require_serial_growth()?; }
@@ -2786,6 +2856,15 @@ pub(super) fn plan_for_draw(retained: &mut Retained, page: &Page, text: CanvasTe
         combined.dedup();
         &combined[..]
     } else if patchable { moved } else { &[] };
+    if usage == PlanUse::Packet && batch && let [row] = rows && let Some(revision) = from
+        && let Some((coverage, translation)) = retained.plan_index.translated_group(&retained.scene, &opts, *row) {
+        moda_engine::text_draw::install_text_builder(None);
+        moda_engine::text_draw::install_text_painter(None);
+        return Ok(Plan { addresses: retained.plan_index.addresses(&coverage), options: opts,
+            record_budget: retained.plan_index.record_budget(), picture_text, resources, coverage,
+            translation: Some(translation), change: None, revision, packet: true, text: builder,
+            scene: (retained.id, generation) });
+    }
     let patched = retained.plan_index.update(&retained.scene, &retained.hashes, &opts, generation,
         frame_key, rows, batch, &mut retained.caches);
     drop(patch_profile);
@@ -2801,7 +2880,7 @@ pub(super) fn plan_for_draw(retained: &mut Retained, page: &Page, text: CanvasTe
             // The plan as it stands: the same state.
             Some((plan, warnings)) => Ok((plan, warnings, None, from)),
             None if from.is_some() && crate::canvas_host_memory::require_serial_growth().is_err() => {
-                Err(wgpu::optional_allocations::Refused.into())
+                Err(crate::canvas_host_memory::SerialGrowth.into())
             }
             None => {
                 collect_page(retained, &opts, frame_key).map(|(plan, warnings, before)|
@@ -2823,7 +2902,7 @@ pub(super) fn plan_for_draw(retained: &mut Retained, page: &Page, text: CanvasTe
     warnings.ensure_drawn()?;
     let packet = retained.plan_index.holds(&plan);
     let addresses = retained.plan_index.addresses(&plan);
-    Ok(Plan { addresses, options: opts, record_budget: retained.plan_index.record_budget(), picture_text, resources, coverage: plan, change, revision, packet, text: builder, scene: (retained.id, generation) })
+    Ok(Plan { translation: None, addresses, options: opts, record_budget: retained.plan_index.record_budget(), picture_text, resources, coverage: plan, change, revision, packet, text: builder, scene: (retained.id, generation) })
 }
 
 fn collect_page(retained: &mut Retained, opts: &moda_engine::RenderOptions, key: u64)
@@ -2839,14 +2918,16 @@ fn collect_page(retained: &mut Retained, opts: &moda_engine::RenderOptions, key:
 
 impl Plan {
     pub(super) fn materialize(&mut self, retained: &mut Retained) -> Result<()> {
-        if self.addresses.is_none() { return Ok(()); }
+        if self.addresses.is_none() && self.translation.is_none() { return Ok(()); }
         self.restore_or_collect(retained)
     }
 
     fn restore_or_collect(&mut self, retained: &mut Retained) -> Result<()> {
         moda_engine::text_draw::install_text_builder(Some(self.text.clone()));
-        let full = retained.plan_index.materialize(&self.coverage, &retained.scene, &retained.hashes,
-            &self.options, &mut retained.caches);
+        let full = if self.translation.take().is_some() { None } else {
+            retained.plan_index.materialize(&self.coverage, &retained.scene, &retained.hashes,
+                &self.options, &mut retained.caches)
+        };
         let translated = full.is_some() && match &mut self.change {
             Some((_, Change::Written(written))) => {
                 self.addresses.as_ref().is_some_and(|a| written.materialize(a).is_some())
@@ -2993,6 +3074,15 @@ impl Engine {
         let cache_registration = renderer.residency.register(engine.frame_cache_reclaimer());
         Self { inner: engine, cache_registration, reuse_picture: true, publishing: Default::default(), published: Default::default(), held: Default::default(), picture_hits: Default::default() }
     }
+    pub(super) fn path_programs(&self, sources: &std::sync::Arc<[moda_engine::paint::PathProgramSource]>, words: &[u32], errors: Option<&wgpu::Buffer>) -> Result<()> {
+        if self.inner.set_path_programs(sources, words, errors)? { self.held.borrow_mut().take(); }
+        Ok(())
+    }
+
+    pub(super) fn serial_mask_captures(&self) -> u64 { self.inner.serial_mask_captures() }
+
+    pub(super) fn publishing(&self) -> bool { self.publishing.get() }
+
     pub(super) fn publish_masks(&self, enabled: bool) -> moda_engine::frame::SharedCaptures {
         let previous = self.publishing.replace(enabled);
         if enabled && !previous {
@@ -3031,6 +3121,7 @@ impl Engine {
             return Ok(picture.texture.clone());
         }
         self.held.borrow_mut().take();
+        self.inner.clear_path_errors();
         let result = self.inner.render_shared_plan_to_texture(&plan.coverage, plan.key, plan.record_budget, captures);
         self.inner.drop_deferred();
         if let Ok(texture) = &result && plan.resources == resources && resources == picture_resources() {
@@ -3093,11 +3184,12 @@ impl Engine {
     }
     fn draw_revision(&self, plan: &mut Plan, retained: &mut Retained) -> Result<wgpu::Texture> {
         if let Some(texture) = self.picture(plan.scene, &plan.picture_text) { return Ok(texture); }
+        self.inner.clear_path_errors();
         // All owner revisions attempt the same packet write, including a fully resident plan.
         let key = moda_engine::frame::PlanKey { owner: plan.scene.0, revision: plan.revision };
         if plan.packet && plan.resources == picture_resources() {
             self.cache_registration.touch();
-            if let Some(texture) = self.inner.try_owned_bundle(&plan.coverage, key, plan.packet_change().as_ref(), plan.addresses.as_deref()) {
+            if let Some(texture) = self.inner.try_translated_bundle(&plan.coverage, key, plan.packet_change().as_ref(), plan.addresses.as_deref(), plan.translation) {
                 if self.reuse_picture {
                     *self.held.borrow_mut() = Some(HeldPicture { scene: plan.scene, source: PictureSource::Serial(plan.picture_text.clone()),
                         resources: plan.resources, texture: texture.clone() });
@@ -3276,7 +3368,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("hdr.mkv");
         ensure!(std::process::Command::new("ffmpeg").args(["-v", "error", "-f", "lavfi", "-i",
-            "color=s=64x48", "-frames:v", "1", "-c:v", "ffv1", "-color_trc", "smpte2084"])
+            "color=s=64x48,setparams=color_trc=smpte2084", "-frames:v", "1", "-c:v", "ffv1"])
             .arg(&path).status()?.success(), "encode PQ fixture");
         let mut scene: vork_scene::Scene = serde_json::from_value(serde_json::json!({
             "version": 2, "composition": {"space": "2d"},
@@ -3346,7 +3438,7 @@ mod tests {
         scene.continue_stamps_from(&retained.scene);
         retained.scene = scene;
         let draw = |r: &mut Retained| -> Result<_> {
-            let p = plan_for_draw(r, &page, text.clone())?;
+            let p = plan_for_draw(r, &page, text.clone(), PlanUse::Packet)?;
             let mask = &p.masks[0];
             let key = mask.image.as_ref().unwrap().rendered.as_ref().unwrap().cache_key.unwrap();
             Ok((key, mask.origin, p.page_size))
@@ -3380,7 +3472,7 @@ mod tests {
         let mut page = Page { size: [64, 48], scale: [1.; 2], offset: [0.; 2], background: Some([1., 0., 0., 1.]), working: None };
         let text: CanvasTextBuilder = std::rc::Rc::new(|_, _, _, _, _, _, _, _| Ok(None));
         let mut retained = Retained::new(&page, &[], &[])?;
-        let mut planned = plan_for_draw(&mut retained, &page, text.clone())?;
+        let mut planned = plan_for_draw(&mut retained, &page, text.clone(), PlanUse::Packet)?;
         let old = format!("{:?}", planned.coverage);
         page.background = Some([0., 1., 0., 1.]);
         retained.update(&page, &[], &[])?;
@@ -3568,24 +3660,82 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lowered_group_opacity_writes_only_composition_outputs() -> Result<()> {
+    fn grouped_disks() -> Result<(Vec<Node>, Vec<Values>, Page)> {
         use std::sync::Arc;
         let path = Arc::new(PathItem {
             points: moda_points(&vork_std::moda::path_commands("M-2 0A2 2 0 1 0 2 0A2 2 0 1 0-2 0Z")?.0),
             closed: true.into(), bounds: None, length: 0.,
             fill: PaintSource::Color([1.,0.,0.,1.]), stroke: PaintSource::None,
             fill_rule: Default::default(), linecap: Default::default(), linejoin: Default::default(),
-            miterlimit: 4., dasharray: Vec::new(), path_length: None, stroke_first: false,
+            miterlimit: 4., dasharray: Vec::new(), sampled_dash: None, path_length: None, stroke_first: false, paint_clock: 0,
             values: PathValues {fill:Some([1.,0.,0.,1.]),stroke:None,stroke_width:0.,stroke_dashoffset:0.,fill_opacity:1.,stroke_opacity:1.},
         });
         let mut nodes = vec![Node {parent:None,clip_path:None,mask:None,mask_type:Default::default(),blend:Default::default(),isolation:Default::default(),filter:Default::default(),kind:Kind::Group}];
         nodes.extend((0..40).map(|_| Node {parent:Some(0),clip_path:None,mask:None,mask_type:Default::default(),blend:Default::default(),isolation:Default::default(),filter:Default::default(),kind:Kind::Path(path.clone())}));
         let mut values = vec![Values {style_revision:0,transform:Default::default(),visible:true,opacity:1.,
             path:Some(path.values),texts:0,text_composition:Vec::new(),world:None,text_revision:0,text_paint_revisions:Default::default()};nodes.len()];
-        values[0].path=None; values[0].opacity=0.6;
+        values[0].path=None;
         for (i, value) in values.iter_mut().enumerate().skip(1) { value.transform.translation=[8. + i as f32 * 2.,40.,0.]; }
         let page=Page {size:[320,180],scale:[1.,1.],offset:[0.,0.],background:None,working:None};
+        Ok((nodes, values, page))
+    }
+
+    #[test]
+    fn translated_lowered_group_materializes_the_same_order_and_values_as_a_fresh_plan() -> Result<()> {
+        let (nodes, mut values, page) = grouped_disks()?;
+        let refs: Vec<_> = nodes.iter().collect();
+        let builder: CanvasTextBuilder = std::rc::Rc::new(|_,_,_,_,_,_,_,_| Ok(None));
+        let mut retained = Retained::new(&page, &refs, &values)?;
+        plan(&mut retained, &page, builder.clone())?;
+        for (row, x) in [(0, 0.21333334), (0, 7.45), (0, -0.65), (1, 13.25)] {
+            values[row].transform.translation[0] = x;
+            assert!(retained.write(&page, |i| refs[i], &values, &[(row, change::TRANSLATION)])?);
+            let mut prepared = plan_for_draw(&mut retained, &page, builder.clone(), PlanUse::Packet)?;
+            assert_eq!(prepared.translation.is_some(), row == 0);
+            if row != 0 || x < 0. {
+                prepared.materialize(&mut retained)?;
+                let mut fresh = Retained::new(&page, &refs, &values)?;
+                let expected = plan(&mut fresh, &page, builder.clone())?;
+                assert_eq!(format!("{:?}", prepared.coverage), format!("{:?}", expected.coverage));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parent_pan_resumes_after_a_child_step_and_publishes_current_worker_matrices() -> Result<()> {
+        let (nodes, mut values, page) = grouped_disks()?;
+        let refs: Vec<_> = nodes.iter().collect();
+        let text: CanvasTextBuilder = Rc::new(|_, _, _, _, _, _, _, _| Ok(None));
+        let mut retained = Retained::new(&page, &refs, &values)?;
+        plan(&mut retained, &page, text.clone())?;
+
+        // A nonintegral parent pose straddles an exponent boundary for this child.
+        values[0].transform.translation[0] = 5.3333335;
+        values[1].transform.translation[0] = 15.25;
+        retained.write(&page, |i| refs[i], &values, &[(0, change::TRANSLATION), (1, change::TRANSLATION)])?;
+        let changed = plan_for_draw(&mut retained, &page, text.clone(), PlanUse::Packet)?;
+        assert!(changed.translation.is_none() && matches!(changed.change, Some((_, Change::Written(_)))));
+        drop(changed);
+        for x in [6.25, -1.75, 3.5] {
+            values[0].transform.translation[0] = x;
+            retained.write(&page, |i| refs[i], &values, &[(0, change::TRANSLATION)])?;
+            let packet = plan_for_draw(&mut retained, &page, text.clone(), PlanUse::Packet)?;
+            assert!(packet.translation.is_some(), "parent run at {x}");
+        }
+
+        let worker = crate::canvas_host_memory::with_workers(|| plan(&mut retained, &page, text.clone()))?;
+        assert!(worker.shared().is_some());
+        let mut fresh = Retained::new(&page, &refs, &values)?;
+        let expected = plan(&mut fresh, &page, text)?;
+        assert_eq!(format!("{:?}", worker.coverage), format!("{:?}", expected.coverage));
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_group_opacity_writes_only_composition_outputs() -> Result<()> {
+        let (nodes, mut values, page) = grouped_disks()?;
+        values[0].opacity = 0.6;
         let refs=nodes.iter().collect::<Vec<_>>();
         let mut retained=Retained::new(&page,&refs,&values)?;
         let builder: CanvasTextBuilder=std::rc::Rc::new(|_,_,_,_,_,_,_,_| Ok(None));
@@ -3754,7 +3904,7 @@ mod retained_world_tests {
                 json!({"type":"line","x":20,"y":20})]), closed: true.into(), bounds: Some([0.,0.,20.,20.]), length: 60.,
             fill: PaintSource::Color([1.,0.,0.,1.]), stroke: PaintSource::None,
             fill_rule: Default::default(), linecap: Default::default(), linejoin: Default::default(),
-            miterlimit: 4., dasharray: Vec::new(), path_length: None, stroke_first: false,
+            miterlimit: 4., dasharray: Vec::new(), sampled_dash: None, path_length: None, stroke_first: false, paint_clock: 0,
             values: PathValues {fill:None,stroke:None,stroke_width:0.,stroke_dashoffset:0.,fill_opacity:1.,stroke_opacity:1.},
         });
         let source = Node {parent:None,clip_path:None,mask:None,mask_type:Default::default(),blend:Default::default(),isolation:Default::default(),filter:Default::default(),kind:Kind::Path(path.clone())};

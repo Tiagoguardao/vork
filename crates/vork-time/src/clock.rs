@@ -1,7 +1,9 @@
-//! Authored seconds retain their spelling until a discrete consumer needs it.
+//! Authored seconds retain their spelling for serialization. Discrete
+//! consumers read the exact clock value.
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::exact::{Rational, decimal};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11,7 +13,15 @@ pub struct Clock {
     binary: bool,
 }
 impl Clock {
-    pub fn exact(&self) -> Rational { if self.binary {Rational::from_float(self.numeric).expect("finite buffer clock")}else{decimal(&self.spelling).expect("validated clock")} }
+    pub fn exact(&self) -> Rational {
+        if self.binary {
+            Rational::from_float(self.numeric).expect("finite buffer clock")
+        } else if self.spelling.contains('/') {
+            decimal(&self.spelling).expect("validated clock")
+        } else {
+            simplest_binary64(self.numeric)
+        }
+    }
     pub fn binary(value:f32)->Self {Self {spelling:value.to_string().into(),numeric:f64::from(value),binary:true}}
     pub fn as_f64(&self) -> f64 { self.numeric }
     pub fn as_f32(&self) -> f32 { self.numeric as f32 }
@@ -21,11 +31,78 @@ impl std::str::FromStr for Clock {
     fn from_str(text: &str) -> Result<Self> {
         let numeric = if text.contains('/') {decimal(text)?.to_f64().unwrap_or(f64::INFINITY)} else {
             let number:serde_json::Number = text.parse()?;
-            number.as_f64().unwrap_or(f64::INFINITY)
+            number.as_f64().context("numeric clock must fit a finite binary64 value")?
         };
         Ok(Self { spelling: text.into(), numeric, binary:false })
     }
 }
+
+/// The minimum-denominator rational in this binary64 rounding cell, choosing
+/// the smallest absolute numerator if there is a tie.
+fn simplest_binary64(value: f64) -> Rational {
+    // In this range an integral value is the closest integer to zero in its cell.
+    if value.abs() <= (1_u64 << f64::MANTISSA_DIGITS) as f64 && value.fract() == 0. {
+        return Rational::from_integer(BigInt::from(value as i64));
+    }
+    let bits = value.abs().to_bits();
+    let exponent = (bits >> 52) as i32;
+    let fraction = bits & ((1 << 52) - 1);
+    let significand = fraction | (u64::from(exponent != 0) << 52);
+    // In quarter-ULPs the adjacent midpoints share a power-of-two denominator.
+    // Only a normal power of two above the smallest normal has a closer predecessor.
+    let lower = 4 * significand - if fraction == 0 && exponent > 1 { 1 } else { 2 };
+    let upper = 4 * significand + 2;
+    let shift = 1023 + 52 + 2 - exponent.max(1);
+    let closed = significand & 1 == 0;
+    let (numerator, denominator) = if shift <= 0 {
+        // Both endpoints are integers. Pick the first integer admitted by the cell.
+        ((BigInt::from(lower) << -shift) + u8::from(!closed), BigInt::from(1))
+    } else if let Some(scale) = 1_u64.checked_shl(shift as u32) {
+        let (n, d) = simplest_in_cell(lower, upper, scale, closed);
+        (BigInt::from(n), BigInt::from(d))
+    } else {
+        let scale = num_bigint::BigUint::from(1_u8) << shift;
+        let (n, d) = simplest_in_cell(lower.into(), upper.into(), scale, closed);
+        (BigInt::from(n), BigInt::from(d))
+    };
+    Rational::new_raw(if value.is_sign_negative() { -numerator } else { numerator }, denominator)
+}
+
+// For a Stern–Brocot bound p/q, the distances to the two endpoints are
+// integer cross-products |endpoint*q - scale*p|. Adding the other bound
+// subtracts its distances in reverse order. The distances only decrease,
+// and ancestors of the cell center have p and q no larger than its terms.
+struct FareyBound<T> {
+    p: T,
+    q: T,
+    near: T,
+    far: T,
+}
+
+impl<T: num_integer::Integer + Clone> FareyBound<T> {
+    fn advance(&mut self, other: &Self, closed: bool) -> bool {
+        if self.near < other.far || (closed && self.near == other.far) {
+            return false;
+        }
+        // Skip all mediants on this side. An included midpoint ends the search.
+        let distance = if closed { self.near.clone() - T::one() } else { self.near.clone() };
+        let steps = distance / other.far.clone();
+        self.near = self.near.clone() - steps.clone() * other.far.clone();
+        self.far = self.far.clone() - steps.clone() * other.near.clone();
+        self.p = self.p.clone() + steps.clone() * other.p.clone();
+        self.q = self.q.clone() + steps * other.q.clone();
+        true
+    }
+}
+
+fn simplest_in_cell<T: num_integer::Integer + Clone>(lower: T, upper: T, scale: T, closed: bool) -> (T, T) {
+    let mut left = FareyBound { p: T::zero(), q: T::one(), near: lower, far: upper };
+    let mut right = FareyBound { p: T::one(), q: T::zero(), near: scale.clone(), far: scale };
+    while left.advance(&right, closed) || right.advance(&left, closed) {}
+    // The first admitted mediant is reduced and has minimum denominator.
+    (left.p + right.p, left.q + right.q)
+}
+
 impl From<f64> for Clock {
     fn from(value: f64) -> Self { value.to_string().parse().expect("finite clock") }
 }
@@ -149,10 +226,10 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn authored_clock_roundtrips_without_binary_rounding() -> Result<()> {
+    fn authored_clock_roundtrips_preserving_its_spelling() -> Result<()> {
         for text in ["0.016666666666666666", "1e-100", "\"1/120\"", "3600"] {
             let clock: Clock=serde_json::from_str(text)?;
-            assert_eq!(serde_json::from_str::<Clock>(&serde_json::to_string(&clock)?)?.exact(),clock.exact());
+            assert_eq!(serde_json::to_string(&clock)?, text);
         }
         let fps:crate::Time="30000/1001".parse()?;
         let clock:Clock=serde_json::from_str("3600")?;
@@ -162,6 +239,63 @@ mod tests {
             let request=Request::Frame(n,fps);
             assert_eq!(request.exact()?.scale(&decimal(&fps.to_string())?).floor(),n.into());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_clocks_recover_fractions_and_respect_adjacent_values() -> Result<()> {
+        let expected = decimal("5/12")?;
+        for text in ["0.4166666666666667", "0.41666666666666670", "4166666666666667e-16"] {
+            assert_eq!(serde_json::from_str::<Clock>(text)?.exact(), expected);
+        }
+        assert_eq!(serde_json::from_str::<Clock>("-0.4166666666666667")?.exact(), -&expected);
+        let offset: Clock = "0.4166666666666667".parse()?;
+        for (adjacent, order) in [
+            (offset.as_f64().next_down(), std::cmp::Ordering::Less),
+            (offset.as_f64().next_up(), std::cmp::Ordering::Greater),
+        ] {
+            let clock = Clock::from(adjacent);
+            assert_eq!(clock.exact().cmp(&expected), order);
+            assert_eq!(clock.exact().to_f64(), Some(adjacent));
+        }
+        assert_eq!(serde_json::from_str::<Clock>("\"4166666666666667/10000000000000000\"")?.exact(),
+            decimal("0.4166666666666667")?);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_clock_fractions_span_the_native_integer_boundary() {
+        // The common dyadic scale needs 63 bits of shift at 2^-9 and 64 just below.
+        for (n, d) in [(1, 511), (1, 512), (1, 513), (355, 113), (4181, 6765)] {
+            let value = f64::from(n) / f64::from(d);
+            let expected = Rational::new(n.into(), d.into());
+            assert_eq!(simplest_binary64(value), expected);
+            assert_eq!(simplest_binary64(-value), -expected);
+        }
+    }
+
+    #[test]
+    fn numeric_clocks_handle_ties_and_binary64_limits() -> Result<()> {
+        // Spacing becomes two at 2^53. An even significand includes integer
+        // midpoints and an odd significand excludes them.
+        for (input, expected) in [
+            ("9007199254740992", "9007199254740992"),
+            ("9007199254740994", "9007199254740994"),
+            ("9007199254740996", "9007199254740995"),
+            ("-9007199254740996", "-9007199254740995"),
+        ] {
+            assert_eq!(serde_json::from_str::<Clock>(input)?.exact(), decimal(expected)?);
+        }
+        // For the smallest subnormal, the upper midpoint is excluded. The
+        // first unit fraction below it is the simplest in the cell.
+        let tiny: Clock = "5e-324".parse()?;
+        let denominator = (BigInt::from(1) << 1075_u32) / 3 + 1;
+        assert_eq!(tiny.exact(), Rational::new(BigInt::from(1), denominator));
+        assert_eq!(serde_json::from_str::<Clock>("-1e-324")?.exact(), decimal("0")?);
+        let max = Clock::from(f64::MAX);
+        assert!(max.exact().is_integer());
+        assert_eq!(max.exact().to_f64(), Some(f64::MAX));
+        assert!(serde_json::from_str::<Clock>("1e309").is_err());
         Ok(())
     }
 }

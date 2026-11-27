@@ -835,7 +835,7 @@ impl Scene {
                             let keyed = &*keyed;
                             Self::validate_text(keyed, &self.images).with_context(|| format!("track {path}"))?;
                             if let NodeKind::Path {fill,stroke,..} | NodeKind::Text {fill,stroke,..}=&keyed.kind {
-                                for paint in [fill,stroke] {if let Paint::Image(image)=paint {ensure!(self.images.contains_key(&image.image),"track {path}: unknown image {:?}",image.image);}}
+                                for paint in [fill,stroke] { self.validate_path_material(paint).with_context(||format!("track {path}"))?; if let Paint::Image(image)=paint {ensure!(self.images.contains_key(&image.image),"track {path}: unknown image {:?}",image.image);}}
                             }
 
                             if let NodeProperty::Style(p) = property {
@@ -855,6 +855,7 @@ impl Scene {
                         TrackTarget::Text { property: UnitProperty::TransformOrigin, .. } => {text::transform_origin(value.as_str().context("transform-origin keys are CSS strings")?).map_err(|e|anyhow::anyhow!("track {path}: {e}"))?;}
                         TrackTarget::Text { .. } => {
                             let paint:Paint=serde_json::from_value(value.clone()).with_context(||format!("track {path}: invalid paint"))?;
+                            ensure!(!matches!(paint, Paint::Material(_)), "track {path}: program paint is supported on paths only");
                             if let Paint::Css(css)=&paint {if !css.contains("gradient("){text::paint(css).map_err(|e|anyhow::anyhow!("track {path}: {e}"))?;}}
                             if let Paint::Image(image)=&paint {ensure!(self.images.contains_key(&image.image),"track {path}: unknown image {:?}",image.image);}
                         }

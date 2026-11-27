@@ -13,6 +13,7 @@ doctest = false
 
 [dependencies]
 moda-scene = { path = "../moda-scene" }
+vork-inputs = { path = "../vork-inputs" }
 blake3 = "1"
 serde_json = "1"
 # The canonical plain text (unit-transform indexing).

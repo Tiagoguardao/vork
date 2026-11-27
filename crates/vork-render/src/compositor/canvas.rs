@@ -109,7 +109,7 @@ impl CanvasGraph {
             let path = base.join(file);
             let installed = (|| -> Result<_> {
                 let source = if crate::footage::is_media(&path) { opened.canvas_source(&path, image.color_space)? }
-                    else { crate::footage::Source::Sequence { files: vec![path.clone()], fps: None } };
+                    else { crate::footage::Source::Sequence { files: vec![path.clone()], fps: None, inputs: opened.files.clone() } };
                 crate::footage::Installed::from_source(r, &name, source, image.time.clone(), working, false, image.color_space, scene.render.fps)
             })().with_context(|| format!("composition.compositor: image {name} ({})", path.display()))?;
             let file = if crate::footage::is_media(&path) { FileInput::Media(installed.file_input()) }
@@ -255,4 +255,56 @@ impl CanvasGraph {
     /// Wait for the last `draw` and refuse a result that is not finite: for a picture with no collection point
     /// of its own.
     pub(crate) fn check(&self, r: &Renderer) -> Result<()> { self.errors.check(r) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires real GPU and pinned Slang"]
+    fn working_images_follow_last_bindings_and_belong_to_the_replica() -> Result<()> {
+        let r = crate::test_renderer()?;
+        let scene = Scene::from_json(&serde_json::to_vec(&json!({
+            "version": 2, "composition": {"space": "2d", "compositor": [
+                {"name": "keep", "material": "pass"}, "pass", "pass", "pass",
+                {"material": "merge", "resolution": [8, 4]}
+            ]}, "render": {"resolution": [16, 8]}, "nodes": [],
+            "programs": {
+                "pass": {"source": "struct Inputs {}; float4 composite(CompositeContext c, Inputs i) { return compositor_sample(c.uv); }"},
+                "merge": {"source": "struct Inputs { Image saved; }; float4 composite(CompositeContext c, Inputs i) { return compositor_sample(c.uv) + compositor_sample(i.saved,c.uv) + float4(float(c.frame),0.,0.,1.); }"}
+            }, "materials": {
+                "pass": {"program": "pass"},
+                "merge": {"program": "merge", "inputs": {"saved": {"step": "keep"}}}
+            }
+        }))?)?;
+        let (graph, allocations) = crate::gpu_memory::test_buffer_allocations(||
+            CanvasGraph::new(&r, &scene, Path::new("."), &Default::default()));
+        let graph = graph?.unwrap();
+        // keep + two alternating full-size steps + one smaller step. The full-size
+        // resample may reuse an alternating step, but still binds keep read-only.
+        let images: Vec<_> = allocations.iter().filter(|label| label.starts_with("Compositor image ")).collect();
+        assert_eq!(images.len(), 4, "{images:?}");
+        let replica = CanvasGraph::from_programs(&r, &scene, graph.programs())?;
+        assert_ne!(replica.output, graph.output);
+
+        // Queue both graphs and then reuse the first graph before collecting any
+        // picture. Each consumer sees its own frame even after scratch is rewritten.
+        let source = texture(&r.device, "blank canvas", 16, 8, 1,
+            wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let mut pictures = Vec::new();
+        for (index, instance) in [(1, &graph), (2, &replica), (3, &graph)] {
+            pictures.push((index, instance.draw(&r, &source, &vork_time::Request::Numeric(0.),
+                Some(index), &[], None, None)?));
+        }
+        for (index, picture) in pictures.into_iter().rev() {
+            let pixels = moda_engine::readback::read_texture_rgba16f(&r.device, &r.queue, &picture, 16, 8)?;
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel[0].to_f32(), index as f32);
+                assert_eq!(pixel[3].to_f32(), 1.);
+            }
+        }
+        Ok(())
+    }
 }

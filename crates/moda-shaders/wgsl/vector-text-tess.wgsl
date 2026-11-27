@@ -1,7 +1,13 @@
 // #include "working-color.wgsl"
 
-struct DrawUniforms {
+struct VectorPlacement {
   model: mat4x4<f32>,
+  padding: vec2<f32>,
+};
+@group(0) @binding(4) var<storage, read> placements: array<VectorPlacement>;
+
+struct DrawUniforms {
+  placement: u32,
   color: vec4<f32>,
   params: vec4<f32>,   // x=zDepth, y=opacity, z=blur(px), w=stroke(px) — z/w solid analytic only
   pageClip: vec4<f32>, // x, y, w, h in world space
@@ -20,22 +26,25 @@ struct DrawUniforms {
 // proves w > 0 inside the node's box; glyph geometry that overflows the box (bearings,
 // descenders) could in principle cross the horizon (w ≤ 0) under an extreme warp and
 // get hardware-clipped — accepted: plausible matrices keep the horizon far outside.
-fn vectorWarpLocal(local: vec2<f32>) -> vec3<f32> {
+fn vectorWarpLocal(draw: DrawUniforms, local: vec2<f32>) -> vec3<f32> {
   if (draw.distort0.w < 0.5) {
     return vec3<f32>(local, 1.0);
   }
   let p = vec3<f32>(local, 1.0);
   return vec3<f32>(dot(draw.distort0.xyz, p), dot(draw.distort1.xyz, p), dot(draw.distort2.xyz, p));
 }
+// #include "frame-uniform.wgsl"
 // #include "rect-clip.wgsl"
-@group(0) @binding(1) var<uniform> draw: DrawUniforms;
+@group(0) @binding(1) var<storage, read> draws: array<DrawUniforms>;
 
-struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) clip: vec4<f32> };
+struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) clip: vec4<f32>, @location(1) @interpolate(flat) operation: u32 };
 
-@vertex fn vs(@location(0) pos: vec2<f32>) -> VSOut {
+@vertex fn vs(@location(0) pos: vec2<f32>, @builtin(instance_index) operation: u32) -> VSOut {
+  let draw = draws[operation];
   var o: VSOut;
-  let h = vectorWarpLocal(pos);
-  let world = draw.model * vec4<f32>(h.xy, 0.0, h.z);
+  o.operation = operation;
+  let h = vectorWarpLocal(draw, pos);
+  let world = placements[draw.placement].model * vec4<f32>(h.xy, 0.0, h.z);
   o.pos = frameUniforms.viewProjection * world;
   o.pos.z = draw.params.x * h.z; // hardware divide restores params.x
   o.clip = projectRectClip(draw.pageClip);
@@ -43,6 +52,7 @@ struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat
 }
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4<f32> {
+  let draw = draws[in.operation];
   if (outsideRectClip(in.pos.xy, in.clip)) {
     discard;
   }

@@ -1206,9 +1206,9 @@ impl FrameSlot {
         // A camera that did not exist at the previous frame has no earlier pose: its first
         // frame is a cut, like a camera switch (rule 1).
         if s.animation.has_clocks() && !self.exposure_cut {
-            let previous=s.animation.clocks(&self.nominal_request.previous(s.render.fps)?.exact()?)?;
+            let previous=self.nominal_request.previous(s.render.fps)?.exact()?;
             let camera=s.animation.camera_at_request(&self.nominal_request,s.camera)?;
-            self.exposure_cut=std::iter::once(camera).chain(s.graph.views.image_renders().map(|image|image.camera)).any(|camera|previous[camera].is_none());
+            self.exposure_cut=!s.animation.camera_presence_at(&previous, std::iter::once(camera).chain(s.graph.views.image_renders().map(|image|image.camera)))?;
         }
         let frame_motion_blur = self.exposure_shutter.clone();
         let shutter = frame_motion_blur.as_ref();

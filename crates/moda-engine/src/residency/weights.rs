@@ -72,6 +72,13 @@ impl Allocations {
         let mut bytes = capacity(masks);
         for mask in masks {
             bytes += mask.source_node_id.capacity() + mask.owner_node_id.capacity() + capacity(&mask.positions) + capacity(&mask.draws);
+            for draw in mask.draws.iter() {
+                if let crate::seams::MaskPaint::Program { stroke_uv, .. } = &draw.paint {
+                    if !stroke_uv.is_empty() && self.charge(stroke_uv.as_ptr() as usize) {
+                        bytes += std::mem::size_of_val(stroke_uv.as_ref()) + 2 * size_of::<usize>();
+                    }
+                }
+            }
             if let Some(image) = &mask.image {
                 bytes += image.rgba.capacity() + image.surface.as_ref().map_or(0, String::capacity);
                 if let Some(rendered) = &image.rendered {
@@ -109,7 +116,7 @@ impl Allocations {
                 DrawItem::Vacant | DrawItem::PageFill { .. } => 0,
                 DrawItem::Body { node_id, instance, geometry, paint, .. } => {
                     let payload = match paint {
-                        BodyPaint::Solid => 0,
+                        BodyPaint::Solid | BodyPaint::Program(_) => 0,
                         BodyPaint::Gradient(g) => size_of_val(&**g),
                         BodyPaint::Pattern(p) => size_of_val(&**p) + p.texture.key.capacity()
                             + self.array(&p.texture.image.rgba_premultiplied)

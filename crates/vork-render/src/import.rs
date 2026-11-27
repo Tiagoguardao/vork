@@ -29,7 +29,7 @@ fn check_extension(path: &Path) -> Result<()> {
 fn warn_instancing(document: &gltf::Document,path: &Path) {
     for node in document.nodes() {
         if node.extension_value("EXT_mesh_gpu_instancing").is_some() {
-            crate::warnings::dropped("gltf_instancing", serde_json::json!({"file":path,"node":node.index(),"name":node.name(),"extension":"EXT_mesh_gpu_instancing"}),
+            crate::warnings::dropped("gltf_instancing", serde_json::json!({"file":crate::warnings::source_name(path),"node":node.index(),"name":node.name(),"extension":"EXT_mesh_gpu_instancing"}),
                 "instance placements are ignored; using the node's mesh once. Export separate mesh nodes instead of EXT_mesh_gpu_instancing.".into());
         }
     }

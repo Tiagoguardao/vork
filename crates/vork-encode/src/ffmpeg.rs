@@ -23,7 +23,7 @@ pub(super) fn readback_command(
     let clock = Clock::query()?;
     clock.validate(fps, frames, path)?;
     let prores = codec == "prores_ks";
-    let mut command = Command::new("ffmpeg");
+    let mut command = vork_inputs::tool_command("ffmpeg");
     command.args([
         "-v",
         "error",
@@ -254,7 +254,7 @@ pub(super) fn validate_fallback_clock(fps: Time, frames: u64, path: &Path) -> Re
 /// Probe and validate actual timing options. Successful help can be persisted by
 /// the caller in its existing content-addressed store; failures are never cached.
 pub fn probe_video_clock_capabilities() -> Result<String> {
-    let output = Command::new("ffmpeg")
+    let output = vork_inputs::tool_command("ffmpeg")
         .args(["-hide_banner", "-h", "full"])
         .stdin(Stdio::null())
         .output()
@@ -288,7 +288,7 @@ pub(super) fn validate_mux_rate(fps: Time) -> Result<()> {
 pub(super) fn mux_command(fps: Time, path: &Path) -> Result<Command> {
     validate_mux_rate(fps)?;
     let clock = Clock::query()?;
-    let mut command = Command::new("ffmpeg");
+    let mut command = vork_inputs::tool_command("ffmpeg");
     command.args([
         "-v",
         "error",

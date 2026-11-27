@@ -321,27 +321,58 @@ pub fn prefetch_blocking(
 /// returning `(store_key, outcome, span)` per job, ordered by store
 /// key so the report is deterministic.
 fn run_jobs(jobs: &[Job], config: &PrefetchConfig) -> Vec<(String, Outcome, Span)> {
+    let mut results = bounded_jobs(jobs, config.concurrency, |job| run_job(job, config));
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    results
+}
+
+fn bounded_jobs<J: Sync, T: Send>(jobs: &[J], concurrency: usize, load: impl Fn(&J) -> T + Sync) -> Vec<T> {
     let next = AtomicUsize::new(0);
-    let workers = config.concurrency.max(1).min(jobs.len());
-    let mut results: Vec<(String, Outcome, Span)> = std::thread::scope(|scope| {
+    let workers = concurrency.max(1).min(jobs.len());
+    std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
                     let mut out = Vec::new();
-                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        out.push(run_job(job, config));
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else { break };
+                        out.push((index, load(job)));
                     }
                     out
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("prefetch worker panicked"))
-            .collect()
+        let mut ordered: Vec<_> = handles.into_iter()
+            .flat_map(|h| h.join().expect("prefetch worker panicked")).collect();
+        ordered.sort_unstable_by_key(|(index, _)| *index);
+        ordered.into_iter().map(|(_, result)| result).collect()
+    })
+}
+
+/// Load canvas raster sources with the renderer's colour decoder, sharing the
+/// ordinary asset preparation cache, concurrency and store.
+pub fn prefetch_canvas_rasters(
+    requests: &std::collections::BTreeSet<String>,
+    source: impl Fn(&str) -> (&str, bool, bool) + Sync,
+    read: impl Fn(&str) -> Result<Vec<u8>> + Sync,
+    decode: impl Fn(&str, &[u8], bool, bool) -> Result<PreparedImage> + Sync,
+) -> Result<AssetStore> {
+    let config = PrefetchConfig::default();
+    let keys: Vec<_> = requests.iter().collect();
+    let results = bounded_jobs(&keys, config.concurrency, |&key| {
+        let (src, natural, srgb) = source(key);
+        let bytes = if src.starts_with("data:") { fetch_bytes(&config, src)?.0 } else { read(src)? };
+        let mode = if srgb { RasterColor::Srgb } else { RasterColor::Described };
+        cached_raster(&bytes, natural, mode, || decode(src, &bytes, natural, srgb))
+            .map(|image| (key, image))
     });
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-    results
+    let mut store = AssetStore::default();
+    for result in results {
+        let (key, image) = result?;
+        store.insert(key.clone(), AssetEntry::Loaded(Arc::new(image)));
+    }
+    Ok(store)
 }
 
 fn run_job(job: &Job, config: &PrefetchConfig) -> (String, Outcome, Span) {
@@ -470,7 +501,8 @@ const DECODED_RASTER_BUDGET: usize = 128 << 20;
 
 /// Recently decoded rasters, least recently used first, by the BLAKE3 hash of their source bytes, and their pixel
 /// bytes in total.
-static DECODED_RASTERS: std::sync::Mutex<(Vec<([u8; 32], PreparedImage)>, usize)> =
+type RasterKey = ([u8; 32], bool, RasterColor);
+static DECODED_RASTERS: std::sync::Mutex<(Vec<(RasterKey, PreparedImage)>, usize)> =
     std::sync::Mutex::new((Vec::new(), 0));
 
 /// [`prepare_raster`] of `bytes` (`natural`: [`crate::decode::prepare_raster_natural`]), decoded once per process
@@ -478,14 +510,16 @@ static DECODED_RASTERS: std::sync::Mutex<(Vec<([u8; 32], PreparedImage)>, usize)
 /// again for each new scene and scale; the pixels of bytes it has seen are reused. The key is the bytes' hash
 /// and the preparation, so other bytes (an edited file at the same path) decode afresh.
 fn decoded_raster(bytes: &[u8], natural: bool) -> Result<PreparedImage> {
-    let key = {
-        let mut hash = blake3::Hasher::new();
-        hash.update(bytes);
-        if natural {
-            hash.update(b"natural");
-        }
-        *hash.finalize().as_bytes()
-    };
+    cached_raster(bytes, natural, RasterColor::Imported, || {
+        if natural { crate::decode::prepare_raster_natural(bytes) } else { prepare_raster(bytes) }
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RasterColor { Imported, Described, Srgb }
+
+fn cached_raster(bytes: &[u8], natural: bool, color: RasterColor, prepare: impl FnOnce() -> Result<PreparedImage>) -> Result<PreparedImage> {
+    let key = (*blake3::hash(bytes).as_bytes(), natural, color);
     let cache = || DECODED_RASTERS.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut c = cache();
@@ -495,7 +529,7 @@ fn decoded_raster(bytes: &[u8], natural: bool) -> Result<PreparedImage> {
             return Ok(hit.1);
         }
     }
-    let img = if natural { crate::decode::prepare_raster_natural(bytes)? } else { prepare_raster(bytes)? };
+    let img = prepare()?;
     let size = img.rgba_premul.len();
     if size <= DECODED_RASTER_BUDGET {
         let mut c = cache();

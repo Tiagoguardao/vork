@@ -29,7 +29,7 @@ impl Images {
             let path=base.join(definition.file.as_ref().context("environment programs cannot sample rendered images")?);
             let media=crate::footage::is_media(&path).then(||opened.source(&path).map(|mut source| {source.prepare_gpu(r);source})).transpose()?.map(std::sync::Mutex::new);
             let bytes = if media.is_none() {
-                match std::fs::read(&path) {
+                match opened.files.source(&path).read() {
                     Ok(bytes) => Some(bytes),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
                         && !path.extension().is_some_and(|e|e.eq_ignore_ascii_case("ies")) => None,
@@ -157,6 +157,40 @@ fn encode(definition:&v2::Image,srgb:bool,image:image::DynamicImage)->Vec<u32> {
         }
     }
     words
+}
+
+#[cfg(test)]
+fn packed_hdr_pixel(definition: serde_json::Value) -> Result<[f32; 4]> {
+    let definition: v2::Image = serde_json::from_value(definition)?;
+    let path = Path::new(definition.file.as_deref().unwrap());
+    let mut bytes = Vec::new();
+    // Exactly representable as RGBE, with samples on both sides of one.
+    image::codecs::hdr::HdrEncoder::new(&mut bytes)
+        .encode(&[image::Rgb([0.25, 0.5, 4.0])], 1, 1)?;
+    let srgb = definition.is_srgb();
+    let image = crate::texture_source::decode_light(
+        path, &bytes, 1, definition.color_space, crate::texture_source::upload(srgb),
+    )?;
+    let words = encode(&definition, srgb, image);
+    assert_eq!(words[5], 15); // All four components are constant.
+    Ok(std::array::from_fn(|channel| f32::from_bits(words[6 + channel])))
+}
+
+#[cfg(test)]
+#[test]
+fn untagged_radiance_hdr_environment_preserves_linear_samples() -> Result<()> {
+    assert_eq!(packed_hdr_pixel(serde_json::json!({"file": "sky.hdr"}))?, [0.25, 0.5, 4.0, 1.0]);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn explicit_srgb_overrides_radiance_hdr_environment_default() -> Result<()> {
+    let actual = packed_hdr_pixel(serde_json::json!({"file": "sky.hdr", "color_space": "sRGB"}))?;
+    for (actual, expected) in actual.into_iter().zip([0.05087609, 0.21404114, 25.314663, 1.0]) {
+        assert!((actual - expected).abs() < 1e-5, "got {actual}, expected {expected}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

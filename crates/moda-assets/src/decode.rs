@@ -130,6 +130,26 @@ pub fn coverage_permille(non_transparent: u64, total: u64) -> u16 {
     (non_transparent * 1000).div_ceil(total).min(1000) as u16
 }
 
+/// A still's natural size as displayed, read without decoding its pixel payload.
+pub fn upright_dimensions(path: &std::path::Path) -> image::ImageResult<(u32, u32)> {
+    raster_dimensions(image::ImageReader::open(path)?)
+}
+
+fn raster_dimensions(reader: image::ImageReader<impl std::io::BufRead + std::io::Seek>) -> image::ImageResult<(u32, u32)> {
+    use image::metadata::Orientation::*;
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    Ok(match raster_orientation(&mut decoder) {
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (height, width),
+        _ => (width, height),
+    })
+}
+
+/// Treat an unreadable orientation as ordinary stored pixels, as raster decode does.
+pub fn raster_orientation(decoder: &mut impl ImageDecoder) -> image::metadata::Orientation {
+    decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
 /// Decode raster bytes (PNG/JPEG/WebP/GIF) to straight-alpha sRGB RGBA8,
 /// applying an embedded ICC profile via moxcms when present.
 ///
@@ -173,10 +193,11 @@ pub fn decode_raster(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, bool)> {
             None => anyhow::Error::new(e).context("image decoder"),
         }
     })?;
+    let source = decoder.color_type();
     let icc = decoder.icc_profile().ok().flatten();
     // A camera JPEG's EXIF orientation: Chromium draws it upright (`createImageBitmap` and `<img>` default to
     // `from-image`), and the header sniffs report the upright size, so the pixels are turned here too.
-    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let orientation = raster_orientation(&mut decoder);
 
     let (mut rgba, mut w, mut h) = {
         // Same contract as the `into_decoder` arm: stable "image decode:"
@@ -209,7 +230,7 @@ pub fn decode_raster(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, bool)> {
 
     let mut icc_applied = false;
     if let Some(icc_bytes) = icc {
-        if let Ok(()) = apply_icc_to_srgb(&mut rgba, &icc_bytes) {
+        if let Ok(()) = apply_icc_to_srgb(&mut rgba, &icc_bytes, source) {
             icc_applied = true;
         }
     }
@@ -395,22 +416,36 @@ fn png_is_structurally_complete(bytes: &[u8]) -> bool {
 
 /// ICC → sRGB in place on straight-alpha RGBA8 (alpha passes through).
 /// Chromium parity: decode-time color management to the sRGB target.
-fn apply_icc_to_srgb(rgba: &mut [u8], icc: &[u8]) -> Result<()> {
-    use moxcms::{ColorProfile, Layout, TransformOptions};
+pub fn apply_icc_to_srgb(rgba: &mut [u8], icc: &[u8], source: image::ColorType) -> Result<()> {
+    use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions};
+    anyhow::ensure!(rgba.len() % 4 == 0, "ICC input must contain whole RGBA pixels");
     let src = ColorProfile::new_from_slice(icc).context("ICC parse")?;
+    let gray = src.color_space == DataColorSpace::Gray;
+    anyhow::ensure!(!gray || !source.has_color(), "gray ICC profile requires grayscale pixels");
     let dst = ColorProfile::new_srgb();
     let transform = src
         .create_transform_8bit(
-            Layout::Rgba,
+            if gray { Layout::GrayAlpha } else { Layout::Rgba },
             &dst,
             Layout::Rgba,
             TransformOptions::default(),
         )
         .context("ICC transform build")?;
-    let input = rgba.to_vec();
-    transform
-        .transform(&input, rgba)
-        .context("ICC transform apply")?;
+    let mut input = [0; 16 * 1024];
+    for output in rgba.chunks_mut(input.len()) {
+        let input = if gray {
+            let input = &mut input[..output.len() / 2];
+            for (gray_alpha, rgba) in input.chunks_exact_mut(2).zip(output.chunks_exact(4)) {
+                gray_alpha.copy_from_slice(&[rgba[0], rgba[3]]);
+            }
+            input
+        } else {
+            let input = &mut input[..output.len()];
+            input.copy_from_slice(output);
+            input
+        };
+        transform.transform(input, output).context("ICC transform apply")?;
+    }
     Ok(())
 }
 
@@ -492,7 +527,12 @@ pub fn prepare_raster_natural(bytes: &[u8]) -> Result<PreparedImage> {
 }
 
 fn prepare(bytes: &[u8], sized: bool) -> Result<PreparedImage> {
-    let (mut rgba, nw, nh, icc_applied) = decode_raster(bytes)?;
+    let (rgba, nw, nh, icc_applied) = decode_raster(bytes)?;
+    prepare_rgba(rgba, nw, nh, sized, icc_applied)
+}
+
+/// Apply the pattern's sizing and association to straight sRGB RGBA8.
+pub fn prepare_rgba(mut rgba: Vec<u8>, nw: u32, nh: u32, sized: bool, icc_applied: bool) -> Result<PreparedImage> {
     // Alpha tally rides the premultiply walk (zero extra pass). Counted at
     // NATURAL size, BEFORE the sizing-policy resize, which is correct for the
     // blank verdict: Mitchell convolution of an all-zero alpha channel is
@@ -664,8 +704,14 @@ mod tests {
         assert!(top[0] > 200 && top[2] < 60, "top is red: {top:?}");
         assert!(bottom[2] > 200 && bottom[0] < 60, "bottom is blue: {bottom:?}");
         // Orientation 1 keeps the stored pixels.
-        let (_, w, h, _) = decode_raster(&jpeg_with_orientation(img, 1)).unwrap();
-        assert_eq!((w, h), (32, 16));
+        for tag in 1..=8 {
+            let bytes = jpeg_with_orientation(img.clone(), tag);
+            let reader = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Jpeg);
+            let expected = if tag < 5 { (32, 16) } else { (16, 32) };
+            assert_eq!(raster_dimensions(reader).unwrap(), expected, "EXIF orientation {tag}");
+            let (_, w, h, _) = decode_raster(&bytes).unwrap();
+            assert_eq!((w, h), expected, "EXIF orientation {tag}");
+        }
     }
 
     #[test]
@@ -717,6 +763,39 @@ mod tests {
         );
         // Color management never touches alpha.
         assert_eq!(px_icc[3], 255);
+    }
+
+    #[test]
+    fn gray_icc_converts_multiple_chunks_and_preserves_alpha() {
+        let profile = moxcms::ColorProfile::new_gray_with_gamma(1.).encode().unwrap();
+        let mut rgba: Vec<u8> = (0..8193)
+            .flat_map(|i| {
+                let level = i as u8;
+                [level, level, level, (i / 256) as u8]
+            })
+            .collect();
+        apply_icc_to_srgb(&mut rgba, &profile, image::ColorType::La8).unwrap();
+        for (i, pixel) in rgba.chunks_exact(4).enumerate() {
+            let linear = f64::from(i as u8) / 255.;
+            let srgb = if linear <= 0.0031308 {
+                12.92 * linear
+            } else {
+                1.055 * linear.powf(1. / 2.4) - 0.055
+            };
+            let expected = (srgb * 255.).round() as u8;
+            assert!(pixel[..3].iter().all(|&code| code.abs_diff(expected) <= 1), "{i}: {pixel:?}, expected {expected}");
+            assert_eq!(pixel[3], (i / 256) as u8);
+        }
+    }
+
+    #[test]
+    fn gray_icc_on_rgb_keeps_stored_colors() {
+        let color = [64, 100, 150, 128];
+        let profile = moxcms::ColorProfile::new_gray_with_gamma(1.).encode().unwrap();
+        let png = encode_png_with_icc(&color, 1, 1, &profile);
+        let (rgba, _, _, applied) = decode_raster(&png).unwrap();
+        assert!(!applied);
+        assert_eq!(rgba, color);
     }
 
     /// A malformed/unparseable ICC profile must degrade gracefully: the

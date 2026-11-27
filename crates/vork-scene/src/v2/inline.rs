@@ -52,7 +52,7 @@ fn edges(kind: &str) -> &'static [(&'static str, &'static str, bool)] {
         "node" => &[("children.*","node",false),("animation.*","layer",false),("geometry","geometry",true),("materials.*","materials",true),
             ("instances.count","buffers",true),("instances.attributes.*","buffers",true),
             ("skin.inverse_bind_matrices","buffers",true),("image","images",true),
-            ("medium","materials",true),("material","materials",true),("composition","composition",false)],
+            ("fill.material","materials",true),("stroke.material","materials",true),("medium","materials",true),("material","materials",true),("composition","composition",false)],
         "composition" => &[("view","materials",true),("compositor.*","composite",false)],
         "geometry" => &[("status.buffer","buffers",true),("ids","buffers",true),("count","buffers",true),("indices","buffers",true),("curve_vertex_counts","buffers",true),("widths","buffers",true),
             ("attributes.*","buffers",true),("morphs.*.POSITION","buffers",true),("morphs.*.NORMAL","buffers",true)],
@@ -91,6 +91,22 @@ fn lower_resource(root: &mut Map<String, Value>, kind: &str, entry: &mut Value, 
                 origins.entry(format!("cameras.{name}")).or_default().push(path.into());
             }
         }
+    }
+    if kind == "layer" {
+        slots(entry, "tracks.*", path, &mut |track, at| {
+            let Some(target) = track["path"].as_array() else { return };
+            let Some((field, owner)) = target.split_last() else { return };
+            let node_target = matches!(owner, [nodes, _] if nodes == "nodes")
+                || owner.chunks(2).all(|hop| matches!(hop, [children, name] if children == "children" && name.is_string()));
+            if node_target && matches!(field.as_str(), Some("fill" | "stroke"))
+                && let Some(keys) = track["keys"].as_array_mut() {
+                for (index, key) in keys.iter_mut().enumerate() {
+                    if let Some(material) = key.get_mut(1).and_then(|v| v.get_mut("material")) {
+                        hoist(root, "materials", material, &format!("{at}.keys[{index}][1].material"), origins);
+                    }
+                }
+            }
+        });
     }
     if kind == "composite" {
         if entry.get("material").is_some() {

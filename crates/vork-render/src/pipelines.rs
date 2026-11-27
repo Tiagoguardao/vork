@@ -401,6 +401,8 @@ impl Compiler {
     /// One background compilation, counted until it retires. `after_foreground`
     /// holds it back until foreground preparation has finished.
     fn spawn_worker(&self, mode: VariantCompile, after_foreground: bool, build: impl FnOnce() -> Result<()> + Send + 'static) {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        crate::compile_idle::started();
         self.pending.0.lock().unwrap().workers += 1;
         let c = self.clone();
         std::thread::spawn(move || {
@@ -424,6 +426,9 @@ impl Compiler {
             pending.workers -= 1;
             if pending.failure.is_none() { pending.failure = failure; }
             done.notify_all();
+            drop(pending);
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            crate::compile_idle::retired();
         });
     }
     fn time(&self, label: Option<&str>, start: std::time::Instant) {
@@ -506,7 +511,11 @@ impl Compiler {
     pub(crate) fn remember(&self, key: impl Into<Option<blake3::Hash>>) {
         let Some(key)=key.into() else {return;};
         let mut known = self.known.lock().unwrap();
-        known.added |= known.keys.insert(*key.as_bytes());
+        if known.keys.insert(*key.as_bytes()) {
+            known.added = true;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            crate::compile_idle::compiled();
+        }
     }
     /// Snapshot without consuming dirty state: every unsuccessful save can retry.
     /// The renderer serializes saves before taking this snapshot.

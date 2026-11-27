@@ -131,13 +131,16 @@ pub struct Worlds {
     frame_of: Vec<u32>,
 
     // The columns.
-    /// Per plain row, the node's accumulated transform in its page: [`Scene::accumulated_affine`]'s answer.
-    own: Vec<Placed>,
-    /// Paint-order visibility derived along the same source ancestry.
+    /// Per plain row, the node's local transform. Readers compose it with its parent's current frame.
+    local: Vec<Placed>,
+    /// Whether this row hides its subtree before inherited visibility is applied.
     hidden: Vec<bool>,
     visibility_plain: Vec<bool>,
     /// Per frame-keeping row, its accumulated transform as a transform parent.
     frames: Vec<Placed>,
+    frame_hidden: Vec<bool>,
+    /// Positions in DFS order of rows whose transform other rows inherit.
+    parent_positions: Vec<u32>,
 
     /// Scratch for a refresh: the written rows' ranges of `order`.
     ranges: Vec<(u32, u32)>,
@@ -163,16 +166,8 @@ impl Worlds {
             || self.end[row] - self.at[row] != 1 {
             return false;
         }
-        let [x, y] = xy;
-        let (e, f) = match self.link[row] {
-            NONE => (x, y),
-            parent => {
-                let a = self.frames[self.frame_of[parent as usize] as usize].affine;
-                (a.a * x + a.c * y + a.e, a.b * x + a.d * y + a.f)
-            }
-        };
-        self.own[row].affine.e = e;
-        self.own[row].affine.f = f;
+        self.local[row].affine.e = xy[0];
+        self.local[row].affine.f = xy[1];
         true
     }
 
@@ -185,16 +180,22 @@ impl Worlds {
 
     /// The accumulated transform of the node at `row` in its page, when the columns are current at `clock` and
     /// answer for the row.
-    pub(crate) fn placed(&self, clock: u64, row: usize) -> Option<&Placed> {
+    pub(crate) fn placed(&self, clock: u64, row: usize) -> Option<Placed> {
         if !self.current(clock) || !*self.plain.get(row)? {
             return None;
         }
-        self.own.get(row)
+        let parent = self.parent_frame(row);
+        Some(self.local[row].under(parent.map(|i| &self.frames[i])))
+    }
+
+    fn parent_frame(&self, row: usize) -> Option<usize> {
+        let parent = self.link[row];
+        (parent != NONE).then(|| self.frame_of[parent as usize] as usize)
     }
 
     pub(crate) fn hidden(&self, clock: u64, row: usize) -> Option<bool> {
         (self.current(clock) && *self.plain.get(row)? && *self.visibility_plain.get(row)?)
-            .then(|| self.hidden[row])
+            .then(|| self.hidden[row] || self.parent_frame(row).is_some_and(|i| self.frame_hidden[i]))
     }
 
     /// The position of the page of the node at `row` (of a row the columns answer for).
@@ -215,6 +216,28 @@ impl Worlds {
 
     pub fn is_empty(&self) -> bool {
         self.plain.is_empty()
+    }
+
+    /// Parent frames in hierarchy order, with the row whose direct children read each frame.
+    pub fn parents(&self) -> impl DoubleEndedIterator<Item = u32> + '_ {
+        self.parent_positions.iter().map(|&p| self.order[p as usize])
+    }
+
+    /// A pure translation inherited by direct children. The page offset must be zero
+    /// so composing a leaf has exactly the same addition order as the draw matrix.
+    pub fn child_translation(&self, row: u32) -> Option<[f64; 2]> {
+        let i = row as usize;
+        if self.page.get(i) != Some(&(0., 0.)) || !self.plain.get(i).copied()? { return None; }
+        let a = self.frames.get(*self.frame_of.get(i)? as usize)?.affine;
+        ([a.a, a.b, a.c, a.d] == [1., 0., 0., 1.] && a.e.is_finite() && a.f.is_finite())
+            .then_some([a.e, a.f])
+    }
+
+    /// The local affine and its transform parent for a canonical row.
+    pub fn local_placement(&self, row: u32) -> Option<(Affine, Option<u32>)> {
+        let i = row as usize;
+        self.plain.get(i).copied().filter(|&plain| plain)?;
+        Some((self.local[i].affine, (self.link[i] != NONE).then_some(self.link[i])))
     }
 
     /// Where `row` and everything under it sit in the parent-before-child order: positions `.0..(.1)`. One
@@ -254,12 +277,13 @@ impl Worlds {
             });
         if stands {
             // The subtrees of the written rows, as the union of their ranges: a range starts inside an earlier
-            // one only when it lies wholly inside it, so every row is computed once, after its parent.
+            // one only when it lies wholly inside it, so each inherited frame is refreshed once, after its parent.
             self.ranges.clear();
-            for list in self.lists.iter().flatten() {
-                for &row in scene.stamps.dirty(*list) {
-                    if let Some(range) = self.range(row) {
-                        self.ranges.push(range);
+            for list in self.lists.into_iter().flatten() {
+                for &row in scene.stamps.dirty(list) {
+                    self.read_local(scene, row as usize);
+                    if self.frame_of[row as usize] != NONE {
+                        if let Some(range) = self.range(row) { self.ranges.push(range); }
                     }
                 }
             }
@@ -270,38 +294,40 @@ impl Worlds {
                 if to <= covered {
                     continue;
                 }
-                for position in from.max(covered)..to {
-                    self.place(scene, self.order[position as usize] as usize);
+                let first = self.parent_positions.partition_point(|&p| p < from.max(covered));
+                let end = self.parent_positions.partition_point(|&p| p < to);
+                for i in first..end {
+                    let position = self.parent_positions[i] as usize;
+                    self.place_parent(scene, self.order[position] as usize);
                 }
                 covered = to;
             }
         } else {
             self.read_hierarchy(scene);
             for position in 0..self.order.len() {
-                self.place(scene, self.order[position] as usize);
+                let row = self.order[position] as usize;
+                self.read_local(scene, row);
+                if self.frame_of[row] != NONE { self.place_parent(scene, row); }
             }
         }
         self.current_at = Some(clock);
     }
 
-    /// Compute the columns of `row` from its node and the frame of its transform parent, which is current.
-    fn place(&mut self, scene: &Scene, row: usize) {
-        if !self.plain[row] {
-            return;
+    fn read_local(&mut self, scene: &Scene, row: usize) {
+        if self.plain[row] {
+            let node = &scene.doc.nodes[row];
+            self.local[row] = Placed::own(node);
+            self.hidden[row] = Scene::hides_paint_subtree(node);
         }
-        let node = &scene.doc.nodes[row];
-        let above = match self.link[row] {
-            NONE => None,
-            parent => Some(self.frames[self.frame_of[parent as usize] as usize]),
-        };
-        self.own[row] = Placed::own(node).under(above.as_ref());
-        self.hidden[row] = Scene::hides_paint_subtree(node)
-            || (self.link[row] != NONE && self.hidden[self.link[row] as usize]);
-        let frame = self.frame_of[row];
-        if frame != NONE {
-            // A plain row is its own resolved record and no boolean's source.
-            self.frames[frame as usize] = Placed::parent(node, false).under(above.as_ref());
-        }
+    }
+
+    /// An inherited affine and visibility value are computed once for all children.
+    /// A leaf's world-space consumers compose its local value at the point of use.
+    fn place_parent(&mut self, scene: &Scene, row: usize) {
+        let frame = self.frame_of[row] as usize;
+        let above = self.parent_frame(row);
+        self.frames[frame] = Placed::parent(&scene.doc.nodes[row], false).under(above.map(|i| &self.frames[i]));
+        self.frame_hidden[frame] = self.hidden[row] || above.is_some_and(|i| self.frame_hidden[i]);
     }
 
     /// Read the scene's hierarchy into the row arrays.
@@ -322,12 +348,14 @@ impl Worlds {
         reset(&mut self.whole, rows, true);
         reset(&mut self.parent, rows, false);
         reset(&mut self.frame_of, rows, NONE);
-        reset(&mut self.own, rows, identity);
+        reset(&mut self.local, rows, identity);
         reset(&mut self.hidden, rows, false);
         reset(&mut self.visibility_plain, rows, false);
         self.order.clear();
         self.order.reserve(rows);
         self.frames.clear();
+        self.frame_hidden.clear();
+        self.parent_positions.clear();
         // A repeated id draws its last copy; only that row is the node.
         let canonical = |row: usize| scene.node_index.get(scene.doc.nodes[row].id()) == Some(&row);
         // Each row's first link of `transform_parent_chain`, by the same rules. A parent that holds children
@@ -456,8 +484,11 @@ impl Worlds {
             };
         }
         // A plain row that holds children keeps a frame for them.
-        for row in 0..rows {
+        for (position, &source) in self.order.iter().enumerate() {
+            let row = source as usize;
             if self.plain[row] && self.parent[row] {
+                self.parent_positions.push(position as u32);
+                self.frame_hidden.push(false);
                 self.frame_of[row] = self.frames.len() as u32;
                 self.frames.push(identity);
             }
@@ -476,6 +507,8 @@ impl Worlds {
         });
         if !agrees {
             reset(&mut self.plain, rows, false);
+            reset(&mut self.frame_of, rows, NONE);
+            self.parent_positions.clear();
         }
     }
 }

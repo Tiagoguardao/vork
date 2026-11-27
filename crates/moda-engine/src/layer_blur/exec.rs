@@ -167,7 +167,7 @@ pub(crate) fn crop_gaussian_source(plan: &mut CoveragePlan, group: &LayerBlurGro
                     let stroke_flags = (g.stroke_gradient_meta[3].round() as u32) / 4;
                     (g.gradient_flags.round() as u32 | stroke_flags) & 8 == 0
                 }
-                crate::seams::BodyPaint::Pattern(_) => false,
+                crate::seams::BodyPaint::Pattern(_) | crate::seams::BodyPaint::Program(_) => false,
             },
             _ => false,
         })

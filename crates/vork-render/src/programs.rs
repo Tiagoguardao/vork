@@ -18,7 +18,7 @@ pub(crate) fn program_source(
 ) -> Result<(String, PathBuf)> {
     // Authored origins must mean the same thing after the compiler enters its
     // workspace, and under relative/absolute spellings of the scene path.
-    let base: PathBuf = std::env::current_dir()?.join(base).components().collect();
+    let base: PathBuf = vork_inputs::current_dir()?.join(base).components().collect();
     match (&program.file, &program.source) {
         (Some(file), None) => {
             let path = base.join(file);
@@ -715,7 +715,7 @@ pub(crate) fn install<'a>(
     let mut compiled=unique;
     let sources=unique_sources;
     for (program,(_,origin)) in compiled.iter().zip(&sources) {
-        if !program.warnings.trim().is_empty() {eprintln!("{}: {}",origin.display(),program.warnings.trim());}
+        if !program.warnings.trim().is_empty() {crate::warnings::diagnostic(&format!("{}: {}",origin.display(),program.warnings.trim()));}
     }
     let mut dynamic_inputs = HashMap::<String, std::collections::BTreeSet<String>>::new();
     for track in scene.animation.iter().flat_map(|layer| layer.tracks.iter().flatten()) {
@@ -933,16 +933,18 @@ pub(crate) fn parallel_map_with_limit<T: Sync, R: Send>(items: &[T], limit: usiz
             loop {
                 let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(item) = items.get(index) else { break };
-                results.push((index, f(item)));
+                let (result, notices) = crate::warnings::Notices::defer(|| f(item));
+                results.push((index, result, notices));
             }
             Ok::<_, anyhow::Error>(results)
         })).collect();
         let mut results = Vec::new();
         for job in jobs { results.extend(job.join().expect("program worker panicked")?); }
-        results.sort_by_key(|(index, _)| *index);
+        results.sort_by_key(|(index, _, _)| *index);
         let mut values = Vec::new();
         let mut errors = Vec::new();
-        for (_, result) in results {
+        for (_, result, notices) in results {
+            notices.replay();
             match result {
                 Ok(value) => values.push(value),
                 Err(error) => errors.push(error),
@@ -980,6 +982,11 @@ fn input_key(tag: &[u8], abi: &Abi, identity: &[u8]) -> Result<blake3::Hasher> {
 /// reads and writes the same record. It names this host's files: like the exact receipts it
 /// sits beside them and is not among the kinds read from shipped shaders.
 struct Admissions<'a>(&'a dyn Fn(blake3::Hash)->PathBuf);
+impl Admissions<'_> {
+    fn installation_entry(&self, stamp: blake3::Hash) -> Option<PathBuf> {
+        Some((self.0)(stamp).parent()?.join(format!("{stamp}.slang-installation-v1.entry")))
+    }
+}
 impl vork_slang::AdmissionLedger for Admissions<'_> {
     fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf> {
         Some((self.0)(toolchain).parent()?.join(format!("{}.slang-admission-v1.entry",toolchain.to_hex())))
@@ -989,6 +996,15 @@ impl vork_slang::AdmissionLedger for Admissions<'_> {
     }
     fn record(&self, entry: &Path, toolchain: blake3::Hash) {
         let _=disk_cache::write(entry,toolchain.as_bytes());
+    }
+    fn installed(&self, stamp: blake3::Hash) -> Option<blake3::Hash> {
+        let bytes = disk_cache::read(&self.installation_entry(stamp)?)?;
+        Some(blake3::Hash::from_bytes(bytes.try_into().ok()?))
+    }
+    fn record_installation(&self, stamp: blake3::Hash, toolchain: blake3::Hash) {
+        if let Some(entry) = self.installation_entry(stamp) {
+            let _ = disk_cache::write(&entry, toolchain.as_bytes());
+        }
     }
 }
 
@@ -1009,7 +1025,7 @@ pub(crate) fn bound_program_identity(
     let admitted=admit(&|key|store.path("slang-input",1,key),compiler)?;
     let mut raw=input_key(b"program-input-receipt-v2",abi,source.as_bytes())?;
     raw.update(&(bindings.len() as u64).to_le_bytes());raw.update(bindings.as_bytes());
-    for part in [admitted.input_policy(),std::env::current_dir()?.join(origin).to_string_lossy().into_owned()] {
+    for part in [admitted.input_policy(),vork_inputs::current_dir()?.join(origin).to_string_lossy().into_owned()] {
         raw.update(&(part.len() as u64).to_le_bytes());raw.update(part.as_bytes());
     }
     let path=store.path("slang-input",1,raw.finalize());
@@ -1164,7 +1180,7 @@ pub(crate) fn native_input_receipt_path(
     identities: &std::collections::BTreeMap<String,Vec<u8>>,
     inputs: &[vork_slang::InputIdentity],
 ) -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
+    let cwd = vork_inputs::current_dir()?;
     let mut include = false;
     let absolute_args: Vec<String> = args.iter().map(|arg| {
         let value = if include {
@@ -1220,7 +1236,7 @@ pub(crate) fn cached<T: serde::Serialize + serde::de::DeserializeOwned>(
 
 /// All proof stages share exact compiler receipts. Stage ABI, generated bindings
 /// and options belong in the caller key; the compiler policy belongs here.
-fn cached_proof<T: serde::Serialize + serde::de::DeserializeOwned>(
+pub(crate) fn cached_proof<T: serde::Serialize + serde::de::DeserializeOwned>(
     store: &disk_cache::Store, key: blake3::Hash, compiler: &Compiler,
     abi: &Abi, source: &str, origin: &Path,
     build: impl FnOnce(&Compiler) -> Result<T>,
@@ -1490,15 +1506,18 @@ pub(crate) fn native(abi: &Abi, programs: &[Program], physical_hair: bool, cover
 mod help_tests {
     use super::*;
     #[test]
-    fn parallel_errors_follow_input_order() {
+    fn parallel_diagnostics_follow_input_order() {
         if std::thread::available_parallelism().map_or(1, usize::from) < 2 { return; }
         let second_started = std::sync::atomic::AtomicBool::new(false);
+        let warnings = crate::warnings::Collector::quiet();
+        let _scope = warnings.enter();
         let error = parallel_map_with_limit(&[0, 1, 2], 2, |i| -> Result<()> {
+            if *i == 0 {
+                while !second_started.load(std::sync::atomic::Ordering::Acquire) { std::thread::yield_now(); }
+            }
+            crate::warnings::dropped("test", serde_json::json!(i), "test warning".into());
             match i {
-                0 => {
-                    while !second_started.load(std::sync::atomic::Ordering::Acquire) { std::thread::yield_now(); }
-                    Ok(())
-                }
+                0 => Ok(()),
                 1 => {
                     second_started.store(true, std::sync::atomic::Ordering::Release);
                     anyhow::bail!("first error")
@@ -1506,6 +1525,8 @@ mod help_tests {
                 _ => anyhow::bail!("later error"),
             }
         }).unwrap_err();
+        let order: Vec<_> = warnings.snapshot().into_iter().map(|warning| warning.requested).collect();
+        assert_eq!(order, [0, 1, 2].map(|index| serde_json::json!(index)));
         assert_eq!(error.root_cause().to_string(), "first error");
         assert!(error.to_string().starts_with("first error"), "{error:#}");
     }
@@ -1753,7 +1774,7 @@ pub(crate) fn bind_inputs(
 ) -> Result<()> {
     bind_input_words(plan, material, layout, words, base, offset, false)
 }
-fn bind_input_words(
+pub(crate) fn bind_input_words(
     plan: &mut crate::animation::Plan, material: &str, layout: &vork_slang::InputLayout,
     words: &mut [u32], base: usize, offset: f32, discrete: bool,
 ) -> Result<()> {
@@ -2284,7 +2305,7 @@ mod bundled_origin_tests {
         let receipt_key = |args: &[&str], input: &vork_slang::InputIdentity|
             native_input_receipt_path(&cache,&compiler,&modules,"main",&entries,args,&Default::default(),std::slice::from_ref(input));
         assert_ne!(receipt_key(&args,&original)?,receipt_key(&args,&other)?);
-        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        let cwd = vork_inputs::current_dir()?.to_string_lossy().into_owned();
         assert_eq!(receipt_key(&["-target",target,"-I","."],&original)?,receipt_key(&["-target",target,"-I",&cwd],&original)?);
         let binary=prepared.context("first input must be captured")?.compile()?;
         let artifact=cache(blake3::hash(&original.identity));

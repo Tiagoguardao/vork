@@ -3,7 +3,8 @@ mod process;
 mod records;
 mod revision;
 pub use process::{DecoderProcess, PixelPipes, stop_decoders_for_exit};
-pub use revision::{MediaReader, MediaRevision};
+pub use vork_inputs::tool_command;
+pub use revision::{MediaBinding, MediaReader, MediaRevision};
 
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -25,7 +26,7 @@ pub fn opaque_stream(codec: &str, format: &str) -> bool {
 }
 
 /// Y′CbCr coefficients for an opaque picture accepted by the native NV12 converter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NativeMatrix {
     Bt709 = 1,
     Bt601 = 2,
@@ -40,13 +41,13 @@ impl NativeMatrix {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct MissingCropOffsets;
 
 // The clock stays usable when an older probe cannot certify the source window.
 type ProbedMatrix = Result<Option<NativeMatrix>, MissingCropOffsets>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Picture {
     pts: i64,
     raw_pts: Option<i64>,
@@ -110,8 +111,8 @@ impl Probe {
         Self::command(revision, fields, source_raster)
     }
 
-    fn command(revision: &MediaRevision, fields: &str, source_raster: Option<[u32; 2]>) -> Result<ProbeCommand> {
-        let mut command = Command::new("ffprobe");
+    fn command(revision: &MediaRevision, fields: &'static str, source_raster: Option<[u32; 2]>) -> Result<ProbeCommand> {
+        let mut command = tool_command("ffprobe");
         if source_raster.is_some() {
             command.args(["-apply_cropping", "0"]);
         }
@@ -130,18 +131,21 @@ impl Probe {
                 "compact=p=1",
             ])
             .stdout(Stdio::piped());
-        revision.input(&mut command)?;
+        revision.attach(&mut command)?;
         Ok(ProbeCommand { command, source_raster })
     }
 
-    fn start(ProbeCommand { command, source_raster }: ProbeCommand) -> Result<(Self, Picture)> {
+    fn spawn(ProbeCommand { command, source_raster }: ProbeCommand) -> Result<Self> {
         let child = DecoderProcess::start(command).context("probe displayed video frames")?;
-        let mut probe = Self {
+        Ok(Self {
             stdout: BufReader::new(child.stdout()),
             child,
             line: String::new(),
             source_raster,
-        };
+        })
+    }
+    fn start(command: ProbeCommand) -> Result<(Self, Picture)> {
+        let mut probe = Self::spawn(command)?;
         let first = probe.next()?.context("video has no displayed frames")?;
         Ok((probe, first))
     }

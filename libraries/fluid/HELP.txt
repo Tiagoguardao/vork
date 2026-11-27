@@ -1,12 +1,7 @@
-fluid: APIC/FLIP liquid surfaces, wetting and whitewater (advanced simulation).
-Authoring: from vork.fluid import build (installed Python SDK); materials shade surfaces.
-Install the Python SDK with pip install vork, or from the archive's python directory.
-First use compiles custom simulation shaders and can take several minutes even
-at time zero. Lower image resolution does not reduce shader compilation, simulation
-grid sizes or pressure iterations. --at T replays simulation ticks from zero to T.
-Begin at --at 0 with a coarse grid and small particle budget; then advance time.
-Watch shader/pipeline progress; later runs reuse cached programs. GPU timing depends
-on simulation grids and tick count as well as image resolution.
+fluid: APIC/FLIP liquid, wetting and whitewater. Use from vork.fluid import build
+(vork help sdk). Start with a coarse grid, small particle budget and --at 0;
+first compile can take minutes. Later runs reuse cached shaders. --at T replays ticks to T. Reduce grid size and
+pressure iterations for cheaper simulation; resolution only changes render work.
 build() returns geometry["water"] using buffers["surface"] and
 geometry["floor_film"] using buffers["film_surface"]. With whitewater_budget > 0,
 it also returns geometry["whitewater"] using buffers["white_draw_position"],
@@ -83,8 +78,7 @@ must share the authored height; the bounded field rejects overflowing depth.
 With whitewater_budget > 0 only, geometry["whitewater"] uses
 buffers["white_draw_position"] for compact point positions and buffers["white_width"]
 for fixed diameters, both in solver units; use node scale=scale.
-buffers["white_count"] is the active prefix. Width is not compute-bound:
-the renderer can bound sphere tessellation from its physical size and camera near plane.
+buffers["white_count"] is the active prefix. Width is fixed.
 buffers["white_draw_id"] carries slot/generation identities through compaction. Bind it as
 geometry.ids so deaths, compaction and slot reuse preserve historical correspondence.
 buffers["white_position"], buffers["white_life"] and buffers["white_kind"]
@@ -116,8 +110,7 @@ fluid_status is a sticky u32 receipt bound to bulk and film geometry.status. Non
 values refuse the exposure with the mesh node name and remedy: 1 domain escape,
 2 insufficient reconstruction capacity, 3 nonconvergence, 4 invalid numeric
 state, 5 unresolved zero cell, 6 overflowing film height. Enlarge the free container or refine surface_grid
-for capacity; correct callbacks or reduce dt for invalid/escaping state. The
-private raw field tags solid samples; failures never deliberately publish NaNs.
+for capacity; correct callbacks or reduce dt for invalid/escaping state.
 Rest-density feedback in ghost-fluid pressure relaxes over the cell's gravity/
 capillary time. Signed feedback is restricted to a bulk neighbourhood covering
 quadratic transfer support; boundary cells only correct over-density. Scalar
@@ -142,9 +135,6 @@ A beach should use a bounded breaking-wave patch with authored spectral boundary
 velocity and volume accounting, not allocate a finely resolved open ocean. No sparse
 solver, adaptive sheet resampling, open-boundary marker recycling, two-way air or rigid
 body coupling. Fine spray does not repair unresolved sheets or an authored regular impulse.
-References: https://doi.org/10.1145/2766996 (APIC);
-https://doi.org/10.1145/2421636.2421641 (Yu–Turk);
-https://cg.informatik.uni-freiburg.de/publications/2012_CGI_sprayFoamBubbles.pdf
 
 fluid.particles: Yu–Turk anisotropic particle-surface mathematics (ACM TOG 2013).
   particle_moment(inout ParticleMoments, relative:float3, neighbourhood_radius:float):
